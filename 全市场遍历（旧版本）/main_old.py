@@ -22,27 +22,27 @@ def backtest(df, n_days,buy_mode):
     
     for buy_date in buy_dates:
         idx = df.index.get_loc(buy_date)
-    
-        if buy_mode == 'open':  #次日开盘买入
-            if idx + 1 + n_days < len(df):
-                prev_close = df.iloc[idx]['close']
-                open_price = df.iloc[idx + 1]['open']
-                limit_up_price = round(prev_close * 1.10, 2)
 
-                if open_price >= limit_up_price:  #开盘涨停，无法买入
-                    continue
-
-                buy_price = open_price
-                sell_price = df.iloc[idx + 1 + n_days]['close']
-            else:
+        if buy_mode == 'open':
+            if idx + 1 >= len(df):
                 continue
+            buy_price = df.iloc[idx + 1]['open']
+            buy_idx = idx + 1
+            sell_start_idx = idx + 2  # 第二天开始才有持仓
 
-        elif buy_mode == 'close':  #当日尾盘买入
-            if idx + n_days < len(df):
-                buy_price = df.iloc[idx]['close']
-                sell_price = df.iloc[idx + n_days]['close']
-            else:
+        elif buy_mode == 'close':
+            if idx >= len(df):
                 continue
+            buy_price = df.iloc[idx]['close']
+            buy_idx = idx
+            sell_start_idx = idx + 1  # 第二天才能卖出
+
+        elif buy_mode == 'signal_open':
+            if idx >= len(df):
+                continue
+            buy_price = df.iloc[idx]['open']
+            buy_idx = idx
+            sell_start_idx = idx + 1
 
         else:
             raise ValueError(f"不支持的买入模式: {buy_mode}")

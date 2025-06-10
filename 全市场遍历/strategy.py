@@ -1,31 +1,23 @@
-#单针下20
-from indicators import momentum_multi
+from indicators import bupiao
+import pandas as pd
+
 
 def buy_signal(df):
-    short, mid, midlong, long = momentum_multi(df)
-
+    short, mid, midlong, long = bupiao(df)
     signal = (short <= 20) & (long >= 80)
-
     return signal.fillna(False)
 
-###############################################################################################
+def sell_signal(df):
+    """
+    返回两个布尔序列：
+    - sell_by_open: 是否满足开盘价卖出条件
+    - sell_by_close: 是否满足收盘价卖出条件
+    """
+    short, mid, midlong, long = bupiao(df)
+    sell_by_open = (short <= 80) & (long <= 80)  # 示例条件
+    sell_by_close = (short <= 80) & (long <= 80)  # 示例条件
 
-#j负值后带量突破
-# from indicators import kdj, volume_ratio
-
-# def buy_signal(df):
-#     # 计算 KDJ
-#     k, d, j = kdj(df)
-
-#     # 计算量比 VR
-#     vr = volume_ratio(df)
-
-#     # 将 J 值向后移动一位，代表“前一天的 J 值”
-#     j_prev = j.shift(1)
-
-#     # 构建买入信号条件
-#     signal = (j_prev < 0) & (vr > 2)
-
-#     return signal.fillna(False)
-
-###############################################################################################
+    return pd.DataFrame({
+        'sell_by_open': sell_by_open.fillna(False),
+        'sell_by_close': sell_by_close.fillna(False)
+    })
