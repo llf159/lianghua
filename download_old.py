@@ -6,7 +6,7 @@ from datetime import datetime
 from tqdm import tqdm
 
 # ======== 用户配置 ========
-TOKEN = '7d068520a3a326aa8e39cd002a6ebdc836a7d12768c4c9b343cfecbf'
+TOKEN = ''#请自行到 https://tushare.pro 获取token
 SAVE_DIR = r'E:\gupiao'
 START_DATE = '20050101'
 END_DATE = datetime.today().strftime('%Y%m%d')
