@@ -34,11 +34,11 @@ def volume_ratio(df, n=20):
     """
     量比 VR = 当前成交量 / 过去n日平均成交量
     """
-    avg_volume = df['volume'].rolling(n).mean()
-    vr = df['volume'] / avg_volume
+    avg_volume = df['vol'].rolling(n).mean()
+    vr = df['vol'] / avg_volume
     return vr
 
-def momentum_multi(df, n1=5, n2=30):
+def bupiao(df, n1=3, n2=21):
     """计算短期/中期/中长期/长期动量指标"""
     C = df['close']
     L = df['low']
@@ -64,7 +64,7 @@ def four_line_zero_strategy(df, **params):
     n2 = params.get("n2", 30)  # 长期
 
     # 获取四个动量值（你之前提供的公式）
-    short, mid, midlong, long = momentum_multi(df, n1=n1, n2=n2)
+    short, mid, midlong, long = bupiao(df, n1=n1, n2=n2)
 
     # 加入 df 可视化（非必要）
     df['short'] = short
@@ -76,3 +76,32 @@ def four_line_zero_strategy(df, **params):
     signal = (short <= 6) & (mid <= 6) & (midlong <= 6) & (long <= 6)
 
     return signal.fillna(False)
+
+def cci(df, n=14):
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    ma = tp.rolling(n).mean()
+    md = tp.rolling(n).apply(lambda x: (abs(x - x.mean())).mean())
+    return (tp - ma) / (0.015 * md)
+
+def shuangjunxian(df, n=5):
+    df = df.copy()
+    df["avg_price"] = df["close"].rolling(n).mean()
+    df["avg_vol"] = df["vol"].rolling(n).mean()
+
+    df["price_up"] = df["avg_price"] > df["avg_price"].shift(1)
+    df["vol_up"] = df["avg_vol"] > df["avg_vol"].shift(1)
+
+    df["bar_color"] = "green"  # 默认绿柱
+    df.loc[df["price_up"] & df["vol_up"], "bar_color"] = "red"
+    df.loc[df["price_up"] ^ df["vol_up"], "bar_color"] = "yellow"
+
+    return df["bar_color"]
+
+def bbi(df):
+    ma3 = df['close'].rolling(3).mean()
+    ma6 = df['close'].rolling(6).mean()
+    ma12 = df['close'].rolling(12).mean()
+    ma24 = df['close'].rolling(24).mean()
+
+    return (ma3 + ma6 + ma12 + ma24) / 4
+

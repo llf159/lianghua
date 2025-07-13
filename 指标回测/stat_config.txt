@@ -1,4 +1,0 @@
-n-1=kdj.j
-n-2=rsi
-n-5~n-1=pct
-n-10~n-1=vol

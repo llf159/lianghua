@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import argparse
+import time
 import os
 from datetime import datetime
 import openpyxl
@@ -14,14 +15,14 @@ from strategy import buy_signal, sell_signal
 from config import HOLD_DAYS, START_DATE, END_DATE, BUY_MODE, SELL_MODE, DATA_DIR, FALLBACK_SELL_MODE, MAX_HOLD_DAYS
 from utils import ensure_datetime_index
 
-# === 初始化运行时间 & 文件路径 ===
+#初始化运行时间 & 文件路径
 RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M")
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 CSV_PATH = os.path.join(RESULTS_DIR, f"summary_{RUN_TIMESTAMP}.csv")
 XLSX_PATH = CSV_PATH.replace(".csv", ".xlsx")
 
-
+#逻辑部分#########################################################################################
 def backtest(df, n_days, buy_mode):
     signals = buy_signal(df)
     buy_dates = df.index[signals]
@@ -37,7 +38,7 @@ def backtest(df, n_days, buy_mode):
                 prev_close = df.iloc[idx]['close']
                 open_price = df.iloc[idx + 1]['open']
                 limit_up_price = round(prev_close * 1.10, 2)
-                if open_price >= limit_up_price:
+                if open_price >= limit_up_price:                          # 如果开盘价大于等于涨停价，则不买入
                     continue
                 buy_price = open_price
                 sell_start_idx = idx + 1 + n_days
@@ -55,7 +56,7 @@ def backtest(df, n_days, buy_mode):
             if idx >= len(df):
                 continue
             buy_price = df.iloc[idx]['open']
-            sell_start_idx = idx + 1
+            sell_start_idx = idx + n_days
 
         else:
             raise ValueError(f"不支持的买入模式: {buy_mode}")
@@ -63,13 +64,14 @@ def backtest(df, n_days, buy_mode):
         # === 卖出逻辑 ===
         if SELL_MODE == 'open':
             sell_price = df.iloc[sell_start_idx]['open']
+            
         elif SELL_MODE == 'close':
             sell_price = df.iloc[sell_start_idx]['close']
+        
         elif SELL_MODE == 'strategy':
             max_days = MAX_HOLD_DAYS if MAX_HOLD_DAYS != -1 else len(df)
             sell_signals = all_sell_signals.iloc[sell_start_idx : sell_start_idx + max_days + 1]
             sell_window = df.iloc[sell_start_idx : sell_start_idx + max_days + 1]
-
             sell_price = None
             for offset in range(1, max_days + 1):
                 if offset >= len(sell_signals):
@@ -101,7 +103,7 @@ def backtest(df, n_days, buy_mode):
         elif ret < 0:
             losses.append(ret)
 
-    # === 统计结果 ===
+#统计部分##########################################################################################
     returns = np.array(results)
     win_avg = np.mean(wins) if wins else 0
     loss_avg = abs(np.mean(losses)) if losses else 0
@@ -131,8 +133,10 @@ def run_backtest_on_file(file_path):
     summary = backtest(df, HOLD_DAYS, BUY_MODE)
     return os.path.basename(file_path), summary
 
-
+#主函数##################################################################################################
 def main():
+    start_time = time.time()
+    
     parser = argparse.ArgumentParser(description="量化策略回测工具 v3")
     parser.add_argument('--file', help='单个CSV数据文件路径（可选）')
     args = parser.parse_args()
@@ -147,7 +151,7 @@ def main():
             return
         files = [os.path.join(DATA_DIR, f) for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
 
-    VERBOSE = False
+    VERBOSE = 0
     # total = len(files)
     # for i, fpath in enumerate(files, 1):
     #     print(f"正在回测第 {i}/{total} 支股票：{os.path.basename(fpath)}")
@@ -160,14 +164,18 @@ def main():
             for k, v in summary.items():
                 print(f"  {k}: {v}")
         all_results.append(dict(filename=fname, **summary))
+        
+    end_time = time.time()
+    print(f"\n总用时：{end_time - start_time:.2f} 秒")
+    input("按下回车退出...")
 
-    # 保存 CSV/Excel 结果
+    # 保存 CSV/Excel 结果#################################################################################
     df_all = pd.DataFrame(all_results)
     df_all.to_csv(CSV_PATH, index=False, encoding='utf-8-sig')
     # ==== 加权平均盈亏比 ====
     valid_rows = df_all[pd.to_numeric(df_all["盈亏比"], errors='coerce').notna()]
-    valid_rows["信号数"] = pd.to_numeric(valid_rows["信号数"], errors='coerce')
-    valid_rows["盈亏比"] = pd.to_numeric(valid_rows["盈亏比"], errors='coerce')
+    valid_rows.loc[:, "信号数"] = pd.to_numeric(valid_rows["信号数"], errors='coerce')
+    valid_rows.loc[:, "盈亏比"] = pd.to_numeric(valid_rows["盈亏比"], errors='coerce')
 
     total_signals = valid_rows["信号数"].sum()
     if total_signals > 0:
