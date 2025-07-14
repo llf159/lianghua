@@ -1,11 +1,11 @@
-# from indicators import bupiao
-# import pandas as pd
+from indicators import bupiao
+import pandas as pd
 
 
-# def buy_signal(df):
-#     short, mid, midlong, long = bupiao(df)
-#     signal = (short <= 20) & (long >= 80)
-#     return signal.fillna(False)
+def buy_signal(df):
+    short, mid, midlong, long = bupiao(df)
+    signal = (short <= 20) & (long >= 80)
+    return signal.fillna(False)
 
 # def sell_signal(df):
 #     """
@@ -48,27 +48,32 @@
 #         'sell_by_close': sell_by_close
 #     })
 
-import pandas as pd
-from indicators import bupiao
-from patterns import is_soft_W_pattern
+# import pandas as pd
+# from indicators import bupiao
 
-def buy_signal(df):
-    short, _, _, long = bupiao(df)
-    df['short'] = short
-    df['long'] = long
+# def buy_signal(df):
+#     short, _, _, long = bupiao(df)
+#     df["short"] = short
+#     df["long"] = long
 
-    cond1 = df['long'].rolling(5).min() > 80
-    cond2 = pd.Series(False, index=df.index)
+#     # 将所需数据向后/向前平移
+#     day1_long = df["long"].shift(2)
+#     day1_short = df["short"].shift(2)
 
-    n = 10
-    for i in range(n, len(df)):
-        if not cond1.iloc[i]:
-            continue
-        window_series = df['short'].iloc[i-n:i+1]
-        if is_soft_W_pattern(window_series):
-            cond2.iloc[i] = True
+#     day2_long = df["long"].shift(1)
+#     day2_short = df["short"].shift(1)
 
-    return (cond1 & cond2).fillna(False)
+#     day3_long = df["long"]
+#     day3_short = df["short"]
+
+#     # 构造条件
+#     cond = (
+#         (day1_long == 100) & (day1_short == 100) &
+#         (day2_long > 80) & (day2_short < 25) &
+#         (day3_long > 80) & (day3_short > 80)
+#     )
+
+#     return cond.fillna(False)
 
 
 from indicators import bbi

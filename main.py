@@ -22,7 +22,7 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 CSV_PATH = os.path.join(RESULTS_DIR, f"summary_{RUN_TIMESTAMP}.csv")
 XLSX_PATH = CSV_PATH.replace(".csv", ".xlsx")
 
-#逻辑部分#########################################################################################
+#逻辑部分#################################################################################################
 def backtest(df, n_days, buy_mode):
     signals = buy_signal(df)
     buy_dates = df.index[signals]
@@ -103,7 +103,7 @@ def backtest(df, n_days, buy_mode):
         elif ret < 0:
             losses.append(ret)
 
-#统计部分##########################################################################################
+#统计部分#################################################################################################
     returns = np.array(results)
     win_avg = np.mean(wins) if wins else 0
     loss_avg = abs(np.mean(losses)) if losses else 0
@@ -137,19 +137,9 @@ def run_backtest_on_file(file_path):
 def main():
     start_time = time.time()
     
-    parser = argparse.ArgumentParser(description="量化策略回测工具 v3")
-    parser.add_argument('--file', help='单个CSV数据文件路径（可选）')
-    args = parser.parse_args()
-
     all_results = []
 
-    if args.file:
-        files = [args.file]
-    else:
-        if not os.path.exists(DATA_DIR):
-            print(f"配置中的数据目录不存在: {DATA_DIR}")
-            return
-        files = [os.path.join(DATA_DIR, f) for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
+    files = [os.path.join(DATA_DIR, f) for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
 
     VERBOSE = 0
     # total = len(files)
@@ -166,8 +156,6 @@ def main():
         all_results.append(dict(filename=fname, **summary))
         
     end_time = time.time()
-    print(f"\n总用时：{end_time - start_time:.2f} 秒")
-    input("按下回车退出...")
 
     # 保存 CSV/Excel 结果#################################################################################
     df_all = pd.DataFrame(all_results)
@@ -204,6 +192,9 @@ def main():
     ws.cell(row=1, column=2, value=round(weighted_pl_ratio, 4))
 
     wb.save(XLSX_PATH)
+    
+    print(f"\n总用时：{end_time - start_time:.2f} 秒")
+    input("按下回车退出...")
 
 
 if __name__ == '__main__':

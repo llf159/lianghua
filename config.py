@@ -2,7 +2,7 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)) 
 
 # 配置参数
-HOLD_DAYS = 2  # 买入持有天数
+HOLD_DAYS = 5  # 买入持有天数
 
 START_DATE = "2010-01-01"
 END_DATE = "2025-06-01"
@@ -18,6 +18,8 @@ BUY_MODE = "open"
 
 #open为买入后n日开盘价卖出，close为收盘价卖出，strategy为策略卖出
 SELL_MODE = "strategy"
+# SELL_MODE = "open"
+# SELL_MODE = "close"
 
 MAX_HOLD_DAYS = -1  # -1 表示不限制持有天数，其他正整数表示最多持有几天
 

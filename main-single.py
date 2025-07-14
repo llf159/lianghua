@@ -124,7 +124,7 @@ def main():
     output_path = os.path.join("results", f"{target_file.replace('.csv', '_trades.csv')}")
     trades_df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
-    print(f"\n✅ 交易明细已保存至：{output_path}")
+    print(f"\n 交易明细已保存至：{output_path}")
     print(trades_df)
 
 if __name__ == "__main__":
