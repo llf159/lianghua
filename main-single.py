@@ -7,12 +7,15 @@ from utils import ensure_datetime_index
 
 def backtest_single_stock(df):
     signals = buy_signal(df)
-    buy_dates = df.index[signals]
-    all_sell_signals = sell_signal(df)
+    buy_dates = pd.to_datetime(df.index[signals])
 
     trades = []
+    holding_until = None 
 
     for buy_date in buy_dates:
+        if holding_until and buy_date <= holding_until:
+            continue
+        
         idx = df.index.get_loc(buy_date)
 
         # === 买入逻辑 ===
@@ -34,59 +37,74 @@ def backtest_single_stock(df):
             sell_start_idx = idx + HOLD_DAYS
 
         elif BUY_MODE == 'signal_open':
-            if idx >= len(df):
+            if idx + HOLD_DAYS >= len(df):
                 continue
             buy_price = df.iloc[idx]['open']
-            sell_start_idx = idx + HOLD_DAYS
+            sell_start_idx = idx + 1
 
         else:
             raise ValueError(f"不支持的买入模式: {BUY_MODE}")
 
         # === 卖出逻辑 ===
-        if SELL_MODE == 'open':
-            if sell_start_idx >= len(df): continue
-            sell_price = df.iloc[sell_start_idx]['open']
+        if SELL_MODE in ['open', 'close']:
+            max_days = HOLD_DAYS
+            if sell_start_idx + max_days >= len(df):
+                continue
 
-        elif SELL_MODE == 'close':
-            if sell_start_idx >= len(df): continue
-            sell_price = df.iloc[sell_start_idx]['close']
+            if SELL_MODE == 'open':
+                sell_price = df.iloc[sell_start_idx]['open']
+            else:
+                sell_price = df.iloc[sell_start_idx]['close']
+            real_sell_idx = sell_start_idx
 
         elif SELL_MODE == 'strategy':
             max_days = MAX_HOLD_DAYS if MAX_HOLD_DAYS != -1 else len(df)
-            sell_signals = all_sell_signals.iloc[sell_start_idx : sell_start_idx + max_days + 1]
-            sell_window = df.iloc[sell_start_idx : sell_start_idx + max_days + 1]
+
+            if sell_start_idx >= len(df):
+                continue
+
+            remaining_len = len(df) - sell_start_idx
+            actual_window = min(max_days + 1, remaining_len)
+
+            all_sell_signals = sell_signal(df, [buy_date])
+            
+            sell_signals = all_sell_signals.iloc[sell_start_idx : sell_start_idx + actual_window]
+            sell_window  = df.iloc[sell_start_idx : sell_start_idx + actual_window]
+
             sell_price = None
-            for offset in range(1, max_days + 1):
-                if offset >= len(sell_signals): break
+            real_sell_idx = None
+
+            for offset in range(0, len(sell_signals)):
                 if sell_signals.iloc[offset]['sell_by_open']:
                     sell_price = sell_window.iloc[offset]['open']
-                    sell_start_idx += offset
+                    real_sell_idx = sell_start_idx + offset
                     break
                 elif sell_signals.iloc[offset]['sell_by_close']:
                     sell_price = sell_window.iloc[offset]['close']
-                    sell_start_idx += offset
+                    real_sell_idx = sell_start_idx + offset
                     break
 
-            if sell_price is None:
-                fallback_idx = sell_start_idx + max_days
-                if fallback_idx >= len(df): continue
-                sell_price = df.iloc[fallback_idx]['open'] if FALLBACK_SELL_MODE == 'open' else df.iloc[fallback_idx]['close']
-                sell_start_idx = fallback_idx
+            if real_sell_idx is None or real_sell_idx >= len(df):
+                continue
 
         else:
             raise ValueError(f"不支持的 SELL_MODE: {SELL_MODE}")
 
+        holding_until = df.index[real_sell_idx]
+
+#统计部分###############################################################################
         ret = (sell_price - buy_price) / buy_price
-        hold_days = (df.index[sell_start_idx] - buy_date).days
+        hold_days = (df.index[real_sell_idx] - buy_date).days
 
         trades.append({
-            "买入日期": buy_date.strftime("%Y-%m-%d"),
-            "卖出日期": df.index[sell_start_idx].strftime("%Y-%m-%d"),
-            "持股天数": hold_days,
-            "买入价": round(buy_price, 2),
-            "卖出价": round(sell_price, 2),
-            "收益率": f"{ret:.2%}"
-        })
+        "买入日期": str(buy_date.date()),
+        "卖出日期": str(df.index[real_sell_idx].date()),
+        "持股天数": (df.index[real_sell_idx] - buy_date).days,
+        "买入价": round(buy_price, 2),
+        "卖出价": round(sell_price, 2),
+        "收益率": f"{ret:.2%}"
+})
+
 
     return trades
 

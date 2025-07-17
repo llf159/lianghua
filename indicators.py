@@ -1,4 +1,5 @@
 import pandas as pd
+EPS = 1e-9 
 
 def moving_average(series, window):
     return series.rolling(window).mean()
@@ -24,7 +25,8 @@ def rsi(series, period=14):
 def kdj(df, n=9, k_period=3, d_period=3):
     low_min = df['low'].rolling(n).min()
     high_max = df['high'].rolling(n).max()
-    rsv = 100 * (df['close'] - low_min) / (high_max - low_min)
+    denom = (high_max - low_min).replace(0, EPS)
+    rsv = 100 * (df['close'] - low_min) / denom
     k = rsv.ewm(com=(k_period - 1)).mean()
     d = k.ewm(com=(d_period - 1)).mean()
     j = 3 * k - 2 * d
@@ -105,3 +107,27 @@ def bbi(df):
 
     return (ma3 + ma6 + ma12 + ma24) / 4
 
+# def z_score(df, window=20, smooth=3):
+#     oc_return = (df['close'] - df['open']) / df['open'] * 100
+#     mean = oc_return.rolling(window).mean()
+#     std = oc_return.rolling(window).std()
+
+#     z_score = (oc_return - mean) / std
+#     z_slope = z_score - z_score.shift(1)
+
+#     return pd.DataFrame({
+#         'z_score': z_score,
+#         'z_slope': z_slope
+#     })
+
+def z_score(df, window=20, smooth=3):
+    oc_return = (df['close'] - df['open']) / df['open'] * 100
+    mean = oc_return.rolling(window).mean()
+    std = oc_return.rolling(window).std()
+    std = std.replace(0, EPS)
+    z = (oc_return - mean) / std
+    slope = z.diff().rolling(smooth).mean()
+    return pd.DataFrame({
+        'z_score': z,
+        'z_slope': slope
+    }).fillna(0)

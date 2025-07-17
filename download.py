@@ -9,7 +9,7 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # ========== 用户配置 ==========
-TOKEN = ''
+TOKEN = ''               # https://tushare.pro/
 API_NAME = "pro_bar"
 START_DATE = '20050101'
 END_DATE = datetime.today().strftime('%Y%m%d')

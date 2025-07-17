@@ -2,19 +2,19 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)) 
 
 # 配置参数
-HOLD_DAYS = 5  # 买入持有天数
+HOLD_DAYS = 2  # 买入持有天数
 
-START_DATE = "2010-01-01"
+START_DATE = "2018-01-01"
 END_DATE = "2025-06-01"
 
 # 数据目录路径（可绝对路径或相对路径）
 DATA_DIR = "E://gupiao"
 # DATA_DIR = os.path.join(BASE_DIR, "test") 
 
-#open为次日开盘价买入，close为当日收盘价买入,single_open为信号当天开盘买入；open涨停不买入
-BUY_MODE = "open"
+#open为次日开盘价买入，close为当日收盘价买入,signal_open为信号当天开盘买入；open涨停不买入
+# BUY_MODE = "open"
 # BUY_MODE = "close"
-# BUY_MODE = "single_open"
+BUY_MODE = "signal_open"
 
 #open为买入后n日开盘价卖出，close为收盘价卖出，strategy为策略卖出
 SELL_MODE = "strategy"
