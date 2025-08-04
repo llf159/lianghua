@@ -20,7 +20,8 @@ import pandas as pd
 from tqdm import tqdm
 from tabulate import tabulate
 from backtest_core import backtest
-from strategy import buy_signal, sell_signal
+from strategy_buy import buy_signal
+from strategy_sell import sell_signal
 from config import (
     DATA_DIR,
     HOLD_DAYS,

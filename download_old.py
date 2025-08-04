@@ -9,12 +9,12 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # ========== 用户配置 ==========
-TOKEN = ''               # https://tushare.pro/
+TOKEN = ""              # https://tushare.pro/
 API_NAME = "pro_bar"
 START_DATE = '20050101'
 END_DATE = datetime.today().strftime('%Y%m%d')
-MAX_WORKERS = 20  # 并发线程数
-SAVE_DIR = r'E:\gupiao'
+MAX_WORKERS = 15  # 并发线程数
+SAVE_DIR = r'E:\gupiao-hfq'
 # ==============================
 
 ts.set_token(TOKEN)
@@ -23,7 +23,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ========== 缓存目录设置 ==========
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR = os.path.join(SCRIPT_DIR, 'data')
+CACHE_DIR = os.path.join(SCRIPT_DIR, 'cache')
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 def load_or_fetch(name, fetch_func):
@@ -51,7 +51,7 @@ stocks = load_or_fetch(
 print(f"[提示] 共获取到 {len(stocks)} 支股票")
 
 # ========== 下载函数 ==========
-def download_one_stock(row, retries=1, retry_delay=60):
+def download_one_stock(row, retries=1, retry_delay=15):
     ts_code = row['ts_code']
     name = row['name']
     filename = f"{ts_code}_{API_NAME}.csv"
@@ -68,7 +68,7 @@ def download_one_stock(row, retries=1, retry_delay=60):
                 ts_code=ts_code,
                 start_date=START_DATE,
                 end_date=END_DATE,
-                adj='qfq',
+                adj='hfq',
                 freq='D',
                 asset='E'
             )
@@ -86,7 +86,7 @@ def download_one_stock(row, retries=1, retry_delay=60):
                 time.sleep(retry_delay)
             else:
                 print(f"[错误] {ts_code} 第{attempt}次失败：{err_msg}")
-                time.sleep(3)
+                time.sleep(5)
 
     return (ts_code, f'失败: {err_msg}')
 

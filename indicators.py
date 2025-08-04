@@ -131,3 +131,4 @@ def z_score(df, window=20, smooth=3):
         'z_score': z,
         'z_slope': slope
     }).fillna(0)
+    
