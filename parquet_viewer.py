@@ -38,12 +38,17 @@ import datetime as dt
 from typing import List, Optional, Iterable
 
 # 第三方库（duckdb 可选）
-try:
-    import duckdb  # type: ignore
-    HAS_DUCKDB = True
-except Exception:
-    duckdb = None  # type: ignore
-    HAS_DUCKDB = False
+# try:
+#     import duckdb  # type: ignore
+#     HAS_DUCKDB = True
+#     duckdb.sql("PRAGMA progress_bar_time = FALSE;")
+# except Exception:
+#     duckdb = None  # type: ignore
+#     HAS_DUCKDB = False
+
+import duckdb
+HAS_DUCKDB = True
+duckdb.sql("PRAGMA disable_progress_bar;") 
 
 import pandas as pd
 
@@ -111,7 +116,8 @@ def glob_partitions(root: str, start: str, end: str) -> List[str]:
 
 def scan_with_duckdb(root: str, ts_code: Optional[str], start: str, end: str,
                      columns: Optional[List[str]] = None, limit: Optional[int] = None) -> pd.DataFrame:
-    pattern = os.path.join(root, "trade_date=*/part-*.parquet").replace("\\", "/")
+    # pattern = os.path.join(root, "trade_date=*/part-*.parquet").replace("\\", "/")
+    pattern = os.path.join(root, "trade_date=*/*.parquet").replace("\\", "/")
     sel = "*" if not columns else ", ".join(columns)
     where = [f"trade_date BETWEEN '{start}' AND '{end}'"]
     if ts_code:
@@ -130,7 +136,8 @@ def scan_with_pandas(root: str, ts_code: Optional[str], start: str, end: str,
     remaining = limit if limit is not None else None
 
     for pdir in parts:
-        files = glob.glob(os.path.join(pdir, "part-*.parquet"))
+        # files = glob.glob(os.path.join(pdir, "part-*.parquet"))
+        files = glob.glob(os.path.join(pdir, "*.parquet"))
         for f in files:
             df = pd.read_parquet(f)
             # 过滤列
@@ -173,7 +180,8 @@ def read_range(base: str, asset: str, adj: str, ts_code: Optional[str], start: s
 def read_day(base: str, asset: str, adj: str, day: str, limit: Optional[int] = None) -> pd.DataFrame:
     root = asset_root(base, asset, adj if asset == "stock" else "daily")
     pdir = os.path.join(root, f"trade_date={day}")
-    files = glob.glob(os.path.join(pdir, "part-*.parquet"))
+    # files = glob.glob(os.path.join(pdir, "part-*.parquet"))
+    files = glob.glob(os.path.join(pdir, "*.parquet"))
     frames = [pd.read_parquet(f) for f in files]
     if not frames:
         return pd.DataFrame()
@@ -222,7 +230,7 @@ def show_schema(parquet_file: str):
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="按 trade_date 分区的 Parquet 行情查看工具")
-    parser.add_argument("--base", default="data", help="数据根目录（默认: data）")
+    parser.add_argument("--base", default="E:\\stock_data", help="数据根目录（默认: data）")
 
     sub = parser.add_subparsers(dest="cmd", required=True)
 
