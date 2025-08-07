@@ -81,7 +81,7 @@ LOG_LEVEL = "INFO"
 
 # -------- FAST INIT (按股票多线程全历史回补) 开关 --------
 FAST_INIT_MODE = True                     # 首次全历史快速抓取
-FAST_INIT_THREADS = 18                    # 并发线程数
+FAST_INIT_THREADS = 1                    # 并发线程数
 FAST_INIT_STOCK_DIR = os.path.join(DATA_ROOT, "fast_init_symbol")
 API_ADJ = "qfq"                           # qfq/hfq/raw
 # 若 FAST_INIT_MODE=True，可通过设置 API_ADJ 控制接口返回的复权方式：
@@ -111,7 +111,7 @@ FAILED_RETRY_WAIT = 5             # 下载结束到补抓之间的等待秒（�
 # ====== Skip 文件完整性快速检查参数 ======
 CHECK_SKIP_MIN_MAX = True                 # 是否启用跳过前检查
 CHECK_SKIP_READ_COLUMNS = ["trade_date"]  # 读取的列，尽量最少减少 IO
-CHECK_SKIP_ALLOW_LAG_DAYS = 2           # 允许已有文件的最大日期距离 end_date 的“滞后”天数 (0=必须等于 end_date)
+CHECK_SKIP_ALLOW_LAG_DAYS = 1           # 允许已有文件的最大日期距离 end_date 的“滞后”天数 (0=必须等于 end_date)
 SKIP_CHECK_START_ENABLED = False          # 是否启用开始日期检查（如果不需要可以关闭，减少接口调用）
 # ==========================================
 
@@ -199,12 +199,7 @@ INDICATOR_REGISTRY = {
     },
     "kdj": {
         "kind": "df",
-        "out": ["k","d","j"],
-    },
-    "rsi": {
-        "kind": "series_close",
-        "out": "rsi",
-        "kwargs": {"period": 14},
+        "out": ["j"],
     },
     "bbi": {
         "kind": "df",
@@ -215,20 +210,10 @@ INDICATOR_REGISTRY = {
         "out": "vr",
         "kwargs": {"n": 20},
     },
-    "macd": {
-        "kind": "series_close",
-        "out": ["macd","macd_signal","macd_hist"],
-        "kwargs": {"fast": 12, "slow": 26, "signal": 9},
-    },
     "bupiao": {
         "kind": "df",
-        "out": ["bupiao_short","bupiao_mid","bupiao_midlong","bupiao_long"],
+        "out": ["bupiao_short","bupiao_long"],
         "kwargs": {"n1": 3, "n2": 21},
-    },
-    "cci": {
-        "kind": "df",
-        "out": "cci",
-        "kwargs": {"n": 14},
     },
     "shuangjunxian": {
         "kind": "df",
@@ -276,6 +261,10 @@ def _add_indicators(df, names):
 
         # 落地
         if isinstance(res, pd.DataFrame):
+            # 如果在注册表里指定了 out，就只保留这些列
+            if out_names:
+                keep = out_names if isinstance(out_names, (list, tuple)) else [out_names]
+                res = res[[c for c in res.columns if c in keep]]
             for col in res.columns:
                 out[col] = res[col]
         elif isinstance(res, (list, tuple)):
@@ -318,7 +307,10 @@ def _write_symbol_product(ts_code: str, df: pd.DataFrame, end_date: str):
     df2 = df.copy()
     if "trade_date" not in df2.columns:
         raise ValueError("df 缺少 trade_date 列")
-    df2["trade_date"] = pd.to_datetime(df2["trade_date"].astype(str))
+    df2["trade_date"] = (
+        pd.to_datetime(df2["trade_date"].astype(str))   # 保留日期计算能力
+        .dt.strftime("%Y%m%d")                       # 立即转回字符串
+    )
     df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
 
     # 3) 增量 warm-up（如已有旧文件：保留旧数据<warmup起点，warm-up 段与新数据一起重算指标）
@@ -346,8 +338,21 @@ def _write_symbol_product(ts_code: str, df: pd.DataFrame, end_date: str):
 
     # 5) 最终落盘（再次按日期去重）
     df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+    price_cols = ["open", "high", "low", "close", "pre_close", "change"]
+    for col in price_cols:
+        if col in df2.columns:
+            df2[col] = df2[col].round(2)
+            
+    INDICATOR_DECIMALS = {
+        "j": 3,               # KDJ-J
+        "vr": 4,              # volume_ratio
+        "z_score": 6          # z_score
+    }
+    for col, n in INDICATOR_DECIMALS.items():
+        if col in df2.columns:
+            df2[col] = df2[col].round(n)
     df2.to_parquet(out_path, index=False, engine=PARQUET_ENGINE)
-    logging.info("[PRODUCT][%s] 成品已写出：%s（rows=%d, warmup=%s）",
+    logging.debug("[PRODUCT][%s] 成品已写出：%s（rows=%d, warmup=%s）",
                  ts_code, out_path, len(df2), SYMBOL_PRODUCT_WARMUP_DAYS if warmup_start is not None else 0)
 
 def _rate_limit():
@@ -554,7 +559,6 @@ def _need_duck_merge(daily_dir: str) -> bool:
 
     # ② 或新增行数 ≥ 阈值
     return new_rows >= DUCK_MERGE_MIN_ROWS
-
 
 # ========== 按交易日批量模式（原有日常增量） ==========
 def sync_stock_daily(start: str, end: str):

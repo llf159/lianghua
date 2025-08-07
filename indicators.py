@@ -30,7 +30,7 @@ def kdj(df, n=9, k_period=3, d_period=3):
     k = rsv.ewm(com=(k_period - 1)).mean()
     d = k.ewm(com=(d_period - 1)).mean()
     j = 3 * k - 2 * d
-    return k, d, j
+    return j
 
 def volume_ratio(df, n=20):
     """
@@ -55,7 +55,7 @@ def bupiao(df, n1=3, n2=21):
     midlong = calc_momentum(20)
     long = calc_momentum(n2)
 
-    return short, mid, midlong, long
+    return short, long
 
 def four_line_zero_strategy(df, **params):
     """
