@@ -20,6 +20,7 @@ def mute_duckdb_progress():
 
 import os
 import sys
+from pathlib import Path
 os.environ["TQDM_DISABLE"] = "0"
 os.environ.setdefault("TQDM_DISABLE", "0")
 
@@ -28,6 +29,11 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 mute_duckdb_progress()
+ROOT = Path(__file__).resolve().parent  # 当前脚本所在的根目录
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import parquet_viewer as pv
 import argparse
 import glob
 from datetime import datetime, date
@@ -35,11 +41,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from utils import ensure_datetime_index
 import pandas as pd
 from tabulate import tabulate
-from backtest_core import backtest
-from strategy_buy import buy_signal
-from strategy_sell import sell_signal
+from backtest_core import backtest buy_signal, sell_signal 
 from config import *
-import parquet_viewer as pv
 import re
 from contextlib import redirect_stdout, redirect_stderr
 import multiprocessing
@@ -51,12 +54,8 @@ from functools import partial
 import time
 from tqdm.rich import tqdm
 _TQDM_BAR = None
-
 PROGRESS_LOCK = multiprocessing.RLock()
 GLOBAL_LOCK = PROGRESS_LOCK
-# from safe_progress import tqdm, set_lock
-# from safe_concurrency import process_map
-
 CPU_COUNT = os.cpu_count() or 1
 N_WORKERS = max(1, CPU_COUNT - 1)  # 保留一个核心用于系统任务
 
@@ -64,27 +63,6 @@ START_TS  = pd.to_datetime(START_DATE)
 END_TS    = pd.to_datetime(END_DATE)
 START_STR = START_TS.strftime("%Y%m%d")   # 供 Parquet 分区读取
 END_STR   = END_TS.strftime("%Y%m%d")
-
-# def _pbar_update(done: int, total: int, start_ts: float, desc: str = "回测进度") -> None:
-#     """在 stderr 单行刷新进度条（主进程专用）"""
-#     if not sys.stderr.isatty():
-#         return
-#     pct = done / total if total else 1.0
-#     bar_len = 28
-#     filled = int(bar_len * pct)
-#     elapsed = max(0.0, time.time() - start_ts)
-#     rate = (done / elapsed) if elapsed > 0 else 0.0
-#     eta = ((total - done) / rate) if rate > 0 else 0.0
-#     bar = "#" * filled + "." * (bar_len - filled)
-#     sys.stderr.write(
-#         f"\r{desc}: [{bar}] {done}/{total} {pct:6.2%} | {rate:.1f}/s | ETA {eta:5.1f}s"
-#     )
-#     sys.stderr.flush()
-
-# def _pbar_finish() -> None:
-#     if sys.stderr.isatty():
-#         sys.stderr.write("\n")
-#         sys.stderr.flush()
 
 def _pbar_update(done: int, total: int, start_ts: float, desc: str = "回测进度") -> None:
     """主进程用 tqdm 展示进度；子进程已禁用"""
@@ -156,17 +134,17 @@ def as_timestamp(x) -> pd.Timestamp:
     """统一成 pandas Timestamp，供 DataFrame 过滤用。"""
     return pd.to_datetime(x)
 
-# def make_pbar(total, desc="回测进度"):
-#     return tqdm(
-#         total=total,
-#         desc=desc,
-#         leave=True,
-#         position=0,
-#         refresh_per_second=2,
-#         ascii=True, 
-#         disable=not sys.stderr.isatty(),
-#         file=sys.stderr,
-#     )
+def make_pbar(total, desc="回测进度"):
+    return tqdm(
+        total=total,
+        desc=desc,
+        leave=True,
+        position=0,
+        refresh_per_second=2,
+        ascii=True, 
+        disable=not sys.stderr.isatty(),
+        file=sys.stderr,
+    )
 
 def normalize_ts(ts_input: str, asset: str = "stock") -> str:
     ts = (ts_input or "").strip()
@@ -181,8 +159,8 @@ def normalize_ts(ts_input: str, asset: str = "stock") -> str:
     return ts.upper()
 
 def load_df_from_parquet(ts_code: str) -> pd.DataFrame:
-    cols = ["ts_code","trade_date","open","high","low","close","vol","amount"]
-
+    # cols = ["ts_code","trade_date","open","high","low","close","vol","amount"]
+    cols = None
     df = pv.read_range(PARQUET_BASE, "stock", PARQUET_ADJ,
                    ts_code, START_STR, END_STR, columns=cols, limit=None)
     df = ensure_datetime_index(df)

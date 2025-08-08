@@ -1,34 +1,89 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 r"""
-核心特性：
-  1. FAST_INIT_MODE=True 时（首次全历史快速回补）：
-       - 多线程按“股票”调用 pro_bar，一次性获取 2005-至今（START_DATE→END_DATE）的日线
-       - 可选择直接接口 qfq (FAST_INIT_USE_QFQ=True，最快) 或 未复权 raw
-       - 下载结果按股票临时存放 data/fast_init_symbol/ts_code=*.parquet
-       - 完成后自动归并为标准按日期分区 data/stock/daily/trade_date=YYYYMMDD/part-*.parquet
-       - 若 FAST_INIT_USE_QFQ=False 可以再拉全历史因子 + 本地计算 qfq/hfq
-  2. FAST_INIT_MODE=False 时（日常增量）：
-       - 使用批量按交易日接口 pro.daily / pro.adj_factor 增量同步（调用次数极少）
-       - 可构建本地 qfq/hfq
-  3. 前复权 / 后复权：
-       - 本地复权采用“反向收集 latest_factor → 正序计算 first_factor”逻辑，保证正确性
-  4. 进度条：tqdm 显示 FAST_INIT 下载与归并进度
-  5. 限频：滑动窗口 CALLS_PER_MIN 控制，防止触发大规模限频
-  6. 断点：
-       - FAST_INIT 已下载的股票文件存在则跳过
-       - 日常增量根据已有分区最大 trade_date 推断起始
-  7. 元数据与报告：
-       - _META.json：本次运行模式、区间、复权方式
-       - fast_init_failed.txt：FAST_INIT 失败股票列表
-       - completeness_report.json：缺失日期（整日分区缺失）报告
-       - adjust_build_report.json：复权构建统计
+用途
+----
+FAST_INIT 用于“首次全历史快速回补”。它按股票多线程抓取 Tushare 日线数据，并立刻产出两类数据：
+1) 单股票成品(含指标、带增量 warm-up) → 便于回测直接读取
+2) (可选)原始K线的按日分区 → 便于后续离线加工或校验
+
+关键配置
+--------
+- TOKEN:           Tushare Token(必填)
+- DATA_ROOT:       本地数据根目录
+- START_DATE:      起始日期，如 "20050101"
+- END_DATE:        结束日期，支持 "today"
+- FAST_INIT_MODE:  True=启用 FAST_INIT；False=走日常增量
+- API_ADJ:         原始接口的复权选择："raw" / "qfq" / "hfq"
+- FAST_INIT_THREADS: 下载并发线程
+- CALLS_PER_MIN:   限频窗口(滑动计数，避免被限流)
+- WRITE_SYMBOL_PRODUCT: True 时写“单股票成品(含指标)”
+- SYMBOL_PRODUCT_INDICATORS: 指标配置，"all" 或逗号分隔
+- SYMBOL_PRODUCT_WARMUP_DAYS: 指标增量重算的 warm-up 天数(默认 60 天)
+- DUCK_MERGE_DAY_LAG: 仅当按日分区的最大 trade_date 落后超过 LAG 天才触发合并
+- DUCKDB_THREADS / DUCKDB_MEMORY_LIMIT / DUCKDB_TEMP_DIR: DuckDB 并行、内存与临时目录参数
+
+生成目录结构
+------------
+(1) 临时/缓存：每只股票的原始下载文件
+    {DATA_ROOT}/fast_init_symbol/{API_ADJ}/{ts_code}.parquet
+
+(2) 单股票成品(含指标，带 warm-up 增量)
+    {DATA_ROOT}/stock/by_symbol_{adj}/{ts_code}.parquet
+    说明：{adj} 由 API_ADJ 决定，"daily" / "daily_qfq" / "daily_hfq"
+          文件内字段：基础行情 + 已计算的各类指标(精度按 INDICATOR_DECIMALS 控制)
+
+(3) 按日分区(含指标；增量 COPY)
+    {DATA_ROOT}/stock/{adj}_indicators/trade_date=YYYYMMDD/part-*.parquet
+    产出方式：调用 duckdb_merge_symbol_products_to_daily()，
+    将 (2) 中 “by_symbol_{adj}/*.parquet” 增量 COPY 到该分区目录
+
+(4) (可选)原始K线的按日分区(不含指标)
+    {DATA_ROOT}/stock/daily[/daily_qfq/daily_hfq]/trade_date=YYYYMMDD/part-*.parquet
+    产出方式：STREAM_MERGE(流式合并 fast_init_symbol/{raw|qfq|hfq} → 对应 daily* 目录)
+
+执行流程
+--------
+A. 下载阶段(多线程、限频、重试)
+   - 对股票清单逐只调用 ts.pro_bar(..., adj=API_ADJ)，写入 (1)
+   - 若开启 WRITE_SYMBOL_PRODUCT：对每只股票
+       · 读取“旧成品”尾部 warm-up 区间 + 新数据 → 合并后统一重算指标 → 写入 (2)
+
+B. 合并阶段(默认开启)
+   - 运行 duckdb_merge_symbol_products_to_daily()：
+     从 (2) 增量 COPY 新 trade_date 到 (3) 的按日分区
+
+C. (可选)原始K线流式合并
+   - 将 (1) 的 raw/qfq/hfq 分别流式合并到 (4)
+
+断点与幂等
+----------
+- FAST_INIT 下载：若 {fast_init_symbol}/{API_ADJ}/{ts_code}.parquet 已存在，
+  且其最大 trade_date ≥ (END_DATE - CHECK_SKIP_ALLOW_LAG_DAYS)，则跳过
+- 成品写入：单股票文件按 trade_date 去重；指标 warm-up 仅重算尾部窗口
+- 合并到按日分区：使用 DuckDB 的 COPY + PARTITION_BY(trade_date) + OVERWRITE_OR_IGNORE
+
+常见搭配
+--------
+1) “最快可用”方案(接口直接 qfq)
+   FAST_INIT_MODE=True, API_ADJ="qfq", WRITE_SYMBOL_PRODUCT=True, ADJ_MODE="none"
+   → 立即得到带指标的 by_symbol_daily_qfq 与 {daily_qfq}_indicators
+
+2) “更稳健的本地复权”方案(推荐)
+   FAST_INIT_MODE=True, API_ADJ="raw", WRITE_SYMBOL_PRODUCT=True, ADJ_MODE="both"
+   → 先拉原始，再本地构建 qfq/hfq，并同步生成对应的 *_indicators
+
+与回测对齐
+----------
+- 回测若读取 “含指标的按日分区”，请指向 {DATA_ROOT}/stock/{adj}_indicators/...
+- 若回测读取的是“原始K线按日分区”，请确认指标在读取端现算或从 by_symbol_* 读取
+- 强烈建议回测端的 PARQUET_ADJ 与这里的 {adj} 保持一致
 
 使用建议：
 | 使用场景            | FAST\_INIT\_MODE | API\_ADJ | ADJ\_MODE                               |
 | --------------------|------------------| -------- | --------------------------------------- |
 | 快速获取接口前复权   | True             | `"qfq"`  | `"none"`                                |
-| 本地构建复权（推荐） | True             | `"raw"`  | `"both"`                                |
+| 本地构建复权(推荐) | True             | `"raw"`  | `"both"`                                |
 | 日常增量更新         | False            | 无用     | `"qfq"` / `"hfq"` / `"both"` / `"none"` |
 
 
@@ -63,7 +118,7 @@ import threading
 
 # ===================== 配置区 =====================
 TOKEN = ""  # <-- 必填
-# DATA_ROOT = "./data"             # 下载数据目录（可改为绝对路径）
+# DATA_ROOT = "./data"             # 下载数据目录(可改为绝对路径)
 DATA_ROOT = r"E:\stock_data"
 ASSETS = ["stock", "index"]      # 可选: ["stock"], ["index"], ["stock","index"]
 START_DATE = "20050101"
@@ -87,7 +142,7 @@ API_ADJ = "qfq"                           # qfq/hfq/raw
 # 若 FAST_INIT_MODE=True，可通过设置 API_ADJ 控制接口返回的复权方式：
 ADJ_MODE = "none"      # 本地复权模式: 'none' | 'qfq' | 'hfq' | 'both'
 
-# -------- 按股票下载后同步生成成品（含指标） --------
+# -------- 按股票下载后同步生成成品(含指标) --------
 WRITE_SYMBOL_PRODUCT = True                # 打开后：每只股票下载成功就同步写成品
 SYMBOL_PRODUCT_INDICATORS = "all"  # 或 "all"
 SYMBOL_PRODUCT_WARMUP_DAYS = 60          # 增量重算指标的 warm-up 天数
@@ -101,38 +156,38 @@ RETRY_LOG_LEVEL = "INFO"             # 等待日志级别：INFO / DEBUG
 
 # ==== Streaming Merge 配置 ================
 STREAM_FLUSH_DATE_BATCH = 80      # 缓冲多少个不同 trade_date 就刷盘一次
-STREAM_FLUSH_STOCK_BATCH = 200    # 处理多少只股票后强制刷盘（避免长时间不落盘）
+STREAM_FLUSH_STOCK_BATCH = 200    # 处理多少只股票后强制刷盘(避免长时间不落盘)
 STREAM_LOG_EVERY = 300            # 每处理多少只股票打印一次进度日志
 FAILED_RETRY_ONCE = True          # 第一次下载后自动对失败股票再跑一轮
 FAILED_RETRY_THREADS = 8          # 失败补抓的线程数(可低一些)
-FAILED_RETRY_WAIT = 5             # 下载结束到补抓之间的等待秒（缓冲限频）
+FAILED_RETRY_WAIT = 5             # 下载结束到补抓之间的等待秒(缓冲限频)
 # ==========================================
 
 # ====== Skip 文件完整性快速检查参数 ======
 CHECK_SKIP_MIN_MAX = True                 # 是否启用跳过前检查
 CHECK_SKIP_READ_COLUMNS = ["trade_date"]  # 读取的列，尽量最少减少 IO
 CHECK_SKIP_ALLOW_LAG_DAYS = 1           # 允许已有文件的最大日期距离 end_date 的“滞后”天数 (0=必须等于 end_date)
-SKIP_CHECK_START_ENABLED = False          # 是否启用开始日期检查（如果不需要可以关闭，减少接口调用）
+SKIP_CHECK_START_ENABLED = False          # 是否启用开始日期检查(如果不需要可以关闭，减少接口调用)
 # ==========================================
 
 # ==== DuckDB 分批归并配置 =================
-DUCKDB_BATCH_SIZE = 300          # 每批处理的“单股票文件”数量（内存紧 → 降到 150/100）
+DUCKDB_BATCH_SIZE = 300          # 每批处理的“单股票文件”数量(内存紧 → 降到 150/100)
 DUCKDB_THREADS = 12              # DuckDB 并行线程 (2~8 之间；太大内存峰值上升)
-DUCKDB_MEMORY_LIMIT = "16GB"      # 给 DuckDB 的内存上限（小机器可设 "4GB"）
-DUCKDB_TEMP_DIR = "duckdb_tmp"   # Spill 目录（磁盘剩余空间要够）
+DUCKDB_MEMORY_LIMIT = "16GB"      # 给 DuckDB 的内存上限(小机器可设 "4GB")
+DUCKDB_TEMP_DIR = "duckdb_tmp"   # Spill 目录(磁盘剩余空间要够)
 DUCKDB_CLEAR_DAILY_BEFORE = False # 首次构建或要完全重建设 True，会清空 daily 目录
 DUCKDB_COLUMNS = "*"             # 列裁剪：可改成 "ts_code,trade_date,open,high,low,close,vol,amount"
 DUCKDB_ENABLE_COMPACT_AFTER = "if_needed"       # 启用压实
 COMPACT_MAX_FILES_PER_DATE = 12          # 超过 12 个 part 的日期执行压实
-COMPACT_TMP_DIR = "compact_tmp"          # 若 compact 函数里需要临时目录（当前版本没用到）
+COMPACT_TMP_DIR = "compact_tmp"          # 若 compact 函数里需要临时目录(当前版本没用到)
 DUCK_MERGE_DAY_LAG = 5          # parquet 最大日期距离 duck 表 > 5 天才触发合并
 DUCK_MERGE_MIN_ROWS = 1_000_000 # 或过去 5 天新增行数 > 100 万行才触发
 # ==========================================
 
 # ==== 复权因子多线程下载配置 ===============
 ADJ_MT_ENABLE = True          # 启用多线程因子下载
-ADJ_THREADS = 6               # 并发线程数（3~8 合理）
-ADJ_CALLS_PER_MIN = 466       # 给因子下载预留的每分钟调用预算（与 CALLS_PER_MIN 总和不要超过额度）
+ADJ_THREADS = 6               # 并发线程数(3~8 合理)
+ADJ_CALLS_PER_MIN = 466       # 给因子下载预留的每分钟调用预算(与 CALLS_PER_MIN 总和不要超过额度)
 ADJ_RETRY = 4                 # 每个日期的轻量重试次数
 ADJ_BACKOFF_BASE = 1.5        # 指数回退基数
 # ==========================================
@@ -160,14 +215,14 @@ _CALL_TS_LOCK = threading.Lock()
 
 
 # === 全局日志策略 ======================================================
-# 1.  INFO 及以上 → fast_init.log（每天轮换，保留 7 份）
-# 2.  WARNING 及以上 → 终端 stdout（与 tqdm 共存）
+# 1.  INFO 及以上 → fast_init.log(每天轮换，保留 7 份)
+# 2.  WARNING 及以上 → 终端 stdout(与 tqdm 共存)
 # =======================================================================
 
 root = logging.getLogger()
 root.setLevel(logging.INFO)          # 全局级别
 
-# 文件 Handler（轮换）
+# 文件 Handler(轮换)
 file_hdl = TimedRotatingFileHandler(
     "fast_init.log",
     when="midnight",
@@ -178,7 +233,7 @@ file_fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
 file_hdl.setFormatter(file_fmt)
 root.addHandler(file_hdl)
 
-# 终端 Handler（仅 WARNING+）
+# 终端 Handler(仅 WARNING+)
 console_hdl = logging.StreamHandler(sys.stdout)
 console_hdl.setLevel(logging.INFO)
 console_hdl.setFormatter(file_fmt)
@@ -189,13 +244,13 @@ dl_hdl.setLevel(logging.INFO)
 dl_hdl.setFormatter(file_fmt)
 root.addHandler(dl_hdl)
 
-# ===== 本地指标引擎（合并自 preprocess_symbols.py 的必要部分） =====
+# ===== 本地指标引擎(合并自 preprocess_symbols.py 的必要部分) =====
 # 说明：为了避免外部依赖 preprocess_symbols.py，这里内置了最小可用的指标注册和计算函数。
 # 仍依赖项目同目录下的 indicators.py 中的具体指标实现。
 INDICATOR_REGISTRY = {
     "z_score": {
         "kind": "df",
-        "out": "dataframe",  # 直接把 DataFrame 合并进去（包含 z_score, z_slope）
+        "out": "z_slope0",  # 直接把 DataFrame 合并进去(包含 z_score, z_slope)
     },
     "kdj": {
         "kind": "df",
@@ -290,7 +345,7 @@ def _decide_symbol_adj_for_fast_init() -> str:
 
 def _write_symbol_product(ts_code: str, df: pd.DataFrame, end_date: str):
     """
-    把该 ts_code 的 DataFrame 计算指标后写入 by_symbol 成品（带 warm-up 增量）。
+    把该 ts_code 的 DataFrame 计算指标后写入 by_symbol 成品(带 warm-up 增量)。
     要求 df 至少包含: trade_date, open, high, low, close, vol[, amount, pre_close]
     """
     if not WRITE_SYMBOL_PRODUCT:
@@ -313,7 +368,7 @@ def _write_symbol_product(ts_code: str, df: pd.DataFrame, end_date: str):
     )
     df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
 
-    # 3) 增量 warm-up（如已有旧文件：保留旧数据<warmup起点，warm-up 段与新数据一起重算指标）
+    # 3) 增量 warm-up(如已有旧文件：保留旧数据<warmup起点，warm-up 段与新数据一起重算指标)
     warmup_start = None
     if os.path.exists(out_path):
         try:
@@ -321,14 +376,14 @@ def _write_symbol_product(ts_code: str, df: pd.DataFrame, end_date: str):
             if not old.empty:
                 last_dt = pd.to_datetime(old["trade_date"].astype(str)).max()
                 warmup_start = (last_dt - pd.Timedelta(days=SYMBOL_PRODUCT_WARMUP_DAYS))
-                # 拼接：旧数据的非 warmup 段 + 新数据（截到 end_date）
+                # 拼接：旧数据的非 warmup 段 + 新数据(截到 end_date)
                 old["trade_date"] = pd.to_datetime(old["trade_date"].astype(str))
                 keep_old = old[old["trade_date"] < warmup_start]
                 df2 = pd.concat([keep_old, df2[df2["trade_date"] >= warmup_start]], ignore_index=True)
         except Exception as e:
             logging.warning("[PRODUCT][%s] 读取旧文件失败，按全量重算：%s", ts_code, e)
 
-    # 4) 直接使用内置指标引擎（不再依赖 preprocess_symbols.py）
+    # 4) 直接使用内置指标引擎(不再依赖 preprocess_symbols.py)
     try:
         indicators = _parse_indicators(SYMBOL_PRODUCT_INDICATORS) if SYMBOL_PRODUCT_INDICATORS else []
         df2 = _add_indicators(df2, indicators)
@@ -336,7 +391,7 @@ def _write_symbol_product(ts_code: str, df: pd.DataFrame, end_date: str):
         logging.exception("[PRODUCT][%s] 指标计算失败：%s", ts_code, e)
         return
 
-    # 5) 最终落盘（再次按日期去重）
+    # 5) 最终落盘(再次按日期去重)
     df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
     price_cols = ["open", "high", "low", "close", "pre_close", "change"]
     for col in price_cols:
@@ -352,7 +407,7 @@ def _write_symbol_product(ts_code: str, df: pd.DataFrame, end_date: str):
         if col in df2.columns:
             df2[col] = df2[col].round(n)
     df2.to_parquet(out_path, index=False, engine=PARQUET_ENGINE)
-    logging.debug("[PRODUCT][%s] 成品已写出：%s（rows=%d, warmup=%s）",
+    logging.debug("[PRODUCT][%s] 成品已写出：%s(rows=%d, warmup=%s)",
                  ts_code, out_path, len(df2), SYMBOL_PRODUCT_WARMUP_DAYS if warmup_start is not None else 0)
 
 def _rate_limit():
@@ -373,9 +428,9 @@ def _retry(fn: Callable[[], pd.DataFrame], desc: str, retries: int = RETRY_TIMES
     """
     固定延迟序列重试：15s -> 10s -> 5s -> 5s ...
     失败后等待时加入轻微随机抖动，减少多线程同时再次打接口。
-    :param fn: 无参调用（外部用 lambda 封装）
+    :param fn: 无参调用(外部用 lambda 封装)
     :param desc: 日志标识
-    :param retries: 最大尝试次数（包含第一次）
+    :param retries: 最大尝试次数(包含第一次)
     """
     import random
     last_msg = ""
@@ -418,7 +473,7 @@ def _trade_dates(start: str, end: str) -> List[str]:
         "trade_cal"
     )
     if cal.empty:
-        raise RuntimeError(f"trade_cal 返回为空（{start}~{end}）")
+        raise RuntimeError(f"trade_cal 返回为空({start}~{end})")
     return cal["cal_date"].astype(str).tolist()
 
 def _last_partition_date(root: str) -> Optional[str]:
@@ -447,7 +502,7 @@ def _tqdm_iter(seq, desc: str, unit="日"):
 def compact_daily_partitions():
     """
     压实按日期分区目录：如果某日期下 parquet 文件数超过阈值，
-    以 DuckDB 读取后重写（尽量生成少量新文件）。
+    以 DuckDB 读取后重写(尽量生成少量新文件)。
     """
     import duckdb, glob, shutil
 
@@ -478,7 +533,7 @@ def compact_daily_partitions():
         if len(parts) <= COMPACT_MAX_FILES_PER_DATE:
             continue
 
-        # 计算合并批次数（近似控制输出文件数）
+        # 计算合并批次数(近似控制输出文件数)
         # DuckDB 的 COPY 不直接指定目标 part 个数，只能一次性写 -> 得到 1 个或少量 part
         tmp_out = os.path.join(daily_dir, f"__tmp_compact_{d}")
         shutil.rmtree(tmp_out, ignore_errors=True)
@@ -560,7 +615,7 @@ def _need_duck_merge(daily_dir: str) -> bool:
     # ② 或新增行数 ≥ 阈值
     return new_rows >= DUCK_MERGE_MIN_ROWS
 
-# ========== 按交易日批量模式（原有日常增量） ==========
+# ========== 按交易日批量模式(原有日常增量) ==========
 def sync_stock_daily(start: str, end: str):
     root = os.path.join(DATA_ROOT, "stock", "daily")
     os.makedirs(root, exist_ok=True)
@@ -621,7 +676,7 @@ def sync_index_daily(start: str, end: str, whitelist: List[str]):
 
 def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: int = 8):
     """
-    按“指数代码”一次性拉取区间数据（并发），写出到 data/index/daily/trade_date=YYYYMMDD/part-*.parquet
+    按“指数代码”一次性拉取区间数据(并发)，写出到 data/index/daily/trade_date=YYYYMMDD/part-*.parquet
     比原来“按交易日 × 指数”快一个数量级以上。
     """
     import threading
@@ -630,7 +685,7 @@ def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: i
     root = os.path.join(DATA_ROOT, "index", "daily")
     os.makedirs(root, exist_ok=True)
 
-    # 增量起始（沿用你现有的分区规则）
+    # 增量起始(沿用你现有的分区规则)
     last_dt = _last_partition_date(root)
     actual_start = start if last_dt is None else str(int(last_dt) + 1)
     if actual_start > end:
@@ -641,8 +696,8 @@ def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: i
     ok = skip = err = empty = 0
 
     def write_partition(df: pd.DataFrame):
-        """把单只指数的全量/增量数据，按 trade_date 分区写盘（带简单缓冲）。"""
-        # 只保留需要的列可以减小体积（按需裁剪）
+        """把单只指数的全量/增量数据，按 trade_date 分区写盘(带简单缓冲)。"""
+        # 只保留需要的列可以减小体积(按需裁剪)
         # cols = ["ts_code","trade_date","open","high","low","close","pre_close","vol","amount"]
         # df = df[cols]
         for dt, sub in df.groupby("trade_date"):
@@ -656,7 +711,7 @@ def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: i
                 sub.to_parquet(fname, index=False, engine=PARQUET_ENGINE)
 
     def fetch_one(code: str):
-        # 先尝试 pro_bar（更稳），失败再退回 pro.index_daily
+        # 先尝试 pro_bar(更稳)，失败再退回 pro.index_daily
         def call_bar():
             return ts.pro_bar(
                 ts_code=code,
@@ -742,7 +797,7 @@ def sync_adj_factor_mt(start: str, end: str):
         return
 
     dates_all = _trade_dates(actual_start, end)
-    # 逆序（新到旧）优先：可更快满足构建最近复权需求
+    # 逆序(新到旧)优先：可更快满足构建最近复权需求
     dates_all.reverse()
 
     def work(trade_date: str) -> Tuple[str, str]:
@@ -757,7 +812,7 @@ def sync_adj_factor_mt(start: str, end: str):
                 if df is None or df.empty:
                     return trade_date, "empty"
                 os.makedirs(pdir, exist_ok=True)
-                # 精简列（若未来想减肥，可保留 ts_code,trade_date,adj_factor）
+                # 精简列(若未来想减肥，可保留 ts_code,trade_date,adj_factor)
                 df.to_parquet(fpath, index=False, engine=PARQUET_ENGINE)
                 return trade_date, "ok"
             except Exception as e:
@@ -925,8 +980,8 @@ def _fetch_stock_list() -> pd.DataFrame:
 
 def fast_init_download(end_date: str):
     """
-    第一阶段：多线程按股票全量下载到 fast_init_symbol 目录（一个股票一个文件）。
-    下载完自动执行一次失败股票补抓（若开启 FAILED_RETRY_ONCE）。
+    第一阶段：多线程按股票全量下载到 fast_init_symbol 目录(一个股票一个文件)。
+    下载完自动执行一次失败股票补抓(若开启 FAILED_RETRY_ONCE)。
     """
     os.makedirs(FAST_INIT_STOCK_DIR, exist_ok=True)
     stocks = _fetch_stock_list()
@@ -1027,7 +1082,7 @@ def fast_init_download(end_date: str):
             for c,m in failed:
                 f.write(f"{c},{m}\n")
 
-    # ====== 自动失败补抓（一次） ======
+    # ====== 自动失败补抓(一次) ======
     if FAILED_RETRY_ONCE and failed_codes:
         logging.info("[FAST_INIT] 等待 %ds 后开始失败补抓，失败数=%d", FAILED_RETRY_WAIT, len(failed_codes))
         time.sleep(FAILED_RETRY_WAIT)
@@ -1089,7 +1144,7 @@ def fast_init_download(end_date: str):
 
 def duckdb_merge_symbol_products_to_daily():
     """
-    将 stock/by_symbol_<adj> 下的“单股票成品（含指标）”按 trade_date 增量 COPY
+    将 stock/by_symbol_<adj> 下的“单股票成品(含指标)”按 trade_date 增量 COPY
     到 stock/<adj>_indicators/trade_date=YYYYMMDD/ 下。
     <adj> 取自 FAST_INIT 的 API_ADJ：daily / daily_qfq / daily_hfq
     """
@@ -1104,7 +1159,7 @@ def duckdb_merge_symbol_products_to_daily():
         return
     os.makedirs(dst_dir, exist_ok=True)
 
-    # —— 是否需要合并（沿用你的触发规则）——
+    # —— 是否需要合并(沿用你的触发规则)——
     if not _need_duck_merge(dst_dir):
         logging.info("[DUCK MERGE IND] 已最新，跳过")
         return
@@ -1115,7 +1170,7 @@ def duckdb_merge_symbol_products_to_daily():
     os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
     con.execute(f"PRAGMA temp_directory='{DUCKDB_TEMP_DIR}';")
 
-    # ① 读取目标端（已分区）能看到的最大 trade_date
+    # ① 读取目标端(已分区)能看到的最大 trade_date
     try:
         glob_path = os.path.join(dst_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
         last_duck = con.sql(
@@ -1143,7 +1198,7 @@ def duckdb_merge_symbol_products_to_daily():
     con.close()
     logging.info("[DUCK MERGE IND] 完成，写入新日期 > %s 到 %s", last_duck, dst_dir)
 
-# ====== 增量重算：把新增日期涉及的股票，补齐“按股票成品（含指标）”并合并到按日分区 ======
+# ====== 增量重算：把新增日期涉及的股票，补齐“按股票成品(含指标)”并合并到按日分区 ======
 def _pick_target_adj_for_normal() -> str:
     """
     基于 NORMAL 模式下的 ADJ_MODE 选择指标来源：
@@ -1160,7 +1215,7 @@ def _pick_target_adj_for_normal() -> str:
 
 def _with_api_adj(temp_api_adj: str, fn, *args, **kwargs):
     """
-    临时切换 API_ADJ（仅用于复用 _write_symbol_product/duckdb_merge_* 内的 by_symbol 目录判定），
+    临时切换 API_ADJ(仅用于复用 _write_symbol_product/duckdb_merge_* 内的 by_symbol 目录判定)，
     调用结束后恢复，避免侵入式改函数签名。
     """
     global API_ADJ
@@ -1173,10 +1228,10 @@ def _with_api_adj(temp_api_adj: str, fn, *args, **kwargs):
 
 def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0):
     """
-    NORMAL（日常增量）在写完 stock/daily(+qfq/hfq) 后调用：
+    NORMAL(日常增量)在写完 stock/daily(+qfq/hfq) 后调用：
     1) 找出 stock/<target_adj> 新增的 trade_date
     2) 提取这些日期涉及到的 ts_code 集合
-    3) 仅对这些股票重算 by_symbol_<adj> 成品（含指标，带 warm-up）
+    3) 仅对这些股票重算 by_symbol_<adj> 成品(含指标，带 warm-up)
     4) 合并到 stock/<adj>_indicators/trade_date=YYYYMMDD/
     """
     import duckdb, os
@@ -1187,7 +1242,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
     src_dir = os.path.join(DATA_ROOT, "stock", target_adj)
     dst_dir = os.path.join(DATA_ROOT, "stock", f"{target_adj}_indicators")
     if not os.path.isdir(src_dir):
-        logging.warning("[INC_IND] 源目录不存在：%s（可能尚未构建 %s）", src_dir, target_adj)
+        logging.warning("[INC_IND] 源目录不存在：%s(可能尚未构建 %s)", src_dir, target_adj)
         return
 
     con = duckdb.connect()
@@ -1196,7 +1251,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
     os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
     con.execute(f"PRAGMA temp_directory='{DUCKDB_TEMP_DIR}';")
 
-    # ① 目标端（已分区）最新 trade_date
+    # ① 目标端(已分区)最新 trade_date
     try:
         glob_dst = os.path.join(dst_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
         last_duck = con.sql(
@@ -1206,7 +1261,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
         last_duck = 0
     last_duck_str = str(last_duck).zfill(8)
 
-    # ② 源端（daily/daily_qfq/daily_hfq）新增日期涉及的股票
+    # ② 源端(daily/daily_qfq/daily_hfq)新增日期涉及的股票
     glob_src = os.path.join(src_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
     try:
         df_codes = con.sql(f"""
@@ -1218,7 +1273,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
         df_codes = pd.DataFrame(columns=["ts_code"])
 
     if df_codes.empty:
-        logging.info("[INC_IND] 指标分区已最新（last=%s，源端无新增日期）。", last_duck)
+        logging.info("[INC_IND] 指标分区已最新(last=%s，源端无新增日期)。", last_duck)
         c
 
 def duckdb_partition_merge():

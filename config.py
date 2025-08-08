@@ -14,6 +14,11 @@ START_DATE = "20250101"
 END_DATE = "20250801"
 # 数据目录路径（可绝对路径或相对路径）
 DATA_DIR = "E://gupiao-hfq"
+TDX_BUY_PATH = "./buy_rule.txt"
+TDX_SELL_PATH = "./sell_rule.txt"
+TDX_SELL_OPEN_PATH = "./sell_open_rule.txt"
+TDX_SELL_CLOSE_PATH = "./sell_close_rule.txt"
+
 # DATA_DIR = os.path.join(BASE_DIR, "test") 
 #open为次日开盘价买入，close为当日收盘价买入,signal_open为信号当天开盘买入；open涨停不买入
 # BUY_MODE = "open"

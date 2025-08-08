@@ -57,28 +57,6 @@ def bupiao(df, n1=3, n2=21):
 
     return short, long
 
-def four_line_zero_strategy(df, **params):
-    """
-    四线归零买入逻辑：
-    - 若短期、中期、中长期、长期动量都 <= 6，则返回 True（买入信号）
-    """
-    n1 = params.get("n1", 5)   # 短期
-    n2 = params.get("n2", 30)  # 长期
-
-    # 获取四个动量值（你之前提供的公式）
-    short, mid, midlong, long = bupiao(df, n1=n1, n2=n2)
-
-    # 加入 df 可视化（非必要）
-    df['short'] = short
-    df['mid'] = mid
-    df['midlong'] = midlong
-    df['long'] = long
-
-    # 四线都处于低位（如 <= 6）
-    signal = (short <= 6) & (mid <= 6) & (midlong <= 6) & (long <= 6)
-
-    return signal.fillna(False)
-
 def cci(df, n=14):
     tp = (df["high"] + df["low"] + df["close"]) / 3
     ma = tp.rolling(n).mean()
@@ -107,19 +85,6 @@ def bbi(df):
 
     return (ma3 + ma6 + ma12 + ma24) / 4
 
-# def z_score(df, window=20, smooth=3):
-#     oc_return = (df['close'] - df['open']) / df['open'] * 100
-#     mean = oc_return.rolling(window).mean()
-#     std = oc_return.rolling(window).std()
-
-#     z_score = (oc_return - mean) / std
-#     z_slope = z_score - z_score.shift(1)
-
-#     return pd.DataFrame({
-#         'z_score': z_score,
-#         'z_slope': z_slope
-#     })
-
 def z_score(df, window=20, smooth=3):
     oc_return = (df['close'] - df['open']) / df['open'] * 100
     mean = oc_return.rolling(window).mean()
@@ -132,3 +97,18 @@ def z_score(df, window=20, smooth=3):
         'z_slope': slope
     }).fillna(0)
     
+def zhixing_mid_long(df):
+    """知行中期多空线"""
+    ema1 = ema(df['close'], span=10)
+    ema2 = ema(ema1, span=10)
+    return ema2
+
+def weighted_price_line(df, n1=3, smooth=5):
+    """加权价线（平滑 VWAP）"""
+    # VWAP = 成交额 / 成交量 / 100
+    weighted_price = (
+        df['amount'].rolling(n1).sum() /
+        df['vol'].rolling(n1).sum() / 100
+    )
+    smoothed = moving_average(weighted_price, smooth)
+    return smoothed

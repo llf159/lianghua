@@ -18,10 +18,11 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import json
 
-# 确保可以导入同目录下的 parquet_viewer.py
-HERE = os.path.abspath(os.path.dirname(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+ROOT = Path(__file__).resolve().parent  # 当前脚本所在的根目录
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import parquet_viewer as pv
 
 # 导入你上传的工具函数
 import parquet_viewer as pv  # type: ignore

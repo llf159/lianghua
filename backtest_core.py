@@ -1,6 +1,14 @@
 import numpy as np
 import pandas as pd
 from typing import Callable, Tuple, List, Dict, Optional
+from indicators import *
+from tdx_compat import evaluate
+from config import (
+    TDX_SELL_OPEN_PATH,
+    TDX_SELL_CLOSE_PATH,
+    TDX_SELL_PATH,
+)
+
 
 def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL_MODE, buy_signal, sell_signal, record_trades=False) -> Tuple[Dict, Optional[List[Dict]]]:
 
@@ -11,6 +19,16 @@ def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL
     trades: List[Dict] = []
 
     holding_until = None  # avoid overlapping positions
+
+    all_sell_signals = None
+    if SELL_MODE == 'strategy':
+        all_sell_signals = sell_signal(df, [])
+        if all_sell_signals is None or all_sell_signals.empty:
+            # 防御：没有任何卖出信号时提供全 False 的占位，避免后续空判断分支过多
+            all_sell_signals = pd.DataFrame({
+                "sell_by_open":  pd.Series(False, index=df.index),
+                "sell_by_close": pd.Series(False, index=df.index),
+            })
 
     for buy_date in buy_dates:
         if holding_until is not None and buy_date <= holding_until:
@@ -38,7 +56,12 @@ def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL
             else:
                 continue
 
-        elif BUY_MODE == 'signal_open': 
+        elif BUY_MODE == 'signal_open':
+            prev_close = df.iloc[idx]['close']
+            open_price = df.iloc[idx]['open']
+            limit_up_price = round(prev_close * 1.099, 2)
+            if open_price >= limit_up_price:
+                continue
             if SELL_MODE in ('open', 'close') and idx + HOLD_DAYS >= len(df):
                 continue
             buy_price = df.iloc[idx]['open']
@@ -60,25 +83,14 @@ def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL
             real_sell_idx = sell_idx
         elif SELL_MODE == 'close':
             sell_price = df.iloc[sell_idx]['close']
-            real_sell_idx = sell_idx  
+            real_sell_idx = sell_idx
+        
         elif SELL_MODE == 'strategy':
-            max_days = MAX_HOLD_DAYS if MAX_HOLD_DAYS != -1 else len(df)
-
-            if sell_start_idx >= len(df):
-                continue  # 起始点越界，不能开始卖出窗口
-
             remaining_len = len(df) - sell_start_idx
-            actual_window = min(max_days, remaining_len)
-
+            actual_window = min(MAX_HOLD_DAYS, remaining_len)
             if actual_window <= 0:
                 continue
-
-            all_sell_signals = sell_signal(df, [buy_date])
-
-            # 防止返回空 DataFrame（可能是提前 return 的）
-            if all_sell_signals is None or all_sell_signals.empty:
-                continue
-
+            # ⬇️ 直接切片使用预先计算的 all_sell_signals
             sell_signals = all_sell_signals.iloc[sell_start_idx : sell_start_idx + actual_window]
             sell_window  = df.iloc[sell_start_idx : sell_start_idx + actual_window]
 
@@ -170,3 +182,54 @@ def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL
     }
 
     return (summary, trades) if record_trades else (summary, None)
+
+def _read_tdx(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+def buy_signal(df: pd.DataFrame) -> pd.Series:
+    """
+    返回布尔 Series（索引与 df.index 对齐）。
+    """
+    script = _read_tdx(TDX_BUY_PATH)
+    res = evaluate(script, df)
+    sig = res.get("SIG") or res.get("LAST_EXPR")
+    return pd.Series(sig, index=df.index).fillna(False).astype(bool)
+
+def _eval_tdx_bool(script_path: str, df: pd.DataFrame) -> pd.Series:
+    """读取并执行 TDX 文本规则，返回布尔 Series（与 df.index 对齐）"""
+    script = _read_tdx(script_path)
+    res = evaluate(script, df)
+    sig = res.get("SIG") or res.get("LAST_EXPR")
+    return pd.Series(sig, index=df.index).fillna(False).astype(bool)
+
+def tdxsell(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    分别用两份 TDX 文本规则生成：
+      - sell_by_open: 开盘卖出信号（布尔序列）
+      - sell_by_close: 收盘卖出信号（布尔序列）
+    两份规则**格式完全一致**，互不耦合。
+    """
+    # 向后兼容：如果没配置新路径，则退化为老的 TDX_SELL_PATH -> 全部当作收盘卖出
+    if TDX_SELL_OPEN_PATH and TDX_SELL_CLOSE_PATH:
+        open_sig  = _eval_tdx_bool(TDX_SELL_OPEN_PATH,  df)
+        close_sig = _eval_tdx_bool(TDX_SELL_CLOSE_PATH, df)
+    elif TDX_SELL_PATH:
+        open_sig  = pd.Series(False, index=df.index)
+        close_sig = _eval_tdx_bool(TDX_SELL_PATH, df)
+    else:
+        # 都没配：全 False
+        open_sig  = pd.Series(False, index=df.index)
+        close_sig = pd.Series(False, index=df.index)
+
+    # 可选：避免同一天既开盘又收盘都为 True 的歧义（优先开盘）
+    close_sig = close_sig & ~open_sig
+
+    return pd.DataFrame({
+        "sell_by_open":  open_sig,
+        "sell_by_close": close_sig,
+    })
+
+def sell_signal(df: pd.DataFrame, buy_dates: list) -> pd.DataFrame:
+    # 接口保持不变，buy_dates 暂不使用但必须保留
+    return tdxsell(df)
