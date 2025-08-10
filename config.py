@@ -6,7 +6,8 @@ USE_PARQUET = True
 # USE_PARQUET = False
 
 PARQUET_BASE = r"E:\stock_data"   # 与 download_new.py 的 DATA_ROOT 保持一致
-PARQUET_ADJ = "daily_qfq"         # 或 "daily_hfq"/"daily"
+PARQUET_ADJ = "daily_qfq_indicators"         # parquet 复权方式
+# {"daily","qfq","hfq","daily_indicators","daily_qfq_indicators","daily_hfq_indicators"}
 
 # 配置参数
 HOLD_DAYS = 2  # 买入持有天数

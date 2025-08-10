@@ -4,12 +4,44 @@ import numpy as np
 import pandas as pd
 
 EPS = 1e-12
+# 1) 统一把条件转成布尔并把 NaN 当 False
+def _as_bool(cond):
+    s = pd.Series(cond)
+    # NaN 一律按 False 处理，避免“开头数据不全”把条件误判为 True
+    return s.fillna(False).astype(bool)
+
+def IF(cond, a, b):
+    condb = _as_bool(cond)
+    idx = a.index if isinstance(a, pd.Series) else (b.index if isinstance(b, pd.Series) else None)
+    return pd.Series(np.where(condb, a, b), index=idx)
+
+def COUNT(cond, n):
+    cond_series = _as_bool(cond)
+    # COUNT 在样本不足 n 时，按“已有样本”计数（TDX 的常见用法也是从起始可用）
+    return cond_series.rolling(int(n), min_periods=1).sum()
+
+def BARSLAST(cond):
+    cond = _as_bool(cond)
+    idx = pd.Series(np.where(cond, np.arange(len(cond)), np.nan), index=cond.index).ffill()
+    return pd.Series(np.arange(len(cond)), index=cond.index) - idx
+
+def MA(x, n):  
+    return x.rolling(int(n), min_periods=1).mean()
+
+def SUM(x, n): 
+    return x.rolling(int(n), min_periods=1).sum()
+
+def HHV(x, n): 
+    return x.rolling(int(n), min_periods=1).max()
+
+def LLV(x, n): 
+    return x.rolling(int(n), min_periods=1).min()
+
+def STD(x, n): 
+    return x.rolling(int(n), min_periods=1).std(ddof=0)
 
 def REF(x, n=1):
     return x.shift(int(n))
-
-def MA(x, n):
-    return x.rolling(int(n)).mean()
 
 def EMA(x, n):
     return x.ewm(span=int(n), adjust=False).mean()
@@ -18,17 +50,32 @@ def SMA(x, n, m):
     alpha = float(m) / float(n)
     return x.ewm(alpha=alpha, adjust=False).mean()
 
-def SUM(x, n):
-    return x.rolling(int(n)).sum()
+# def MA(x, n):
+#     return x.rolling(int(n)).mean()
 
-def HHV(x, n):
-    return x.rolling(int(n)).max()
+# def SUM(x, n):
+#     return x.rolling(int(n)).sum()
 
-def LLV(x, n):
-    return x.rolling(int(n)).min()
+# def HHV(x, n):
+#     return x.rolling(int(n)).max()
 
-def STD(x, n):
-    return x.rolling(int(n)).std(ddof=0)
+# def LLV(x, n):
+#     return x.rolling(int(n)).min()
+
+# def STD(x, n):
+#     return x.rolling(int(n)).std(ddof=0)
+
+# def IF(cond, a, b):
+#     return pd.Series(np.where(cond.astype(bool), a, b), index=a.index if isinstance(a, pd.Series) else b.index)
+
+# def COUNT(cond, n):
+#     cond_series = cond.astype(bool)
+#     return cond_series.rolling(int(n)).sum()
+
+# def BARSLAST(cond):
+#     cond = cond.astype(bool)
+#     idx = pd.Series(np.where(cond, np.arange(len(cond)), np.nan), index=cond.index).ffill()
+#     return pd.Series(np.arange(len(cond)), index=cond.index) - idx
 
 def ABS(x):
     return np.abs(x)
@@ -38,13 +85,6 @@ def MAX(a, b):
 
 def MIN(a, b):
     return np.minimum(a, b)
-
-def IF(cond, a, b):
-    return pd.Series(np.where(cond.astype(bool), a, b), index=a.index if isinstance(a, pd.Series) else b.index)
-
-def COUNT(cond, n):
-    cond_series = cond.astype(bool)
-    return cond_series.rolling(int(n)).sum()
 
 def _ensure_series(x):
     if isinstance(x, pd.Series):
@@ -56,10 +96,15 @@ def CROSS(a, b):
     b = _ensure_series(b)
     return (a > b) & (a.shift(1) <= b.shift(1))
 
-def BARSLAST(cond):
-    cond = cond.astype(bool)
-    idx = pd.Series(np.where(cond, np.arange(len(cond)), np.nan), index=cond.index).ffill()
-    return pd.Series(np.arange(len(cond)), index=cond.index) - idx
+def SAFE_DIV(a, b):
+    # 安全除法：b≈0 时避免 NaN/Inf
+    return a / (b + EPS)
+
+def RSV(C, H, L, n=9):
+    # RSV = 100 * (C - LLV(L,n)) / (HHV(H,n) - LLV(L,n) + EPS)
+    llv = LLV(L, n)
+    hhv = HHV(H, n)
+    return 100.0 * (C - llv) / (hhv - llv + EPS)
 
 VAR_MAP = {
     "C": "df['close']",
@@ -75,8 +120,11 @@ VAR_MAP = {
     "AMOUNT": "df['amount']",
     "REFDATE": "REFDATE",
     "J": "df['j']",
-    "Z_SCORE": "df['z_score']",
     "VR": "df['vr']",
+    "Z_SLOPE": "df['z_slope']",
+    "BBI": "df['bbi']",
+    "BUPIAO_SHORT": "df['bupiao_short']",
+    "BUPIAO_LONG": "df['bupiao_long']",
 }
 
 FUNC_MAP = {
@@ -186,6 +234,8 @@ def evaluate(script, df, extra_context=None):
         "STD": STD, "ABS": ABS, "MAX": MAX, "MIN": MIN, "IF": IF, "COUNT": COUNT, "CROSS": CROSS,
         "BARSLAST": BARSLAST,
         "EPS": EPS,
+        "SAFE_DIV": SAFE_DIV,
+        "RSV": RSV,
     }
     if extra_context:
         ctx.update(extra_context)

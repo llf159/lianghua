@@ -41,7 +41,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from utils import ensure_datetime_index
 import pandas as pd
 from tabulate import tabulate
-from backtest_core import backtest buy_signal, sell_signal 
+from backtest_core import backtest, buy_signal, sell_signal 
 from config import *
 import re
 from contextlib import redirect_stdout, redirect_stderr
@@ -159,13 +159,18 @@ def normalize_ts(ts_input: str, asset: str = "stock") -> str:
     return ts.upper()
 
 def load_df_from_parquet(ts_code: str) -> pd.DataFrame:
-    # cols = ["ts_code","trade_date","open","high","low","close","vol","amount"]
+    base_adj = "qfq" if "qfq" in PARQUET_ADJ else ("hfq" if "hfq" in PARQUET_ADJ else "daily")
+    with_ind = "indicators" in PARQUET_ADJ
     cols = None
-    df = pv.read_range(PARQUET_BASE, "stock", PARQUET_ADJ,
-                   ts_code, START_STR, END_STR, columns=cols, limit=None)
+
+    try:
+        df = pv.read_by_symbol(PARQUET_BASE, base_adj, ts_code, with_indicators=with_ind)
+    except Exception:
+        df = pv.read_range(PARQUET_BASE, "stock", PARQUET_ADJ,
+                           ts_code, START_STR, END_STR, columns=cols, limit=None)
+
     df = ensure_datetime_index(df)
     df = df[(df.index >= START_TS) & (df.index <= END_TS)]
-
     return df
 
 def load_file_by_code(code: str) -> str:

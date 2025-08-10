@@ -1,0 +1,18 @@
+2025-08-10 18:25:37,607 INFO [feature] 批量特征挖掘开始
+2025-08-10 18:32:52,766 INFO [feature] 批量特征挖掘开始
+2025-08-10 18:35:59,282 INFO [feature] 批量特征挖掘开始
+2025-08-11 00:19:11,443 INFO [feature] 批量特征挖掘开始
+2025-08-11 00:19:11,443 ERROR [feature] 获取代码列表失败: stock 的 adj 仅支持: daily, daily_hfq, daily_hfq_indicators, daily_indicators, daily_qfq, daily_qfq_indicators
+Traceback (most recent call last):
+  File "E:\量化\feature_mining.py", line 300, in main
+    codes = load_all_codes()
+  File "E:\量化\feature_mining.py", line 63, in load_all_codes
+    latest_dates = pv.list_trade_dates(pv.asset_root(PARQUET_BASE, "stock", PARQUET_ADJ))
+                                       ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\量化\parquet_viewer.py", line 90, in asset_root
+    raise ValueError("stock 的 adj 仅支持: " + ", ".join(sorted(allowed)))
+ValueError: stock 的 adj 仅支持: daily, daily_hfq, daily_hfq_indicators, daily_indicators, daily_qfq, daily_qfq_indicators
+2025-08-11 00:20:11,350 INFO [feature] 批量特征挖掘开始
+2025-08-11 00:22:02,676 INFO [feature] 批量特征挖掘开始
+2025-08-11 00:34:15,340 INFO [feature] 批量特征挖掘开始
+2025-08-11 00:37:21,145 INFO [feature] 批量特征挖掘开始

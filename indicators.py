@@ -1,5 +1,149 @@
+# indicators.py
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Union
 import pandas as pd
-EPS = 1e-9 
+
+EPS = 1e-9
+
+@dataclass
+class IndMeta:
+    name: str
+    out: Dict[str, int]                 # 输出列 -> 小数位，如 {"j":2}、{"z_slope":3, "z_score":3}
+    tdx: Optional[str] = None           # 可选：TDX 脚本
+    py_func: Optional[Callable] = None  # 可选：Python 兜底函数
+    kwargs: Dict = field(default_factory=dict)
+    tags: List[str] = field(default_factory=list)  # 使用场景标签，如 ["product","prelaunch"]
+
+REGISTRY: Dict[str, IndMeta] = {
+    "kdj": IndMeta(
+        name="kdj",
+        out={"j": 2},
+        tdx="""
+            RSV := RSV(C, H, L, 9);
+            K := SMA(RSV, 3, 1);
+            D := SMA(K, 3, 1);
+            J := 3*K - 2*D;
+        """,
+        py_func=lambda df, **kw: kdj(df, **kw),  # 复用你已有的 kdj(df) 实现
+        kwargs={}, 
+        tags=["product","prelaunch"]
+    ),
+    "z_score": IndMeta(
+        name="z_score",
+        out={"z_slope": 3, "z_score": 3},
+        tdx="""
+            OC := SAFE_DIV(C - O, O) * 100;
+            MEAN := MA(OC, 20);
+            STDV := STD(OC, 20);
+            Z_SCORE := SAFE_DIV(OC - MEAN, STDV);
+            Z_SLOPE := MA(Z_SCORE - REF(Z_SCORE, 1), 3);
+        """,
+        py_func=lambda df, **kw: z_score(df, **kw),  # 你已有的 z_score(df) 返回含两列
+        kwargs={"window": 20, "smooth": 3},
+        tags=["product","prelaunch"]
+    ),
+    "volume_ratio": IndMeta(
+        name="volume_ratio",
+        out={"vr": 4},
+        tdx="VR := SAFE_DIV(V, MA(V, 20));",
+        py_func=lambda df, **kw: volume_ratio(df, **kw),
+        kwargs={"n": 20},
+        tags=["product","prelaunch"]
+    ),
+    "bbi": IndMeta(
+        name="bbi",
+        out={"bbi": 2},
+        tdx="BBI := (MA(C,3) + MA(C,6) + MA(C,12) + MA(C,24)) / 4;",
+        py_func=lambda df, **kw: bbi(df),
+        tags=["product","prelaunch"]
+    ),
+    "bupiao": IndMeta(
+        name="bupiao",
+        out={"bupiao_short": 2, "bupiao_long": 2},
+        tdx="""
+            LLV3 := LLV(L, 3); HHV3 := HHV(C, 3);
+            BUPIAO_SHORT := SAFE_DIV(100*(C-LLV3), (HHV3-LLV3+EPS));
+            LLV21 := LLV(L, 21); HHV21 := HHV(C, 21);
+            BUPIAO_LONG := SAFE_DIV(100*(C-LLV21), (HHV21-LLV21+EPS));
+        """,
+        py_func=lambda df, **kw: bupiao(df, **kw),
+        kwargs={"n1": 3, "n2": 21},
+        tags=["product","prelaunch"]
+    ),
+    "shuangjunxian": IndMeta(
+        name="shuangjunxian",
+        out={"bar_color": 0},           # 字符串列不 round，可设 0 或特殊处理
+        tdx=None,                        # 这个保留 Python 版本
+        py_func=lambda df, **kw: shuangjunxian(df, **kw),
+        kwargs={"n": 5},
+        tags=["product"]
+    ),
+}
+
+# —— 统一计算入口：优先 TDX，失败回退 Python —— 
+def compute(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
+    from tdx_compat import evaluate as tdx_eval
+    out_df = df.copy()
+    for name in names or []:
+        meta = REGISTRY.get(name)
+        if not meta:
+            continue
+        # 1) TDX 优先
+        if meta.tdx:
+            try:
+                res = tdx_eval(meta.tdx, out_df)
+                for col in meta.out.keys():
+                    # 支持大小写键
+                    val = (res.get(col) or res.get(col.upper()) or res.get(col.lower()))
+                    if val is not None:
+                        out_df[col] = val
+                continue
+            except Exception:
+                pass  # 回退 Python
+
+        # 2) Python 兜底
+        if meta.py_func:
+            res = meta.py_func(out_df, **meta.kwargs)
+            # 兼容：DataFrame / Series / (tuple/list of Series)
+            if isinstance(res, pd.DataFrame):
+                for col in meta.out.keys():
+                    if col in res.columns:
+                        out_df[col] = res[col]
+            elif isinstance(res, (list, tuple)):
+                if len(res) == len(meta.out):
+                    for col, series in zip(meta.out.keys(), res):
+                        out_df[col] = series
+            else:  # 单列
+                only_col = next(iter(meta.out.keys()))
+                out_df[only_col] = res
+    return out_df
+
+def outputs_for(names: List[str]) -> Dict[str, int]:
+    """返回这些指标的所有输出列及小数位，供统一 round 使用。"""
+    out = {}
+    for n in names or []:
+        meta = REGISTRY.get(n)
+        if meta:
+            out.update(meta.out)
+    return out
+
+def names_by_tag(tag: str) -> List[str]:
+    return [n for n,m in REGISTRY.items() if tag in m.tags]
+
+# =================== python兼容层 ==========================
+def shuangjunxian(df, n=5):
+    df = df.copy()
+    df["avg_price"] = df["close"].rolling(n).mean()
+    df["avg_vol"] = df["vol"].rolling(n).mean()
+
+    df["price_up"] = df["avg_price"] > df["avg_price"].shift(1)
+    df["vol_up"] = df["avg_vol"] > df["avg_vol"].shift(1)
+
+    df["bar_color"] = "green"  # 默认绿柱
+    df.loc[df["price_up"] & df["vol_up"], "bar_color"] = "red"
+    df.loc[df["price_up"] ^ df["vol_up"], "bar_color"] = "yellow"
+
+    return df["bar_color"]
 
 def moving_average(series, window):
     return series.rolling(window).mean()

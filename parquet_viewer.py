@@ -59,25 +59,46 @@ try:
 except Exception:
     HAS_PYARROW = False
 
-
 # --------------------------- 工具函数 ---------------------------
-
 def asset_root(base: str, asset: str, adj: str) -> str:
-    """
-    解析资产根目录。
-    asset: "index" | "stock"
-    adj  : index 固定传 "daily"；stock 传 "daily"/"daily_qfq"/"daily_hfq"
-    """
     if asset not in {"index", "stock"}:
         raise ValueError("asset 仅支持 index / stock")
     if asset == "index":
         sub = "daily"
     else:
-        if adj not in {"daily", "daily_qfq", "daily_hfq"}:
-            raise ValueError("stock 的 adj 仅支持 daily / daily_qfq / daily_hfq")
+        allowed = {
+            "daily","daily_qfq","daily_hfq",
+            "daily_indicators","daily_qfq_indicators","daily_hfq_indicators",
+        }
+        if adj not in allowed:
+            raise ValueError("stock 的 adj 仅支持: " + ", ".join(sorted(allowed)))
         sub = adj
     return os.path.join(base, asset, sub)
 
+def asset_root(base: str, asset: str, adj: str) -> str:
+    if asset not in {"index", "stock"}:
+        raise ValueError("asset 仅支持 index / stock")
+    if asset == "index":
+        sub = "daily"
+        return os.path.join(base, asset, sub)
+
+    allowed = {
+        "daily","daily_qfq","daily_hfq",
+        "daily_indicators","daily_qfq_indicators","daily_hfq_indicators",
+    }
+    if adj not in allowed:
+        raise ValueError("stock 的 adj 仅支持: " + ", ".join(sorted(allowed)))
+
+    nested = os.path.join(base, "stock", "daily", adj)
+    return nested
+
+def read_by_symbol(base: str, adj: str, ts_code: str, with_indicators: bool = True):
+    sub = f"single_{adj}" + ("_indicators" if with_indicators else "")
+    f = os.path.join(base, "stock", "single", sub, f"{ts_code}.parquet")
+    if not os.path.isfile(f):
+        raise FileNotFoundError(f)
+    import pandas as pd
+    return pd.read_parquet(f)
 
 def list_trade_dates(root: str) -> List[str]:
     if not os.path.isdir(root):
@@ -91,7 +112,6 @@ def list_trade_dates(root: str) -> List[str]:
                 continue
     return sorted(dates)
 
-
 def date_chunks(start: str, end: str, step_days: int = 365) -> Iterable[tuple[str, str]]:
     d0 = dt.datetime.strptime(start, "%Y%m%d").date()
     d1 = dt.datetime.strptime(end, "%Y%m%d").date()
@@ -100,7 +120,6 @@ def date_chunks(start: str, end: str, step_days: int = 365) -> Iterable[tuple[st
         nxt = min(cur + dt.timedelta(days=step_days - 1), d1)
         yield cur.strftime("%Y%m%d"), nxt.strftime("%Y%m%d")
         cur = nxt + dt.timedelta(days=1)
-
 
 def glob_partitions(root: str, start: str, end: str) -> List[str]:
     """返回指定日期范围内的分区目录绝对路径列表"""
@@ -112,7 +131,6 @@ def glob_partitions(root: str, start: str, end: str) -> List[str]:
         if start <= d <= end:
             parts.append(os.path.join(root, f"trade_date={d}"))
     return parts
-
 
 def scan_with_duckdb(root: str, ts_code: Optional[str], start: str, end: str,
                      columns: Optional[List[str]] = None, limit: Optional[int] = None) -> pd.DataFrame:
@@ -127,7 +145,6 @@ def scan_with_duckdb(root: str, ts_code: Optional[str], start: str, end: str,
     if limit:
         sql += f" LIMIT {int(limit)}"
     return duckdb.sql(sql).df()  # type: ignore
-
 
 def scan_with_pandas(root: str, ts_code: Optional[str], start: str, end: str,
                      columns: Optional[List[str]] = None, limit: Optional[int] = None) -> pd.DataFrame:
@@ -165,17 +182,26 @@ def scan_with_pandas(root: str, ts_code: Optional[str], start: str, end: str,
         out = out.iloc[:limit]
     return out
 
-
 def read_range(base: str, asset: str, adj: str, ts_code: Optional[str], start: str, end: str,
                columns: Optional[List[str]] = None, limit: Optional[int] = None) -> pd.DataFrame:
     root = asset_root(base, asset, adj if asset == "stock" else "daily")
     if not os.path.isdir(root):
         raise FileNotFoundError(f"目录不存在: {root}")
+    
+    all_dates = list_trade_dates(root)
+    if not all_dates:
+        raise FileNotFoundError(f"目录下没有任何 trade_date=* 分区: {root}")
     if HAS_DUCKDB:
-        return scan_with_duckdb(root, ts_code, start, end, columns, limit)
+        df = scan_with_duckdb(root, ts_code, start, end, columns, limit)
     else:
-        return scan_with_pandas(root, ts_code, start, end, columns, limit)
+        df = scan_with_pandas(root, ts_code, start, end, columns, limit)
 
+    if df is None or df.empty:
+        raise FileNotFoundError(
+            f"没有找到符合条件的数据文件: ts_code={ts_code}, start={start}, end={end}, root={root}"
+        )
+
+    return df
 
 def read_day(base: str, asset: str, adj: str, day: str, limit: Optional[int] = None) -> pd.DataFrame:
     root = asset_root(base, asset, adj if asset == "stock" else "daily")
@@ -190,7 +216,6 @@ def read_day(base: str, asset: str, adj: str, day: str, limit: Optional[int] = N
         df = df.head(limit)
     return df
 
-
 def print_df(df: pd.DataFrame, limit: Optional[int] = None):
     if df is None or df.empty:
         print("（空结果）")
@@ -199,7 +224,6 @@ def print_df(df: pd.DataFrame, limit: Optional[int] = None):
         df = df.head(limit)
     with pd.option_context("display.max_rows", 200, "display.max_columns", 50, "display.width", 180):
         print(df.to_string(index=False))
-
 
 def show_schema(parquet_file: str):
     if not os.path.isfile(parquet_file):
@@ -225,9 +249,7 @@ def show_schema(parquet_file: str):
     except Exception as e:
         print(f"读取失败：{e}")
 
-
 # --------------------------- CLI ---------------------------
-
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="按 trade_date 分区的 Parquet 行情查看工具")
     parser.add_argument("--base", default="E:\\stock_data", help="数据根目录（默认: data）")
@@ -250,7 +272,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_show = sub.add_parser("show", help="查看某代码在一段时间内的记录")
     p_show.add_argument("--asset", required=True, choices=["index", "stock"])
-    p_show.add_argument("--adj", default="daily", choices=["daily", "daily_qfq", "daily_hfq"])
+    p_show.add_argument("--adj", default="daily", choices=["daily", "daily_qfq", "daily_hfq", "daily_indicators", "daily_qfq_indicators", "daily_hfq_indicators"])
     p_show.add_argument("--ts", required=True, help="ts_code，如 000001.SH 或 600000.SH")
     p_show.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
     p_show.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
@@ -262,7 +284,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_export = sub.add_parser("export", help="导出到 CSV（参数同 show）")
     p_export.add_argument("--asset", required=True, choices=["index", "stock"])
-    p_export.add_argument("--adj", default="daily", choices=["daily", "daily_qfq", "daily_hfq"])
+    p_export.add_argument("--adj", default="daily", choices=["daily", "daily_qfq", "daily_hfq", "daily_indicators", "daily_qfq_indicators", "daily_hfq_indicators"])
     p_export.add_argument("--ts", required=True, help="ts_code")
     p_export.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
     p_export.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
@@ -330,7 +352,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     parser.print_help()
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

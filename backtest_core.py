@@ -9,7 +9,6 @@ from config import (
     TDX_SELL_PATH,
 )
 
-
 def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL_MODE, buy_signal, sell_signal, record_trades=False) -> Tuple[Dict, Optional[List[Dict]]]:
 
     signals = buy_signal(df)
