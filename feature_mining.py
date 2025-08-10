@@ -295,7 +295,7 @@ def main():
         return
 
     # ===== 批量模式 =====
-    LOG.info("批量特征挖掘开始")
+    LOG.info("批量特征回测开始")
     try:
         codes = load_all_codes()
     except Exception as e:
@@ -350,18 +350,18 @@ def main():
     feats = pd.concat(all_feat, ignore_index=True)
     feats.to_parquet(out_dir / "prelaunch_features.parquet", index=False)
     # 简单统计输出
-    g = feats.groupby("rel_day").agg({
-        "j_median": ("j", "median"),
-        "j_q25": ("j", lambda s: s.quantile(0.25)),
-        "j_q75": ("j", lambda s: s.quantile(0.75)),
-        "j_diff_median": ("j_diff","median"),
-        "z_slope": ("z_slope","median"),
-        "z_turn_up": ("z_turn_up","mean"),
-        "vr": ("vr","median"),
-        "bbi_diff": ("bbi_diff","median"),
-        "bupiao_s": ("bupiao_s","median"),
-        "bupiao_l": ("bupiao_l","median"),
-    })
+    g = feats.groupby("rel_day").agg(
+        j_median=("j", "median"),
+        j_q25=("j", lambda s: s.quantile(0.25)),
+        j_q75=("j", lambda s: s.quantile(0.75)),
+        j_diff_median=("j_diff", "median"),
+        z_slope=("z_slope", "median"),
+        z_turn_up=("z_turn_up", "mean"),
+        vr=("vr", "median"),
+        bbi_diff=("bbi_diff", "median"),
+        bupiao_s=("bupiao_s", "median"),
+        bupiao_l=("bupiao_l", "median"),
+    )
     g.to_csv(out_dir / "prelaunch_summary.csv", encoding="utf-8-sig")
     
     if all_launch:
