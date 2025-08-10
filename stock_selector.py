@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-stock_selector_tdx.py — 读取 {DATA_ROOT}/stock/daily(或*复权) 最新 trade_date 分区，
+stock_selector.py — 读取 {DATA_ROOT}/stock/daily(或*复权) 最新 trade_date 分区，
 用 TDX 兼容层脚本进行选股，输出当日候选清单。
 
 依赖：

@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 EPS = 1e-12
-# 1) 统一把条件转成布尔并把 NaN 当 False
+# 统一把条件转成布尔并把 NaN 当 False
 def _as_bool(cond):
     s = pd.Series(cond)
     # NaN 一律按 False 处理，避免“开头数据不全”把条件误判为 True

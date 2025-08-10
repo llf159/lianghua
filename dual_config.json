@@ -1,0 +1,40 @@
+{
+  "blend": {
+    "w_long": 0.6,
+    "w_short": 0.4
+  },
+  "long_term": {
+    "window": 120,
+    "patterns": [
+      { "name": "break_60", "tdx": "C>=HHV(C,60)", "score": 2.0 },
+      { "name": "ma_trending", "tdx": "MA(C,5)>MA(C,10) AND MA(C,10)>MA(C,20)", "score": 1.5 },
+      { "name": "vol_contract", "tdx": "MA(V,5)<MA(V,20)", "score": 0.5 },
+      { "name": "tight_range", "tdx": "(HHV(H,5)-LLV(L,5))/REF(C,5)<=0.05", "score": 0.8 },
+      { "name": "hammer", "tdx": "(C>O) AND ((L-MIN(O,C))/ (H-L+EPS) >= 0.6) AND (H-L)>0", "score": 0.8 },
+      { "name": "engulf_bull", "tdx": "(C>O) AND (REF(C,1)<REF(O,1)) AND (C>=REF(O,1)) AND (O<=REF(C,1))", "score": 1.2 }
+    ],
+    "penalties": [
+      { "name": "huge_drop", "tdx": "(C/REF(C,1)-1)<=-0.07", "score": -2.0 },
+      { "name": "fall_below_ma20", "tdx": "C<MA(C,20)", "score": -0.5 }
+    ],
+    "normalize": { "method": "per_bar_mean", "scale": 1.0 }
+  },
+  "short_term": {
+    "rules": [
+      { "name": "gap_up", "tdx": "O>=REF(H,1) AND (C>=O)", "score": 1.5 },
+      { "name": "vol_spike", "tdx": "V/MA(V,20)>=1.8", "score": 1.2 },
+      { "name": "strong_close", "tdx": "(C/O-1)>=0.02", "score": 1.0 },
+      { "name": "near_high", "tdx": "C>=HHV(C,60)", "score": 0.8 }
+    ],
+    "penalties": [
+      { "name": "upper_shadow", "tdx": "(H-C)/(H-L+EPS)>=0.5", "score": -0.6 },
+      { "name": "limit_up", "tdx": "(C/REF(C,1)-1)>=0.095", "score": -0.3 }
+    ],
+    "normalize": { "method": "identity" }
+  },
+  "filters": {
+    "min_avg_amount20": 20000000,
+    "exclude_patterns": ["^ST", "[*]ST"],
+    "min_list_days": 180
+  }
+}
