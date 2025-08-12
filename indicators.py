@@ -70,14 +70,6 @@ REGISTRY: Dict[str, IndMeta] = {
         kwargs={"n1": 3, "n2": 21},
         tags=["product","prelaunch"]
     ),
-    "shuangjunxian": IndMeta(
-        name="shuangjunxian",
-        out={"bar_color": 0},           # 字符串列不 round，可设 0 或特殊处理
-        tdx=None,                        # 这个保留 Python 版本
-        py_func=lambda df, **kw: shuangjunxian(df, **kw),
-        kwargs={"n": 5},
-        tags=["product"]
-    ),
 }
 
 # —— 统一计算入口：优先 TDX，失败回退 Python —— 
@@ -131,20 +123,6 @@ def names_by_tag(tag: str) -> List[str]:
     return [n for n,m in REGISTRY.items() if tag in m.tags]
 
 # =================== python兼容层 ==========================
-def shuangjunxian(df, n=5):
-    df = df.copy()
-    df["avg_price"] = df["close"].rolling(n).mean()
-    df["avg_vol"] = df["vol"].rolling(n).mean()
-
-    df["price_up"] = df["avg_price"] > df["avg_price"].shift(1)
-    df["vol_up"] = df["avg_vol"] > df["avg_vol"].shift(1)
-
-    df["bar_color"] = "green"  # 默认绿柱
-    df.loc[df["price_up"] & df["vol_up"], "bar_color"] = "red"
-    df.loc[df["price_up"] ^ df["vol_up"], "bar_color"] = "yellow"
-
-    return df["bar_color"]
-
 def moving_average(series, window):
     return series.rolling(window).mean()
 
@@ -207,20 +185,6 @@ def cci(df, n=14):
     md = tp.rolling(n).apply(lambda x: (abs(x - x.mean())).mean())
     return (tp - ma) / (0.015 * md)
 
-def shuangjunxian(df, n=5):
-    df = df.copy()
-    df["avg_price"] = df["close"].rolling(n).mean()
-    df["avg_vol"] = df["vol"].rolling(n).mean()
-
-    df["price_up"] = df["avg_price"] > df["avg_price"].shift(1)
-    df["vol_up"] = df["avg_vol"] > df["avg_vol"].shift(1)
-
-    df["bar_color"] = "green"  # 默认绿柱
-    df.loc[df["price_up"] & df["vol_up"], "bar_color"] = "red"
-    df.loc[df["price_up"] ^ df["vol_up"], "bar_color"] = "yellow"
-
-    return df["bar_color"]
-
 def bbi(df):
     ma3 = df['close'].rolling(3).mean()
     ma6 = df['close'].rolling(6).mean()
@@ -240,19 +204,3 @@ def z_score(df, window=20, smooth=3):
         'z_score': z,
         'z_slope': slope
     }).fillna(0)
-    
-def zhixing_mid_long(df):
-    """知行中期多空线"""
-    ema1 = ema(df['close'], span=10)
-    ema2 = ema(ema1, span=10)
-    return ema2
-
-def weighted_price_line(df, n1=3, smooth=5):
-    """加权价线（平滑 VWAP）"""
-    # VWAP = 成交额 / 成交量 / 100
-    weighted_price = (
-        df['amount'].rolling(n1).sum() /
-        df['vol'].rolling(n1).sum() / 100
-    )
-    smoothed = moving_average(weighted_price, smooth)
-    return smoothed

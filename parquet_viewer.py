@@ -36,45 +36,19 @@ import glob
 import argparse
 import datetime as dt
 from typing import List, Optional, Iterable
-
-# 第三方库（duckdb 可选）
-# try:
-#     import duckdb  # type: ignore
-#     HAS_DUCKDB = True
-#     duckdb.sql("PRAGMA progress_bar_time = FALSE;")
-# except Exception:
-#     duckdb = None  # type: ignore
-#     HAS_DUCKDB = False
-
 import duckdb
 HAS_DUCKDB = True
 duckdb.sql("PRAGMA disable_progress_bar;") 
-
 import pandas as pd
 
 try:
-    import pyarrow  # noqa: F401
-    import pyarrow.parquet as pq  # noqa: F401
+    import pyarrow
+    import pyarrow.parquet as pq
     HAS_PYARROW = True
 except Exception:
     HAS_PYARROW = False
 
 # --------------------------- 工具函数 ---------------------------
-def asset_root(base: str, asset: str, adj: str) -> str:
-    if asset not in {"index", "stock"}:
-        raise ValueError("asset 仅支持 index / stock")
-    if asset == "index":
-        sub = "daily"
-    else:
-        allowed = {
-            "daily","daily_qfq","daily_hfq",
-            "daily_indicators","daily_qfq_indicators","daily_hfq_indicators",
-        }
-        if adj not in allowed:
-            raise ValueError("stock 的 adj 仅支持: " + ", ".join(sorted(allowed)))
-        sub = adj
-    return os.path.join(base, asset, sub)
-
 def asset_root(base: str, asset: str, adj: str) -> str:
     if asset not in {"index", "stock"}:
         raise ValueError("asset 仅支持 index / stock")
@@ -99,6 +73,25 @@ def read_by_symbol(base: str, adj: str, ts_code: str, with_indicators: bool = Tr
         raise FileNotFoundError(f)
     import pandas as pd
     return pd.read_parquet(f)
+
+def list_symbols(root: str) -> List[str]:
+    pattern = os.path.join(root, "trade_date=*/*.parquet").replace("\\", "/")
+    try:
+        df = duckdb.sql(f"SELECT DISTINCT ts_code FROM parquet_scan('{pattern}')").df()
+        if "ts_code" in df.columns:
+            return sorted(x for x in df["ts_code"].astype(str).tolist() if x)
+    except Exception:
+        pass
+    # 兜底：pandas 遍历
+    syms = set()
+    for p in glob.glob(os.path.join(root, "trade_date=*/*.parquet")):
+        try:
+            df = pd.read_parquet(p, columns=["ts_code"])
+            if "ts_code" in df.columns:
+                syms.update(df["ts_code"].dropna().astype(str).tolist())
+        except Exception:
+            continue
+    return sorted(syms)
 
 def list_trade_dates(root: str) -> List[str]:
     if not os.path.isdir(root):

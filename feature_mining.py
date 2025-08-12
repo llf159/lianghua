@@ -38,24 +38,35 @@
    - 启动日前若干天(LOOKBACK_K)的指标快照
 """
 
-import os
+import os, argparse, logging
 import pandas as pd
 import numpy as np
+from config import *
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import PARQUET_BASE, PARQUET_ADJ, START_DATE as START_STR, END_DATE as END_STR
 import parquet_viewer as pv
 from utils import ensure_datetime_index
 import indicators as ind
+from logging.handlers import RotatingFileHandler
+from time import time
+from tqdm import tqdm
+try:
+    from backtest_core import buy_signal as _buy_signal
+except Exception:
+    _buy_signal = None
 
-# ——— 参数(可调)———
-N_FUTURE = 10        # 启动判定窗口
-M_DD     = 3        # 回撤检测窗口
-RET_MIN  = 0.2      # 启动未来涨幅阈值
-DD_MAX   = 0.1      # 允许的最大回撤
-VR_MIN   = 1.2       # 启动当天量比
-RES_PAD  = 0.02      # 距55日高点容差2%
-LOOKBACK_K = 5       # 回看天数，统计 t-1..t-K
+
+# 启动日前回看多少天做快照
+LOOKBACK_K = 5
+# z-score 计算窗口（过去 P 天均值/方差）
+SURGE_P = 60
+# 在未来 N 天窗口里，取“任意连续子区间”的 z-score 最大和
+SURGE_N = 15
+# 触发阈值（zmax_fut ≥ SURGE_Z_THR 视作 surge 起点）
+SURGE_Z_THR = 5.0
+# 冷却天数：命中后至少隔这么多天才允许再次命中
+SURGE_COOLDOWN = 10
 MAX_WORKERS = 8
 
 def load_all_codes():
@@ -69,49 +80,21 @@ def load_all_codes():
     return sorted(df["ts_code"].dropna().unique().tolist())
 
 def read_df(code):
-    # 根据 PARQUET_ADJ 推断 single 目录的 adj 和是否带指标
     base_adj = "qfq" if "qfq" in PARQUET_ADJ else ("hfq" if "hfq" in PARQUET_ADJ else "daily")
-    with_ind = "indicators" in PARQUET_ADJ
-
+    # ① 先强行尝试 single_<adj>_indicators
     try:
-        # ① 优先读取单股成品（速度快，直接拿到已算好的指标）
-        df = pv.read_by_symbol(PARQUET_BASE, base_adj, code, with_indicators=with_ind)
+        df = pv.read_by_symbol(PARQUET_BASE, base_adj, code, with_indicators=True)
     except Exception:
-        # ② 回退到按日分区（兼容老目录/老数据）
-        df = pv.read_range(
-            PARQUET_BASE, "stock", PARQUET_ADJ,
-            ts_code=code, start=START_STR, end=END_STR, columns=None, limit=None
-        )
-
+        # ② 退到 single_<adj>（不带指标）
+        try:
+            df = pv.read_by_symbol(PARQUET_BASE, base_adj, code, with_indicators=False)
+        except Exception:
+            # ③ 再退到按日分区
+            df = pv.read_range(PARQUET_BASE, "stock", PARQUET_ADJ,
+                               ts_code=code, start=START_STR, end=END_STR, columns=None, limit=None)
     if df is None or df.empty:
         return None
-    df = ensure_datetime_index(df)
-    df = df.sort_index()
-    return df
-
-def label_launch(df: pd.DataFrame):
-    C = df["close"].astype(float)
-    H_future = C.rolling(N_FUTURE).max().shift(-N_FUTURE+1)      # 未来N天最高收
-    L_future = df["low"].astype(float).rolling(M_DD).min().shift(-M_DD+1)  # 未来M天最低价
-    ret_fut = (H_future - C) / C
-    dd_fut = (L_future - C) / C
-
-    # 压力位：55日最高收
-    hhv55 = C.rolling(55).max()
-    near_res_ok = (C <= hhv55 * (1 + RES_PAD))
-
-    vr_series = df.get("vr", pd.Series(index=df.index, dtype=float)).fillna(0)
-    vr_ok = vr_series >= VR_MIN
-
-    cond = (ret_fut >= RET_MIN) & (dd_fut >= -DD_MAX) & vr_ok & near_res_ok
-    df["is_launch"] = cond.astype(int)
-
-    # ——保留用于导出查看的列——
-    df["fut_ret_maxN"] = ret_fut
-    df["fut_dd_minM"] = dd_fut
-    df["vr_now"] = vr_series
-    df["hhv55"] = hhv55
-    df["gap_to_hhv55"] = (C / hhv55) - 1.0  # 离55日最高的相对距离
+    df = ensure_datetime_index(df).sort_index()
     return df
 
 def collect_features(df: pd.DataFrame):
@@ -121,54 +104,195 @@ def collect_features(df: pd.DataFrame):
     2) 添加派生特征(j_diff, bbi_diff, z_turn_up)
     3) 截取启动日前 LOOKBACK_K 天的特征快照
     """
-    # 1) 获取需要的指标名
-    need_names = ind.names_by_tag("prelaunch")
-    decimals = ind.outputs_for(need_names)
+    # need_names = ind.names_by_tag("prelaunch")
+    # decimals = ind.outputs_for(need_names)
 
-    # 2) 计算指标(缺啥补啥)
-    df = ind.compute(df, need_names)
+    # df = ind.compute(df, need_names)
 
-    # 3) 统一 round
-    for col, n in decimals.items():
-        if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
-            df[col] = df[col].round(n)
+    # for col, n in decimals.items():
+    #     if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+    #         df[col] = df[col].round(n)
 
-    # 4) 派生特征
-    if "j" in df.columns:
-        df["j_diff"] = df["j"].diff()
-    else:
-        df["j_diff"] = np.nan
-    if "bbi" in df.columns:
-        df["bbi_diff"] = df["bbi"].diff()
-    else:
-        df["bbi_diff"] = np.nan
-    if "z_slope" in df.columns:
-        df["z_turn_up"] = (df["z_slope"] > 0) & (df["z_slope"].shift(1) <= 0)
-    else:
-        df["z_turn_up"] = False
-        
-    # 5) 启动日前 LOOKBACK_K 天的快照
     rows = []
-    idxs = np.where(df["is_launch"] == 1)[0]
+    idxs = np.where(df["is_surge_dyn"] == 1)[0]
+    exclude = {
+        "ts_code","trade_date","open","high","low","close","vol","amount","pre_close","change",
+        "is_surge_dyn","zmax_fut"  # 这些是标签/辅助列，通常不算“特征列”
+    }
+
     for i in idxs:
         for k in range(1, LOOKBACK_K+1):
             j = i - k
-            if j < 0: continue
-            snap = dict(
-                ts=str(df["ts_code"].iloc[j]) if "ts_code" in df.columns else "",
-                trade_date=str(df.index[j].date()),
-                rel_day=-k,
-                j=df["j"].iloc[j],
-                j_diff=df["j_diff"].iloc[j],
-                z_slope=df["z_slope"].iloc[j],
-                z_turn_up=bool(df["z_turn_up"].iloc[j]),
-                vr=df["vr"].iloc[j],
-                bbi=df["bbi"].iloc[j],
-                bbi_diff=df["bbi_diff"].iloc[j],
-                bupiao_s=df["bupiao_short"].iloc[j],
-                bupiao_l=df["bupiao_long"].iloc[j],
-            )
+            if j < 0: 
+                continue
+            snap = {
+                "ts": str(df["ts_code"].iloc[j]) if "ts_code" in df.columns else "",
+                "trade_date": str(df.index[j].date()),
+                "rel_day": -k,
+            }
+            # 动态枚举：把剩余列全带上
+            for col in df.columns:
+                if col not in exclude and col in df.columns:
+                    snap[col] = df[col].iloc[j]
             rows.append(snap)
+    return pd.DataFrame(rows)
+
+def last_true_before(i: int, cond: pd.Series) -> int | None:
+    """
+    在位置 i 之前（严格小于 i），向前寻找 cond==True 的最近位置。
+    返回索引号（整数位置），找不到则 None。
+    """
+    if i <= 0:
+        return None
+    # 用到的都是顺序索引，提升性能可用向量化写法；这里用简洁做法
+    prev = cond.iloc[:i].to_numpy().nonzero()[0]
+    if prev.size == 0:
+        return None
+    return int(prev[-1])  # 最近一次
+
+# ====== 1) 动态“可观涨幅”打标（z-score累计） ======
+def label_surge_dynamic(df: pd.DataFrame,
+                        P: int | None = None,
+                        N: int | None = None,
+                        Z_THR: float | None = None,
+                        cooldown: int | None = None,
+                        col_close: str = "close") -> pd.DataFrame:
+    """
+    用未来 N 天内“任意连续子区间”的 z-score 最大和做动态打标：
+      1) r_t = pct_change(close)
+      2) z_t = (r_t - rolling_mean(P)) / rolling_std(P)
+      3) zmax_fut_t = max_{1<=k<=N} sum_{j=1..k} z_{t+j}     ← 连续子段最大值（Kadane）
+      4) zmax_fut_t >= Z_THR → surge 起点
+      5) 命中之间施加 cooldown 天冷却
+    """
+    P = int(P or SURGE_P)
+    N = int(N or SURGE_N)
+    Z_THR = float(Z_THR if Z_THR is not None else SURGE_Z_THR)
+    cooldown = int(cooldown or SURGE_COOLDOWN)
+
+    df = df.copy()
+    C = df[col_close].astype(float)
+
+    # --- z-score（过去 P 天滚动） ---
+    r = C.pct_change()
+    m = r.rolling(P, min_periods=max(10, P // 3)).mean()
+    s = r.rolling(P, min_periods=max(10, P // 3)).std().replace(0, np.nan)
+    z = (r - m) / s
+
+    # --- 未来 N 天“连续子区间最大和” ---
+    z_values = z.to_numpy()
+    T = len(z_values)
+    zmax_fut = np.full(T, np.nan)
+
+    for t in range(T):
+        start = t + 1
+        end = min(T, t + 1 + N)
+        if start >= end:
+            continue
+        window = z_values[start:end]
+        # NaN 不参与：置为极小值，确保不会被选中
+        window = np.nan_to_num(window, nan=-1e12)
+
+        # Kadane 最大子段和（允许全负，取最大单值）
+        best = window[0]
+        cur = window[0]
+        for v in window[1:]:
+            cur = v if (cur + v) < v else (cur + v)
+            best = best if best >= cur else cur
+        zmax_fut[t] = best
+
+    df["zmax_fut"] = zmax_fut
+
+    # --- 触发 + 冷却（优先保留每段第一个命中） ---
+    raw_hit = (df["zmax_fut"] >= Z_THR).astype(int).to_numpy()
+    keep = np.zeros(T, dtype=int)
+    last_kept = -10**9
+    hit_idx = np.where(raw_hit == 1)[0]
+    for i in hit_idx:
+        if i - last_kept >= cooldown:
+            keep[i] = 1
+            last_kept = i
+
+    df["is_surge_dyn"] = keep
+    return df
+
+# ====== 2) 买入信号布尔序列（复用你的回测买点）======
+def compute_buy_cond(df: pd.DataFrame) -> pd.Series:
+    # 需要 backtest_core.buy_signal(df)；若未提供，暂用保守占位符
+    try:
+        cond = buy_signal(df)
+        cond = pd.Series(cond, index=df.index).fillna(False).astype(bool)
+    except Exception:
+        cond = pd.Series(False, index=df.index)  # 占位：先全 False，待你提供源码后替换
+    return cond
+
+# ====== 3) 窗口画像聚合 ======
+def aggregate_window_features(
+    df: pd.DataFrame,
+    surge_flag_col: str = "is_surge_dyn",
+    W: int = 10,                       # 画像窗口长度（起点往前 W 天，不含起点）
+) -> pd.DataFrame:
+    """
+    对每个启动起点，统计“起点前 W 天”的关键信息（信号密度/次数/连续段/最近-最远间隔等）。
+    输出列（示例）：
+      - ts_code, surge_date, win_start, win_end, W
+      - signal_count, signal_days_ratio, signal_streak_max, signal_last_lag, signal_first_lag
+      - zcum_fut_at_surge（可观强度快照）
+    """
+    if df is None or df.empty or surge_flag_col not in df.columns:
+        return pd.DataFrame()
+
+    idx = df.index
+    buy_cond = compute_buy_cond(df)
+    flags = df[surge_flag_col].fillna(0).astype(int)
+
+    rows = []
+    hit_pos = np.where(flags.to_numpy() == 1)[0]
+    for pos in hit_pos:
+        win_l = max(0, pos - W)  # [win_l, pos)  不含 pos
+        win_r = pos
+        if win_r <= win_l:
+            continue
+        win_idx = idx[win_l:win_r]
+        sig = buy_cond.reindex(win_idx).fillna(False).to_numpy()
+
+        # 1) 次数与占比
+        count = int(sig.sum())
+        ratio = float(count) / len(sig)
+
+        # 2) 最长连续段
+        streak = 0
+        cur = 0
+        for v in sig:
+            if v:
+                cur += 1
+                streak = max(streak, cur)
+            else:
+                cur = 0
+
+        # 3) 最近/最早信号距起点的“天数”
+        last_lag = None
+        first_lag = None
+        if count > 0:
+            hit_days = np.where(sig)[0]           # 在窗口内的相对位置（0 是最早那天）
+            last_lag  = (len(sig) - 1) - hit_days[-1]  # 距起点最近一次
+            first_lag = (len(sig) - 1) - hit_days[0]   # 距起点最早一次
+
+        rows.append(dict(
+            ts_code = df.get("ts_code", pd.Series(index=idx, dtype=object)).reindex([idx[pos]]).iat[0]
+                      if "ts_code" in df.columns else None,
+            surge_date = idx[pos].date(),
+            win_start  = win_idx[0].date(),
+            win_end    = win_idx[-1].date(),
+            W = int(W),
+            signal_count = int(count),
+            signal_days_ratio = float(ratio),
+            signal_streak_max = int(streak),
+            signal_last_lag   = (None if last_lag is None else int(last_lag)),
+            signal_first_lag  = (None if first_lag is None else int(first_lag)),
+            zcum_fut_at_surge = float(df["zcum_fut"].iat[pos]) if "zcum_fut" in df.columns else None,
+        ))
+
     return pd.DataFrame(rows)
 
 def process_one(code: str):
@@ -176,12 +300,13 @@ def process_one(code: str):
         df = read_df(code)
         if df is None or df.empty:
             return None, None
-        df = label_launch(df)
+        df = label_surge_dynamic(df, P=60, N=15, Z_THR=5.0, cooldown=10)
+
 
         if "ts_code" not in df.columns:
             df["ts_code"] = code
 
-        launches = df[df["is_launch"] == 1].copy()
+        launches = df[df["is_surge_dyn"] == 1].copy()
         if not launches.empty:
             launches = launches.assign(
                 launch_date=launches.index.date,
@@ -202,12 +327,6 @@ def process_one(code: str):
     except Exception as e:
         # 避免单只股票异常阻断整体任务
         return None, None
-
-import argparse
-import logging
-from logging.handlers import RotatingFileHandler
-from time import time
-from tqdm import tqdm
 
 LOG = logging.getLogger("feature")
 
@@ -230,41 +349,42 @@ def _setup_logging(log_level:str="INFO", log_file:str|None=None):
         fh.setLevel(level)
         root.addHandler(fh)
 
-def _run_single(ts_code:str, out_dir:Path):
-    LOG.info("单股特征提取开始: %s", ts_code)
+def _run_single(ts_code: str, out_dir: Path):
+    LOG.info("单股特征挖掘开始: %s", ts_code)
     df = read_df(ts_code)
     if df is None or df.empty:
         LOG.warning("无数据: %s", ts_code)
         return
-    df = label_launch(df)
-    snap = collect_features(df)
-    # 启动日导出
-    launches = df[df["is_launch"] == 1].copy()
-    if "ts_code" not in launches.columns:
-        launches["ts_code"] = ts_code
-    if not launches.empty:
-        launches = launches.assign(
-            launch_date=launches.index.date,
-            close_now=launches["close"].astype(float),
-        )[["ts_code","launch_date","close_now","vr_now","gap_to_hhv55","fut_ret_maxN","fut_dd_minM"]]
-        launches.to_csv(out_dir / f"launch_dates_{ts_code.replace('.','_')}.csv", index=False, encoding="utf-8-sig")
-        launches.to_parquet(out_dir / f"launch_dates_{ts_code.replace('.','_')}.parquet", index=False)
-        LOG.info("启动日导出完成 rows=%d", len(launches))
 
-    if snap is not None and not snap.empty:
-        snap["ts_code"] = ts_code
-        snap.to_parquet(out_dir / f"prelaunch_features_{ts_code.replace('.','_')}.parquet", index=False)
-        LOG.info("特征快照导出完成 rows=%d", len(snap))
-    LOG.info("单股特征提取结束: %s", ts_code)
+    # ——新：股性化启动标注（zscore 累计）——
+    df = label_surge_dynamic(df, P=60, N=15, Z_THR=5.0, cooldown=10)
+
+    # ——新：起点前窗口画像——
+    stats_list = []
+    for W in (5, 10, 20):
+        stats = aggregate_window_features(df, surge_flag_col="is_surge_dyn", W=W)
+        if not stats.empty:
+            stats["ts_code"] = ts_code
+            stats_list.append(stats)
+
+    if stats_list:
+        out = pd.concat(stats_list, ignore_index=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out.to_parquet(out_dir / f"surge_window_stats_{ts_code.replace('.','_')}.parquet", index=False)
+        LOG.info("窗口画像导出 rows=%d", len(out))
+    else:
+        LOG.info("没有命中的启动点: %s", ts_code)
+
+    LOG.info("单股特征挖掘结束: %s", ts_code)
 
 def main():
     global MAX_WORKERS
     parser = argparse.ArgumentParser(description="启动前特征挖掘")
     parser.add_argument("--code", help="仅处理单个股票(支持6位或TS代码，例如 000001 或 000001.SZ)")
     parser.add_argument("--max-workers", type=int, default=MAX_WORKERS, help="线程数")
-    parser.add_argument("--log-file", default="feature_mining.log", help="日志文件")
+    parser.add_argument("--log-file", default=os.path.join(".", "log", "feature_mining.log"), help="日志文件")
     parser.add_argument("--log-level", default="INFO", help="日志级别: DEBUG/INFO/WARN/ERROR")
-    parser.add_argument("--out", default="feature_out", help="输出目录")
+    parser.add_argument("--out", default="./output/feature_mining", help="输出目录")
     args = parser.parse_args()
 
     _setup_logging(args.log_level, args.log_file)
@@ -329,7 +449,7 @@ def main():
     #     # ——导出启动日清单(逐只股票)——
     #     if "ts_code" not in df.columns:
     #         df["ts_code"] = code
-    #     launches = df[df["is_launch"] == 1].copy()
+    #     launches = df[df["is_surge_dyn"] == 1].copy()
     #     if not launches.empty:
     #         launches = launches.assign(
     #             launch_date = launches.index.date,

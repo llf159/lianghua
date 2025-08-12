@@ -89,7 +89,7 @@ def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL
             actual_window = min(MAX_HOLD_DAYS, remaining_len)
             if actual_window <= 0:
                 continue
-            # ⬇️ 直接切片使用预先计算的 all_sell_signals
+            # 直接切片使用预先计算的 all_sell_signals
             sell_signals = all_sell_signals.iloc[sell_start_idx : sell_start_idx + actual_window]
             sell_window  = df.iloc[sell_start_idx : sell_start_idx + actual_window]
 

@@ -344,7 +344,7 @@ def run_batch() -> None:
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = "results"
+    out_dir = "./output/strategy_backtest"
     os.makedirs(out_dir, exist_ok=True)
     xlsx_path = os.path.join(out_dir, f"summary_{timestamp}.xlsx")
     with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
