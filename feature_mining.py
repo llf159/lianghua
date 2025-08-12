@@ -52,7 +52,7 @@ from logging.handlers import RotatingFileHandler
 from time import time
 from tqdm import tqdm
 try:
-    from backtest_core import buy_signal as _buy_signal
+    from backtest_core import buy_signal
 except Exception:
     _buy_signal = None
 

@@ -160,14 +160,11 @@ def normalize_ts(ts_input: str, asset: str = "stock") -> str:
 
 def load_df_from_parquet(ts_code: str) -> pd.DataFrame:
     base_adj = "qfq" if "qfq" in PARQUET_ADJ else ("hfq" if "hfq" in PARQUET_ADJ else "daily")
-    with_ind = "indicators" in PARQUET_ADJ
-    cols = None
-
     try:
-        df = pv.read_by_symbol(PARQUET_BASE, base_adj, ts_code, with_indicators=with_ind)
+        df = pv.read_by_symbol(PARQUET_BASE, base_adj, ts_code, with_indicators=True)
     except Exception:
         df = pv.read_range(PARQUET_BASE, "stock", PARQUET_ADJ,
-                           ts_code, START_STR, END_STR, columns=cols, limit=None)
+                           ts_code, START_STR, END_STR, columns=None, limit=None)
 
     df = ensure_datetime_index(df)
     df = df[(df.index >= START_TS) & (df.index <= END_TS)]

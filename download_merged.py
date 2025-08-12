@@ -17,7 +17,7 @@ FAST_INIT 用于“首次全历史快速回补”。它按股票多线程抓取 
 - API_ADJ:         原始接口的复权选择："raw" / "qfq" / "hfq"
 - FAST_INIT_THREADS: 下载并发线程
 - CALLS_PER_MIN:   限频窗口(滑动计数，避免被限流)
-- WRITE_SYMBOL_PRODUCT: True 时写“单股票成品(含指标)”
+- WRITE_SYMBOL_INDICATORS: True 时写“单股票成品(含指标)”
 - SYMBOL_PRODUCT_INDICATORS: 指标配置，"all" 或逗号分隔
 - SYMBOL_PRODUCT_WARMUP_DAYS: 指标增量重算的 warm-up 天数(默认 60 天)
 - DUCK_MERGE_DAY_LAG: 仅当按日分区的最大 trade_date 落后超过 LAG 天才触发合并
@@ -46,7 +46,7 @@ FAST_INIT 用于“首次全历史快速回补”。它按股票多线程抓取 
 --------
 A. 下载阶段(多线程、限频、重试)
    - 对股票清单逐只调用 ts.pro_bar(..., adj=API_ADJ)，写入 (1)
-   - 若开启 WRITE_SYMBOL_PRODUCT：对每只股票
+   - 若开启 WRITE_SYMBOL_INDICATORS：对每只股票
        · 读取“旧成品”尾部 warm-up 区间 + 新数据 → 合并后统一重算指标 → 写入 (2)
 
 B. 合并阶段(默认开启)
@@ -66,11 +66,11 @@ C. (可选)原始K线流式合并
 常见搭配
 --------
 1) “最快可用”方案(接口直接 qfq)
-   FAST_INIT_MODE=True, API_ADJ="qfq", WRITE_SYMBOL_PRODUCT=True, ADJ_MODE="none"
+   FAST_INIT_MODE=True, API_ADJ="qfq", WRITE_SYMBOL_INDICATORS=True, ADJ_MODE="none"
    → 立即得到带指标的 by_symbol_qfq 与 {qfq}_indicators
 
 2) “更稳健的本地复权”方案(推荐)
-   FAST_INIT_MODE=True, API_ADJ="raw", WRITE_SYMBOL_PRODUCT=True, ADJ_MODE="both"
+   FAST_INIT_MODE=True, API_ADJ="raw", WRITE_SYMBOL_INDICATORS=True, ADJ_MODE="both"
    → 先拉原始，再本地构建 qfq/hfq，并同步生成对应的 *_indicators
 
 与回测对齐
@@ -106,9 +106,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import pandas as pd
 from tqdm import tqdm
-from tdx_compat import evaluate as tdx_eval
 import warnings
-import indicators as ind
 warnings.filterwarnings(
     "ignore",
     category=FutureWarning,
@@ -116,74 +114,11 @@ warnings.filterwarnings(
     message=".*fillna.*method.*deprecated.*"
 )
 
-# ===================== 配置区 =====================
-TOKEN = ""  # <-- 必填
-# DATA_ROOT = "./data"             # 下载数据目录(可改为绝对路径)
-DATA_ROOT = r"E:\stock_data"
-ASSETS = ["stock", "index"]      # 可选: ["stock"], ["index"], ["stock","index"]
-START_DATE = "20050101"
-END_DATE = "today"               # 或具体日期 'YYYYMMDD'
-INDEX_WHITELIST = [
-    "000001.SH","399001.SZ","399300.SZ","399905.SZ","399006.SZ","000016.SH","000852.SH"
-]
+from config import *
+from tdx_compat import evaluate as tdx_eval
+import indicators as ind
+from utils import normalize_trade_date
 
-# 通用限频：你的权限额度
-CALLS_PER_MIN = 475
-RETRY_TIMES = 5
-PARQUET_ENGINE = "pyarrow"
-LOG_LEVEL = "INFO"
-STOCK_INC_THREADS = 40         # 增量下载线程数
-
-# -------- FAST INIT(按股票多线程全历史回补)开关 --------
-FAST_INIT_MODE = False                     # 首次全历史快速抓取
-FAST_INIT_THREADS = 40                    # 并发线程数
-FAST_INIT_STOCK_DIR = os.path.join(DATA_ROOT, "fast_init_symbol")
-API_ADJ = "qfq"                           # qfq/hfq/raw
-# 若 FAST_INIT_MODE=True，可通过设置 API_ADJ 控制接口返回的复权方式：
-ADJ_MODE = "none"      # 本地复权模式: 'none' | 'qfq' | 'hfq' | 'both'
-
-# -------- 按股票下载后同步生成成品(含指标) --------
-WRITE_SYMBOL_PRODUCT = True              # 打开后：每只股票下载成功就同步写成品
-SYMBOL_PRODUCT_INDICATORS = "all"        # 需要计算哪些指标，如果需要全部则 "all"
-SYMBOL_PRODUCT_WARMUP_DAYS = 60          # 增量重算指标的 warm-up 天数
-SYMBOL_PRODUCT_OUT = None                # None → 自动写到 <base>/stock/by_symbol_<adj>
-
-# ===== 重试策略配置 (固定序列 + 抖动) =====
-RETRY_DELAY_SEQUENCE = [10, 10, 5]   # 固定序列；超过长度后都用最后一个值(5)
-RETRY_JITTER_RANGE = (-0.5, 0.5)     # 每次等待加的随机抖动秒数范围 (可调为 (-1,1))
-RETRY_LOG_LEVEL = "INFO"             # 等待日志级别：INFO / DEBUG
-# ==========================================
-
-# ==== Streaming Merge 配置 ================
-STREAM_FLUSH_DATE_BATCH = 80      # 缓冲多少个不同 trade_date 就刷盘一次
-STREAM_FLUSH_STOCK_BATCH = 200    # 处理多少只股票后强制刷盘(避免长时间不落盘)
-STREAM_LOG_EVERY = 300            # 每处理多少只股票打印一次进度日志
-FAILED_RETRY_ONCE = True          # 第一次下载后自动对失败股票再跑一轮
-FAILED_RETRY_THREADS = 8          # 失败补抓的线程数(可低一些)
-FAILED_RETRY_WAIT = 5             # 下载结束到补抓之间的等待秒(缓冲限频)
-# ==========================================
-
-# ====== Skip 文件完整性快速检查参数 ======
-CHECK_SKIP_MIN_MAX = True                 # 是否启用跳过前检查
-CHECK_SKIP_READ_COLUMNS = ["trade_date"]  # 读取的列，尽量最少减少 IO
-CHECK_SKIP_ALLOW_LAG_DAYS = 0           # 允许已有文件的最大日期距离 end_date 的“滞后”天数 (0=必须等于 end_date)
-SKIP_CHECK_START_ENABLED = False          # 是否启用开始日期检查(如果不需要可以关闭，减少接口调用)
-# ==========================================
-
-# ==== DuckDB 分批归并配置 =================
-DUCKDB_BATCH_SIZE = 300          # 每批处理的“单股票文件”数量(内存紧 → 降到 150/100)
-DUCKDB_THREADS = 10              # DuckDB 并行线程 (2~8 之间；太大内存峰值上升)
-DUCKDB_MEMORY_LIMIT = "18GB"      # 给 DuckDB 的内存上限(小机器可设 "4GB")
-DUCKDB_TEMP_DIR = "duckdb_tmp"   # Spill 目录(磁盘剩余空间要够)
-DUCKDB_CLEAR_DAILY_BEFORE = False # 首次构建或要完全重建设 True，会清空 daily 目录
-DUCKDB_COLUMNS = "*"             # 列裁剪：可改成 "ts_code,trade_date,open,high,low,close,vol,amount"
-DUCKDB_ENABLE_COMPACT_AFTER = "if_needed"       # 启用压实
-COMPACT_MAX_FILES_PER_DATE = 12          # 超过 12 个 part 的日期执行压实
-COMPACT_TMP_DIR = "compact_tmp"          # 若 compact 函数里需要临时目录(当前版本没用到)
-DUCK_MERGE_DAY_LAG = 5          # parquet 最大日期距离 duck 表 > 5 天才触发合并
-DUCK_MERGE_MIN_ROWS = 1_000_000 # 或过去 5 天新增行数 > 100 万行才触发
-# ==========================================
-# ==========================================
 
 # ------------- 基本检查 -------------
 if TOKEN.startswith("在这里"):
@@ -230,7 +165,7 @@ console_hdl = logging.StreamHandler(sys.stdout)
 console_hdl.setLevel(logging.INFO)
 console_hdl.setFormatter(file_fmt)
 root.addHandler(console_hdl)
-log_dir = os.path.join(DATA_ROOT, "log")
+log_dir = os.path.join("./log", "log")
 os.makedirs(log_dir, exist_ok=True)
 log_path = os.path.join(log_dir, "download.log")
 dl_hdl = logging.FileHandler(log_path, encoding="utf-8")
@@ -242,17 +177,12 @@ def _parse_indicators(arg: str):
     if not arg:
         return []
     if arg.lower().strip() == "all":
-        return list(ind_REGISTRY.keys())
+        return list(ind.REGISTRY.keys())
     return [x.strip() for x in arg.split(",") if x.strip()]
 
 def _decide_symbol_adj_for_fast_init() -> str:
-    # FAST_INIT 下基于 API_ADJ 决定写到哪个 by_symbol 目录
-    aj = (API_ADJ or "raw").lower()
-    if aj == "qfq":
-        return "qfq"
-    if aj == "hfq":
-        return "hfq"
-    return "daily"
+    aj = (API_ADJ).lower()
+    return aj 
 
 def _maybe_compact(dirpath: str):
     mode = str(DUCKDB_ENABLE_COMPACT_AFTER).lower()
@@ -286,13 +216,15 @@ def _update_fast_init_cache(ts_code: str, df: pd.DataFrame, adj: str):
     fpath = os.path.join(symbol_dir, f"{ts_code}.parquet")
 
     df2 = df.copy()
-    df2["trade_date"] = pd.to_datetime(df2["trade_date"].astype(str)).dt.strftime("%Y%m%d")
+    df2 = normalize_trade_date(df2)
     df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
 
     if os.path.exists(fpath):
         try:
             old = pd.read_parquet(fpath)
-            old["trade_date"] = pd.to_datetime(old["trade_date"].astype(str)).dt.strftime("%Y%m%d")
+            old = normalize_trade_date(old)
+
+            old = normalize_trade_date(old)
             both = pd.concat([old, df2], ignore_index=True)
             both = both.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
             both.to_parquet(fpath, index=False)
@@ -301,99 +233,113 @@ def _update_fast_init_cache(ts_code: str, df: pd.DataFrame, adj: str):
             logging.warning("[FAST_CACHE] 读取旧缓存失败 %s -> 覆盖写新: %s", ts_code, e)
     df2.to_parquet(fpath, index=False)
 
-def _write_symbol_product(ts_code: str, df: pd.DataFrame, end_date: str):
+def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str):
     """
     把该 ts_code 的 DataFrame 计算指标后写入 by_symbol 成品(带 warm-up 增量)。
     要求 df 至少包含: trade_date, open, high, low, close, vol[, amount, pre_close]
     """
-    if not WRITE_SYMBOL_PRODUCT:
+    if not (WRITE_SYMBOL_PLAIN or WRITE_SYMBOL_INDICATORS):
         return
         # 1) 选择输出目录（按你要求的命名）
-    adj = _decide_symbol_adj_for_fast_init()  # 'daily' | 'qfq' | 'hfq'
+    adj = _decide_symbol_adj_for_fast_init()  # 'raw' | 'qfq' | 'hfq'
     base_dir = DATA_ROOT
 
-    # 不带指标的单股目录：.../stock/single/single_<adj>
     single_plain_dir = os.path.join(base_dir, "stock", "single", f"single_{adj}")
-    # 带指标的单股目录：.../stock/single/single_<adj>_indicators
     single_ind_dir   = os.path.join(base_dir, "stock", "single", f"single_{adj}_indicators")
+    single_plain_dir_csv = os.path.join(base_dir, "stock", "single", "csv", adj)
+    single_ind_dir_csv   = os.path.join(base_dir, "stock", "single", "csv", f"{adj}_indicators")
+    if WRITE_SYMBOL_PLAIN:
+        os.makedirs(single_plain_dir, exist_ok=True)
+        os.makedirs(single_plain_dir_csv, exist_ok=True)
+    if WRITE_SYMBOL_INDICATORS:
+        os.makedirs(single_ind_dir, exist_ok=True)
+        os.makedirs(single_ind_dir_csv, exist_ok=True)
 
-    os.makedirs(single_plain_dir, exist_ok=True)
-    os.makedirs(single_ind_dir,   exist_ok=True)
+    plain_parquet = os.path.join(single_plain_dir, f"{ts_code}.parquet")
+    plain_csv     = os.path.join(single_plain_dir_csv, f"{ts_code}.csv")
+    ind_out_path_parquet = os.path.join(single_ind_dir, f"{ts_code}.parquet")
+    ind_out_path_csv     = os.path.join(single_ind_dir_csv, f"{ts_code}.csv")
 
-    plain_out_path = os.path.join(single_plain_dir, f"{ts_code}.parquet")
-    ind_out_path   = os.path.join(single_ind_dir,   f"{ts_code}.parquet")
-
+    
     # 2) 规范、排序、去重
     df2 = df.copy()
     if "trade_date" not in df2.columns:
         raise ValueError("df 缺少 trade_date 列")
-    df2["trade_date"] = (
-        pd.to_datetime(df2["trade_date"].astype(str))
-          .dt.strftime("%Y%m%d")
-    )
+    
     df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-
-    # 3) 先写一份“不带指标”的单股文件
-    df_plain = df2.copy()
+    df2 = normalize_trade_date(df2)
     price_cols = ["open", "high", "low", "close", "pre_close", "change"]
-    for col in price_cols:
-        if col in df_plain.columns and pd.api.types.is_numeric_dtype(df_plain[col]):
-            df_plain[col] = df_plain[col].round(2)
-    df_plain = df_plain.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-    df_plain.to_parquet(plain_out_path, index=False, engine=PARQUET_ENGINE)
 
-    # 4) warm-up 增量（若已有“带指标”的历史文件，则回看 warm-up 重新计算）
-    warmup_start = None
-    if os.path.exists(ind_out_path):
+    # ---------- plain：不带指标 ----------
+    if WRITE_SYMBOL_PLAIN:
+        df_plain = df2.copy()
+        for col in price_cols:
+            if col in df_plain.columns and pd.api.types.is_numeric_dtype(df_plain[col]):
+                df_plain[col] = df_plain[col].round(2)
+        df_plain = df_plain.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+
+        plain_parquet = os.path.join(single_plain_dir, f"{ts_code}.parquet")
+        plain_csv     = os.path.join(single_plain_dir_csv, f"{ts_code}.csv")
+
+        if "parquet" in SYMBOL_PRODUCT_FORMATS.get("plain", []):
+            df_plain.to_parquet(plain_parquet, index=False, engine=PARQUET_ENGINE)
+        if "csv" in SYMBOL_PRODUCT_FORMATS.get("plain", []):
+            df_plain.to_csv(plain_csv, index=False, encoding="utf-8-sig")
+
+    # ---------- ind：带指标 ----------
+    if WRITE_SYMBOL_INDICATORS:
+        # warm-up 增量（沿用原逻辑）
+        ind_out_path_parquet = os.path.join(single_ind_dir, f"{ts_code}.parquet")
+        ind_out_path_csv     = os.path.join(single_ind_dir_csv, f"{ts_code}.csv")
+
+        warm_df = df2.copy()
+        warmup_start = None
+        if os.path.exists(ind_out_path_parquet) or os.path.exists(ind_out_path_csv):
+            try:
+                # 优先读 parquet；若不存在再读 csv
+                if os.path.exists(ind_out_path_parquet):
+                    old = pd.read_parquet(ind_out_path_parquet)
+                else:
+                    old = pd.read_csv(ind_out_path_csv, dtype=str)
+                if not old.empty:
+                    old_td = pd.to_datetime(old["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+                    last = old_td.max()
+                    warmup_start = (last - pd.Timedelta(days=SYMBOL_PRODUCT_WARMUP_DAYS))
+
+                    keep_old = old.loc[old_td < warmup_start].copy()
+                    keep_old = normalize_trade_date(keep_old)
+
+                    new_part = df2.loc[pd.to_datetime(df2["trade_date"].astype(str), format="%Y%m%d", errors="coerce") >= warmup_start].copy()
+                    new_part = normalize_trade_date(new_part)
+                    warm_df = pd.concat([keep_old, new_part], ignore_index=True)
+            except Exception as e:
+                logging.warning("[PRODUCT][%s] 读取旧(带指标)失败，按全量重算：%s", ts_code, e)
+
+        # 统一指标引擎计算 + 四舍五入
         try:
-            old = pd.read_parquet(ind_out_path)
-            if not old.empty:
-                # 旧文件：转为 datetime 仅用于比较，随后再转回字符串
-                old_td = pd.to_datetime(old["trade_date"].astype(str))
-                last = old_td.max()
-                warmup_start = (last - pd.Timedelta(days=SYMBOL_PRODUCT_WARMUP_DAYS))
-
-                # 旧数据保留 warm-up 之前的部分（转回 'YYYYMMDD'）
-                keep_old = old.loc[old_td < warmup_start].copy()
-                keep_old["trade_date"] = pd.to_datetime(
-                    keep_old["trade_date"].astype(str)
-                ).dt.strftime("%Y%m%d")
-
-                # 新数据取 warm-up 起点及之后的部分（确保为 'YYYYMMDD'）
-                new_part = df2.loc[
-                    pd.to_datetime(df2["trade_date"].astype(str)) >= warmup_start
-                ].copy()
-                new_part["trade_date"] = pd.to_datetime(
-                    new_part["trade_date"].astype(str)
-                ).dt.strftime("%Y%m%d")
-
-                # 重新拼接
-                df2 = pd.concat([keep_old, new_part], ignore_index=True)
+            names = (SYMBOL_PRODUCT_INDICATORS or "all")
+            names = list(ind.REGISTRY.keys()) if str(names).lower() == "all" else [x.strip() for x in str(names).split(",") if x.strip()]
+            warm_df = ind.compute(warm_df, names)
         except Exception as e:
-            logging.warning("[PRODUCT][%s] 读取旧(带指标)失败，按全量重算：%s", ts_code, e)
+            logging.exception("[PRODUCT][%s] 指标计算失败：%s", ts_code, e)
+            raise
 
-    # 5) 统一指标引擎计算 + 四舍五入
-    try:
-        names = (SYMBOL_PRODUCT_INDICATORS or "").strip()
-        names = list(ind.REGISTRY.keys()) if names.lower() == "all" else [x.strip() for x in names.split(",") if x.strip()]
-        df2 = ind.compute(df2, names)
-    except Exception as e:
-        logging.exception("[PRODUCT][%s] 指标计算失败：%s", ts_code, e)
-        return
+        decimals = ind.outputs_for(names)
+        for col, n in decimals.items():
+            if col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]):
+                warm_df[col] = warm_df[col].round(n)
+        for col in price_cols:
+            if col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]):
+                warm_df[col] = warm_df[col].round(2)
 
-    decimals = ind.outputs_for(names)
-    for col, n in decimals.items():
-        if col in df2.columns and pd.api.types.is_numeric_dtype(df2[col]):
-            df2[col] = df2[col].round(n)
-    for col in price_cols:
-        if col in df2.columns and pd.api.types.is_numeric_dtype(df2[col]):
-            df2[col] = df2[col].round(2)
+        warm_df = normalize_trade_date(warm_df)
+        warm_df = warm_df.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
 
-    # 6) 最终写“带指标”的单股文件
-    df2["trade_date"] = pd.to_datetime(df2["trade_date"].astype(str)).dt.strftime("%Y%m%d")
-    df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-    df2.to_parquet(ind_out_path, index=False, engine=PARQUET_ENGINE)
-    logging.debug("[PRODUCT][%s] 成品已写出(不带指标→%s；带指标→%s)", ts_code, plain_out_path, ind_out_path)
+        if "parquet" in SYMBOL_PRODUCT_FORMATS.get("ind", []):
+            warm_df.to_parquet(ind_out_path_parquet, index=False, engine=PARQUET_ENGINE)
+        if "csv" in SYMBOL_PRODUCT_FORMATS.get("ind", []):
+            warm_df.to_csv(ind_out_path_csv, index=False, encoding="utf-8-sig")
+        logging.debug("[PRODUCT][%s] 成品已写出 plain_dir=%s ind_dir=%s", ts_code, single_plain_dir, single_ind_dir)
 
 def _rate_limit():
     now = time.time()
@@ -611,64 +557,6 @@ def _need_duck_merge(daily_dir: str) -> bool:
     return new_rows >= DUCK_MERGE_MIN_ROWS
 
 # ========== 按交易日批量模式(原有日常增量) ==========
-def sync_stock_daily(start: str, end: str):
-    root = os.path.join(DATA_ROOT, "stock", "daily")
-    os.makedirs(root, exist_ok=True)
-    last = _last_partition_date(root)
-    actual_start = start if last is None else str(int(last) + 1)
-    if actual_start > end:
-        logging.info("[stock] 日线已最新 (last=%s)", last)
-        return
-    dates = _trade_dates(actual_start, end)
-    pbar = _tqdm_iter(dates, desc="股票日线")
-    try:
-        for d in pbar:
-            pbar.set_postfix_str(d)
-            try:
-                df = _retry(lambda dd=d: pro.daily(trade_date=dd), f"stock_daily_{d}")
-            except Exception:
-                continue
-            _save_partition(df, root)
-    except KeyboardInterrupt:
-        pbar.close()
-        logging.warning("[stock] 中断 %d/%d", pbar.n, len(dates))
-        raise
-    finally:
-        pbar.close()
-
-def sync_index_daily(start: str, end: str, whitelist: List[str]):
-    root = os.path.join(DATA_ROOT, "index", "daily")
-    os.makedirs(root, exist_ok=True)
-    last = _last_partition_date(root)
-    actual_start = start if last is None else str(int(last) + 1)
-    if actual_start > end:
-        logging.info("[index] 日线已最新 (last=%s)", last)
-        return
-    dates = _trade_dates(actual_start, end)
-    wl = set(whitelist)
-    pbar = _tqdm_iter(dates, desc="指数日线")
-    try:
-        for d in pbar:
-            pbar.set_postfix_str(d)
-            all_df = []
-            for code in whitelist:
-                try:
-                    df = _retry(lambda dd=d, ts_code=code: pro.index_daily(trade_date=dd, ts_code=ts_code),
-                                f"index_daily_{d}_{code}")
-                    all_df.append(df)
-                except Exception:
-                    continue
-            if all_df:
-                df_all = pd.concat(all_df, ignore_index=True)
-                _save_partition(df_all, root)
-
-    except KeyboardInterrupt:
-        pbar.close()
-        logging.warning("[index] 中断 %d/%d", pbar.n, len(dates))
-        raise
-    finally:
-        pbar.close()
-
 def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: int = 8):
     """
     按“指数代码”一次性拉取区间数据(并发)，写出到 data/index/daily/trade_date=YYYYMMDD/part-*.parquet
@@ -754,14 +642,18 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
     按“股票代码(ts_code)”一次性并发拉取区间(日线)，
     写出到 data/stock/daily/trade_date=YYYYMMDD/part-*.parquet
     """
-    import threading
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    root = os.path.join(DATA_ROOT, "stock", "daily")
-    os.makedirs(root, exist_ok=True)
+    adj = _decide_symbol_adj_for_fast_init()  # 返回 'raw' | 'qfq' | 'hfq'
+    adj_dir_map = {
+        "raw": os.path.join(DATA_ROOT, "stock", "daily", "daily_raw"),
+        "qfq": os.path.join(DATA_ROOT, "stock", "daily", "daily_qfq"),
+        "hfq": os.path.join(DATA_ROOT, "stock", "daily", "daily_hfq"),
+    }
+    dst_dir = adj_dir_map[adj]
+    os.makedirs(dst_dir, exist_ok=True)
+    
 
     # 增量起点沿用你现有分区规则
-    last = _last_partition_date(root)
+    last = _last_partition_date(dst_dir)
     actual_start = start if last is None else str(int(last) + 1)
     if actual_start > end:
         logging.info("[stock][FAST] 日线已最新 (last=%s)", last)
@@ -775,7 +667,7 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
         for dt, sub in df.groupby("trade_date"):
             if dt < actual_start or dt > end:
                 continue
-            pdir = os.path.join(root, f"trade_date={dt}")
+            pdir = os.path.join(dst_dir, f"trade_date={dt}")
             os.makedirs(pdir, exist_ok=True)
             fname = os.path.join(pdir, f"part-{int(time.time()*1e6)}.parquet")
             with lock_io:
@@ -798,23 +690,19 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
                 freq='D',
                 asset='E'
             )
-        def call_daily_by_dates():
-            # 极少数接口异常时的兜底：按日期循环 daily 再拼接
-            all_df = []
-            for d in _trade_dates(actual_start, end):  # 你已有交易日获取。:contentReference[oaicite:4]{index=4}
-                try:
-                    df_d = _retry(lambda dd=d: pro.daily(trade_date=dd, ts_code=ts_code),
-                                  f"stock_daily_{ts_code}_{d}")
-                    if df_d is not None and not df_d.empty:
-                        all_df.append(df_d)
-                except Exception:
-                    continue
-            return pd.concat(all_df, ignore_index=True) if all_df else pd.DataFrame()
-
         try:
             df = _retry(lambda: call_bar(), f"stock_pro_bar_{ts_code}")
             if df is None or df.empty:
-                df = call_daily_by_dates()
+                all_df = []
+                for d in _trade_dates(actual_start, end):  # 你已有交易日获取。
+                    try:
+                        df_d = _retry(lambda dd=d: pro.daily(trade_date=dd, ts_code=ts_code),
+                                    f"stock_daily_{ts_code}_{d}")
+                        if df_d is not None and not df_d.empty:
+                            all_df.append(df_d)
+                    except Exception:
+                        continue
+                df = pd.concat(all_df, ignore_index=True) if all_df else pd.DataFrame()
             if df is None or df.empty:
                 return ts_code, "empty"
             df = df.sort_values("trade_date")
@@ -823,7 +711,6 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
         except Exception as e:
             return ts_code, f"err:{e}"
 
-    from tqdm import tqdm
     with ThreadPoolExecutor(max_workers=threads) as exe:
         futs = {exe.submit(fetch_one, code): code for code in codes}
         pbar = tqdm(as_completed(futs), total=len(futs), desc="股票(日线)并发拉取", ncols=120)
@@ -920,7 +807,8 @@ def fast_init_download(end_date: str):
                 return (ts_code, 'empty', None)
             df = df.sort_values("trade_date")
             df.to_parquet(fpath, index=False)
-            _write_symbol_product(ts_code, df, end_date)
+            if API_ADJ != "raw":
+                _WRITE_SYMBOL_INDICATORS(ts_code, df, end_date)
             return (ts_code, 'ok', None)
         except Exception as e:
             return (ts_code, 'err', str(e))
@@ -941,7 +829,12 @@ def fast_init_download(end_date: str):
                 else:
                     err += 1
                     failed.append((ts_code, msg))
+                    pbar.close()
+                    # 立即取消还在排队/执行的任务
+                    exe.shutdown(cancel_futures=True)
+                    raise RuntimeError(f"FAIL-FAST 触发：{ts_code} 指标/写盘报错：{msg}")
             pbar.set_postfix(ok=ok, skip=skip, empty=empty, err=err)
+
         pbar.close()
 
     logging.info("[FAST_INIT] 初轮完成 ok=%d skip=%d empty=%d err=%d", ok, skip, empty, err)
@@ -978,7 +871,8 @@ def fast_init_download(end_date: str):
                     return (ts_code, 'empty')
                 df = df.sort_values("trade_date")
                 df.to_parquet(fpath, index=False)
-                _write_symbol_product(ts_code, df, end_date)
+                if API_ADJ != "raw":
+                    _WRITE_SYMBOL_INDICATORS(ts_code, df, end_date)
                 return (ts_code, 'ok')
             except Exception as e:
                 return (ts_code, f"err:{e}")
@@ -1079,23 +973,9 @@ def duckdb_merge_symbol_products_to_daily(batch_days:int=30):
     _maybe_compact(dst_dir)
 
 # ====== 增量重算：把新增日期涉及的股票，补齐“按股票成品(含指标)”并合并到按日分区 ======
-def _pick_target_adj_for_normal() -> str:
-    """
-    基于 NORMAL 模式下的 ADJ_MODE 选择指标来源：
-    - 'qfq' or 'both' -> qfq
-    - 'hfq'           -> hfq
-    - else            -> daily
-    """
-    mode = (ADJ_MODE or "none").lower()
-    if mode in ("qfq", "both"):
-        return "qfq"
-    if mode == "hfq":
-        return "hfq"
-    return "daily"
-
 def _with_api_adj(temp_api_adj: str, fn, *args, **kwargs):
     """
-    临时切换 API_ADJ(仅用于复用 _write_symbol_product/duckdb_merge_* 内的 by_symbol 目录判定)，
+    临时切换 API_ADJ(仅用于复用 _WRITE_SYMBOL_INDICATORS/duckdb_merge_* 内的 by_symbol 目录判定)，
     调用结束后恢复，避免侵入式改函数签名。
     """
     global API_ADJ
@@ -1111,15 +991,15 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
     NORMAL(日常增量)的核心补全：
     1) 找出 stock/<target_adj> 新增日期涉及的 ts_code
     2) 以 warm-up 窗口回看，抽取这批 ts_code 的历史数据
-    3) 用统一的 _write_symbol_product() 重算单股成品(含指标)
+    3) 用统一的 _WRITE_SYMBOL_INDICATORS() 重算单股成品(含指标)
     4) 回灌 fast_init 缓存；再合并到 <adj>_indicators 分区
     """
     import duckdb, os
     import pandas as pd
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    target_adj = _pick_target_adj_for_normal()     # daily / qfq / hfq
-    src_dir = os.path.join(DATA_ROOT, "stock", target_adj)
+    target_adj = _decide_symbol_adj_for_fast_init()     # raw / qfq / hfq
+    src_dir = os.path.join(DATA_ROOT, "stock", "daily", f"daily_{target_adj}")
     dst_dir = os.path.join(DATA_ROOT, "stock", "daily", f"daily_{target_adj}_indicators")
     if not os.path.isdir(src_dir):
         logging.warning("[INC_IND] 源目录不存在：%s(可能尚未构建 %s)", src_dir, target_adj)
@@ -1159,7 +1039,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
 
     ts_list = df_codes["ts_code"].dropna().astype(str).unique().tolist()
     logging.info("[INC_IND] 需要补的股票数=%d (last_ind_date=%s)", len(ts_list), last_duck_str)
-    con.close()
+
     # ③ 为每个 ts_code 提取“历史 + warm-up”窗数据
     #    为避免全量扫，限定提取窗口：从 (end - SYMBOL_PRODUCT_WARMUP_DAYS - 40) 起拿
     #    多回看 40 天只为冗余保险（遇到节假日/停牌）
@@ -1174,13 +1054,23 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
             loc.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}';")
             os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
             loc.execute(f"PRAGMA temp_directory='{DUCKDB_TEMP_DIR}';")
-
             qbase = f"FROM parquet_scan('{glob_src}') WHERE ts_code = '{ts_code}'"
-            df = loc.sql(
-                f"SELECT * {qbase} AND trade_date >= '{start_win}' AND trade_date <= '{end}'"
-            ).df()
-            if df is None or df.empty:
+
+            ind_parquet = os.path.join(DATA_ROOT, "stock", "single", f"single_{target_adj}_indicators", f"{ts_code}.parquet")
+            ind_csv     = os.path.join(DATA_ROOT, "stock", "single", "csv", f"{target_adj}_indicators", f"{ts_code}.csv")
+            no_single_ind_file = not (os.path.exists(ind_parquet) or os.path.exists(ind_csv))
+
+            if no_single_ind_file:
+                # 首次构建该股票成品 → 直接全量
                 df = loc.sql(f"SELECT * {qbase}").df()
+            else:
+                # 只回看 warm-up 窗口
+                df = loc.sql(
+                    f"SELECT * {qbase} AND trade_date >= '{start_win}' AND trade_date <= '{end}'"
+                ).df()
+                if df is None or df.empty:
+                    df = loc.sql(f"SELECT * {qbase}").df()
+
 
             loc.close()
 
@@ -1210,7 +1100,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
         # 保持 by_symbol 的 adj 目录规则，且在调用期间临时切换 API_ADJ 以重用目录判定
         temp_api_adj = {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}[target_adj]
         try:
-            _with_api_adj(temp_api_adj, _write_symbol_product, ts_code, df, end)
+            _with_api_adj(temp_api_adj, _WRITE_SYMBOL_INDICATORS, ts_code, df, end)
             _update_fast_init_cache(ts_code, df, target_adj)  # 回灌 fast_init 缓存
             return ts_code, "ok"
         except Exception as e:
@@ -1234,10 +1124,11 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
     logging.info("[INC_IND] 单股成品重算完成 ok=%d empty=%d err=%d", ok, empty, err)
 
     # ⑤ 把 by_symbol_<adj> 的新增日期 COPY 到 <adj>_indicators（与 FAST 一致）
-    _with_api_adj(
-        {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}[target_adj],
-        duckdb_merge_symbol_products_to_daily
-    )
+    if WRITE_SYMBOL_INDICATORS:
+        _with_api_adj(
+            {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}[target_adj],
+            duckdb_merge_symbol_products_to_daily
+        )
 
 def duckdb_partition_merge(batch_days:int=30):
     """
@@ -1250,11 +1141,11 @@ def duckdb_partition_merge(batch_days:int=30):
 
     merge_tasks = [
         ("raw", os.path.join(FAST_INIT_STOCK_DIR, "raw"),
-                os.path.join(DATA_ROOT, "stock", "daily", "daily")),
+                os.path.join(DATA_ROOT, "stock", "daily", "daily_raw")),
         ("qfq", os.path.join(FAST_INIT_STOCK_DIR, "qfq"),
-                os.path.join(DATA_ROOT, "stock", "daily", "qfq")),
+                os.path.join(DATA_ROOT, "stock", "daily", "daily_qfq")),
         ("hfq", os.path.join(FAST_INIT_STOCK_DIR, "hfq"),
-                os.path.join(DATA_ROOT, "stock", "daily", "hfq")),
+                os.path.join(DATA_ROOT, "stock", "daily", "daily_hfq")),
     ]
 
     for mode, src_dir, dst_dir in merge_tasks:
@@ -1318,13 +1209,13 @@ def duckdb_partition_merge(batch_days:int=30):
 
 def streaming_merge_after_download():
     """
-    第二阶段：将 fast_init_symbol 下每个股票 parquet 文件流式合并到
+    第二阶段：将  下每个股票 parquet 文件流式合并到
     data/stock/daily/ 和 data/stock/qfq/ 目录，分别处理原始和前复权数据。
     """
     merge_tasks = [
-    ("raw", os.path.join(FAST_INIT_STOCK_DIR, "raw"), os.path.join(DATA_ROOT, "stock", "daily", "daily")),
-    ("qfq", os.path.join(FAST_INIT_STOCK_DIR, "qfq"), os.path.join(DATA_ROOT, "stock", "daily", "qfq")),
-    ("hfq", os.path.join(FAST_INIT_STOCK_DIR, "hfq"), os.path.join(DATA_ROOT, "stock", "daily", "hfq")),
+    ("raw", os.path.join(FAST_INIT_STOCK_DIR, "raw"), os.path.join(DATA_ROOT, "stock", "daily", "daily_raw")),
+    ("qfq", os.path.join(FAST_INIT_STOCK_DIR, "qfq"), os.path.join(DATA_ROOT, "stock", "daily", "daily_qfq")),
+    ("hfq", os.path.join(FAST_INIT_STOCK_DIR, "hfq"), os.path.join(DATA_ROOT, "stock", "daily", "daily_hfq")),
     ]
 
     for mode_label, symbol_dir, daily_root in merge_tasks:
@@ -1398,11 +1289,16 @@ def main():
         fast_init_download(end_date)   # 这里 end_date 已经算好
         if DUCK_MERGE_DAY_LAG >= 0:      # 简单开关，可设 -1 跳过
             duckdb_partition_merge()
-        if WRITE_SYMBOL_PRODUCT:
+        if WRITE_SYMBOL_INDICATORS:
             duckdb_merge_symbol_products_to_daily()
-
     else:
         # ======= 日常增量模式 =======
+        # 优先把 fastinit 缓存合并进 daily，避免全历史重拉
+        if any(os.path.isdir(os.path.join(FAST_INIT_STOCK_DIR, d)) and
+            len(glob.glob(os.path.join(FAST_INIT_STOCK_DIR, d, "*.parquet"))) > 0
+            for d in ("raw","qfq","hfq")):
+            duckdb_partition_merge()  # 只 copy 新增 trade_date，速度很快
+
         if "stock" in assets:
             sync_stock_daily_fast(START_DATE, end_date, threads=STOCK_INC_THREADS)
         if "index" in assets:

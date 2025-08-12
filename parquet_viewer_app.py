@@ -24,9 +24,6 @@ if str(ROOT) not in sys.path:
 
 import parquet_viewer as pv
 
-# 导入你上传的工具函数
-import parquet_viewer as pv  # type: ignore
-
 # 配置文件路径：放在当前用户目录下
 CONFIG_PATH = Path.home() / ".parquet_viewer_app.json"
 # 默认 base（也允许用环境变量覆盖）
@@ -58,7 +55,6 @@ def load_base(default_base: str) -> str:
         pass
     return default_base
 
-
 def save_base(base: str):
     """保存本次的 base 到配置文件；出错时静默忽略。"""
     try:
@@ -68,7 +64,6 @@ def save_base(base: str):
         )
     except Exception:
         pass
-
 
 def get_info(base: str) -> str:
     base = base or "DEFAULT_BASE"
@@ -89,7 +84,6 @@ def get_info(base: str) -> str:
         lines.append(f"- {name:<16} {dates[0]} ~ {dates[-1]}  共 {len(dates)} 天  路径: {root}")
     return "\n".join(lines)
 
-
 def get_dates(base: str, asset: str, adj: str) -> str:
     root = pv.asset_root(base, asset, adj if asset == "stock" else "daily")
     dates = pv.list_trade_dates(root)
@@ -97,11 +91,9 @@ def get_dates(base: str, asset: str, adj: str) -> str:
         return "（无分区）"
     return f"{asset} / {('daily' if asset=='index' else adj)}: {len(dates)} 天\n" + ", ".join(dates)
 
-
 def run_day(base: str, asset: str, adj: str, date: str, limit: Optional[int]) -> pd.DataFrame:
     df = pv.read_day(base, asset, adj, date, limit)
     return df
-
 
 def run_show(base: str, asset: str, adj: str, ts: str, start: str, end: str,
              columns: Optional[str], limit: Optional[int]) -> Tuple[pd.DataFrame, Optional[plt.Figure]]:
@@ -129,7 +121,6 @@ def run_show(base: str, asset: str, adj: str, ts: str, start: str, end: str,
                 plt.tight_layout()
     return df, fig
 
-
 def run_schema(file_path: str) -> str:
     if not os.path.isfile(file_path):
         return f"文件不存在：{file_path}"
@@ -151,7 +142,6 @@ def run_schema(file_path: str) -> str:
     except Exception as e:
         return f"读取失败：{e}"
 
-
 def run_export(base: str, asset: str, adj: str, ts: str, start: str, end: str,
                columns: Optional[str], out_dir: str) -> Tuple[str, Optional[str]]:
     ts_norm = normalize_ts(ts, asset)
@@ -164,7 +154,6 @@ def run_export(base: str, asset: str, adj: str, ts: str, start: str, end: str,
     out_path = os.path.abspath(os.path.join(out_dir, f"{ts_norm}_{start}_{end}.csv"))
     df.to_csv(out_path, index=False, encoding="utf-8-sig")
     return f"已导出：{out_path}  行数={len(df)}", out_path
-
 
 # -------------------- Gradio 界面 --------------------
 def build_ui(base_default: str = DEFAULT_BASE):
@@ -238,8 +227,6 @@ def build_ui(base_default: str = DEFAULT_BASE):
 
     return demo
 
-
-
 def _enable_queue_compat(demo):
     """
     适配不同 Gradio 版本的 queue() 参数：
@@ -259,7 +246,6 @@ def _enable_queue_compat(demo):
         # 若出现异常，退化为不传参数
         return demo.queue()
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--share", action="store_true", help="开启公网/局域网临时可访问链接")
@@ -273,7 +259,6 @@ def main():
     except Exception:
         pass
     demo.launch(share=args.share)
-
 
 if __name__ == "__main__":
     main()
