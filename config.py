@@ -11,14 +11,14 @@ PARQUET_USE_INDICATORS = True     # True: *_indicators 分区；False: 非 indic
 
 # 配置参数
 HOLD_DAYS = 2  # 买入持有天数
-START_DATE = "20250101"
-END_DATE = "20250801"
+STRATEGY_START_DATE = "20250101"
+STRATEGY_END_DATE = "20250801"
 # 数据目录路径（可绝对路径或相对路径）
 DATA_DIR = "E://gupiao-hfq"
-TDX_BUY_PATH = "./buy_rule.txt"
-TDX_SELL_PATH = "./sell_rule.txt"
-TDX_SELL_OPEN_PATH = "./sell_open_rule.txt"
-TDX_SELL_CLOSE_PATH = "./sell_close_rule.txt"
+TDX_BUY_PATH = "./buy_rules.txt"
+TDX_SELL_PATH = "./sell_rules.txt"
+TDX_SELL_OPEN_PATH = "./sell_open_rules.txt"
+TDX_SELL_CLOSE_PATH = "./sell_close_rules.txt"
 
 # DATA_DIR = os.path.join(BASE_DIR, "test") 
 #open为次日开盘价买入，close为当日收盘价买入,signal_open为信号当天开盘买入；open涨停不买入
@@ -36,7 +36,7 @@ MAX_HOLD_DAYS = -1  # -1 表示不限制持有天数，其他正整数表示最�
 FALLBACK_SELL_MODE = "open"#超过持有天数后强制卖出的模式
 
 # ================= download配置区 =====================
-TOKEN = "646e3fa927e4db94da8605c19ec74bf15f22d6d5dced2149fec55063"  # <-- 必填
+TOKEN = ""  # <-- 必填
 # DATA_ROOT = "./data"             # 下载数据目录(可改为绝对路径)
 DATA_ROOT = r"E:\stock_data"
 ASSETS = ["stock", "index"]      # 可选: ["stock"], ["index"], ["stock","index"]
@@ -55,11 +55,10 @@ STOCK_INC_THREADS = 40         # 增量下载线程数
 
 # -------- FAST INIT(按股票多线程全历史回补)开关 --------
 FAST_INIT_MODE = True                     # 首次全历史快速抓取
-FAST_INIT_THREADS = 40                    # 并发线程数
+FAST_INIT_THREADS = 50                    # 并发线程数
 FAST_INIT_STOCK_DIR = os.path.join(DATA_ROOT, "fast_init_symbol")
 API_ADJ = "qfq"                           # qfq/hfq/raw
 # 若 FAST_INIT_MODE=True，可通过设置 API_ADJ 控制接口返回的复权方式：
-ADJ_MODE = "none"      # 本地复权模式: 'none' | 'qfq' | 'hfq' | 'both'
 
 # -------- 单股成品输出控制---------
 WRITE_SYMBOL_PLAIN = True            # 是否输出「不带指标」的单股文件
@@ -71,7 +70,7 @@ SYMBOL_PRODUCT_FORMATS = {
 }
 
 SYMBOL_PRODUCT_INDICATORS = "all"        # 需要计算哪些指标，如果需要全部则 "all"
-SYMBOL_PRODUCT_WARMUP_DAYS = 60          # 增量重算指标的 warm-up 天数
+SYMBOL_PRODUCT_WARMUP_DAYS = 90          # 增量重算指标的 warm-up 天数
 SYMBOL_PRODUCT_OUT = None                # None → 自动写到 <base>/stock/by_symbol_<adj>
 
 # ===== 重试策略配置 (固定序列 + 抖动) =====

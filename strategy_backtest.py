@@ -59,8 +59,8 @@ GLOBAL_LOCK = PROGRESS_LOCK
 CPU_COUNT = os.cpu_count() or 1
 N_WORKERS = max(1, CPU_COUNT - 1)  # 保留一个核心用于系统任务
 
-START_TS  = pd.to_datetime(START_DATE)
-END_TS    = pd.to_datetime(END_DATE)
+START_TS  = pd.to_datetime(STRATEGY_START_DATE)
+END_TS    = pd.to_datetime(STRATEGY_END_DATE)
 START_STR = START_TS.strftime("%Y%m%d")   # 供 Parquet 分区读取
 END_STR   = END_TS.strftime("%Y%m%d")
 

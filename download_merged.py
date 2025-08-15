@@ -65,13 +65,9 @@ C. (可选)原始K线流式合并
 
 常见搭配
 --------
-1) “最快可用”方案(接口直接 qfq)
-   FAST_INIT_MODE=True, API_ADJ="qfq", WRITE_SYMBOL_INDICATORS=True, ADJ_MODE="none"
+   “最快可用”方案(接口直接 qfq)
+   FAST_INIT_MODE=True, API_ADJ="qfq", WRITE_SYMBOL_INDICATORS=True
    → 立即得到带指标的 by_symbol_qfq 与 {qfq}_indicators
-
-2) “更稳健的本地复权”方案(推荐)
-   FAST_INIT_MODE=True, API_ADJ="raw", WRITE_SYMBOL_INDICATORS=True, ADJ_MODE="both"
-   → 先拉原始，再本地构建 qfq/hfq，并同步生成对应的 *_indicators
 
 与回测对齐
 ----------
@@ -150,8 +146,11 @@ root = logging.getLogger()
 root.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
 
 # 文件 Handler(轮换)
+LOG_DIR = os.path.join(".", "log")
+log_file_path = os.path.join(LOG_DIR, "fast_init.log")
+os.makedirs(LOG_DIR, exist_ok=True)
 file_hdl = TimedRotatingFileHandler(
-    "fast_init.log",
+    log_file_path,
     when="midnight",
     backupCount=7,
     encoding="utf-8"
@@ -165,7 +164,7 @@ console_hdl = logging.StreamHandler(sys.stdout)
 console_hdl.setLevel(logging.INFO)
 console_hdl.setFormatter(file_fmt)
 root.addHandler(console_hdl)
-log_dir = os.path.join("./log", "log")
+log_dir = os.path.join(".", "log")
 os.makedirs(log_dir, exist_ok=True)
 log_path = os.path.join(log_dir, "download.log")
 dl_hdl = logging.FileHandler(log_path, encoding="utf-8")
@@ -1280,9 +1279,9 @@ def main():
     assets = {a.lower() for a in ASSETS}
 
     logging.info(
-        "=== 启动 mode=%s assets=%s 区间=%s-%s 原始数据复权=%s 本地复权=%s===",
+        "=== 启动 mode=%s assets=%s 区间=%s-%s 原始数据复权=%s ===",
         "FAST_INIT" if FAST_INIT_MODE else "NORMAL",
-        sorted(assets), START_DATE, end_date, API_ADJ, ADJ_MODE
+        sorted(assets), START_DATE, end_date, API_ADJ
     )
 
     if FAST_INIT_MODE:
@@ -1311,8 +1310,7 @@ def main():
         "api_adj": API_ADJ if FAST_INIT_MODE else None,
         "rebuilt_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "start_date": START_DATE,
-        "end_date": end_date,
-        "adj_mode": ADJ_MODE,
+        "end_date": END_DATE,
         "assets": sorted(list(assets))
     }
     with open(os.path.join(DATA_ROOT, "_META.json"), "w", encoding="utf-8") as f:

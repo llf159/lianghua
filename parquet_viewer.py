@@ -104,16 +104,23 @@ def read_by_symbol(base: str, adj: str | None, ts_code: str, with_indicators: bo
         False -> 读取 single_{adj}
         None  -> 两者都尝试，先指标后无指标
     """
-    adj_dir = normalize_stock_adj(base, adj, PARQUET_USE_INDICATORS)
-    # 从目录名提取关键后缀（daily_raw -> raw；daily_qfq -> qfq；daily -> daily）
-    suffix = adj_dir.replace("daily_", "") if adj_dir.startswith("daily_") else adj_dir
-    candidates: List[str] = []
-    if with_indicators:
-        candidates = [f"single_{suffix}_indicators"]
-    else:
-        candidates = [f"single_{suffix}"]
+    # adj_dir = normalize_stock_adj(base, adj, PARQUET_USE_INDICATORS)
+    # # 从目录名提取关键后缀（daily_raw -> raw；daily_qfq -> qfq；daily -> daily）
+    # suffix = adj_dir.replace("daily_", "") if adj_dir.startswith("daily_") else adj_dir
+    # candidates: List[str] = []
+    # if with_indicators:
+    #     candidates = [f"single_{suffix}_indicators"]
+    # else:
+    #     candidates = [f"single_{suffix}"]
 
-
+    amap = {"daily": "daily", "raw": "raw", "qfq": "qfq", "hfq": "hfq"}
+    kind = (adj or "daily").lower()
+    if kind not in amap:
+        raise ValueError(f"无效的复权类型: {adj}，可选: {list(amap.keys())}")
+    suffix = amap[kind]
+    # 单股成品文件不需要依赖任何按日分区目录存在与否；直接按候选路径探测
+    candidates: List[str] = [f"single_{suffix}_indicators"] if with_indicators else [f"single_{suffix}"]
+    
     for sub in candidates:
         f = os.path.join(base, "stock", "single", sub, f"{ts_code}.parquet")
         if os.path.isfile(f):

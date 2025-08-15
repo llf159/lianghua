@@ -28,20 +28,6 @@ REGISTRY: Dict[str, IndMeta] = {
         kwargs={}, 
         tags=["product","prelaunch"]
     ),
-    "z_score": IndMeta(
-        name="z_score",
-        out={"z_slope": 3, "z_score": 3},
-        tdx="""
-            OC := SAFE_DIV(C - O, O) * 100;
-            MEAN := MA(OC, 20);
-            STDV := STD(OC, 20);
-            Z_SCORE := SAFE_DIV(OC - MEAN, STDV);
-            Z_SLOPE := MA(Z_SCORE - REF(Z_SCORE, 1), 3);
-        """,
-        py_func=lambda df, **kw: z_score(df, **kw),  # 你已有的 z_score(df) 返回含两列
-        kwargs={"window": 20, "smooth": 3},
-        tags=["product","prelaunch"]
-    ),
     "volume_ratio": IndMeta(
         name="volume_ratio",
         out={"vr": 4},
@@ -70,6 +56,19 @@ REGISTRY: Dict[str, IndMeta] = {
         kwargs={"n1": 3, "n2": 21},
         tags=["product","prelaunch"]
     ),
+    "rsi": IndMeta(
+        name="rsi",
+        out={"rsi": 2},  # 小数位数
+        tdx="""
+            N := 14;
+            LC := REF(CLOSE, 1);
+            RSI := SMA(MAX(CLOSE - LC, 0), N, 1) / SMA(ABS(CLOSE - LC), N, 1) * 100;
+        """,
+        py_func=lambda df, **kw: rsi(df['close'], **kw),
+        kwargs={"period": 14},  # Python 兜底参数
+        tags=["product","prelaunch"]
+),
+
 }
 
 # —— 统一计算入口：优先 TDX，失败回退 Python —— 
@@ -80,35 +79,46 @@ def compute(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
         meta = REGISTRY.get(name)
         if not meta:
             continue
-        # 1) TDX 优先
+
+        tdx_ok = False
         if meta.tdx:
             try:
                 res = tdx_eval(meta.tdx, out_df)
+                # 尝试用 TDX 结果填充声明的输出列
+                filled = 0
                 for col in meta.out.keys():
-                    # 支持大小写键
-                    val = (res.get(col) or res.get(col.upper()) or res.get(col.lower()))
-                    if val is not None:
-                        out_df[col] = val
-                continue
+                    # 所有 key 做一份小写映射，避免大小写不一致
+                    lower_map = {k.lower(): v for k, v in res.items()}
+                    if col.lower() in lower_map:
+                        out_df[col] = lower_map[col.lower()]
+                        filled += 1
+                # 若 TDX 把所有声明列都填好了，就视为成功
+                if filled == len(meta.out):
+                    tdx_ok = True
             except Exception:
-                pass  # 回退 Python
+                tdx_ok = False  # TDX 报错则回退
 
-        # 2) Python 兜底
-        if meta.py_func:
-            res = meta.py_func(out_df, **meta.kwargs)
-            # 兼容：DataFrame / Series / (tuple/list of Series)
-            if isinstance(res, pd.DataFrame):
-                for col in meta.out.keys():
-                    if col in res.columns:
-                        out_df[col] = res[col]
-            elif isinstance(res, (list, tuple)):
-                if len(res) == len(meta.out):
-                    for col, series in zip(meta.out.keys(), res):
-                        out_df[col] = series
-            else:  # 单列
-                only_col = next(iter(meta.out.keys()))
-                out_df[only_col] = res
+        # 若 TDX 未成功或未填全 → Python 兜底补齐缺列
+        if (not tdx_ok) and meta.py_func:
+            try:
+                res = meta.py_func(out_df, **meta.kwargs)
+                if isinstance(res, pd.DataFrame):
+                    for col in meta.out.keys():
+                        if col in res.columns:
+                            out_df[col] = res[col]
+                elif isinstance(res, (list, tuple)):
+                    if len(res) == len(meta.out):
+                        for col, series in zip(meta.out.keys(), res):
+                            out_df[col] = series
+                else:
+                    only_col = next(iter(meta.out.keys()))
+                    out_df[only_col] = res
+            except Exception:
+                # 保底：兜底也失败就跳过，不阻塞其它指标
+                pass
+
     return out_df
+
 
 def outputs_for(names: List[str]) -> Dict[str, int]:
     """返回这些指标的所有输出列及小数位，供统一 round 使用。"""
@@ -138,11 +148,16 @@ def macd(series, fast=12, slow=26, signal=9):
     return macd_line, signal_line, hist
 
 def rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    from tdx_compat import SMA
+    s = pd.Series(series)
+    lc = s.shift(1)
+    up = (s - lc).clip(lower=0)      # = MAX(CLOSE - LC, 0)
+    dn = (lc - s).clip(lower=0)      # = MAX(LC - CLOSE, 0) = ABS(CLOSE - LC) 的下行部分
+    avg_up = SMA(up, period, 1)      # TDX: SMA(..., N, 1)
+    avg_dn = SMA(dn, period, 1)
+    rs = avg_up / (avg_dn + EPS)     # SAFE_DIV
+    rsi_val = 100.0 - (100.0 / (1.0 + rs))
+    return rsi_val
 
 def kdj(df, n=9, k_period=3, d_period=3):
     low_min = df['low'].rolling(n).min()
@@ -192,15 +207,3 @@ def bbi(df):
     ma24 = df['close'].rolling(24).mean()
 
     return (ma3 + ma6 + ma12 + ma24) / 4
-
-def z_score(df, window=20, smooth=3):
-    oc_return = (df['close'] - df['open']) / df['open'] * 100
-    mean = oc_return.rolling(window).mean()
-    std = oc_return.rolling(window).std()
-    std = std.replace(0, EPS)
-    z = (oc_return - mean) / std
-    slope = z.diff().rolling(smooth).mean()
-    return pd.DataFrame({
-        'z_score': z,
-        'z_slope': slope
-    }).fillna(0)

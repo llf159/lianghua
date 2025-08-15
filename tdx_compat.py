@@ -238,8 +238,7 @@ def evaluate(script, df, extra_context=None):
         "RSV": RSV,
     }
     if extra_context:
-        ctx.update(extra_context)
-
+        ctx.update(extra_context) 
     results = {}
     last_value = None
     for name, expr in program:
@@ -259,6 +258,7 @@ def evaluate(script, df, extra_context=None):
             last_value = val
     if last_value is not None:
         results["LAST_EXPR"] = last_value
+    results = {k.lower(): v for k, v in results.items()}
     return results
 
 def tdx_to_python(script):
