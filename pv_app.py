@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import json
 import datetime as dt
+import re
 
 ROOT = Path(__file__).resolve().parent  # 当前脚本所在的根目录
 if str(ROOT) not in sys.path:
@@ -45,6 +46,7 @@ def normalize_ts(ts_input: str, asset: str) -> str:
         ts = ts + market
     return ts.upper()
 
+
 def load_base(default_base: str) -> str:
     """读取上次保存的 base；失败或无配置时返回 default_base。"""
     try:
@@ -57,6 +59,7 @@ def load_base(default_base: str) -> str:
         pass
     return default_base
 
+
 def save_base(base: str):
     """保存本次的 base 到配置文件；出错时静默忽略。"""
     try:
@@ -67,11 +70,13 @@ def save_base(base: str):
     except Exception:
         pass
 
+
 def _date_list(root: str) -> List[str]:
     return pv.list_trade_dates(root)
 
+
 def _date_gaps(dates: List[str]) -> List[str]:
-    """粗略检查日期不连续（忽略周末/节假日，设置 >3 天为可疑缺口）。"""
+    """粗略检查日期不连续（忽略周末/节假日，设置 >21 天为可疑缺口）。"""
     gaps: List[str] = []
     for i in range(len(dates)-1):
         d0, d1 = dates[i], dates[i+1]
@@ -79,11 +84,12 @@ def _date_gaps(dates: List[str]) -> List[str]:
             x0 = dt.datetime.strptime(d0, "%Y%m%d")
             x1 = dt.datetime.strptime(d1, "%Y%m%d")
             delta = (x1 - x0).days
-            if delta > 3:
+            if delta > 21:
                 gaps.append(f"{d0}->{d1}({delta}d)")
         except Exception:
             continue
     return gaps
+
 
 def _distinct_count_latest_k(root: str, k: int = 3) -> Dict[str, int]:
     """
@@ -118,6 +124,7 @@ def _distinct_count_latest_k(root: str, k: int = 3) -> Dict[str, int]:
         out[d] = total
     return out
 
+
 def _stock_universe_size(base: str) -> Optional[int]:
     """尝试读取 {base}/stock_list.csv 作为对照的股票基数。"""
     f = os.path.join(base, "stock_list.csv")
@@ -128,6 +135,7 @@ def _stock_universe_size(base: str) -> Optional[int]:
         except Exception:
             return None
     return None
+
 
 def _indicators_alignment(base: str) -> List[Dict[str, Any]]:
     """比较 daily_{adj} 与 daily_{adj}_indicators 的覆盖对齐情况。"""
@@ -174,6 +182,7 @@ def _indicators_alignment(base: str) -> List[Dict[str, Any]]:
             continue
     return rows
 
+
 def _health_score(entry: Dict[str, Any]) -> Tuple[str, str]:
     """
     根据规则给出健康状态：(status, reason)
@@ -194,11 +203,14 @@ def _health_score(entry: Dict[str, Any]) -> Tuple[str, str]:
         return "WARN", "指标目录落后基础目录"
     return "OK", ""
 
+
 def _adj_dir_name(adj_kind: str) -> str:
     amap = {"daily":"daily", "raw":"daily_raw", "qfq":"daily_qfq", "hfq":"daily_hfq"}
     k = str(adj_kind).lower()
     return amap.get(k, "daily_qfq")
 
+
+# -------------------- 底层函数 --------------------
 def overview_df(base: str, adj_kind: str='qfq') -> pd.DataFrame:
     base = base or "DEFAULT_BASE"
     adj_dir = _adj_dir_name(adj_kind)
@@ -274,6 +286,7 @@ def overview_df(base: str, adj_kind: str='qfq') -> pd.DataFrame:
     ])
     return df
 
+
 def get_info(base: str, adj_kind: str='qfq') -> str:
     """保留一个精简文本版（方便复制），详细请看“概览表格”与“诊断建议”。"""
     base = base or "DEFAULT_BASE"
@@ -293,9 +306,11 @@ def get_info(base: str, adj_kind: str='qfq') -> str:
         lines.append(f"[概览生成失败] {e}")
     return "\n".join(lines)
 
+
 def overview_table(base: str, adj_kind: str='qfq') -> pd.DataFrame:
     """用于 UI 显示的完整性表格。"""
     return overview_df(base, adj_kind)
+
 
 def overview_advice(base: str, adj_kind: str='qfq') -> str:
     """根据表格给出动作建议。"""
@@ -322,6 +337,7 @@ def overview_advice(base: str, adj_kind: str='qfq') -> str:
     except Exception as e:
         return f"[生成建议失败] {e}"
 
+
 # -------------------- 业务包装函数（保留原有功能） --------------------
 def get_dates(base: str, asset: str, adj: str) -> str:
     root = pv.asset_root(base, asset, adj if asset == "stock" else "daily")
@@ -330,11 +346,14 @@ def get_dates(base: str, asset: str, adj: str) -> str:
         return "（无分区）"
     return f"{asset} / {('daily' if asset=='index' else adj)}: {len(dates)} 天\n" + ", ".join(dates)
 
+
 def run_day(base: str, asset: str, adj: str, date: str, limit: Optional[int]) -> pd.DataFrame:
     limit_clean = (limit or "").strip()
-    limit = int(limit_clean) if limit_clean.isdigit() and int(limit_clean) > 0 else None
+    is_int = limit_clean.lstrip("-").isdigit()
+    limit = int(limit_clean) if is_int else None
     df = pv.read_day(base, asset, adj, date, limit)
     return df
+
 
 def run_show(base: str, asset: str, adj: str, ts: str, start: str, end: str,
              columns: Optional[str], limit: Optional[int]) -> Tuple[pd.DataFrame, Optional[plt.Figure]]:
@@ -342,7 +361,8 @@ def run_show(base: str, asset: str, adj: str, ts: str, start: str, end: str,
     cols = [c.strip() for c in re.split(r"[，,;；\s]+", columns) if c.strip()] if columns else None
     adj2 = adj if asset == "stock" else "daily"
     limit_clean = (limit or "").strip()
-    limit = int(limit_clean) if limit_clean.isdigit() and int(limit_clean) > 0 else None
+    is_int = limit_clean.lstrip("-").isdigit()
+    limit = int(limit_clean) if is_int else None
     df = pv.read_range(base, asset, adj2, ts_norm, start, end, cols, limit)
 
     fig = None
@@ -364,9 +384,13 @@ def run_show(base: str, asset: str, adj: str, ts: str, start: str, end: str,
                 plt.tight_layout()
     return df, fig
 
-def run_schema(file_path: str) -> str:
+
+def run_schema(file_path: str = "", file_obj=None) -> str:
     if not os.path.isfile(file_path):
-        return f"文件不存在：{file_path}"
+        if file_obj:
+            file_path = file_obj.name
+        else:
+            return f"文件不存在：{file_path}"
     try:
         if pv.HAS_PYARROW:
             import pyarrow.parquet as pq  # type: ignore
@@ -385,6 +409,7 @@ def run_schema(file_path: str) -> str:
     except Exception as e:
         return f"读取失败：{e}"
 
+
 def run_export(base: str, asset: str, adj: str, ts: str, start: str, end: str,
                columns: Optional[str], out_dir: str) -> Tuple[str, Optional[str]]:
     ts_norm = normalize_ts(ts, asset)
@@ -398,6 +423,7 @@ def run_export(base: str, asset: str, adj: str, ts: str, start: str, end: str,
     df.to_csv(out_path, index=False, encoding="utf-8-sig")
     return f"已导出：{out_path}  行数={len(df)}", out_path
 
+
 def run_custom_parquet(file_path: str, columns: Optional[str], limit: Optional[int]) -> pd.DataFrame:
     """自定义读取指定 Parquet 并按列/行数限制显示"""
     if not os.path.isfile(file_path):
@@ -408,11 +434,15 @@ def run_custom_parquet(file_path: str, columns: Optional[str], limit: Optional[i
             col_list = [c.strip() for c in re.split(r"[，,;；\s]+", columns) if c.strip() in df.columns]
             if col_list:
                 df = df[col_list]
-        if limit:
-            df = df.head(int(limit))
+        if isinstance(limit, int):
+            if limit < 0:
+                df = df.tail(-limit)
+            elif limit > 0:
+                df = df.head(limit)
         return df
     except Exception as e:
         return pd.DataFrame([{"error": str(e)}])
+
 
 def run_custom_parquet_ui(text_path: Optional[str], file_obj, columns: Optional[str], limit: Optional[int]) -> pd.DataFrame:
     """
@@ -422,8 +452,9 @@ def run_custom_parquet_ui(text_path: Optional[str], file_obj, columns: Optional[
     """
     picked_path = (getattr(file_obj, "name", None) or text_path or "").strip()
     limit_clean = (limit or "").strip()
-    limit = int(limit_clean) if limit_clean.isdigit() and int(limit_clean) > 0 else None
-    return run_custom_parquet(picked_path, columns, limit)
+    is_int = limit_clean.lstrip("-").isdigit()
+    limit_val = int(limit_clean) if is_int else None
+    return run_custom_parquet(picked_path, columns, limit_val)
 
 # -------------------- Gradio 界面 --------------------
 def build_ui(base_default: str = DEFAULT_BASE):
@@ -459,7 +490,7 @@ def build_ui(base_default: str = DEFAULT_BASE):
             asset_day = gr.Radio(choices=["index", "stock"], value="index", label="资产 asset")
             adj_day = gr.Dropdown(choices=["raw", "qfq", "hfq"], value="qfq", label="复权 adj（index 固定为 daily）")
             date_day = gr.Textbox(label="交易日 YYYYMMDD")
-            limit_day = gr.Textbox(label="最多显示行数", placeholder="可空，默认为全部")
+            limit_day = gr.Textbox(label="最多显示行数", placeholder="可空，默认为全部，负数为倒数")
             btn_day = gr.Button("查询")
             out_day = gr.Dataframe(label="结果（day）")
             btn_day.click(run_day, inputs=[base_day, asset_day, adj_day, date_day, limit_day], outputs=[out_day])
@@ -472,7 +503,7 @@ def build_ui(base_default: str = DEFAULT_BASE):
             start_show = gr.Textbox(label="起始日期 YYYYMMDD")
             end_show = gr.Textbox(label="结束日期 YYYYMMDD")
             cols_show = gr.Textbox(label="仅显示这些列", placeholder="支持半/全角的逗号分号以及空格分隔，可空")
-            limit_show = gr.Textbox(label="最多显示行数", placeholder="可空，默认为全部")
+            limit_show = gr.Textbox(label="最多显示行数", placeholder="可空，默认为全部，负数为倒数")
             btn_show = gr.Button("查询")
             out_show_df = gr.Dataframe(label="结果（show）")
             out_show_fig = gr.Plot(label="（可选）收盘价曲线：若存在 trade_date + close 列自动绘图")
@@ -482,9 +513,10 @@ def build_ui(base_default: str = DEFAULT_BASE):
 
         with gr.Tab("Schema / 统计"):
             file_schema = gr.Textbox(label="Parquet 文件路径")
+            file_custom_file = gr.File(label="直接选择/拖拽 Parquet 文件", file_types=[".parquet"])
             btn_schema = gr.Button("查看 schema")
             out_schema = gr.Textbox(label="Schema / 统计", lines=12)
-            btn_schema.click(run_schema, inputs=[file_schema], outputs=[out_schema])
+            btn_schema.click(run_schema, inputs=[file_schema, file_custom_file], outputs=[out_schema])
 
         with gr.Tab("导出 CSV"):
             base_exp = gr.Textbox(label="数据根目录 base", value=base_default)
@@ -506,7 +538,7 @@ def build_ui(base_default: str = DEFAULT_BASE):
             file_custom_path = gr.Textbox(label="Parquet 文件路径（可手输）")
             file_custom_file = gr.File(label="或直接选择/拖拽 Parquet 文件", file_types=[".parquet"])
             cols_custom = gr.Textbox(label="仅显示这些列", placeholder="支持半/全角的逗号分号以及空格分隔，可空")
-            limit_custom = gr.Textbox(label="最多显示行数", placeholder="可空，默认为全部")
+            limit_custom = gr.Textbox(label="最多显示行数", placeholder="可空，默认为全部，负数为倒数")
             btn_custom = gr.Button("显示")
             out_custom_df = gr.Dataframe(label="结果（自定义）")
             btn_custom.click(run_custom_parquet_ui,
@@ -517,6 +549,7 @@ def build_ui(base_default: str = DEFAULT_BASE):
         gr.Markdown("> 小贴士：安装了duckdb查询速度会更快。未安装时会自动退回 pandas+pyarrow。")
 
     return demo
+
 
 def _enable_queue_compat(demo):
     """
@@ -537,6 +570,7 @@ def _enable_queue_compat(demo):
         # 若出现异常，退化为不传参数
         return demo.queue()
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--share", action="store_true", help="开启 Gradio 公开分享")
@@ -546,6 +580,7 @@ def main():
     demo = build_ui(args.base)
     demo = _enable_queue_compat(demo)
     demo.launch(share=args.share)
+
 
 if __name__ == "__main__":
     main()

@@ -118,6 +118,7 @@ from utils import normalize_trade_date
 
 # ------------- 基本检查 -------------
 if TOKEN.startswith("在这里"):
+    logging.debug('[BRANCH] <module> | IF TOKEN.startswith("在这里") -> taken')
     sys.stderr.write("请先在 TOKEN 中填写你的 Tushare Token.\n")
     sys.exit(1)
 
@@ -174,34 +175,44 @@ root.addHandler(dl_hdl)
 
 def _parse_indicators(arg: str):
     if not arg:
+        logging.debug('[BRANCH] def _parse_indicators | IF not arg -> taken')
         return []
     if arg.lower().strip() == "all":
+        logging.debug('[BRANCH] def _parse_indicators | IF arg.lower().strip() == "all" -> taken')
         return list(ind.REGISTRY.keys())
     return [x.strip() for x in arg.split(",") if x.strip()]
+
 
 def _decide_symbol_adj_for_fast_init() -> str:
     aj = (API_ADJ).lower()
     return aj 
 
+
 def _maybe_compact(dirpath: str):
     mode = str(DUCKDB_ENABLE_COMPACT_AFTER).lower()
     if mode in ("false", "0", "off", "none"):
+        logging.debug('[BRANCH] def _maybe_compact | IF mode in ("false", "0", "off", "none") -> taken')
         return
     # "if_needed" 的判定：仅当某些日期的 part 数超过阈值才做
     if mode in ("if_needed", "auto"):
         # 粗略检查：命中任何一个 trade_date 目录超过阈值就触发
+        logging.debug('[BRANCH] def _maybe_compact | IF mode in ("if_needed", "auto") -> taken')
         over = False
         for d in os.listdir(dirpath):
             p = os.path.join(dirpath, d)
             if d.startswith("trade_date=") and os.path.isdir(p):
+                logging.debug('[BRANCH] def _maybe_compact | IF d.startswith("trade_date=") and os.path.isdir(p) -> taken')
                 cnt = sum(1 for x in os.listdir(p) if x.endswith(".parquet"))
                 if cnt > COMPACT_MAX_FILES_PER_DATE:
+                    logging.debug('[BRANCH] def _maybe_compact | IF cnt > COMPACT_MAX_FILES_PER_DATE -> taken')
                     over = True
                     break
         if not over:
+            logging.debug('[BRANCH] def _maybe_compact | IF not over -> taken')
             return
     # 其余视作强制压实
     compact_daily_partitions(base_dir=dirpath)
+
 
 def _update_fast_init_cache(ts_code: str, df: pd.DataFrame, adj: str):
     """
@@ -219,6 +230,7 @@ def _update_fast_init_cache(ts_code: str, df: pd.DataFrame, adj: str):
     df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
 
     if os.path.exists(fpath):
+        logging.debug('[BRANCH] def _update_fast_init_cache | IF os.path.exists(fpath) -> taken')
         try:
             old = pd.read_parquet(fpath)
             old = normalize_trade_date(old)
@@ -232,12 +244,14 @@ def _update_fast_init_cache(ts_code: str, df: pd.DataFrame, adj: str):
             logging.warning("[FAST_CACHE] 读取旧缓存失败 %s -> 覆盖写新: %s", ts_code, e)
     df2.to_parquet(fpath, index=False)
 
+
 def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str):
     """
     把该 ts_code 的 DataFrame 计算指标后写入 by_symbol 成品(带 warm-up 增量)。
     要求 df 至少包含: trade_date, open, high, low, close, vol[, amount, pre_close]
     """
     if not (WRITE_SYMBOL_PLAIN or WRITE_SYMBOL_INDICATORS):
+        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF not (WRITE_SYMBOL_PLAIN or WRITE_SYMBOL_INDICATORS) -> taken')
         return
         # 1) 选择输出目录（按你要求的命名）
     adj = _decide_symbol_adj_for_fast_init()  # 'raw' | 'qfq' | 'hfq'
@@ -248,9 +262,11 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str):
     single_plain_dir_csv = os.path.join(base_dir, "stock", "single", "csv", adj)
     single_ind_dir_csv   = os.path.join(base_dir, "stock", "single", "csv", f"{adj}_indicators")
     if WRITE_SYMBOL_PLAIN:
+        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF WRITE_SYMBOL_PLAIN -> taken')
         os.makedirs(single_plain_dir, exist_ok=True)
         os.makedirs(single_plain_dir_csv, exist_ok=True)
     if WRITE_SYMBOL_INDICATORS:
+        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF WRITE_SYMBOL_INDICATORS -> taken')
         os.makedirs(single_ind_dir, exist_ok=True)
         os.makedirs(single_ind_dir_csv, exist_ok=True)
 
@@ -263,44 +279,67 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str):
     # 2) 规范、排序、去重
     df2 = df.copy()
     if "trade_date" not in df2.columns:
+        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "trade_date" not in df2.columns -> taken')
         raise ValueError("df 缺少 trade_date 列")
     
     df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
     df2 = normalize_trade_date(df2)
     price_cols = ["open", "high", "low", "close", "pre_close", "change"]
+    # 只保留常用基础行情列（存在即取），作为不带指标的成品
+    base_cols = ["ts_code","trade_date","open","high","low","close","pre_close",
+                 "change","pct_chg","vol","amount"]
+    cols = [c for c in base_cols if c in df2.columns]
+    df_plain = df2[cols].copy() if cols else df2.copy()
 
     # ---------- plain：不带指标 ----------
-    if WRITE_SYMBOL_PLAIN:
-        df_plain = df2.copy()
-        for col in price_cols:
-            if col in df_plain.columns and pd.api.types.is_numeric_dtype(df_plain[col]):
-                df_plain[col] = df_plain[col].round(2)
-        df_plain = df_plain.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+    old_plain = None
+    try:
+        if os.path.exists(plain_parquet):
+            logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF os.path.exists(plain_parquet) -> taken')
+            old_plain = pd.read_parquet(plain_parquet)
+        elif os.path.exists(plain_csv):
+            logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF os.path.exists(plain_csv) -> taken')
+            logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | ELIF os.path.exists(plain_csv) -> taken')
+            old_plain = pd.read_csv(plain_csv, dtype=str)
+    except Exception as e:
+        logging.warning("[PRODUCT][%s] 读取旧 plain 失败，按覆盖写: %s", ts_code, e)
+        old_plain = None
 
-        plain_parquet = os.path.join(single_plain_dir, f"{ts_code}.parquet")
-        plain_csv     = os.path.join(single_plain_dir_csv, f"{ts_code}.csv")
+    merged_plain = df_plain
+    if isinstance(old_plain, pd.DataFrame) and not old_plain.empty:
+        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF isinstance(old_plain, pd.DataFrame) and not old_plain.empty -> taken')
+        old_plain = normalize_trade_date(old_plain)
+        merged_plain = pd.concat([old_plain, df_plain], ignore_index=True)
+        merged_plain = merged_plain.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
 
-        if "parquet" in SYMBOL_PRODUCT_FORMATS.get("plain", []):
-            df_plain.to_parquet(plain_parquet, index=False, engine=PARQUET_ENGINE)
-        if "csv" in SYMBOL_PRODUCT_FORMATS.get("plain", []):
-            df_plain.to_csv(plain_csv, index=False, encoding="utf-8-sig")
+    if "parquet" in SYMBOL_PRODUCT_FORMATS.get("plain", []):
+        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "parquet" in SYMBOL_PRODUCT_FORMATS.get("plain", []) -> taken')
+        merged_plain.to_parquet(plain_parquet, index=False, engine=PARQUET_ENGINE)
+    if "csv" in SYMBOL_PRODUCT_FORMATS.get("plain", []):
+        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "csv" in SYMBOL_PRODUCT_FORMATS.get("plain", []) -> taken')
+        merged_plain.to_csv(plain_csv, index=False, encoding="utf-8-sig")
 
     # ---------- ind：带指标 ----------
     if WRITE_SYMBOL_INDICATORS:
         # warm-up 增量（沿用原逻辑）
+        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF WRITE_SYMBOL_INDICATORS -> taken')
         ind_out_path_parquet = os.path.join(single_ind_dir, f"{ts_code}.parquet")
         ind_out_path_csv     = os.path.join(single_ind_dir_csv, f"{ts_code}.csv")
 
         warm_df = df2.copy()
         warmup_start = None
         if os.path.exists(ind_out_path_parquet) or os.path.exists(ind_out_path_csv):
+            logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF os.path.exists(ind_out_path_parquet) or os.path.exists(ind_out_path_csv) -> taken')
             try:
                 # 优先读 parquet；若不存在再读 csv
                 if os.path.exists(ind_out_path_parquet):
+                    logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF os.path.exists(ind_out_path_parquet) -> taken')
                     old = pd.read_parquet(ind_out_path_parquet)
                 else:
+                    logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | ELSE of IF os.path.exists(ind_out_path_parquet) -> taken')
                     old = pd.read_csv(ind_out_path_csv, dtype=str)
                 if not old.empty:
+                    logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF not old.empty -> taken')
                     old_td = pd.to_datetime(old["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
                     last = old_td.max()
                     warmup_start = (last - pd.Timedelta(days=SYMBOL_PRODUCT_WARMUP_DAYS))
@@ -326,19 +365,24 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str):
         decimals = ind.outputs_for(names)
         for col, n in decimals.items():
             if col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]):
+                logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]) -> taken')
                 warm_df[col] = warm_df[col].round(n)
         for col in price_cols:
             if col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]):
+                logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]) -> taken')
                 warm_df[col] = warm_df[col].round(2)
 
         warm_df = normalize_trade_date(warm_df)
         warm_df = warm_df.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
 
         if "parquet" in SYMBOL_PRODUCT_FORMATS.get("ind", []):
+            logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "parquet" in SYMBOL_PRODUCT_FORMATS.get("ind", []) -> taken')
             warm_df.to_parquet(ind_out_path_parquet, index=False, engine=PARQUET_ENGINE)
         if "csv" in SYMBOL_PRODUCT_FORMATS.get("ind", []):
+            logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "csv" in SYMBOL_PRODUCT_FORMATS.get("ind", []) -> taken')
             warm_df.to_csv(ind_out_path_csv, index=False, encoding="utf-8-sig")
         logging.debug("[PRODUCT][%s] 成品已写出 plain_dir=%s ind_dir=%s", ts_code, single_plain_dir, single_ind_dir)
+
 
 def _rate_limit():
     now = time.time()
@@ -348,12 +392,14 @@ def _rate_limit():
             while _CALL_TS and now - _CALL_TS[0] > 60:
                 _CALL_TS.pop(0)
             if len(_CALL_TS) < CALLS_PER_MIN:
+                logging.debug('[BRANCH] def _rate_limit | IF len(_CALL_TS) < CALLS_PER_MIN -> taken')
                 _CALL_TS.append(now)
                 return
             sleep_for = 60 - (now - _CALL_TS[0]) + 0.01
         time.sleep(sleep_for)
         now = time.time()
-        
+
+
 def _retry(fn: Callable[[], pd.DataFrame], desc: str, retries: int = RETRY_TIMES) -> pd.DataFrame:
     """
     固定延迟序列重试：15s -> 10s -> 5s -> 5s ...
@@ -372,23 +418,29 @@ def _retry(fn: Callable[[], pd.DataFrame], desc: str, retries: int = RETRY_TIMES
             last_msg = str(e)
             logging.warning("%s 失败 (%s) 尝试 %d/%d", desc, last_msg, attempt, retries)
             if attempt == retries:
+                logging.debug('[BRANCH] def _retry | IF attempt == retries -> taken')
                 break  # 出循环抛错
             # 计算基础等待
             if attempt <= len(RETRY_DELAY_SEQUENCE):
+                logging.debug('[BRANCH] def _retry | IF attempt <= len(RETRY_DELAY_SEQUENCE) -> taken')
                 base_wait = RETRY_DELAY_SEQUENCE[attempt - 1]
             else:
+                logging.debug('[BRANCH] def _retry | ELSE of IF attempt <= len(RETRY_DELAY_SEQUENCE) -> taken')
                 base_wait = RETRY_DELAY_SEQUENCE[-1]
             # 抖动
             jitter = random.uniform(RETRY_JITTER_RANGE[0], RETRY_JITTER_RANGE[1])
             wait_sec = max(0.1, base_wait + jitter)
             if RETRY_LOG_LEVEL.upper() == "INFO":
+                logging.debug('[BRANCH] def _retry | IF RETRY_LOG_LEVEL.upper() == "INFO" -> taken')
                 logging.info("%s 重试前等待 %.2fs (base=%ds, jitter=%.2f)",
                              desc, wait_sec, base_wait, jitter)
             else:
+                logging.debug('[BRANCH] def _retry | ELSE of IF RETRY_LOG_LEVEL.upper() == "INFO" -> taken')
                 logging.debug("%s 重试前等待 %.2fs (base=%ds, jitter=%.2f)",
                               desc, wait_sec, base_wait, jitter)
             time.sleep(wait_sec)
     raise RuntimeError(f"{desc} 最终失败: {last_msg}")
+
 
 def _trade_dates(start: str, end: str) -> List[str]:
     cal = _retry(
@@ -402,23 +454,29 @@ def _trade_dates(start: str, end: str) -> List[str]:
         "trade_cal"
     )
     if cal.empty:
+        logging.debug('[BRANCH] def _trade_dates | IF cal.empty -> taken')
         raise RuntimeError(f"trade_cal 返回为空({start}~{end})")
     return cal["cal_date"].astype(str).tolist()
 
+
 def _last_partition_date(root: str) -> Optional[str]:
     if not os.path.exists(root):
+        logging.debug('[BRANCH] def _last_partition_date | IF not os.path.exists(root) -> taken')
         return None
     dates = [d.split("=")[-1] for d in os.listdir(root) if d.startswith("trade_date=")]
     return max(dates) if dates else None
 
+
 def _save_partition(df: pd.DataFrame, root: str):
     if df is None or df.empty:
+        logging.debug('[BRANCH] def _save_partition | IF df is None or df.empty -> taken')
         return
     for dt, sub in df.groupby("trade_date"):
         pdir = os.path.join(root, f"trade_date={dt}")
         os.makedirs(pdir, exist_ok=True)
         fname = os.path.join(pdir, f"part-{int(time.time()*1e6)}.parquet")
         sub.to_parquet(fname, index=False, engine=PARQUET_ENGINE)
+
 
 def _tqdm_iter(seq, desc: str, unit="日"):
     return tqdm(seq,
@@ -427,6 +485,7 @@ def _tqdm_iter(seq, desc: str, unit="日"):
                 ncols=110,
                 unit=unit,
                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+
 
 def compact_daily_partitions(base_dir: str | None = None) -> None:
     """
@@ -437,8 +496,10 @@ def compact_daily_partitions(base_dir: str | None = None) -> None:
 
     daily_dir = os.path.join(DATA_ROOT, "stock", "daily")
     if base_dir is not None:
+        logging.debug('[BRANCH] def compact_daily_partitions | IF base_dir is not None -> taken')
         daily_dir = base_dir
     else:
+        logging.debug('[BRANCH] def compact_daily_partitions | ELSE of IF base_dir is not None -> taken')
         candidates = [
             os.path.join(DATA_ROOT, "stock", "daily", "daily"),
             os.path.join(DATA_ROOT, "stock", "daily"),
@@ -446,6 +507,7 @@ def compact_daily_partitions(base_dir: str | None = None) -> None:
         daily_dir = next((p for p in candidates if os.path.isdir(p)), candidates[0])
 
     if not os.path.isdir(daily_dir):
+        logging.debug('[BRANCH] def compact_daily_partitions | IF not os.path.isdir(daily_dir) -> taken')
         logging.warning("[COMPACT] daily 目录不存在，跳过")
         return
 
@@ -454,6 +516,7 @@ def compact_daily_partitions(base_dir: str | None = None) -> None:
                  if d.startswith("trade_date=") and os.path.isdir(os.path.join(daily_dir, d))]
 
     if not date_dirs:
+        logging.debug('[BRANCH] def compact_daily_partitions | IF not date_dirs -> taken')
         logging.info("[COMPACT] 无日期目录，跳过")
         return
 
@@ -469,6 +532,7 @@ def compact_daily_partitions(base_dir: str | None = None) -> None:
         full = os.path.join(daily_dir, d)
         parts = [p for p in os.listdir(full) if p.endswith(".parquet")]
         if len(parts) <= COMPACT_MAX_FILES_PER_DATE:
+            logging.debug('[BRANCH] def compact_daily_partitions | IF len(parts) <= COMPACT_MAX_FILES_PER_DATE -> taken')
             continue
 
         # 计算合并批次数(近似控制输出文件数)
@@ -507,6 +571,7 @@ def compact_daily_partitions(base_dir: str | None = None) -> None:
     con.close()
     logging.info("[COMPACT] 完成 压实日期数=%d", compacted)
 
+
 def _need_duck_merge(daily_dir: str) -> bool:
     """
     返回 True 表示需要触发 duckdb 合并
@@ -518,6 +583,7 @@ def _need_duck_merge(daily_dir: str) -> bool:
     # parquet 端最新日期
     last_parquet = _last_partition_date(daily_dir)
     if last_parquet is None:
+        logging.debug('[BRANCH] def _need_duck_merge | IF last_parquet is None -> taken')
         return True          # 本地还没任何 parquet，后面流程会自动全量建
 
     con = duckdb.connect()    # 内存连接足够
@@ -530,6 +596,7 @@ def _need_duck_merge(daily_dir: str) -> bool:
         last_duck = None
 
     if last_duck is not None:
+        logging.debug('[BRANCH] def _need_duck_merge | IF last_duck is not None -> taken')
         pattern_new = (
             f"{Path(daily_dir).as_posix()}/trade_date={int(last_duck)+1}%/part-*.parquet"
         )
@@ -541,19 +608,23 @@ def _need_duck_merge(daily_dir: str) -> bool:
         except duckdb.IOException:                        # 分区还没生成 → 说明需要合并
             return True
     else:
+        logging.debug('[BRANCH] def _need_duck_merge | ELSE of IF last_duck is not None -> taken')
         new_rows = 0
 
     # ① 日期差 ≥ N 天
     if last_duck is None:
+        logging.debug('[BRANCH] def _need_duck_merge | IF last_duck is None -> taken')
         return True                             # duckdb 还没建过
     lp = dt.datetime.strptime(str(last_parquet), "%Y%m%d")
     ld = dt.datetime.strptime(str(last_duck), "%Y%m%d")
     day_lag = (lp - ld).days
     if day_lag >= DUCK_MERGE_DAY_LAG:
+        logging.debug('[BRANCH] def _need_duck_merge | IF day_lag >= DUCK_MERGE_DAY_LAG -> taken')
         return True
 
     # ② 或新增行数 ≥ 阈值
     return new_rows >= DUCK_MERGE_MIN_ROWS
+
 
 # ========== 按交易日批量模式(原有日常增量) ==========
 def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: int = 8):
@@ -571,6 +642,7 @@ def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: i
     last = _last_partition_date(root)
     actual_start = start if last is None else str(int(last) + 1)
     if actual_start > end:
+        logging.debug('[BRANCH] def sync_index_daily_fast | IF actual_start > end -> taken')
         logging.info("[index][FAST] 日线已最新 (last=%s)", last)
         return
 
@@ -584,6 +656,7 @@ def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: i
         # df = df[cols]
         for dt, sub in df.groupby("trade_date"):
             if dt < actual_start or dt > end:
+                logging.debug('[BRANCH] def sync_index_daily_fast > def write_partition | IF dt < actual_start or dt > end -> taken')
                 continue
             pdir = os.path.join(root, f"trade_date={dt}")
             os.makedirs(pdir, exist_ok=True)
@@ -613,8 +686,10 @@ def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: i
             df = _retry(lambda: call_bar(), f"index_pro_bar_{code}")
             if df is None or df.empty:
                 # 兜底再试一次 index_daily
+                logging.debug('[BRANCH] def sync_index_daily_fast > def fetch_one | IF df is None or df.empty -> taken')
                 df = _retry(lambda: call_daily(), f"index_daily_{code}")
             if df is None or df.empty:
+                logging.debug('[BRANCH] def sync_index_daily_fast > def fetch_one | IF df is None or df.empty -> taken')
                 return code, "empty"
             df = df.sort_values("trade_date")
             write_partition(df)
@@ -627,14 +702,15 @@ def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: i
         pbar = tqdm(as_completed(futs), total=len(futs), desc="指数(日线)并发拉取", ncols=120)
         for fut in pbar:
             code, st = fut.result()
-            if st == "ok": ok += 1
-            elif st == "empty": empty += 1
-            else: err += 1
+            if st == "ok": logging.debug('[BRANCH] def sync_index_daily_fast | IF st == "ok" -> taken'); ok += 1
+            elif st == "empty": logging.debug('[BRANCH] def sync_index_daily_fast | IF st == "empty" -> taken'); empty += 1
+            else: logging.debug('[BRANCH] def sync_index_daily_fast | ELSE of IF st == "empty" -> taken'); err += 1
             pbar.set_postfix(ok=ok, empty=empty, err=err)
         pbar.close()
 
     logging.info("[index][FAST] 完成 ok=%d empty=%d err=%d 区间=%s~%s 起点=%s",
                  ok, empty, err, start, end, actual_start)
+
 
 def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
     """
@@ -655,6 +731,7 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
     last = _last_partition_date(dst_dir)
     actual_start = start if last is None else str(int(last) + 1)
     if actual_start > end:
+        logging.debug('[BRANCH] def sync_stock_daily_fast | IF actual_start > end -> taken')
         logging.info("[stock][FAST] 日线已最新 (last=%s)", last)
         return
 
@@ -665,6 +742,7 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
     def write_partition(df: pd.DataFrame):
         for dt, sub in df.groupby("trade_date"):
             if dt < actual_start or dt > end:
+                logging.debug('[BRANCH] def sync_stock_daily_fast > def write_partition | IF dt < actual_start or dt > end -> taken')
                 continue
             pdir = os.path.join(dst_dir, f"trade_date={dt}")
             os.makedirs(pdir, exist_ok=True)
@@ -692,17 +770,20 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
         try:
             df = _retry(lambda: call_bar(), f"stock_pro_bar_{ts_code}")
             if df is None or df.empty:
+                logging.debug('[BRANCH] def sync_stock_daily_fast > def fetch_one | IF df is None or df.empty -> taken')
                 all_df = []
                 for d in _trade_dates(actual_start, end):  # 你已有交易日获取。
                     try:
                         df_d = _retry(lambda dd=d: pro.daily(trade_date=dd, ts_code=ts_code),
                                     f"stock_daily_{ts_code}_{d}")
                         if df_d is not None and not df_d.empty:
+                            logging.debug('[BRANCH] def sync_stock_daily_fast > def fetch_one | IF df_d is not None and not df_d.empty -> taken')
                             all_df.append(df_d)
                     except Exception:
                         continue
                 df = pd.concat(all_df, ignore_index=True) if all_df else pd.DataFrame()
             if df is None or df.empty:
+                logging.debug('[BRANCH] def sync_stock_daily_fast > def fetch_one | IF df is None or df.empty -> taken')
                 return ts_code, "empty"
             df = df.sort_values("trade_date")
             write_partition(df)
@@ -715,25 +796,28 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
         pbar = tqdm(as_completed(futs), total=len(futs), desc="股票(日线)并发拉取", ncols=120)
         for fut in pbar:
             code, st = fut.result()
-            if st == "ok": ok += 1
-            elif st == "empty": empty += 1
-            else: err += 1
+            if st == "ok": logging.debug('[BRANCH] def sync_stock_daily_fast | IF st == "ok" -> taken'); ok += 1
+            elif st == "empty": logging.debug('[BRANCH] def sync_stock_daily_fast | IF st == "empty" -> taken'); empty += 1
+            else: logging.debug('[BRANCH] def sync_stock_daily_fast | ELSE of IF st == "empty" -> taken'); err += 1
             pbar.set_postfix(ok=ok, empty=empty, err=err)
         pbar.close()
 
     logging.info("[stock][FAST] 完成 ok=%d empty=%d err=%d 区间=%s~%s 起点=%s",
                  ok, empty, err, start, end, actual_start)
 
+
 # ========== FAST INIT (按股票多线程) ==========
 def _fetch_stock_list() -> pd.DataFrame:
     cache = os.path.join(DATA_ROOT, "stock_list.csv")
     if os.path.exists(cache):
+        logging.debug('[BRANCH] def _fetch_stock_list | IF os.path.exists(cache) -> taken')
         return pd.read_csv(cache, dtype=str)
     df = _retry(lambda: pro.stock_basic(exchange='', list_status='L',
                                         fields='ts_code,name,list_date'),
                 "stock_basic_full")
     df.to_csv(cache, index=False, encoding='utf-8')
     return df
+
 
 def fast_init_download(end_date: str):
     """
@@ -757,14 +841,17 @@ def fast_init_download(end_date: str):
         fpath = os.path.join(sub_dir, f"{ts_code}.parquet")
 
         if os.path.exists(fpath) and CHECK_SKIP_MIN_MAX:
+            logging.debug('[BRANCH] def fast_init_download > def task | IF os.path.exists(fpath) and CHECK_SKIP_MIN_MAX -> taken')
             need_redownload = False
             min_d = max_d = None
             try:
                 df_meta = pd.read_parquet(fpath, columns=CHECK_SKIP_READ_COLUMNS)
                 if df_meta.empty:
+                    logging.debug('[BRANCH] def fast_init_download > def task | IF df_meta.empty -> taken')
                     need_redownload = True
                 else:
                     # 仅用于日志，不参与判定
+                    logging.debug('[BRANCH] def fast_init_download > def task | ELSE of IF df_meta.empty -> taken')
                     min_d = str(df_meta.trade_date.min())
                     max_d = str(df_meta.trade_date.max())
 
@@ -776,6 +863,7 @@ def fast_init_download(end_date: str):
                     ).strftime("%Y%m%d")
 
                     if max_d < lag_threshold:
+                        logging.debug('[BRANCH] def fast_init_download > def task | IF max_d < lag_threshold -> taken')
                         need_redownload = True
 
             except Exception as e:
@@ -785,8 +873,10 @@ def fast_init_download(end_date: str):
             if not need_redownload:
                 # 可选调试
                 # logging.debug("[SKIP] %s min=%s max=%s lag_thr=%s", ts_code, min_d, max_d, lag_threshold)
+                logging.debug('[BRANCH] def fast_init_download > def task | IF not need_redownload -> taken')
                 return (ts_code, 'skip', None)
             else:
+                logging.debug('[BRANCH] def fast_init_download > def task | ELSE of IF not need_redownload -> taken')
                 logging.info("文件尾部滞后 %s min=%s max=%s 需要>=%s(=end - %d天) -> 重下",
                             ts_code, min_d, max_d, lag_threshold, CHECK_SKIP_ALLOW_LAG_DAYS)
 
@@ -803,10 +893,12 @@ def fast_init_download(end_date: str):
         try:
             df = _retry(_call, f"pro_bar_{ts_code}")
             if df is None or df.empty:
+                logging.debug('[BRANCH] def fast_init_download > def task | IF df is None or df.empty -> taken')
                 return (ts_code, 'empty', None)
             df = df.sort_values("trade_date")
             df.to_parquet(fpath, index=False)
             if API_ADJ != "raw":
+                logging.debug('[BRANCH] def fast_init_download > def task | IF API_ADJ != "raw" -> taken')
                 _WRITE_SYMBOL_INDICATORS(ts_code, df, end_date)
             return (ts_code, 'ok', None)
         except Exception as e:
@@ -820,12 +912,23 @@ def fast_init_download(end_date: str):
             ts_code, status, msg = fut.result()
             with lock_stats:
                 if status == 'ok':
+                    logging.debug('[BRANCH] def fast_init_download | IF status == 'ok' -> taken')
                     ok += 1
                 elif status == 'skip':
+                    logging.debug('[BRANCH] def fast_init_download | IF status == 'skip' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELIF status == 'skip' -> taken')
                     skip += 1
                 elif status == 'empty':
+                    logging.debug('[BRANCH] def fast_init_download | IF status == 'empty' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELIF status == 'empty' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | IF status == 'empty' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELIF status == 'empty' -> taken')
                     empty += 1
                 else:
+                    logging.debug('[BRANCH] def fast_init_download | ELSE of IF status == 'empty' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELSE of IF status == 'empty' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELSE of IF status == 'empty' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELSE of IF status == 'empty' -> taken')
                     err += 1
                     failed.append((ts_code, msg))
                     pbar.close()
@@ -841,12 +944,14 @@ def fast_init_download(end_date: str):
     failed_codes = [c for c,_ in failed]
     if failed_codes:
         # 写第一轮失败
+        logging.debug('[BRANCH] def fast_init_download | IF failed_codes -> taken')
         with open(os.path.join(DATA_ROOT, "fast_init_failed_round1.txt"), "w", encoding="utf-8") as f:
             for c,m in failed:
                 f.write(f"{c},{m}\n")
 
     # ====== 自动失败补抓(一次) ======
     if FAILED_RETRY_ONCE and failed_codes:
+        logging.debug('[BRANCH] def fast_init_download | IF FAILED_RETRY_ONCE and failed_codes -> taken')
         logging.info("[FAST_INIT] 等待 %ds 后开始失败补抓，失败数=%d", FAILED_RETRY_WAIT, len(failed_codes))
         time.sleep(FAILED_RETRY_WAIT)
 
@@ -854,6 +959,7 @@ def fast_init_download(end_date: str):
             # fpath = os.path.join(FAST_INIT_STOCK_DIR, f"{ts_code}.parquet")
             fpath = os.path.join(FAST_INIT_STOCK_DIR, API_ADJ, f"{ts_code}.parquet")
             if os.path.exists(fpath):
+                logging.debug('[BRANCH] def fast_init_download > def retry_task | IF os.path.exists(fpath) -> taken')
                 return (ts_code, 'exists')
             def _call():
                 return ts.pro_bar(
@@ -867,10 +973,12 @@ def fast_init_download(end_date: str):
             try:
                 df = _retry(_call, f"retry_pro_bar_{ts_code}")
                 if df is None or df.empty:
+                    logging.debug('[BRANCH] def fast_init_download > def retry_task | IF df is None or df.empty -> taken')
                     return (ts_code, 'empty')
                 df = df.sort_values("trade_date")
                 df.to_parquet(fpath, index=False)
                 if API_ADJ != "raw":
+                    logging.debug('[BRANCH] def fast_init_download > def retry_task | IF API_ADJ != "raw" -> taken')
                     _WRITE_SYMBOL_INDICATORS(ts_code, df, end_date)
                 return (ts_code, 'ok')
             except Exception as e:
@@ -883,29 +991,44 @@ def fast_init_download(end_date: str):
             for fut in pbar2:
                 c, st = fut.result()
                 if st == 'ok':
+                    logging.debug('[BRANCH] def fast_init_download | IF st == 'ok' -> taken')
                     ok2 += 1
                 elif st == 'empty':
+                    logging.debug('[BRANCH] def fast_init_download | IF st == 'empty' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELIF st == 'empty' -> taken')
                     empty2 += 1
                 elif st == 'exists':
+                    logging.debug('[BRANCH] def fast_init_download | IF st == 'exists' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELIF st == 'exists' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | IF st == 'exists' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELIF st == 'exists' -> taken')
                     exists2 += 1
                 else:
+                    logging.debug('[BRANCH] def fast_init_download | ELSE of IF st == 'exists' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELSE of IF st == 'exists' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELSE of IF st == 'exists' -> taken')
+                    logging.debug('[BRANCH] def fast_init_download | ELSE of IF st == 'exists' -> taken')
                     err2 += 1
                 pbar2.set_postfix(ok=ok2, empty=empty2, exists=exists2, err=err2)
             pbar2.close()
         logging.info("[FAST_INIT] 补抓完成 ok=%d empty=%d exists=%d err=%d", ok2, empty2, exists2, err2)
 
         if err2 > 0:
+            logging.debug('[BRANCH] def fast_init_download | IF err2 > 0 -> taken')
             final_failed = []
             for c in failed_codes:
                 fpath = os.path.join(FAST_INIT_STOCK_DIR, API_ADJ, f"{c}.parquet")
                 if not os.path.exists(fpath):
+                    logging.debug('[BRANCH] def fast_init_download | IF not os.path.exists(fpath) -> taken')
                     final_failed.append(c)
             with open(os.path.join(DATA_ROOT, "fast_init_failed_final.txt"), "w", encoding="utf-8") as f:
                 for c in final_failed:
                     f.write(c + "\n")
             logging.warning("[FAST_INIT] 仍失败股票数=%d -> fast_init_failed_final.txt", len(final_failed))
     else:
+        logging.debug('[BRANCH] def fast_init_download | ELSE of IF FAILED_RETRY_ONCE and failed_codes -> taken')
         logging.info("[FAST_INIT] 无需补抓或无失败股票。")
+
 
 def duckdb_merge_symbol_products_to_daily(batch_days:int=30):
     import duckdb, os
@@ -916,6 +1039,7 @@ def duckdb_merge_symbol_products_to_daily(batch_days:int=30):
     src_dir = os.path.join(DATA_ROOT, "stock", "single", f"single_{adj}_indicators")
     dst_dir = os.path.join(DATA_ROOT, "stock", "daily", f"daily_{adj}_indicators")
     if not os.path.isdir(src_dir):
+        logging.debug('[BRANCH] def duckdb_merge_symbol_products_to_daily | IF not os.path.isdir(src_dir) -> taken')
         logging.warning("[DUCK MERGE IND] 源目录不存在：%s", src_dir)
         return
     os.makedirs(dst_dir, exist_ok=True)
@@ -944,6 +1068,7 @@ def duckdb_merge_symbol_products_to_daily(batch_days:int=30):
     """).df()
 
     if df_dates.empty:
+        logging.debug('[BRANCH] def duckdb_merge_symbol_products_to_daily | IF df_dates.empty -> taken')
         logging.info("[DUCK MERGE IND] 已最新，跳过")
         con.close()
         return
@@ -971,6 +1096,7 @@ def duckdb_merge_symbol_products_to_daily(batch_days:int=30):
     logging.info("[DUCK MERGE IND] 合并完成 新增日期数=%d", len(dates))
     _maybe_compact(dst_dir)
 
+
 # ====== 增量重算：把新增日期涉及的股票，补齐“按股票成品(含指标)”并合并到按日分区 ======
 def _with_api_adj(temp_api_adj: str, fn, *args, **kwargs):
     """
@@ -984,6 +1110,7 @@ def _with_api_adj(temp_api_adj: str, fn, *args, **kwargs):
         return fn(*args, **kwargs)
     finally:
         API_ADJ = old
+
 
 def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0):
     """
@@ -1001,6 +1128,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
     src_dir = os.path.join(DATA_ROOT, "stock", "daily", f"daily_{target_adj}")
     dst_dir = os.path.join(DATA_ROOT, "stock", "daily", f"daily_{target_adj}_indicators")
     if not os.path.isdir(src_dir):
+        logging.debug('[BRANCH] def recalc_symbol_products_for_increment | IF not os.path.isdir(src_dir) -> taken')
         logging.warning("[INC_IND] 源目录不存在：%s(可能尚未构建 %s)", src_dir, target_adj)
         return
 
@@ -1032,6 +1160,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
         df_codes = pd.DataFrame(columns=["ts_code"])
 
     if df_codes.empty:
+        logging.debug('[BRANCH] def recalc_symbol_products_for_increment | IF df_codes.empty -> taken')
         logging.info("[INC_IND] 指标分区已最新(last=%s，源端无新增日期)。", last_duck)
         con.close()
         return
@@ -1061,19 +1190,23 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
 
             if no_single_ind_file:
                 # 首次构建该股票成品 → 直接全量
+                logging.debug('[BRANCH] def recalc_symbol_products_for_increment > def fetch_code_df | IF no_single_ind_file -> taken')
                 df = loc.sql(f"SELECT * {qbase}").df()
             else:
                 # 只回看 warm-up 窗口
+                logging.debug('[BRANCH] def recalc_symbol_products_for_increment > def fetch_code_df | ELSE of IF no_single_ind_file -> taken')
                 df = loc.sql(
                     f"SELECT * {qbase} AND trade_date >= '{start_win}' AND trade_date <= '{end}'"
                 ).df()
                 if df is None or df.empty:
+                    logging.debug('[BRANCH] def recalc_symbol_products_for_increment > def fetch_code_df | IF df is None or df.empty -> taken')
                     df = loc.sql(f"SELECT * {qbase}").df()
 
 
             loc.close()
 
             if df is None or df.empty:
+                logging.debug('[BRANCH] def recalc_symbol_products_for_increment > def fetch_code_df | IF df is None or df.empty -> taken')
                 return None
 
             td = pd.to_datetime(df['trade_date'].astype(str), format='%Y%m%d', errors='coerce')
@@ -1095,6 +1228,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
     def work(ts_code: str) -> Tuple[str, str]:
         df = fetch_code_df(ts_code)
         if df is None or df.empty:
+            logging.debug('[BRANCH] def recalc_symbol_products_for_increment > def work | IF df is None or df.empty -> taken')
             return ts_code, "empty"
         # 保持 by_symbol 的 adj 目录规则，且在调用期间临时切换 API_ADJ 以重用目录判定
         temp_api_adj = {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}[target_adj]
@@ -1113,9 +1247,9 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
         pbar = tqdm(as_completed(futs), total=len(futs), desc="INC 重算成品(含指标)", ncols=120)
         for fut in pbar:
             code, st = fut.result()
-            if st == "ok": ok += 1
-            elif st == "empty": empty += 1
-            else: err += 1
+            if st == "ok": logging.debug('[BRANCH] def recalc_symbol_products_for_increment | IF st == "ok" -> taken'); ok += 1
+            elif st == "empty": logging.debug('[BRANCH] def recalc_symbol_products_for_increment | IF st == "empty" -> taken'); empty += 1
+            else: logging.debug('[BRANCH] def recalc_symbol_products_for_increment | ELSE of IF st == "empty" -> taken'); err += 1
             pbar.set_postfix(ok=ok, empty=empty, err=err)
         pbar.close()
 
@@ -1124,10 +1258,12 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
 
     # ⑤ 把 by_symbol_<adj> 的新增日期 COPY 到 <adj>_indicators（与 FAST 一致）
     if WRITE_SYMBOL_INDICATORS:
+        logging.debug('[BRANCH] def recalc_symbol_products_for_increment | IF WRITE_SYMBOL_INDICATORS -> taken')
         _with_api_adj(
             {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}[target_adj],
             duckdb_merge_symbol_products_to_daily
         )
+
 
 def duckdb_partition_merge(batch_days:int=30):
     """
@@ -1149,6 +1285,7 @@ def duckdb_partition_merge(batch_days:int=30):
 
     for mode, src_dir, dst_dir in merge_tasks:
         if not os.path.isdir(src_dir):
+            logging.debug('[BRANCH] def duckdb_partition_merge | IF not os.path.isdir(src_dir) -> taken')
             logging.warning("[DUCK MERGE][%s] 源目录不存在，跳过", mode)
             continue
         os.makedirs(dst_dir, exist_ok=True)
@@ -1179,6 +1316,7 @@ def duckdb_partition_merge(batch_days:int=30):
         """).df()
 
         if df_dates.empty:
+            logging.debug('[BRANCH] def duckdb_partition_merge | IF df_dates.empty -> taken')
             logging.info("[DUCK MERGE][%s] 已最新，跳过", mode)
             con.close()
             continue
@@ -1206,6 +1344,7 @@ def duckdb_partition_merge(batch_days:int=30):
         logging.info("[DUCK MERGE][%s] 合并完成 新增日期数=%d", mode, len(dates))
         _maybe_compact(dst_dir)  # 合并完成日志之后
 
+
 def streaming_merge_after_download():
     """
     第二阶段：将  下每个股票 parquet 文件流式合并到
@@ -1221,6 +1360,7 @@ def streaming_merge_after_download():
         stock_files = glob.glob(os.path.join(symbol_dir, "*.parquet"))
         total_files = len(stock_files)
         if total_files == 0:
+            logging.debug('[BRANCH] def streaming_merge_after_download | IF total_files == 0 -> taken')
             logging.warning("[STREAM_MERGE][%s] 无股票文件可归并", mode_label)
             continue
 
@@ -1232,9 +1372,11 @@ def streaming_merge_after_download():
         def flush(reason: str):
             nonlocal buffer
             if not buffer:
+                logging.debug('[BRANCH] def streaming_merge_after_download > def flush | IF not buffer -> taken')
                 return
             for dt, lst in buffer.items():
                 if not lst:
+                    logging.debug('[BRANCH] def streaming_merge_after_download > def flush | IF not lst -> taken')
                     continue
                 df_day = pd.concat(lst, ignore_index=True)
                 pdir = os.path.join(daily_root, f"trade_date={dt}")
@@ -1252,25 +1394,35 @@ def streaming_merge_after_download():
                 logging.warning("[STREAM_MERGE][%s] 读失败 %s (%s)", mode_label, f, e)
                 continue
             if df is None or df.empty:
+                logging.debug('[BRANCH] def streaming_merge_after_download | IF df is None or df.empty -> taken')
                 continue
             for dt, sub in df.groupby("trade_date"):
                 buffer.setdefault(dt, []).append(sub)
             processed += 1
 
             if len(buffer) >= STREAM_FLUSH_DATE_BATCH:
+                logging.debug('[BRANCH] def streaming_merge_after_download | IF len(buffer) >= STREAM_FLUSH_DATE_BATCH -> taken')
                 flush(f"date_batch>= {STREAM_FLUSH_DATE_BATCH}")
             elif processed % STREAM_FLUSH_STOCK_BATCH == 0:
+                logging.debug('[BRANCH] def streaming_merge_after_download | IF processed % STREAM_FLUSH_STOCK_BATCH == 0 -> taken')
+                logging.debug('[BRANCH] def streaming_merge_after_download | ELIF processed % STREAM_FLUSH_STOCK_BATCH == 0 -> taken')
                 flush(f"stock_batch {STREAM_FLUSH_STOCK_BATCH}")
             elif time.time() - last_flush_time > 60:
+                logging.debug('[BRANCH] def streaming_merge_after_download | IF time.time() - last_flush_time > 60 -> taken')
+                logging.debug('[BRANCH] def streaming_merge_after_download | ELIF time.time() - last_flush_time > 60 -> taken')
+                logging.debug('[BRANCH] def streaming_merge_after_download | IF time.time() - last_flush_time > 60 -> taken')
+                logging.debug('[BRANCH] def streaming_merge_after_download | ELIF time.time() - last_flush_time > 60 -> taken')
                 flush("time>60s")
                 last_flush_time = time.time()
 
             if processed % STREAM_LOG_EVERY == 0:
+                logging.debug('[BRANCH] def streaming_merge_after_download | IF processed % STREAM_LOG_EVERY == 0 -> taken')
                 pbar.set_postfix(proc=processed, pct=f"{processed/total_files*100:.1f}%")
 
         flush("final")
         pbar.close()
         logging.info("[STREAM_MERGE][%s] 完成 处理股票文件=%d", mode_label, processed)
+
 
 # ========== 主入口 ==========
 def main():
@@ -1285,22 +1437,31 @@ def main():
     )
 
     if FAST_INIT_MODE:
+        logging.debug('[BRANCH] def main | IF FAST_INIT_MODE -> taken')
         fast_init_download(end_date)   # 这里 end_date 已经算好
         if DUCK_MERGE_DAY_LAG >= 0:      # 简单开关，可设 -1 跳过
+            logging.debug('[BRANCH] def main | IF DUCK_MERGE_DAY_LAG >= 0 -> taken')
             duckdb_partition_merge()
         if WRITE_SYMBOL_INDICATORS:
+            logging.debug('[BRANCH] def main | IF WRITE_SYMBOL_INDICATORS -> taken')
             duckdb_merge_symbol_products_to_daily()
     else:
         # ======= 日常增量模式 =======
         # 优先把 fastinit 缓存合并进 daily，避免全历史重拉
+        logging.debug('[BRANCH] def main | ELSE of IF FAST_INIT_MODE -> taken')
         if any(os.path.isdir(os.path.join(FAST_INIT_STOCK_DIR, d)) and
             len(glob.glob(os.path.join(FAST_INIT_STOCK_DIR, d, "*.parquet"))) > 0
             for d in ("raw","qfq","hfq")):
+            logging.debug('[BRANCH] def main | IF any(os.path.isdir(os.path.join(FAST_INIT_STOCK_DIR, d)) and
+            len(glob.glob(os.path.join(FAST_INIT_STOCK_DIR, d, "*.parquet"))) > 0
+            for d in ("raw","qfq","hfq")) -> taken')
             duckdb_partition_merge()  # 只 copy 新增 trade_date，速度很快
 
         if "stock" in assets:
+            logging.debug('[BRANCH] def main | IF "stock" in assets -> taken')
             sync_stock_daily_fast(START_DATE, end_date, threads=STOCK_INC_THREADS)
         if "index" in assets:
+            logging.debug('[BRANCH] def main | IF "index" in assets -> taken')
             sync_index_daily_fast(START_DATE, end_date, INDEX_WHITELIST)
         recalc_symbol_products_for_increment(START_DATE, end_date, threads=0)
 
@@ -1318,7 +1479,9 @@ def main():
 
     logging.info("=== 结束 ===")
 
+
 if __name__ == "__main__":
+    logging.debug('[BRANCH] <module> | IF __name__ == "__main__" -> taken')
     try:
         main()
     except KeyboardInterrupt:

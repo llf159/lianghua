@@ -4,6 +4,55 @@ import numpy as np
 import pandas as pd
 
 EPS = 1e-12
+
+COMP_RE = re.compile(r'(<=|>=|==|!=|<|>)')
+
+def _wrap_comparisons_for_bitwise(expr: str) -> str:
+    # 在顶层 & 和 | 处分段；分段内若含比较运算，自动加括号
+    out, buf, depth = [], [], 0
+    def flush():
+        seg = ''.join(buf).strip()
+        if seg and COMP_RE.search(seg):
+            seg = f'({seg})'
+        out.append(seg)
+        buf.clear()
+
+    for ch in expr:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if depth == 0 and ch in '&|':
+            flush()
+            out.append(ch)
+        else:
+            buf.append(ch)
+    flush()
+    return ''.join(out)
+
+def _extract_bool_signal(res: dict, index, prefer_keys=("sig", "last_expr", "SIG", "LAST_EXPR")):
+    """
+    从 evaluate 的结果字典里，按优先级挑一个键并转成布尔 Series。
+    若没有任何候选键，则返回全 False。
+    """
+    import pandas as pd
+
+    for k in prefer_keys:
+        if k in res:
+            s = res[k]
+            # s 可能是 ndarray / list / Series；统一成布尔 Series，并与 index 对齐
+            return pd.Series(s, index=index).fillna(False).astype(bool)
+
+    return pd.Series(False, index=index)
+
+def evaluate_bool(script: str, df, prefer_keys=("sig", "last_expr", "SIG", "LAST_EXPR")):
+    """
+    便捷入口：直接返回一个布尔 Series（与 df.index 对齐）。
+    不改变原有 evaluate 的行为；这是新增接口，纯增量、可并存。
+    """
+    res = evaluate(script, df)  # 仍然返回“多输出”的 dict（键名依旧会被小写化）
+    return _extract_bool_signal(res, df.index, prefer_keys=prefer_keys)
+
 # 统一把条件转成布尔并把 NaN 当 False
 def _as_bool(cond):
     s = pd.Series(cond)
@@ -50,33 +99,6 @@ def SMA(x, n, m):
     alpha = float(m) / float(n)
     return x.ewm(alpha=alpha, adjust=False).mean()
 
-# def MA(x, n):
-#     return x.rolling(int(n)).mean()
-
-# def SUM(x, n):
-#     return x.rolling(int(n)).sum()
-
-# def HHV(x, n):
-#     return x.rolling(int(n)).max()
-
-# def LLV(x, n):
-#     return x.rolling(int(n)).min()
-
-# def STD(x, n):
-#     return x.rolling(int(n)).std(ddof=0)
-
-# def IF(cond, a, b):
-#     return pd.Series(np.where(cond.astype(bool), a, b), index=a.index if isinstance(a, pd.Series) else b.index)
-
-# def COUNT(cond, n):
-#     cond_series = cond.astype(bool)
-#     return cond_series.rolling(int(n)).sum()
-
-# def BARSLAST(cond):
-#     cond = cond.astype(bool)
-#     idx = pd.Series(np.where(cond, np.arange(len(cond)), np.nan), index=cond.index).ffill()
-#     return pd.Series(np.arange(len(cond)), index=cond.index) - idx
-
 def ABS(x):
     return np.abs(x)
 
@@ -105,6 +127,33 @@ def RSV(C, H, L, n=9):
     llv = LLV(L, n)
     hhv = HHV(H, n)
     return 100.0 * (C - llv) / (hhv - llv + EPS)
+
+# def MA(x, n):
+#     return x.rolling(int(n)).mean()
+
+# def SUM(x, n):
+#     return x.rolling(int(n)).sum()
+
+# def HHV(x, n):
+#     return x.rolling(int(n)).max()
+
+# def LLV(x, n):
+#     return x.rolling(int(n)).min()
+
+# def STD(x, n):
+#     return x.rolling(int(n)).std(ddof=0)
+
+# def IF(cond, a, b):
+#     return pd.Series(np.where(cond.astype(bool), a, b), index=a.index if isinstance(a, pd.Series) else b.index)
+
+# def COUNT(cond, n):
+#     cond_series = cond.astype(bool)
+#     return cond_series.rolling(int(n)).sum()
+
+# def BARSLAST(cond):
+#     cond = cond.astype(bool)
+#     idx = pd.Series(np.where(cond, np.arange(len(cond)), np.nan), index=cond.index).ffill()
+#     return pd.Series(np.arange(len(cond)), index=cond.index) - idx
 
 VAR_MAP = {
     "C": "df['close']",
@@ -166,7 +215,8 @@ LOGICAL_MAP = {
     "NOT": "~",
 }
 
-ASSIGN_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:?=\s*(.+?)\s*$')
+# ASSIGN_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:?=\s*(.+?)\s*$')
+ASSIGN_RE = re.compile(r'^\s*([^\W\d]\w*)\s*:?=\s*(.+?)\s*$', flags=re.UNICODE)
 COMMENT_RE = re.compile(r'^\s*[{].*?[}]\s*$')
 INLINE_COMMENT_RE = re.compile(r'\{.*?\}')
 SEMICOL_SPLIT_RE = re.compile(r';(?=(?:[^"]*"[^"]*")*[^"]*$)')
@@ -177,10 +227,12 @@ def _replace_variables(expr):
         expr = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(k)}(?![A-Za-z0-9_])', VAR_MAP[k], expr)
     return expr
 
+
 def _replace_functions(expr):
     for k, v in FUNC_MAP.items():
         expr = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(k)}\s*\(', v + "(", expr)
     return expr
+
 
 def _replace_logicals(expr):
     for k, v in LOGICAL_MAP.items():
@@ -188,14 +240,17 @@ def _replace_logicals(expr):
     expr = expr.replace("&&", "&").replace("||", "|").replace("!", "~")
     return expr
 
+
 def _replace_equality(expr):
     expr = re.sub(r'(?<![<>!:])=(?!=)', '==', expr)
     return expr
+
 
 def _drop_ignored(expr):
     for name in IGNORE_FUNCS:
         expr = re.sub(rf'{name}\s*\([^()]*\)\s*,?', '', expr)
     return expr
+
 
 def translate_expression(expr):
     expr = INLINE_COMMENT_RE.sub('', expr)
@@ -204,10 +259,13 @@ def translate_expression(expr):
     expr = _replace_functions(expr)
     expr = _replace_variables(expr)
     expr = _replace_equality(expr)
+    expr = _wrap_comparisons_for_bitwise(expr)
     return expr.strip()
+
 
 def compile_script(script):
     script = script.replace('\r', '')
+    script = script.translate(str.maketrans({'；': ';', '：': ':', '（': '(', '）': ')', '，': ','}))
     lines = [ln for ln in script.split('\n') if not COMMENT_RE.match(ln)]
     script = '\n'.join(lines)
     parts = [p.strip() for p in SEMICOL_SPLIT_RE.split(script) if p.strip()]
@@ -223,6 +281,7 @@ def compile_script(script):
             if py_expr:
                 program.append((None, py_expr))
     return program
+
 
 def evaluate(script, df, extra_context=None):
     program = compile_script(script)
@@ -260,6 +319,7 @@ def evaluate(script, df, extra_context=None):
         results["LAST_EXPR"] = last_value
     results = {k.lower(): v for k, v in results.items()}
     return results
+
 
 def tdx_to_python(script):
     return compile_script(script)

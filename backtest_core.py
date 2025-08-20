@@ -4,6 +4,7 @@ from typing import Callable, Tuple, List, Dict, Optional
 from indicators import *
 from tdx_compat import evaluate
 from config import (
+    TDX_BUY_PATH,
     TDX_SELL_OPEN_PATH,
     TDX_SELL_CLOSE_PATH,
     TDX_SELL_PATH,
@@ -16,6 +17,9 @@ def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL
 
     results, wins, losses = [], [], []
     trades: List[Dict] = []
+    
+    other_future_max_gains: List[float] = []
+    other_future_days_to_max: List[int] = []
 
     holding_until = None  # avoid overlapping positions
 
@@ -70,20 +74,22 @@ def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL
             raise ValueError(f"不支持的买入模式:  {BUY_MODE}")
 
         # === 卖出逻辑 ===
-        
         if SELL_MODE in ['open', 'close']:
-            # 最多再拿 n_days‑1 根K线；第 HOLD_DAYS 根卖出
-            sell_idx = sell_start_idx + HOLD_DAYS - 1
-            if sell_idx >= len(df):        # 越界就跳过这笔交易
-                continue
-                
-        if SELL_MODE == 'open':
-            sell_price = df.iloc[sell_idx]['open']
-            real_sell_idx = sell_idx
-        elif SELL_MODE == 'close':
-            sell_price = df.iloc[sell_idx]['close']
-            real_sell_idx = sell_idx
-        
+            if SELL_MODE == 'open':
+                # 开盘卖出使用 +HOLD_DAYS，确保至少跨越一个交易日
+                sell_idx = sell_start_idx + HOLD_DAYS
+                if sell_idx >= len(df):
+                    continue
+                sell_price = df.iloc[sell_idx]['open']
+                real_sell_idx = sell_idx
+            elif SELL_MODE == 'close':
+                # 收盘卖出仍然使用 +HOLD_DAYS-1
+                sell_idx = sell_start_idx + HOLD_DAYS - 1
+                if sell_idx >= len(df):
+                    continue
+                sell_price = df.iloc[sell_idx]['close']
+                real_sell_idx = sell_idx      
+    
         elif SELL_MODE == 'strategy':
             remaining_len = len(df) - sell_start_idx
             actual_window = min(MAX_HOLD_DAYS, remaining_len)
@@ -92,40 +98,64 @@ def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL
             # 直接切片使用预先计算的 all_sell_signals
             sell_signals = all_sell_signals.iloc[sell_start_idx : sell_start_idx + actual_window]
             sell_window  = df.iloc[sell_start_idx : sell_start_idx + actual_window]
-
-            if sell_signals.empty or sell_window.empty:
-                continue
-
             sell_price = None
-            for offset in range(0, len(sell_signals)):
+            for offset in range(len(sell_signals)):
                 if sell_signals.iloc[offset]['sell_by_open']:
                     sell_price = sell_window.iloc[offset]['open']
                     real_sell_idx = sell_start_idx + offset
-                    sell_start_idx += offset
                     break
-                elif sell_signals.iloc[offset]['sell_by_close']:
+                if sell_signals.iloc[offset]['sell_by_close']:
                     sell_price = sell_window.iloc[offset]['close']
                     real_sell_idx = sell_start_idx + offset
-                    sell_start_idx += offset
                     break
 
             if sell_price is None:
                 if FALLBACK_SELL_MODE == 'open':
-                    fallback_idx = sell_start_idx + HOLD_DAYS - 1
-                    if fallback_idx < len(df):
-                        sell_price = df.iloc[fallback_idx]['open']
-                        real_sell_idx = fallback_idx
-                    else:
-                        continue  
-                elif FALLBACK_SELL_MODE == 'close':
-                    fallback_idx = sell_start_idx + HOLD_DAYS - 1
-                    if fallback_idx < len(df):
-                        sell_price = df.iloc[fallback_idx]['close']
-                        real_sell_idx = fallback_idx
-                    else:
+                    fallback_idx = sell_start_idx + MAX_HOLD_DAYS
+                    if fallback_idx >= len(df): 
                         continue
+                    sell_price = df.iloc[fallback_idx]['open']
+                    real_sell_idx = fallback_idx
+                elif FALLBACK_SELL_MODE == 'close':
+                    fallback_idx = sell_start_idx + MAX_HOLD_DAYS - 1
+                    if fallback_idx >= len(df): 
+                        continue
+                    sell_price = df.iloc[fallback_idx]['close']
+                    real_sell_idx = fallback_idx
                 else:
                     continue
+
+            if sell_signals.empty or sell_window.empty:
+                continue
+        
+        elif SELL_MODE == 'other':
+            # 仅做“前瞻窗口”评估，不进行真实卖出/收益统计
+            remaining_len = len(df) - sell_start_idx
+            actual_window = min(MAX_HOLD_DAYS, remaining_len)
+            if actual_window <= 0:
+                continue
+
+            window = df.iloc[sell_start_idx : sell_start_idx + actual_window]
+
+            # 用未来窗口中的最高价来计算“可达到的最大涨幅”
+            highs = window['high'].values
+            if highs.size == 0:
+                continue
+
+            max_idx_in_window = int(np.argmax(highs))      # 第一次达到峰值的偏移（从 0 开始）
+            max_high = float(highs[max_idx_in_window])
+
+            future_max_gain = (max_high - float(buy_price)) / float(buy_price)
+            other_future_max_gains.append(future_max_gain)
+            # “达峰用时”按交易日计，从 1 开始计数更直观
+            other_future_days_to_max.append(max_idx_in_window + 1)
+
+            # 为了避免后续买点与本窗口重叠，视为“持有到窗口末端”再释放
+            real_sell_idx = sell_start_idx + actual_window - 1
+            holding_until = df.index[real_sell_idx]
+
+            # 不做真实交易统计（不写入 results/wins/losses/trades）
+            continue
 
         else:
             raise ValueError(f"不支持的 SELL_MODE: {SELL_MODE}")
@@ -145,6 +175,7 @@ def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL
                 "买入日期": str(buy_date.date()),
                 "卖出日期": str(df.index[real_sell_idx].date()),
                 "持股天数": (df.index[real_sell_idx] - buy_date).days,
+                "持股K线数": int(real_sell_idx - idx),
                 "买入价": round(buy_price, 2),
                 "卖出价": round(sell_price, 2),
                 "收益率": f"{ret:.2%}"
@@ -165,7 +196,7 @@ def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL
 
     if len(results) == 0:
         max_loss = None
-    elif len(results) == 1 and results[0] > 0:
+    elif (returns >= 0).all():
         max_loss = 0
     else:
         max_loss = returns.min()
@@ -179,28 +210,45 @@ def backtest(df, *, HOLD_DAYS, BUY_MODE, SELL_MODE, MAX_HOLD_DAYS, FALLBACK_SELL
         "盈亏比": round(pl_ratio, 3) if len(results) else None,
         "平均盈亏比": round(score, 3) if len(results) else None
     }
-
+    
+    if SELL_MODE == 'other':
+        summary["信号数"] = len(other_future_max_gains)
+    # Extra summary for SELL_MODE == 'other'
+    if SELL_MODE == 'other':
+        if other_future_max_gains:
+            avg_future_max = float(np.mean(other_future_max_gains))
+            med_future_max = float(np.median(other_future_max_gains))
+            avg_days_to_max = float(np.mean(other_future_days_to_max))
+            summary.update({
+                "未来窗口最大涨幅(均值)": f"{avg_future_max:.2%}",
+                "未来窗口最大涨幅(中位数)": f"{med_future_max:.2%}",
+                "达峰平均用时(天)": round(avg_days_to_max, 2),
+                "评估窗口(交易日)": int(MAX_HOLD_DAYS),
+            })
+        else:
+            summary.update({
+                "未来窗口最大涨幅(均值)": None,
+                "未来窗口最大涨幅(中位数)": None,
+                "达峰平均用时(天)": None,
+                "评估窗口(交易日)": int(MAX_HOLD_DAYS),
+            })
     return (summary, trades) if record_trades else (summary, None)
+
 
 def _read_tdx(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-def buy_signal(df: pd.DataFrame) -> pd.Series:
-    """
-    返回布尔 Series（索引与 df.index 对齐）。
-    """
-    script = _read_tdx(TDX_BUY_PATH)
-    res = evaluate(script, df)
-    sig = res.get("SIG") or res.get("LAST_EXPR")
-    return pd.Series(sig, index=df.index).fillna(False).astype(bool)
 
 def _eval_tdx_bool(script_path: str, df: pd.DataFrame) -> pd.Series:
     """读取并执行 TDX 文本规则，返回布尔 Series（与 df.index 对齐）"""
     script = _read_tdx(script_path)
-    res = evaluate(script, df)
-    sig = res.get("SIG") or res.get("LAST_EXPR")
-    return pd.Series(sig, index=df.index).fillna(False).astype(bool)
+    # res = evaluate(script, df)
+    # sig = res.get("sig") or res.get("last_expr") or res.get("SIG") or res.get("LAST_EXPR")
+    # return pd.Series(sig, index=df.index).fillna(False).astype(bool)
+    from tdx_compat import evaluate_bool
+    return evaluate_bool(script, df)
+
 
 def tdxsell(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -228,6 +276,16 @@ def tdxsell(df: pd.DataFrame) -> pd.DataFrame:
         "sell_by_open":  open_sig,
         "sell_by_close": close_sig,
     })
+
+
+def buy_signal(df: pd.DataFrame) -> pd.Series:
+    """
+    返回布尔 Series（索引与 df.index 对齐）。
+    """
+    script = _read_tdx(TDX_BUY_PATH)
+    from tdx_compat import evaluate_bool
+    return evaluate_bool(script, df)
+
 
 def sell_signal(df: pd.DataFrame, buy_dates: list) -> pd.DataFrame:
     # 接口保持不变，buy_dates 暂不使用但必须保留

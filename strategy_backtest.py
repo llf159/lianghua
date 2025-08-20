@@ -83,7 +83,8 @@ def _pbar_update(done: int, total: int, start_ts: float, desc: str = "回测进�
         delta = max(0, done - _TQDM_BAR.n)
         if delta:
             _TQDM_BAR.update(delta)
-            
+
+
 def _pbar_finish() -> None:
     global _TQDM_BAR
     if _TQDM_BAR is not None:
@@ -92,6 +93,7 @@ def _pbar_finish() -> None:
     if sys.stderr.isatty():
         sys.stderr.write("\n")
         sys.stderr.flush()
+
 
 def _child_init(lock=None):
     os.environ["TQDM_DISABLE"] = "1"
@@ -119,6 +121,7 @@ def _child_init(lock=None):
     except Exception:
         pass
 
+
 def as_yyyymmdd(x) -> str:
     """把任意日期输入统一成 'YYYYMMDD' 字符串，供 Parquet 分区查询用。"""
     if isinstance(x, (datetime, date, pd.Timestamp)):
@@ -130,9 +133,11 @@ def as_yyyymmdd(x) -> str:
         return pd.to_datetime(s).strftime("%Y%m%d")
     return pd.to_datetime(x).strftime("%Y%m%d")
 
+
 def as_timestamp(x) -> pd.Timestamp:
     """统一成 pandas Timestamp，供 DataFrame 过滤用。"""
     return pd.to_datetime(x)
+
 
 def make_pbar(total, desc="回测进度"):
     return tqdm(
@@ -146,6 +151,7 @@ def make_pbar(total, desc="回测进度"):
         file=sys.stderr,
     )
 
+
 def normalize_ts(ts_input: str, asset: str = "stock") -> str:
     ts = (ts_input or "").strip()
     if asset == "stock" and len(ts) == 6 and ts.isdigit():
@@ -157,6 +163,7 @@ def normalize_ts(ts_input: str, asset: str = "stock") -> str:
             market = ".SZ"
         ts = ts + market
     return ts.upper()
+
 
 def load_df_from_parquet(ts_code: str) -> pd.DataFrame:
     base_adj = "qfq" if "qfq" in PARQUET_ADJ else ("hfq" if "hfq" in PARQUET_ADJ else "daily")
@@ -170,6 +177,7 @@ def load_df_from_parquet(ts_code: str) -> pd.DataFrame:
     df = df[(df.index >= START_TS) & (df.index <= END_TS)]
     return df
 
+
 def load_file_by_code(code: str) -> str:
     """根据股票代码查找文件路径。"""
     pattern = os.path.join(DATA_DIR, f"*{code}*.csv")
@@ -178,6 +186,7 @@ def load_file_by_code(code: str) -> str:
         raise FileNotFoundError(f"找不到股票 {code} 的历史数据文件：{pattern}")
     # 如果有多于一个匹配，取文件名最短/最早的一个
     return sorted(matches)[0]
+
 
 def run_backtest_on_file(file_path: str) -> tuple[str, dict]:
     with open(os.devnull, "w") as devnull, redirect_stdout(devnull), redirect_stderr(devnull):
@@ -201,6 +210,7 @@ def run_backtest_on_file(file_path: str) -> tuple[str, dict]:
         code = os.path.splitext(os.path.basename(file_path))[0]
         return code, summary
 
+
 def run_backtest_on_ts(ts_code: str) -> tuple[str, dict]:
     with open(os.devnull, "w") as fnull, redirect_stdout(fnull), redirect_stderr(fnull):
         df = load_df_from_parquet(ts_code)
@@ -216,6 +226,7 @@ def run_backtest_on_ts(ts_code: str) -> tuple[str, dict]:
             record_trades=False,
         )
         return ts_code, summary
+
 
 def run_single(code: str) -> None:
     if USE_PARQUET:
@@ -247,11 +258,21 @@ def run_single(code: str) -> None:
 
     if trades:
         trades_df = pd.DataFrame(trades)
-        trades_df.columns = ["Buy Date", "Sell Date", "Hold Days", "Buy Price", "Sell Price", "Return Rate"]
+        # 仅选取存在的列，避免长度不一致
+        order = [c for c in ["买入日期","卖出日期","持股天数","持股K线数","买入价","卖出价","收益率"] if c in trades_df.columns]
+        trades_df = trades_df[order]
+
+        # 友好英文列名（没有的列会被忽略）
+        trades_df = trades_df.rename(columns={
+            "买入日期":"Buy Date","卖出日期":"Sell Date",
+            "持股天数":"Hold Days","持股K线数":"Bars Held",
+            "买入价":"Buy Price","卖出价":"Sell Price","收益率":"Return Rate",
+        })
         print("\n===== 交易明细 =====")
         print(tabulate(trades_df, headers='keys', tablefmt='github', showindex=False))
     else:
         print("\n没有产生任何交易信号。")
+
 
 def run_batch() -> None:
     results: list[tuple[str, dict]] = []
@@ -362,6 +383,7 @@ def run_batch() -> None:
                         if pd.notna(total_signals) else 0))
         ws.write(0, 6, f"样本标的数: {len(df)}")
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="量化回测入口脚本")
     parser.add_argument("--code", help="只回测指定股票代码，例如 000001")
@@ -372,7 +394,8 @@ def main() -> None:
         run_single(args.code)
     else:
         run_batch()
-             
+
+
 if __name__ == "__main__":
     import multiprocessing as mp
     try:

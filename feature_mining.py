@@ -46,16 +46,22 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
 from time import time
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from types import SimpleNamespace
+
 import parquet_viewer as pv
 from utils import ensure_datetime_index
 import indicators as ind
 from config import *
+
+LOG = logging.getLogger("feature")
 try:
+    LOG.debug("[BRANCH] try @L55: try")
     from backtest_core import buy_signal
 except Exception:
+    LOG.debug("[BRANCH] except @L57: except Exception")
     buy_signal = None
+
 
 # ========================= 用户可改参数区 =========================
 USER_PARAMS = {
@@ -65,6 +71,7 @@ USER_PARAMS = {
     "SURGE_N": 15,           # 未来观察窗口长度（向前看多少天找最大连续子区间 z-score 和）
     "SURGE_Z_THR": 17.0,      # Z-score 阈值（达到或超过则标记为启动点）
     "SURGE_COOLDOWN": 5,     # 冷却天数（命中启动点后，多少天内不再标记新的启动点）
+
 
     # —— 并发/输出/日志 ——
     "MAX_WORKERS": 8,
@@ -103,20 +110,25 @@ def _check_buy_rules(buy_path: str | Path) -> dict:
             "non_comment_lines": 0, "sha1": None}
 
     if not p.exists():
+        LOG.debug("[BRANCH] if @L108: if not p.exists()")
         return info
 
     try:
+        LOG.debug("[BRANCH] try @L111: try")
         text = p.read_text(encoding="utf-8", errors="ignore")
         # 统计非注释/非空行（通达信/脚本常见注释符：//、#，也顺带跳过空行）
         non_comment = []
         for line in text.splitlines():
             s = line.strip()
             if not s:
+                LOG.debug("[BRANCH] if @L117: if not s")
                 continue
             if s.startswith("//") or s.startswith("#"):
+                LOG.debug("[BRANCH] if @L119: if s.startswith(\"//\") or s.startswith(\"#\")")
                 continue
             # 常见脚本里也可能有以 “-- ” 开头的注释
             if s.startswith("-- "):
+                LOG.debug("[BRANCH] if @L122: if s.startswith(\"-- \")")
                 continue
             non_comment.append(line)
         info["non_comment_lines"] = len(non_comment)
@@ -124,7 +136,9 @@ def _check_buy_rules(buy_path: str | Path) -> dict:
         info["readable"] = True
         return info
     except Exception:
+        LOG.debug("[BRANCH] except @L129: except Exception")
         return info
+
 
 def load_all_codes():
     # 取最新日期的全市场代码列表
@@ -136,6 +150,7 @@ def load_all_codes():
     )
     return sorted(df["ts_code"].dropna().unique().tolist())
 
+
 def read_df(code):
     base_adj = "qfq" if "qfq" in PARQUET_ADJ else ("hfq" if "hfq" in PARQUET_ADJ else "daily")
     # ① 先强行尝试 single_<adj>_indicators
@@ -146,14 +161,17 @@ def read_df(code):
             LOG.info("[read_df] loaded single_%s_indicators for %s", base_adj, code)
 
     except Exception:
+        LOG.debug("[BRANCH] except @L153: except Exception")
         # ② 退到 single_<adj>（不带指标）
         LOG.debug("[read_df] with_indicators=True failed, fallback to with_indicators=False")
         try:
+            LOG.debug("[BRANCH] try @L156: try")
             df = pv.read_by_symbol(PARQUET_BASE, base_adj, code, with_indicators=False)
             if df is not None and not df.empty:
                 LOG.info("[read_df] loaded single_%s (no indicators) for %s", base_adj, code)
 
         except Exception:
+            LOG.debug("[BRANCH] except @L161: except Exception")
             # ③ 再退到按日分区
             LOG.debug("[read_df] fallback to daily range read (partitioned)")
             df = pv.read_range(PARQUET_BASE, "stock", PARQUET_ADJ,
@@ -166,7 +184,31 @@ def read_df(code):
         LOG.warning("[read_df] no data for %s", code)
         return None
     df = ensure_datetime_index(df).sort_index()
+    start = pd.to_datetime(str(STRATEGY_START_DATE))
+    end = pd.to_datetime(str(STRATEGY_END_DATE))
+    
+    # 可选：给滚动/指标计算留一点 warmup 天数，避免开头统计不稳定
+    try:
+        LOG.debug("[BRANCH] try @L178: try")
+        warmup_days = max(0, int(SURGE_P))  # 也可以设成固定 60/90
+    except Exception:
+        LOG.debug("[BRANCH] except @L180: except Exception")
+        warmup_days = 0
+
+    if pd.notna(start) and pd.notna(end):
+        LOG.debug("[BRANCH] if @L183: if pd.notna(start) and pd.notna(end)")
+        # 这里用业务日偏移；若你没有交易日日历，可用普通天数替代
+        start_with_warmup = start - pd.tseries.offsets.BDay(warmup_days)
+        orig_len = len(df)
+        df = df.loc[(df.index >= start_with_warmup) & (df.index <= end)]
+        LOG.info(
+            "[read_df] date filter %s~%s (warmup=%sBD): rows %d -> %d; range %s..%s",
+            STRATEGY_START_DATE, STRATEGY_END_DATE, warmup_days,
+            orig_len, len(df), df.index.min().date() if len(df) else None,
+            df.index.max().date() if len(df) else None,
+        )
     return df
+
 
 def collect_features(df: pd.DataFrame):
     """
@@ -195,6 +237,7 @@ def collect_features(df: pd.DataFrame):
         for k in range(1, LOOKBACK_K+1):
             j = i - k
             if j < 0: 
+                LOG.debug("[BRANCH] if @L223: if j < 0")
                 continue
             # 在这添加需要的特征
             snap = {
@@ -205,9 +248,11 @@ def collect_features(df: pd.DataFrame):
             # 动态枚举：把剩余列全带上
             for col in df.columns:
                 if col not in exclude and col in df.columns:
+                    LOG.debug("[BRANCH] if @L233: if col not in exclude and col in df.columns")
                     snap[col] = df[col].iloc[j]
             rows.append(snap)
     return pd.DataFrame(rows)
+
 
 def last_true_before(i: int, cond: pd.Series) -> int | None:
     """
@@ -215,12 +260,15 @@ def last_true_before(i: int, cond: pd.Series) -> int | None:
     返回索引号（整数位置），找不到则 None。
     """
     if i <= 0:
+        LOG.debug("[BRANCH] if @L244: if i <= 0")
         return None
     # 用到的都是顺序索引，提升性能可用向量化写法；这里用简洁做法
     prev = cond.iloc[:i].to_numpy().nonzero()[0]
     if prev.size == 0:
+        LOG.debug("[BRANCH] if @L248: if prev.size == 0")
         return None
     return int(prev[-1])  # 最近一次
+
 
 # ====== 1) 动态“可观涨幅”打标（z-score累计） ======
 def label_surge_dynamic(df: pd.DataFrame,
@@ -248,20 +296,26 @@ def label_surge_dynamic(df: pd.DataFrame,
     # --- 基础 z：优先使用指标层的新 z_score；没有则回退旧算法 ---
     z = None
     try:
+        LOG.debug("[BRANCH] try @L278: try")
         # 若 df 已带指标列(你 loader 会优先读 *_indicators 分区)
         if "z_score" not in df.columns:
+            LOG.debug("[BRANCH] if @L280: if \"z_score\" not in df.columns")
             # 现场补算（优先 TDX，失败回退 Python 兜底）
             LOG.debug("[label_surge_dynamic] z_score not in df.columns -> compute via indicators.compute()")
             tmp = ind.compute(df, ["z_score"])
             if "z_score" in tmp.columns:
+                LOG.debug("[BRANCH] if @L284: if \"z_score\" in tmp.columns")
                 df = tmp
         if "z_score" in df.columns:
+            LOG.debug("[BRANCH] if @L286: if \"z_score\" in df.columns")
             z = pd.to_numeric(df["z_score"], errors="coerce")
             LOG.info("[label_surge_dynamic] using NEW z_score from indicators")
     except Exception:
+        LOG.debug("[BRANCH] except @L289: except Exception")
         z = None
         LOG.warning("[label_surge_dynamic] indicators z_score compute failed; will fallback")
     if z is None:
+        LOG.debug("[BRANCH] if @L292: if z is None")
         # 旧算法兜底：基于收益的滚动 z
         LOG.info("[label_surge_dynamic] fallback to legacy rolling z computation")
         r = C.pct_change()
@@ -278,6 +332,7 @@ def label_surge_dynamic(df: pd.DataFrame,
         start = t + 1
         end = min(T, t + 1 + N)
         if start >= end:
+            LOG.debug("[BRANCH] if @L308: if start >= end")
             continue
         window = z_values[start:end]
         # NaN 不参与：置为极小值，确保不会被选中
@@ -301,6 +356,7 @@ def label_surge_dynamic(df: pd.DataFrame,
     LOG.debug("[label_surge_dynamic] raw hits=%d (threshold=%.3f)", len(hit_idx), Z_THR)
     for i in hit_idx:
         if i - last_kept >= cooldown:
+            LOG.debug("[BRANCH] if @L331: if i - last_kept >= cooldown")
             keep[i] = 1
             last_kept = i
 
@@ -308,10 +364,12 @@ def label_surge_dynamic(df: pd.DataFrame,
     LOG.info("[label_surge_dynamic] kept hits after cooldown=%d", int(keep.sum()))
     return df
 
+
 # ====== 2) 买入信号布尔序列（复用你的回测买点）======
 def compute_buy_cond(df: pd.DataFrame) -> pd.Series:
     # 需要 backtest_core.buy_signal(df)；若未提供，暂用保守占位符
     try:
+        LOG.debug("[BRANCH] try @L343: try")
         cond = buy_signal(df)
         LOG.debug("[compute_buy_cond] buy_signal(df) executed via backtest_core.buy_signal")
         cond = pd.Series(cond, index=df.index).fillna(False).astype(bool)
@@ -319,6 +377,7 @@ def compute_buy_cond(df: pd.DataFrame) -> pd.Series:
         LOG.warning("[compute_buy_cond] buy_signal unavailable -> return all False")
         cond = pd.Series(False, index=df.index)  # 占位：先全 False，待你提供源码后替换
     return cond
+
 
 # ====== 3) 窗口画像聚合 ======
 def aggregate_window_features(
@@ -366,15 +425,18 @@ def aggregate_window_features(
         cur = 0
         for v in sig:
             if v:
+                LOG.debug("[BRANCH] if @L398: if v")
                 cur += 1
                 streak = max(streak, cur)
             else:
+                LOG.debug("[BRANCH] else @L401: else")
                 cur = 0
 
         # 3) 最近/最早信号距起点的“天数”
         last_lag = None
         first_lag = None
         if count > 0:
+            LOG.debug("[BRANCH] if @L407: if count > 0")
             hit_days = np.where(sig)[0]           # 在窗口内的相对位置（0 是最早那天）
             last_lag  = (len(sig) - 1) - hit_days[-1]  # 距起点最近一次
             first_lag = (len(sig) - 1) - hit_days[0]   # 距起点最早一次
@@ -396,8 +458,10 @@ def aggregate_window_features(
 
     return pd.DataFrame(rows)
 
+
 def process_one(code: str):
     try:
+        LOG.debug("[BRANCH] try @L431: try")
         df = read_df(code)
         if df is None or df.empty:
             LOG.debug("[process_one] skip %s due to empty df", code)
@@ -406,6 +470,7 @@ def process_one(code: str):
         LOG.debug("[process_one] %s label_surge_dynamic done", code)
 
         if "ts_code" not in df.columns:
+            LOG.debug("[BRANCH] if @L439: if \"ts_code\" not in df.columns")
             df["ts_code"] = code
 
         launches = df[df["is_surge_dyn"] == 1].copy()
@@ -413,9 +478,10 @@ def process_one(code: str):
             LOG.info("[process_one] %s surge points=%d", code, len(launches))
             launches = launches.assign(
                 launch_date=launches.index.date,
-                close_now=launches["close"].astype(float),
+                # close_now=launches["close"].astype(float),
+                
             )[[
-                "ts_code", "launch_date", "close_now",
+                "ts_code", "launch_date", "close", "vol", "amount",
             ]]
         else:
             LOG.debug("[process_one] %s no surge points", code)
@@ -426,14 +492,15 @@ def process_one(code: str):
             LOG.debug("[process_one] %s snapshots rows=%d", code, len(snap))
             snap["ts_code"] = code
         else:
+            LOG.debug("[BRANCH] else @L460: else")
             snap = None
         return snap, launches
     except Exception as e:
+        LOG.debug("[BRANCH] except @L463: except Exception as e")
         # 避免单只股票异常阻断整体任务
         LOG.exception("[process_one] fail %s: %s", code, e)
         return None, None
 
-LOG = logging.getLogger("feature")
 
 def _setup_logging(log_level:str="INFO", log_file:str|None=None):
     level = getattr(logging, log_level.upper(), logging.INFO)
@@ -449,10 +516,12 @@ def _setup_logging(log_level:str="INFO", log_file:str|None=None):
     root.addHandler(ch)
 
     if log_file:
+        LOG.debug("[BRANCH] if @L482: if log_file")
         fh = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=3, encoding="utf-8")
         fh.setFormatter(fmt)
         fh.setLevel(level)
         root.addHandler(fh)
+
 
 def _run_single(ts_code: str, out_dir: Path):
     LOG.info("单股特征挖掘开始: %s", ts_code)
@@ -468,11 +537,13 @@ def _run_single(ts_code: str, out_dir: Path):
     for W in W_LIST:
         stats = aggregate_window_features(df, surge_flag_col="is_surge_dyn", W=W)
         if not stats.empty:
+            LOG.debug("[BRANCH] if @L502: if not stats.empty")
             stats["ts_code"] = ts_code
             stats_list.append(stats)
             LOG.info("[_run_single] W=%d stats rows=%d", W, len(stats))
 
     if stats_list:
+        LOG.debug("[BRANCH] if @L507: if stats_list")
         out = pd.concat(stats_list, ignore_index=True)
         out_dir.mkdir(parents=True, exist_ok=True)
         out.to_parquet(out_dir / f"surge_window_stats_{ts_code.replace('.','_')}.parquet", index=False)
@@ -481,6 +552,7 @@ def _run_single(ts_code: str, out_dir: Path):
         LOG.info("没有命中的启动点: %s", ts_code)
 
     LOG.info("单股特征挖掘结束: %s", ts_code)
+
 
 def main():
     global MAX_WORKERS
@@ -512,16 +584,21 @@ def main():
     def _normalize(ts: str) -> str:
         ts = (ts or "").strip().upper()
         if len(ts) == 6 and ts.isdigit():
+            LOG.debug("[BRANCH] if @L547: if len(ts) == 6 and ts.isdigit()")
             if ts.startswith("8"):
+                LOG.debug("[BRANCH] if @L548: if ts.startswith(\"8\")")
                 suf = ".BJ"
             elif ts[0] in {"5","6","9"}:
+                LOG.debug("[BRANCH] elif @L550: elif ts[0] in {\"5\",\"6\",\"9\"}")
                 suf = ".SH"
             else:
+                LOG.debug("[BRANCH] else @L552: else")
                 suf = ".SZ"
             ts += suf
         return ts
     user_codes = [ _normalize(c) for c in (args.codes or []) if c ]
     if user_codes:
+        LOG.debug("[BRANCH] if @L557: if user_codes")
         for ts_code in user_codes:
             _run_single(ts_code, out_dir)
         LOG.info("总耗时 %.2fs", time() - start_ts)
@@ -530,6 +607,7 @@ def main():
     # ===== 批量模式 =====
     LOG.info("批量特征回测开始")
     try:
+        LOG.debug("[BRANCH] try @L565: try")
         codes = load_all_codes()
         LOG.info("加载股票代码数=%d", len(codes))
     except Exception as e:
@@ -545,15 +623,19 @@ def main():
         for fut in tqdm(as_completed(futures), total=len(futures), desc="提取进度", unit="股"):
             code = futures[fut]
             try:
+                LOG.debug("[BRANCH] try @L580: try")
                 snap, launches = fut.result()
             except Exception as e:
+                LOG.debug("[BRANCH] except @L582: except Exception as e")
                 errors += 1
                 LOG.warning("处理失败 %s: %s", code, e)
                 continue
             if snap is not None and not snap.empty:
+                LOG.debug("[BRANCH] if @L586: if snap is not None and not snap.empty")
                 all_feat.append(snap)
                 LOG.debug("[main] add snapshots %s rows=%d", code, len(snap))
             if launches is not None and not launches.empty:
+                LOG.debug("[BRANCH] if @L589: if launches is not None and not launches.empty")
                 all_launch.append(launches)
                 LOG.debug("[main] add launches %s rows=%d", code, len(launches))
     
@@ -589,23 +671,20 @@ def main():
     feats = pd.concat(all_feat, ignore_index=True)
     feats.to_parquet(out_dir / f"prelaunch_features_{ts_tag}.parquet", index=False)
     LOG.info("[main] features total rows=%d", len(feats))
-    # 简单统计输出
-    g = feats.groupby("rel_day").agg(
-    count=("rel_day", "size")
-    # 这里还可以继续加: 其他列名=("列名", "聚合函数")
-)
-    g.to_csv(out_dir / f"prelaunch_summary_{ts_tag}.csv", encoding="utf-8-sig")
-    LOG.info("[main] summary by rel_day rows=%d", len(g))
+    LOG.info("[main] summary by rel_day rows=%d", len(feats[feats["rel_day"].notna()]))
     if all_launch:
-            launch_df = pd.concat(all_launch, ignore_index=True)
-            # 按日期、代码排序，查阅更方便
-            launch_df = launch_df.sort_values(["launch_date","ts_code"])
-            launch_df.to_csv(out_dir / f"launch_dates_{ts_tag}.csv", index=False, encoding="utf-8-sig")
-            # 如需 Parquet 版本：
-            launch_df.to_parquet(out_dir / f"launch_dates_{ts_tag}.parquet", index=False)
-            LOG.info("[main] launch list rows=%d", len(launch_df))
+        LOG.debug("[BRANCH] if @L626: if all_launch")
+        launch_df = pd.concat(all_launch, ignore_index=True)
+        # 按日期、代码排序，查阅更方便
+        launch_df = launch_df.sort_values(["launch_date","ts_code"])
+        launch_df.to_csv(out_dir / f"launch_dates_{ts_tag}.csv", index=False, encoding="utf-8-sig")
+        # 如需 Parquet 版本：
+        launch_df.to_parquet(out_dir / f"launch_dates_{ts_tag}.parquet", index=False)
+        LOG.info("[main] launch list rows=%d", len(launch_df))
 
     LOG.info("批量完成 codes=%d errors=%d 耗时=%.2fs", len(codes), errors, time() - start_ts)
 
+
 if __name__ == "__main__":
+    LOG.debug("[BRANCH] if @L638: if __name__ == \"__main__\"")
     main()

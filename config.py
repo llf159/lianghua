@@ -11,7 +11,7 @@ PARQUET_USE_INDICATORS = True     # True: *_indicators 分区；False: 非 indic
 
 # 配置参数
 HOLD_DAYS = 2  # 买入持有天数
-STRATEGY_START_DATE = "20250101"
+STRATEGY_START_DATE = "20220601"
 STRATEGY_END_DATE = "20250801"
 # 数据目录路径（可绝对路径或相对路径）
 DATA_DIR = "E://gupiao-hfq"
@@ -22,16 +22,13 @@ TDX_SELL_CLOSE_PATH = "./sell_close_rules.txt"
 
 # DATA_DIR = os.path.join(BASE_DIR, "test") 
 #open为次日开盘价买入，close为当日收盘价买入,signal_open为信号当天开盘买入；open涨停不买入
-# BUY_MODE = "open"
+BUY_MODE = "open"
 # BUY_MODE = "close"
-BUY_MODE = "signal_open"
+# BUY_MODE = "signal_open"
 
-#open为买入后n日开盘价卖出，close为收盘价卖出，strategy为策略卖出
-SELL_MODE = "strategy"
-# SELL_MODE = "open"
-# SELL_MODE = "close"
-
-MAX_HOLD_DAYS = -1  # -1 表示不限制持有天数，其他正整数表示最多持有几天
+#open为买入后n日开盘价卖出，close为收盘价卖出，strategy为策略卖出，other为统计MAX_HOLD_DAYS内最大涨幅
+SELL_MODE = "other"
+MAX_HOLD_DAYS = 60  # -1 表示不限制持有天数，其他正整数表示最多持有几天
 
 FALLBACK_SELL_MODE = "open"#超过持有天数后强制卖出的模式
 
@@ -40,8 +37,8 @@ TOKEN = ""  # <-- 必填
 # DATA_ROOT = "./data"             # 下载数据目录(可改为绝对路径)
 DATA_ROOT = r"E:\stock_data"
 ASSETS = ["stock", "index"]      # 可选: ["stock"], ["index"], ["stock","index"]
-START_DATE = "20050101"
-END_DATE = "today"               # 或具体日期 'YYYYMMDD'
+START_DATE = "20220101"
+END_DATE = "20250820"               # 或具体日期 'YYYYMMDD'
 INDEX_WHITELIST = [
     "000001.SH","399001.SZ","399300.SZ","399905.SZ","399006.SZ","000016.SH","000852.SH"
 ]
@@ -54,7 +51,7 @@ LOG_LEVEL = "INFO"
 STOCK_INC_THREADS = 40         # 增量下载线程数
 
 # -------- FAST INIT(按股票多线程全历史回补)开关 --------
-FAST_INIT_MODE = True                     # 首次全历史快速抓取
+FAST_INIT_MODE = False                     # 首次全历史快速抓取
 FAST_INIT_THREADS = 50                    # 并发线程数
 FAST_INIT_STOCK_DIR = os.path.join(DATA_ROOT, "fast_init_symbol")
 API_ADJ = "qfq"                           # qfq/hfq/raw
@@ -91,7 +88,7 @@ FAILED_RETRY_WAIT = 5             # 下载结束到补抓之间的等待秒(缓�
 # ====== Skip 文件完整性快速检查参数 ======
 CHECK_SKIP_MIN_MAX = True                 # 是否启用跳过前检查
 CHECK_SKIP_READ_COLUMNS = ["trade_date"]  # 读取的列，尽量最少减少 IO
-CHECK_SKIP_ALLOW_LAG_DAYS = 0           # 允许已有文件的最大日期距离 end_date 的“滞后”天数 (0=必须等于 end_date)
+CHECK_SKIP_ALLOW_LAG_DAYS = 1           # 允许已有文件的最大日期距离 end_date 的“滞后”天数 (0=必须等于 end_date)
 SKIP_CHECK_START_ENABLED = False          # 是否启用开始日期检查(如果不需要可以关闭，减少接口调用)
 # ==========================================
 

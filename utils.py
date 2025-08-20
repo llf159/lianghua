@@ -7,6 +7,7 @@ import pandas as pd
 import os
 import logging
 
+
 def ensure_datetime_index(df, file_path=None):
     for date_col in ['trade_date', 'date', '交易日期', 'datetime']:
         if date_col in df.columns:
@@ -20,6 +21,7 @@ def ensure_datetime_index(df, file_path=None):
     # 如果没有找到合适的日期列，打印出来方便你排查
     print(f"\n数据文件{file_path if file_path else ''} 缺少日期列！表头为：{df.columns.tolist()}")
     return None
+
 
 def normalize_trade_date(df: pd.DataFrame, col: str = "trade_date") -> pd.DataFrame:
     """

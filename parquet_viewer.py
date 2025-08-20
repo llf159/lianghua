@@ -33,6 +33,7 @@ except Exception:
 def stock_daily_root(base: str) -> str:
     return os.path.join(base, "stock", "daily")
 
+
 def allowed_stock_adjs(base: str) -> List[str]:
     """扫描 <base>/stock/daily 下的实际子目录作为可用 adj"""
     root = stock_daily_root(base)
@@ -48,6 +49,7 @@ def allowed_stock_adjs(base: str) -> List[str]:
         pri = {"daily": 0, "daily_raw": 1, "daily_qfq": 2, "daily_hfq": 3}.get(name, 9)
         return (pri, name)
     return sorted(out, key=_rank)
+
 
 def normalize_stock_adj(base: str, adj_kind: str, use_indicators: bool) -> str:
     """
@@ -85,6 +87,7 @@ def normalize_stock_adj(base: str, adj_kind: str, use_indicators: bool) -> str:
 
     return dir_name
 
+
 # --------------------------- 工具函数 ---------------------------
 def asset_root(base: str, asset: str, adj: Optional[str]) -> str:
     if asset not in {"index", "stock"}:
@@ -94,6 +97,7 @@ def asset_root(base: str, asset: str, adj: Optional[str]) -> str:
     # stock
     adj_dir = normalize_stock_adj(base, adj, PARQUET_USE_INDICATORS)
     return os.path.join(base, "stock", "daily", adj_dir)
+
 
 def read_by_symbol(base: str, adj: str | None, ts_code: str, with_indicators: bool = True):
     """
@@ -128,6 +132,7 @@ def read_by_symbol(base: str, adj: str | None, ts_code: str, with_indicators: bo
     tried = "，".join(candidates)
     raise FileNotFoundError(f"未找到单股文件：{tried} / {ts_code}.parquet")
 
+
 def list_symbols(root: str) -> List[str]:
     pattern = os.path.join(root, "trade_date=*/*.parquet").replace("\\", "/")
     if HAS_DUCKDB:
@@ -148,6 +153,7 @@ def list_symbols(root: str) -> List[str]:
             continue
     return sorted(syms)
 
+
 def list_trade_dates(root: str) -> List[str]:
     if not os.path.isdir(root):
         return []
@@ -160,6 +166,7 @@ def list_trade_dates(root: str) -> List[str]:
                 continue
     return sorted(dates)
 
+
 def date_chunks(start: str, end: str, step_days: int = 365) -> Iterable[tuple[str, str]]:
     d0 = dt.datetime.strptime(start, "%Y%m%d").date()
     d1 = dt.datetime.strptime(end, "%Y%m%d").date()
@@ -168,6 +175,7 @@ def date_chunks(start: str, end: str, step_days: int = 365) -> Iterable[tuple[st
         nxt = min(cur + dt.timedelta(days=step_days - 1), d1)
         yield cur.strftime("%Y%m%d"), nxt.strftime("%Y%m%d")
         cur = nxt + dt.timedelta(days=1)
+
 
 def glob_partitions(root: str, start: str, end: str) -> List[str]:
     """返回指定日期范围内的分区目录绝对路径列表"""
@@ -180,6 +188,7 @@ def glob_partitions(root: str, start: str, end: str) -> List[str]:
             parts.append(os.path.join(root, f"trade_date={d}"))
     return parts
 
+
 def scan_with_duckdb(root: str, ts_code: Optional[str], start: str, end: str,
                      columns: Optional[List[str]] = None, limit: Optional[int] = None) -> pd.DataFrame:
     pattern = os.path.join(root, "trade_date=*/*.parquet").replace("\\", "/")
@@ -188,16 +197,41 @@ def scan_with_duckdb(root: str, ts_code: Optional[str], start: str, end: str,
     if ts_code:
         where.append(f"ts_code = '{ts_code}'")
     where_sql = " AND ".join(where)
-    sql = f"SELECT {sel} FROM parquet_scan('{pattern}') WHERE {where_sql} ORDER BY trade_date"
+    
+    # sql = f"SELECT {sel} FROM parquet_scan('{pattern}') WHERE {where_sql} ORDER BY trade_date"
+    # if limit:
+    #     sql += f" LIMIT {int(limit)}"
+    # return duckdb.sql(sql).df()  # type: ignore
+
+    tail_n = None
+    if isinstance(limit, int) and limit is not None and limit < 0:
+        tail_n = -limit
+        limit = tail_n
+        order_sql = "ORDER BY trade_date DESC"
+    else:
+        order_sql = "ORDER BY trade_date"
+    sql = f"SELECT {sel} FROM parquet_scan('{pattern}') WHERE {where_sql} {order_sql}"
     if limit:
         sql += f" LIMIT {int(limit)}"
-    return duckdb.sql(sql).df()  # type: ignore
+    df = duckdb.sql(sql).df()  # type: ignore
+    # 若是倒数，抓的是降序的前 N，最后再按升序排回展示
+    if tail_n:
+        if "trade_date" in df.columns:
+            df = df.sort_values("trade_date")
+    return df
+
 
 def scan_with_pandas(root: str, ts_code: Optional[str], start: str, end: str,
                      columns: Optional[List[str]] = None, limit: Optional[int] = None) -> pd.DataFrame:
     parts = glob_partitions(root, start, end)
     frames: List[pd.DataFrame] = []
-    remaining = limit if limit is not None else None
+    tail_n = None
+    remaining = None
+    if limit is not None:
+        if limit < 0:
+            tail_n = -limit
+        else:
+            remaining = limit
 
     for pdir in parts:
         files = glob.glob(os.path.join(pdir, "*.parquet"))
@@ -223,10 +257,19 @@ def scan_with_pandas(root: str, ts_code: Optional[str], start: str, end: str,
                     return out.iloc[:limit]  # type: ignore
     if not frames:
         return pd.DataFrame()
+    
+    # out = pd.concat(frames, ignore_index=True).sort_values("trade_date")
+    # if limit is not None:
+    #     out = out.iloc[:limit]
+    # return out
     out = pd.concat(frames, ignore_index=True).sort_values("trade_date")
+    if tail_n is not None:
+        # 倒数 N 行
+        return out.tail(tail_n)
     if limit is not None:
-        out = out.iloc[:limit]
+        return out.iloc[:limit]
     return out
+
 
 def read_range(base: str, asset: str, adj: Optional[str], ts_code: Optional[str], start: str, end: str,
                columns: Optional[List[str]] = None, limit: Optional[int] = None) -> pd.DataFrame:
@@ -248,6 +291,7 @@ def read_range(base: str, asset: str, adj: Optional[str], ts_code: Optional[str]
         )
     return df
 
+
 def read_day(base: str, asset: str, adj: Optional[str], day: str, limit: Optional[int] = None) -> pd.DataFrame:
     root = asset_root(base, asset, adj)
     pdir = os.path.join(root, f"trade_date={day}")
@@ -257,17 +301,25 @@ def read_day(base: str, asset: str, adj: Optional[str], day: str, limit: Optiona
         return pd.DataFrame()
     df = pd.concat(frames, ignore_index=True)
     if limit is not None:
-        df = df.head(limit)
+        if limit < 0:
+            df = df.tail(-limit)
+        else:
+            df = df.head(limit)
     return df
+
 
 def print_df(df: pd.DataFrame, limit: Optional[int] = None):
     if df is None or df.empty:
         print("（空结果）")
         return
     if limit is not None:
-        df = df.head(limit)
+        if limit < 0:
+            df = df.tail(-limit)
+        else:
+            df = df.head(limit)
     with pd.option_context("display.max_rows", 200, "display.max_columns", 50, "display.width", 180):
         print(df.to_string(index=False))
+
 
 def show_schema(parquet_file: str):
     if not os.path.isfile(parquet_file):
@@ -292,6 +344,7 @@ def show_schema(parquet_file: str):
             print("Columns:", ", ".join(df.columns))
     except Exception as e:
         print(f"读取失败：{e}")
+
 
 __all__ = [
     "HAS_DUCKDB", "HAS_PYARROW",
