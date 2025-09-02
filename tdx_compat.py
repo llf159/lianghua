@@ -45,13 +45,13 @@ def _extract_bool_signal(res: dict, index, prefer_keys=("sig", "last_expr", "SIG
 
     return pd.Series(False, index=index)
 
-def evaluate_bool(script: str, df, prefer_keys=("sig", "last_expr", "SIG", "LAST_EXPR")):
-    """
-    便捷入口：直接返回一个布尔 Series（与 df.index 对齐）。
-    不改变原有 evaluate 的行为；这是新增接口，纯增量、可并存。
-    """
-    res = evaluate(script, df)  # 仍然返回“多输出”的 dict（键名依旧会被小写化）
-    return _extract_bool_signal(res, df.index, prefer_keys=prefer_keys)
+# def evaluate_bool(script: str, df, prefer_keys=("sig", "last_expr", "SIG", "LAST_EXPR")):
+#     """
+#     便捷入口：直接返回一个布尔 Series（与 df.index 对齐）。
+#     不改变原有 evaluate 的行为；这是新增接口，纯增量、可并存。
+#     """
+#     res = evaluate(script, df)  # 仍然返回“多输出”的 dict（键名依旧会被小写化）
+#     return _extract_bool_signal(res, df.index, prefer_keys=prefer_keys)
 
 # 统一把条件转成布尔并把 NaN 当 False
 def _as_bool(cond):
@@ -220,6 +220,44 @@ ASSIGN_RE = re.compile(r'^\s*([^\W\d]\w*)\s*:?=\s*(.+?)\s*$', flags=re.UNICODE)
 COMMENT_RE = re.compile(r'^\s*[{].*?[}]\s*$')
 INLINE_COMMENT_RE = re.compile(r'\{.*?\}')
 SEMICOL_SPLIT_RE = re.compile(r';(?=(?:[^"]*"[^"]*")*[^"]*$)')
+
+# tdx_compat.py 追加/替换
+
+import logging
+LOG = logging.getLogger("tdx")
+
+def _extra_ctx_from_df_columns(df) -> dict:
+    """
+    为 df 的每一列建立两个别名：
+      - 原列名（如 z_score）
+      - 全大写（如 Z_SCORE）
+    避免覆盖内置函数名、已存在的 VAR_MAP key 等。
+    """
+    reserved = set(FUNC_MAP.keys()) | set(VAR_MAP.keys()) | {"AND","OR","NOT"}
+    ctx = {}
+    for col in getattr(df, "columns", []):
+        if not isinstance(col, str):
+            continue
+        series = df[col]
+        for key in (col, col.upper()):
+            if key in reserved:
+                continue
+            # 合法的标识符才挂（TDX 里你本来也写成这种）
+            if key.isidentifier():
+                # 如果上一步替换里已经把某些固定符号映射到 df['...']，这里就当补充别名
+                ctx.setdefault(key, series)
+    if LOG.isEnabledFor(logging.DEBUG):
+        LOG.debug("[TDX] alias count=%d (sample=%s)", len(ctx), list(ctx)[:10])
+    return ctx
+
+def evaluate_bool(script: str, df, prefer_keys=("sig", "last_expr", "SIG", "LAST_EXPR")):
+    """
+    便捷入口：直接返回一个布尔 Series（与 df.index 对齐）。
+    自动将 df 中现有列注入上下文（原名 + 全大写）。
+    """
+    extra_ctx = _extra_ctx_from_df_columns(df)
+    res = evaluate(script, df, extra_context=extra_ctx)  # evaluate 会把 extra_context 合入 ctx 使用
+    return _extract_bool_signal(res, df.index, prefer_keys=prefer_keys)
 
 def _replace_variables(expr):
     keys = sorted(VAR_MAP.keys(), key=len, reverse=True)

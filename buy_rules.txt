@@ -1,0 +1,54 @@
+N:= 60;
+AAA:= (C - O) / O * 100;
+BB:= MA(AAA, N);
+CCC:= STD(AAA, N);
+AAZ:= (AAA - BB) / CCC;
+DD:= V / MA(V, 20);
+EE:= MIN(DD, 2);
+Z:= AAZ * EE;
+
+N1:=4;
+S1 := REF(SUM(Z,N1),1);
+S2 := REF(SUM(Z,N1),2);
+S3 := REF(SUM(Z,N1),3);
+S4 := REF(SUM(Z,N1),4);
+S5 := REF(SUM(Z,N1),5);
+S6 := REF(SUM(Z,N1),6);
+S7 := REF(SUM(Z,N1),7);
+S8 := REF(SUM(Z,N1),8);
+S9 := REF(SUM(Z,N1),9);
+S10 := REF(SUM(Z,N1),10);
+S11 := REF(SUM(Z,N1),11);
+S12 := REF(SUM(Z,N1),12);
+T1:=MAX(S1,S2);
+T2:=MAX(S3,S4);
+T3:=MAX(S5,S6);
+T4:=MAX(S7,S8);
+T5:=MAX(S9,S10);
+T6:=MAX(S11,S12);
+G1:=MAX(T1,T2);
+G2:=MAX(T3,T4);
+G3:=MAX(T5,T6);
+P1:=MAX(G1,G2);
+P2:=MAX(P1,G3);
+GG:=COUNT((Z > 1.5),60);
+HH := P2 >= 5 AND GG >= 6;
+
+RSV := (CLOSE - LLV(LOW, 9)) / (HHV(HIGH, 9) - LLV(LOW, 9)) * 100;
+K := SMA(RSV, 3, 1);
+D := SMA(K, 3, 1);
+J := 3 * K - 2 * D;
+KKJ := COUNT((J<0),20) >= 1;
+
+N2:= 30;
+LLLL := LLV(LOW, N2);
+HHHH := HHV(HIGH, N2);
+N3:= 30;
+QQQQ := (HHHH / LLLL - 1) * 100 < N3;
+
+MA60:=MA(C,60);
+DY60:=COUNT((C < MA60),30);
+GT:=MA60 > MA(REF(MA60,1),5);
+QD:=DY60 > 0 AND DY60 < 6 AND GT;
+
+SIG:= HH AND QQQQ AND QD AND KKJ;
