@@ -152,19 +152,6 @@ def make_pbar(total, desc="回测进度"):
     )
 
 
-def normalize_ts(ts_input: str, asset: str = "stock") -> str:
-    ts = (ts_input or "").strip()
-    if asset == "stock" and len(ts) == 6 and ts.isdigit():
-        if ts.startswith("8"):
-            market = ".BJ"
-        elif ts[0] in {"5", "6", "9"}:
-            market = ".SH"
-        else:
-            market = ".SZ"
-        ts = ts + market
-    return ts.upper()
-
-
 def load_df_from_parquet(ts_code: str) -> pd.DataFrame:
     base_adj = "qfq" if "qfq" in PARQUET_ADJ else ("hfq" if "hfq" in PARQUET_ADJ else "daily")
     try:

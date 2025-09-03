@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import parquet_viewer as pv
+from utils import normalize_ts
 
 # 配置文件路径：放在当前用户目录下
 CONFIG_PATH = Path.home() / ".parquet_viewer_app.json"
@@ -34,19 +35,6 @@ DEFAULT_BASE = os.getenv("PARQUET_BASE", "E:\\stock_data")
 
 
 # -------------------- 小工具 --------------------
-def normalize_ts(ts_input: str, asset: str) -> str:
-    ts = (ts_input or "").strip()
-    if asset == "stock" and len(ts) == 6 and ts.isdigit():
-        if ts.startswith("8"):
-            market = ".BJ"
-        elif ts[0] in {"5", "6", "9"}:
-            market = ".SH"
-        else:
-            market = ".SZ"
-        ts = ts + market
-    return ts.upper()
-
-
 def load_base(default_base: str) -> str:
     """读取上次保存的 base；失败或无配置时返回 default_base。"""
     try:

@@ -41,3 +41,49 @@ def normalize_trade_date(df: pd.DataFrame, col: str = "trade_date") -> pd.DataFr
     df = df.loc[mask].copy()
     df[col] = td.dt.strftime("%Y%m%d")
     return df
+
+# utils.py
+import re
+
+def normalize_ts(ts_input: str, asset: str = "stock") -> str:
+    """
+    统一股票/指数代码为 Tushare 风格：'000001.SZ' / '600000.SH' / '430047.BJ'
+    - 接受输入形式：'000001'、'000001.sz'、'sz000001'、'SH600000'、'600000-SH' 等
+    - stock 资产：六位纯数字会按首位规则补后缀：8→BJ；{5,6,9}→SH；其余→SZ
+    - 其它资产（如 index）默认仅做大小写/分隔符清洗，不强行补后缀
+    """
+    s = (ts_input or "").strip().upper()
+    if not s:
+        return s
+    s = s.replace("_", ".")
+    s = re.sub(r"\s+", "", s)
+
+    # 形如 SH600000 / SZ000001 / BJ430047
+    m = re.match(r"^(SH|SZ|BJ)[\.\-]?(\d{6})$", s)
+    if m:
+        ex, code = m.group(1), m.group(2)
+        return f"{code}.{ex}"
+
+    # 形如 600000SH / 000001.SZ
+    m = re.match(r"^(\d{6})[\.\-]?(SH|SZ|BJ)$", s)
+    if m:
+        code, ex = m.group(1), m.group(2)
+        return f"{code}.{ex}"
+
+    # 已是标准形态
+    if re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", s):
+        return s
+
+    # 六位纯数字：仅在股票资产上补后缀
+    if asset == "stock" and re.fullmatch(r"\d{6}", s):
+        code = s
+        if code.startswith("8"):
+            ex = "BJ"
+        elif code[0] in {"5", "6", "9"}:
+            ex = "SH"
+        else:
+            ex = "SZ"
+        return f"{code}.{ex}"
+
+    # 其它情况：返回清洗后的字符串（保持宽容）
+    return s

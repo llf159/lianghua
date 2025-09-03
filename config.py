@@ -38,7 +38,7 @@ TOKEN = ""  # <-- 必填
 DATA_ROOT = r"E:\stock_data"
 ASSETS = ["stock", "index"]      # 可选: ["stock"], ["index"], ["stock","index"]
 START_DATE = "20220101"
-END_DATE = "20250901"               # 或具体日期 'YYYYMMDD'
+END_DATE = "today"               # 或具体日期 'YYYYMMDD'
 INDEX_WHITELIST = [
     "000001.SH","399001.SZ","399300.SZ","399905.SZ","399006.SZ","000016.SH","000852.SH"
 ]
@@ -50,8 +50,7 @@ PARQUET_ENGINE = "pyarrow"
 LOG_LEVEL = "INFO"
 STOCK_INC_THREADS = 40         # 增量下载线程数
 
-# -------- FAST INIT(按股票多线程全历史回补)开关 --------
-FAST_INIT_MODE = True                     # 首次全历史快速抓取
+# -------- FAST INIT(按股票多线程全历史回补) --------
 FAST_INIT_THREADS = 50                    # 并发线程数
 FAST_INIT_STOCK_DIR = os.path.join(DATA_ROOT, "fast_init_symbol")
 API_ADJ = "qfq"                           # qfq/hfq/raw
@@ -88,7 +87,7 @@ FAILED_RETRY_WAIT = 5             # 下载结束到补抓之间的等待秒(缓�
 # ====== Skip 文件完整性快速检查参数 ======
 CHECK_SKIP_MIN_MAX = True                 # 是否启用跳过前检查
 CHECK_SKIP_READ_COLUMNS = ["trade_date"]  # 读取的列，尽量最少减少 IO
-CHECK_SKIP_ALLOW_LAG_DAYS = 1           # 允许已有文件的最大日期距离 end_date 的“滞后”天数 (0=必须等于 end_date)
+CHECK_SKIP_ALLOW_LAG_DAYS = 0             # 允许已有文件的最大日期距离 end_date 的“滞后”天数 (0=必须等于 end_date)
 SKIP_CHECK_START_ENABLED = False          # 是否启用开始日期检查(如果不需要可以关闭，减少接口调用)
 # ==========================================
 
@@ -117,31 +116,24 @@ INC_RECALC_WORKERS = 32                  # None=自动(≈2×CPU)，也可设定
 # ===================== Scoring 系统 =====================
 # 参考日：'today' 或 'YYYYMMDD'
 SC_REF_DATE = "today"
-
 # 打分窗口（日线）、初选窗口（多用于周/月线）
 SC_LOOKBACK_D = 60
 SC_PRESCREEN_LOOKBACK_D = 180
-
 # 基础分与下限
 SC_BASE_SCORE = 50
 SC_MIN_SCORE = 0
-
 # 结果数量、Tie-break（并列打破）：使用 KDJ 的 J 值（越小越靠前）
 SC_TOP_K = 100
 SC_TIE_BREAK = "kdj_j_asc"
-
 # 并行与读取优化
 SC_MAX_WORKERS = None          # None 表示 CPU-1
 SC_READ_TAIL_DAYS = None       # 若不为 None，则强制只读最近 N 天数据
-
 # 输出目录与缓存目录
 SC_OUTPUT_DIR = os.path.join(BASE_DIR, "output", "score")
 SC_CACHE_DIR  = os.path.join(BASE_DIR, "cache", "scorelists")
-
 # —— 名单开关（可选写入）——
 SC_WRITE_WHITELIST = True   # 写白名单 cache/…/whitelist.csv
 SC_WRITE_BLACKLIST = True   # 写黑名单 cache/…/blacklist.csv
-
 # —— 特别关注榜（周期上榜次数统计）——
 SC_ATTENTION_ENABLE    = True          # run_for_date 完成后自动生成关注榜
 SC_ATTENTION_SOURCE    = "top"         # 统计来源：'top' | 'white' | 'black'
@@ -149,6 +141,14 @@ SC_ATTENTION_WINDOW_D  = 20            # 统计窗口：最近 N 个“交易日
 SC_ATTENTION_MIN_HITS  = 2             # 至少上榜次数
 SC_ATTENTION_TOP_K     = 200           # 输出前多少名
 SC_ATTENTION_BACKFILL_ENABLE = True    # 是否需要滚动补算
+# ====== Scoring：指数对比（Benchmark） ======
+SC_BENCH_CODES   = ["399300.SZ", "399001.SZ"]      # 基准指数清单；可多只，比如 ["000001.SH","399300.SZ"]
+SC_BENCH_WINDOW  = 20                 # 特征滚动窗口（天）
+SC_BENCH_FILL    = "ffill"            # 基准对齐方式：'ffill' 前向填充 或 'drop' 只保留共同交易日
+SC_BENCH_FEATURES = ["rs","exret","beta","corr"]  # 输出哪些特征：相对强弱/超额/β/相关
+
+# —— 打分范围：all / white / black / attention 或 直接给一个 ts_code 列表
+SC_UNIVERSE = "all"
 
 # ========== 规则样例（你可随意增删改；支持 TDX 表达式 + scope/clauses） ==========
 SC_RULES = [

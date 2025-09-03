@@ -18,12 +18,15 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 import glob
+import functools
 
 import pandas as pd
 import numpy as np
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
+import logging
+from logging.handlers import TimedRotatingFileHandler
 
 from config import (
     PARQUET_BASE, PARQUET_ADJ, PARQUET_USE_INDICATORS,
@@ -35,13 +38,13 @@ from config import (
     SC_ATTENTION_ENABLE, SC_ATTENTION_SOURCE,
     SC_ATTENTION_WINDOW_D, SC_ATTENTION_MIN_HITS, SC_ATTENTION_TOP_K,
     SC_ATTENTION_BACKFILL_ENABLE,
+    SC_BENCH_CODES, SC_BENCH_WINDOW, SC_BENCH_FILL, SC_BENCH_FEATURES,
+    SC_UNIVERSE, 
 )
 from parquet_viewer import asset_root, list_trade_dates, read_range
 from tdx_compat import evaluate_bool
 from indicators import kdj  # 用于兜底计算 J（若数据不含 j 列）
-import logging
-from logging.handlers import TimedRotatingFileHandler
-
+from utils import normalize_ts
 
 # ------------------------- 日志初始化 -------------------------
 def _init_logger():
@@ -75,11 +78,14 @@ def _single_root_dir() -> str:
     name = f"single_{PARQUET_ADJ}" + ("_indicators" if PARQUET_USE_INDICATORS else "")
     return os.path.join(PARQUET_BASE, "stock", "single", name)
 
+
 def _has_single_dir() -> bool:
     return os.path.isdir(_single_root_dir())
 
+
 def _today_str():
     return dt.datetime.now().strftime("%Y%m%d")
+
 
 def _pick_ref_date() -> str:
     """
@@ -129,6 +135,7 @@ def _pick_ref_date() -> str:
         LOGGER.info(f"[参考日] 使用今日分区 {ref}。")
     return ref
 
+
 def _list_codes_for_day(day: str) -> List[str]:
     """
     返回需要评分的股票列表。
@@ -152,6 +159,7 @@ def _list_codes_for_day(day: str) -> List[str]:
             if name.endswith(".parquet"):
                 codes.append(os.path.splitext(name)[0])
         return sorted(codes)
+
 
 def _compute_read_start(ref_date: str) -> str:
     """
@@ -180,6 +188,58 @@ def _compute_read_start(ref_date: str) -> str:
     start_dt = dt.datetime.strptime(ref_date, "%Y%m%d") - dt.timedelta(days=days)
     return start_dt.strftime("%Y%m%d")
 
+
+def _last_true_lag(s_bool: pd.Series) -> int | None:
+    """返回窗口内最后一次 True 距离末根的 lag（0=当日；None=从未为真）"""
+    s = s_bool.dropna().astype(bool)
+    if s.empty or not s.any():
+        return None
+    last_idx = np.where(s.values)[0][-1]
+    return len(s) - 1 - int(last_idx)
+
+
+def _recent_points(dfD: pd.DataFrame, rule: dict, ref_date: str) -> tuple[float, int|None, str|None]:
+    """
+    计算 RECENT 规则的加分：
+    - rule['dist_points'] 支持两种写法：
+      1) 列表形式：[[min,max,points], ...]
+      2) 字典列表：[{min:0,max:0,points:3}, ...]
+    返回 (加分, lag, 错误或None)
+    """
+    tf = str(rule.get("timeframe", "D")).upper()
+    window = int(rule.get("window", SC_LOOKBACK_D))
+    when = (rule.get("when") or "").strip()
+    if not when:
+        return 0.0, None, "空 when 表达式"
+
+    dfTF = dfD if tf == "D" else _resample(dfD, tf)
+    win_df = _window_slice(dfTF, ref_date, window)
+    if win_df.empty:
+        return 0.0, None, None
+
+    s_bool = evaluate_bool(when, win_df).astype(bool)
+    lag = _last_true_lag(s_bool)
+    if lag is None:
+        return 0.0, None, None
+
+    bins = rule.get("dist_points") or rule.get("distance_points") or []
+    # 允许两种写法混用
+    def _pick_pts(lag_: int) -> float | None:
+        for b in bins:
+            if isinstance(b, dict):
+                lo = int(b.get("min", b.get("lag", 0)))
+                hi = int(b.get("max", b.get("lag", lo)))
+                pts = float(b.get("points", 0))
+            else:
+                lo, hi, pts = int(b[0]), int(b[1]), float(b[2])
+            if lo <= lag_ <= hi:
+                return pts
+        return None
+
+    pts = _pick_pts(lag)
+    return (float(pts) if pts is not None else 0.0), lag, None
+
+
 def _select_columns_for_rules() -> List[str]:
     """
     尽量按需裁列，减少 IO。
@@ -191,7 +251,7 @@ def _select_columns_for_rules() -> List[str]:
         for name in pattern.findall(script):
             name_low = name.lower()
             # tdx 映射里常见的：C O H L V AMOUNT J VR ...
-            if name_low in {"j","vr","bbi","z_slope"}:
+            if name_low in {"j","vr","bbi","z_score"}:
                 need.add(name_low)
     for rr in (SC_RULES or []):
         if "clauses" in rr:
@@ -211,6 +271,93 @@ def _select_columns_for_rules() -> List[str]:
                 scan(rr["when"])
     return sorted(need)
 
+
+def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: list[dict]):
+    try:
+        base = os.path.join(SC_OUTPUT_DIR, "details")
+        os.makedirs(base, exist_ok=True)
+        out_path = os.path.join(base, f"{ts_code}_{ref_date}.json")
+        payload = {
+            "ts_code": ts_code,
+            "ref_date": ref_date,
+            "summary": summary,      # {"score": float, "tiebreak": float|None, "highlights": [...], "drawbacks":[...]}
+            "rules": per_rules       # 每条规则的细粒度命中情况（见下）
+        }
+        with open(out_path, "w", encoding="utf-8-sig") as f:
+            import json
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        LOGGER.debug("[detail] %s -> %s", ts_code, out_path)
+    except Exception as e:
+        LOGGER.warning("[detail] 写明细失败 %s: %s", ts_code, e)
+
+
+def _build_per_rule_detail(df: pd.DataFrame, ref_date: str) -> list[dict]:
+    rows = []
+    for rule in (SC_RULES or []):
+        name = str(rule.get("name", "<unnamed>"))
+        scope = str(rule.get("scope", "ANY")).upper().strip()
+        pts   = float(rule.get("points", 0))
+        tf    = str(rule.get("timeframe", "D")).upper()
+        win   = int(rule.get("window", SC_LOOKBACK_D))
+        expl  = rule.get("explain")
+        when  = None
+        ok = False
+        cnt = None
+        add = 0.0
+        err = None
+        period = None
+        try:
+            try:
+                period = _period_for_clause(df, rule, ref_date)
+            except Exception:
+                period = ref_date
+            if scope in {"EACH", "PERBAR", "EACH_TRUE"}:
+                cnt, err = _count_hits_perbar(df, rule, ref_date)
+                ok = bool(cnt and cnt > 0 and err is None)
+                add = float(pts * int(cnt or 0))
+                if "clauses" in rule and rule["clauses"]:
+                    for c in rule["clauses"]:
+                        if c.get("when"):
+                            when = c["when"]; break
+                else:
+                    when = rule.get("when")
+            # else:
+            #     ok_eval, err_eval = _eval_rule(df, rule, ref_date)
+            #     ok  = bool(ok_eval and not err_eval)
+            #     err = err_eval
+            #     add = (pts if ok else 0.0)
+            #     when = rule.get("when")
+            else:
+                # === RECENT / DIST / NEAR: 按最近一次命中距今天数计分 ===
+                if scope in {"RECENT", "DIST", "NEAR"}:
+                    add, lag, err = _recent_points(df, rule, ref_date)
+                    ok  = bool(add != 0 and not err)
+                    when = rule.get("when")
+                    rows.append({
+                        "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
+                        "when": when, "points": pts, "ok": ok, "cnt": None,
+                        "add": add, "lag": (None if lag is None else int(lag)),
+                        "explain": expl, "error": err
+                    })
+                    continue
+                # === 其余仍走原来的布尔命中路径 ===
+                ok_eval, err_eval = _eval_rule(df, rule, ref_date)
+                ok  = bool(ok_eval and not err_eval)
+                err = err_eval
+                add = (pts if ok else 0.0)
+                when = rule.get("when")
+
+        except Exception as e2:
+            err = f"eval-exception: {e2}"
+
+        rows.append({
+            "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
+            "when": when, "points": pts, "ok": ok, "cnt": (None if cnt is None else int(cnt)),
+            "add": add, "explain": expl, "error": err
+        })
+    return rows
+
+
 def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     if "trade_date" in df.columns:
         idx = pd.to_datetime(df["trade_date"].astype(str))
@@ -218,6 +365,7 @@ def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
             df = df.copy()
             df.index = idx
     return df
+
 
 def _resample(dfD: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
@@ -243,29 +391,107 @@ def _resample(dfD: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     out["trade_date"] = out.index.strftime("%Y%m%d")
     return out
 
+
+def _apply_universe_filter(codes: list[str], ref: str, uni: str | list[str] | None) -> tuple[list[str], str]:
+    """
+    根据 universe 过滤 codes。
+    返回：(过滤后的codes, 来源标签)
+    """
+    uni = uni or "all"
+    key = str(uni).lower()
+
+    if isinstance(uni, (list, set, tuple)):
+        sel = set(str(x) for x in uni)
+        return [c for c in codes if c in sel], "custom"
+
+    if key == "all":
+        return codes, "all"
+
+    if key.startswith("white"):
+        sel = set(_read_cache_list_codes(ref, "whitelist"))
+        return [c for c in codes if c in sel], "whitelist"
+
+    if key.startswith("black"):
+        sel = set(_read_cache_list_codes(ref, "blacklist"))
+        return [c for c in codes if c in sel], "blacklist"
+
+    if key.startswith("att"):  # attention
+        sel = set(_load_attention_codes(ref))
+        return [c for c in codes if c in sel], "attention"
+
+    # 未识别则不动
+    return codes, "all"
+
+
 def _window_slice(dfTF: pd.DataFrame, ref_date: str, window: int) -> pd.DataFrame:
     dfTF = _ensure_datetime_index(dfTF)
     mask = dfTF.index <= dt.datetime.strptime(ref_date, "%Y%m%d")
     return dfTF.loc[mask].tail(int(window))
 
+
+def _load_attention_codes(_ref: str) -> list[str]:
+    """
+    从 SC_OUTPUT_DIR/attention/ 下选择“end<=_ref”的最新一份：
+      attention_{source}_{start}_{end}.csv
+    source 优先用 SC_ATTENTION_SOURCE（如 'top'|'white'|'black'）
+    返回 ts_code 列表；异常返回 []。会打 DEBUG 日志说明匹配的文件。
+    """
+    try:
+        src = str(SC_ATTENTION_SOURCE or "top").lower()
+        attn_dir = os.path.join(SC_OUTPUT_DIR, "attention")
+        if not os.path.isdir(attn_dir):
+            return []
+        # 只匹配当前 source
+        files = sorted(glob.glob(os.path.join(attn_dir, f"attention_{src}_*.csv")))
+        if not files:
+            return []
+        # 选择 end<=_ref 的最新一期；否则退化为按文件名排序的最后一份
+        import re as _re
+        cand = []
+        for f in files:
+            name = os.path.basename(f)
+            m = _re.match(rf"attention_{src}_(\d{{8}})_(\d{{8}})\.csv$", name)
+            if m:
+                start, end = m.group(1), m.group(2)
+                if end <= _ref:
+                    cand.append((end, f))
+        pick = (sorted(cand)[-1][1] if cand else files[-1])
+        df = pd.read_csv(pick, dtype=str)
+        codes = df["ts_code"].astype(str).tolist() if "ts_code" in df.columns else []
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("[screen][范围] attention 源=%s 参考日=%s 匹配文件=%s 命中=%d",
+                         src, _ref, os.path.basename(pick), len(codes))
+        return codes
+    except Exception as e:
+        LOGGER.debug("[screen][范围] 加载特别关注清单失败：%s", e)
+        return []
+
+
 def _scope_hit(s_bool: pd.Series, scope: str) -> bool:
     """
-    scope: LAST | ANY | ALL | COUNT>=k | CONSEC>=m
+    支持的 scope：
+      - 基本：LAST | ANY | ALL | COUNT>=k | CONSEC>=m
+      - 扩展：ANY_n | ALL_n   （n 为正整数；表示“在外层 window 内存在一个长度为 n 的连续子集”）
+          ANY_n：该子集中 “when” 至少 1 天为 True
+          ALL_n：该子集中 “when” 每天都为 True  （等价于“存在长度 n 的连续 True”）
     """
     s = s_bool.dropna().astype(bool)
     if s.empty:
         return False
     ss = scope.upper().strip()
+
     if ss == "LAST":
         return bool(s.iloc[-1])
     if ss == "ANY":
         return bool(s.any())
     if ss == "ALL":
         return bool(s.all())
+
     m1 = re.match(r"COUNT>?\s*=\s*(\d+)", ss)
     if m1:
         k = int(m1.group(1))
         return int(s.sum()) >= k
+
     m2 = re.match(r"CONSEC>?\s*=\s*(\d+)", ss)
     if m2:
         m = int(m2.group(1))
@@ -279,8 +505,33 @@ def _scope_hit(s_bool: pd.Series, scope: str) -> bool:
             else:
                 cur = 0
         return best >= m
+
+    # ---- 新增：ANY_n / ALL_n ----
+    m3 = re.match(r"ANY[_\-]?(\d+)$", ss)
+    if m3:
+        n = int(m3.group(1))
+        if len(s) < n:
+            return False
+        roll = s.rolling(n, min_periods=n).sum()
+        hit = bool((roll >= 1).any())
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(f"[SCOPE] ANY_{n}: len={len(s)} max_in_subwin={int(roll.max())} -> {hit}")
+        return hit
+
+    m4 = re.match(r"ALL[_\-]?(\d+)$", ss)
+    if m4:
+        n = int(m4.group(1))
+        if len(s) < n:
+            return False
+        roll = s.rolling(n, min_periods=n).sum()
+        hit = bool((roll == n).any())
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(f"[SCOPE] ALL_{n}: len={len(s)} max_in_subwin={int(roll.max())} -> {hit}")
+        return hit
+
     # 默认当作 ANY
     return bool(s.any())
+
 
 def _eval_clause(dfD: pd.DataFrame, clause: dict, ref_date: str) -> Tuple[bool, Optional[str]]:
     """
@@ -302,6 +553,7 @@ def _eval_clause(dfD: pd.DataFrame, clause: dict, ref_date: str) -> Tuple[bool, 
         return hit, None
     except Exception as e:
         return False, f"表达式错误: {e}"
+
 
 def _eval_rule(dfD: pd.DataFrame, rule: dict, ref_date: str) -> Tuple[bool, Optional[str]]:
     """
@@ -327,42 +579,6 @@ def _eval_rule(dfD: pd.DataFrame, rule: dict, ref_date: str) -> Tuple[bool, Opti
             return False, err
         return ok, None
 
-# def _read_stock_df(ts_code: str, start: str, end: str, columns: List[str]) -> pd.DataFrame:
-#     """
-#     读取某只股票在给定区间的日线数据，只选需要的列。
-#     - 若存在 single 目录：直接读取 single/{ts_code}.parquet，并在内存中过滤日期
-#     - 否则回退到 daily 读取（read_range）
-#     """
-#     if _has_single_dir():
-#         f = os.path.join(_single_root_dir(), f"{ts_code}.parquet")
-#         if not os.path.isfile(f):
-#             raise FileNotFoundError(f"single 文件不存在: {f}")
-#         df = pd.read_parquet(f)
-#         # 统一为字符串比较
-#         if "trade_date" in df.columns:
-#             df["trade_date"] = df["trade_date"].astype(str)
-#             mask = (df["trade_date"] >= str(start)) & (df["trade_date"] <= str(end))
-#             df = df.loc[mask].copy()
-#         # 按需裁列（仅保留存在的列）
-#         if columns:
-#             keep = [c for c in columns if c in df.columns]
-#             if keep:
-#                 df = df[keep + [c for c in df.columns if c not in keep and c in ("trade_date",)]]
-#     else:
-#         df = read_range(PARQUET_BASE, "stock", PARQUET_ADJ, ts_code, start, end, columns=columns)
-    
-#     if "trade_date" in df.columns:
-#         df["trade_date"] = df["trade_date"].astype(str)
-    
-#     # 兜底 J：若缺 j 列，而 tie-break 需要
-#     if ("j" not in df.columns) and (SC_TIE_BREAK or "").lower() in {"kdj_j_asc", "kdj_j_desc"}:
-#         try:
-#             j = kdj(df)
-#             df = df.copy()
-#             df["j"] = j
-#         except Exception as e:
-#             LOGGER.warning(f"[{ts_code}] 计算 KDJ J 失败：{e}")
-#     return df
 
 def _read_stock_df(ts_code: str, start: str, end: str, columns: List[str]) -> pd.DataFrame:
     """
@@ -399,6 +615,7 @@ def _read_stock_df(ts_code: str, start: str, end: str, columns: List[str]) -> pd
             LOGGER.warning(f"[{ts_code}] 计算 KDJ J 失败：{e}")
     return df
 
+
 def _trade_span(start: Optional[str], end: str) -> List[str]:
     """把自然日区间换成交易日清单（基于现有分区）。"""
     root_daily = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
@@ -410,12 +627,124 @@ def _trade_span(start: Optional[str], end: str) -> List[str]:
     if not start:
         days = days[-int(SC_ATTENTION_WINDOW_D):]
     return days
+
+
+def _sanitize_code(ts_code: str) -> str:
+    """把 '399300.SZ' 变成可用作变量名的 '399300_SZ'。"""
+    import re
+    return re.sub(r'[^A-Za-z0-9_]+', '_', (ts_code or "")).strip('_').upper()
+
+
+@functools.lru_cache(maxsize=8)
+def _load_benchmark_map(start: str, end: str, codes_tuple: tuple[str, ...]) -> dict[str, pd.DataFrame]:
+    """一次加载并缓存基准指数，避免每只股票重复 IO。"""
+    codes = list(codes_tuple or ())
+    bm: dict[str, pd.DataFrame] = {}
+    if not codes:
+        return bm
+    for code in codes:
+        try:
+            df_i = read_range(
+                PARQUET_BASE, "index", "daily",
+                ts_code=code, start=start, end=end,
+                columns=["trade_date","close"], limit=None
+            )
+            if df_i is None or df_i.empty:
+                LOGGER.warning("[bench] 指数空数据: %s (%s~%s)", code, start, end); continue
+            df_i = df_i.copy()
+            df_i["trade_date"] = df_i["trade_date"].astype(str)
+            df_i = df_i.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+            df_i["close"] = pd.to_numeric(df_i["close"], errors="coerce")
+            df_i["ret"]   = df_i["close"].pct_change()
+            bm[code] = df_i
+        except Exception as e:
+            LOGGER.warning("[bench] 读取失败 %s: %s", code, e)
+    LOGGER.debug("[bench] 加载完成 codes=%s 覆盖=%d", codes, len(bm))
+    return bm
+
+
+def _inject_benchmark_features(dfD: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    """
+    把基准指数的特征并进 dfD（按 trade_date 对齐），输出列名示例：
+      - IDX_399300_SZ_CLOSE, RET_399300_SZ
+      - RS_399300_SZ_20, EXRET_399300_SZ, EXRET_SUM_399300_SZ_20
+      - BETA_399300_SZ_20, CORR_399300_SZ_20
+    这些名字都是合法标识符，能直接写到 TDX 规则里。
+    """
+    codes = tuple(SC_BENCH_CODES or [])
+    if not codes:
+        return dfD
+
+    if ("trade_date" not in dfD.columns) or ("close" not in dfD.columns):
+        LOGGER.warning("[bench] df 缺列 trade_date/close，跳过注入"); return dfD
+
+    base = dfD.copy()
+    base["trade_date"] = base["trade_date"].astype(str)
+    c = pd.to_numeric(base["close"], errors="coerce")
+    stock_ret = c.pct_change()
+
+    bm_map = _load_benchmark_map(start, end, codes)
+    if not bm_map:
+        LOGGER.warning("[bench] 无可用基准（可能未下载指数分区），跳过注入"); return base
+
+    W = int(SC_BENCH_WINDOW or 20)
+
+    for code, idx in bm_map.items():
+        tag = _sanitize_code(code)
+        # 左连接对齐（或仅保留共同交易日）
+        merged = base[["trade_date"]].merge(
+            idx[["trade_date","close","ret"]].rename(columns={
+                "close": f"IDX_{tag}_CLOSE", "ret": f"RET_{tag}"
+            }),
+            on="trade_date", how="left"
+        )
+
+        if str(SC_BENCH_FILL).lower() == "ffill":
+            merged[[f"IDX_{tag}_CLOSE", f"RET_{tag}"]] = merged[[f"IDX_{tag}_CLOSE", f"RET_{tag}"]].ffill()
+        else:
+            # 丢弃无共同日的行（对该指数而言）
+            mask = merged[f"IDX_{tag}_CLOSE"].notna()
+            merged = merged.loc[mask].reset_index(drop=True)
+            base  = base.loc[mask].reset_index(drop=True)
+            c = pd.to_numeric(base["close"], errors="coerce")
+            stock_ret = c.pct_change()
+
+        base[f"IDX_{tag}_CLOSE"] = merged[f"IDX_{tag}_CLOSE"]
+        base[f"RET_{tag}"]       = merged[f"RET_{tag}"]
+
+        # === 特征集（可按 config 开关） ===
+        if "exret" in SC_BENCH_FEATURES:
+            base[f"EXRET_{tag}"] = stock_ret - base[f"RET_{tag}"]
+            base[f"EXRET_SUM_{tag}_{W}"] = base[f"EXRET_{tag}"].rolling(W, min_periods=max(5, W//3)).sum()
+
+        if "rs" in SC_BENCH_FEATURES:
+            ratio = c / base[f"IDX_{tag}_CLOSE"]
+            base[f"RS_{tag}_{W}"] = ratio / ratio.rolling(W, min_periods=max(5, W//3)).mean()
+
+        if "beta" in SC_BENCH_FEATURES or "corr" in SC_BENCH_FEATURES:
+            ir = base[f"RET_{tag}"]
+            if "beta" in SC_BENCH_FEATURES:
+                cov = stock_ret.rolling(W).cov(ir)
+                var = ir.rolling(W).var().replace(0, np.nan)
+                base[f"BETA_{tag}_{W}"] = cov / var
+            if "corr" in SC_BENCH_FEATURES:
+                base[f"CORR_{tag}_{W}"] = stock_ret.rolling(W).corr(ir)
+
+        LOGGER.debug(
+            "[bench] 注入 %s: 窗口=%d 列增量=%s",
+            code, W, [col for col in base.columns if col.endswith(tag)]
+        )
+
+    return base
+
+
 # ------------------------- 初选（预筛） -------------------------
 @dataclass
 class PrescreenResult:
     passed: bool
     reason: Optional[str]          # 若淘汰，解释原因
     period: Optional[str]          # 写入缓存的 period（日期或区间）
+
 
 def _period_for_clause(dfD: pd.DataFrame, clause: dict, ref_date: str) -> str:
     tf = clause.get("timeframe", "D").upper()
@@ -427,6 +756,7 @@ def _period_for_clause(dfD: pd.DataFrame, clause: dict, ref_date: str) -> str:
     start = str(win["trade_date"].iloc[0])
     end = str(win["trade_date"].iloc[-1])
     return f"{start}-{end}" if start!=end else end
+
 
 def _prescreen(dfD: pd.DataFrame, ref_date: str) -> PrescreenResult:
     """
@@ -468,6 +798,7 @@ def _prescreen(dfD: pd.DataFrame, ref_date: str) -> PrescreenResult:
                 return PrescreenResult(False, reason, period)
     return PrescreenResult(True, None, None)
 
+
 # ------------------------- 打分主体 -------------------------
 @dataclass
 class ScoreDetail:
@@ -476,6 +807,7 @@ class ScoreDetail:
     highlights: List[str]
     drawbacks: List[str]
     tiebreak: Optional[float]
+
 
 def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str]) -> Optional[Tuple[str, Optional[ScoreDetail], Optional[Tuple[str,str,str]]]]:
     """
@@ -488,6 +820,9 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
         if df is None or df.empty:
             LOGGER.warning(f"[{ts_code}] 数据为空，跳过")
             return (ts_code, None, ("", "", "数据为空"))
+        
+        df = _inject_benchmark_features(df, start_date, ref_date)
+        
         # 初选
         pres = _prescreen(df, ref_date)
         if not pres.passed:
@@ -495,23 +830,6 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
         # 打分
         score = float(SC_BASE_SCORE)
         highlights, drawbacks = [], []
-        # for rule in (SC_RULES or []):
-        #     ok, err = _eval_rule(df, rule, ref_date)
-        #     if err:
-        #         # 异常分支记日志
-        #         LOGGER.warning(f"[{ts_code}] 规则异常：{rule.get('name')} -> {err}")
-        #         continue
-        #     if ok:
-        #         pts = float(rule.get("points", 0))
-        #         score += pts
-        #         # 命中记录要保留（DEBUG）
-        #         expl = rule.get("explain")
-        #         if expl:
-        #             if pts >= 0:
-        #                 highlights.append(str(expl))
-        #             else:
-        #                 drawbacks.append(str(expl))
-        #         LOGGER.debug(f"[HIT][{ts_code}] {rule.get('name','<unnamed>')} +{pts} => {score}")
 
         for rule in (SC_RULES or []):
             scope = str(rule.get("scope", "ANY")).upper().strip()
@@ -543,7 +861,22 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
                     else:
                         LOGGER.debug(f"[MISS][{ts_code}] {rule.get('name','<unnamed>')} EACH 无命中")
                 continue  # EACH 已处理完，下一条
-            # —— 常规路径（保持原逻辑） ——
+            
+            if scope in {"RECENT", "DIST", "NEAR"}:
+                add, lag, err = _recent_points(df, rule, ref_date)
+                if err:
+                    LOGGER.warning(f"[{ts_code}] RECENT 解析异常：{rule.get('name')} -> {err}")
+                if add != 0:
+                    score += add
+                    expl = rule.get("explain")
+                    if expl:
+                        tag = f"{expl}(距今{lag})"
+                        (highlights if add >= 0 else drawbacks).append(tag)
+                    LOGGER.debug(f"[HIT][{ts_code}] {rule.get('name','<unnamed>')} RECENT lag={lag} +{add} => {score}")
+                else:
+                    LOGGER.debug(f"[MISS][{ts_code}] {rule.get('name','<unnamed>')} RECENT 无匹配区间")
+                continue
+            # —— 常规路径 ——
             ok, err = _eval_rule(df, rule, ref_date)
             if err:
                 LOGGER.warning(f"[{ts_code}] 规则异常：{rule.get('name')} -> {err}")
@@ -575,10 +908,38 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
             except Exception as e:
                 LOGGER.warning(f"[{ts_code}] 提取 J 失败：{e}")
                 tb = None
+        try:
+            per_rules = _build_per_rule_detail(df, ref_date)
+            _write_detail_json(
+                ts_code, ref_date,
+                summary={
+                    "score": float(score),
+                    "tiebreak": tb,
+                    "highlights": list(highlights),
+                    "drawbacks": list(drawbacks),
+                },
+                per_rules=per_rules
+            )
+        except Exception as e:
+            LOGGER.warning("[detail] 写单票明细失败 %s: %s", ts_code, e)
         return (ts_code, ScoreDetail(ts_code, score, highlights, drawbacks, tb), None)
+
     except Exception as e:
         LOGGER.error(f"[{ts_code}] 评分失败：{e}")
+        # 若 df 已读到，尽量仍生成一份规则明细，便于排错
+        try:
+            if 'df' in locals() and isinstance(df, pd.DataFrame) and (not df.empty):
+                per_rules = _build_per_rule_detail(df, ref_date)
+                _write_detail_json(
+                    ts_code, ref_date,
+                    summary={"score": float(SC_BASE_SCORE), "tiebreak": None,
+                             "highlights": [], "drawbacks": []},
+                    per_rules=per_rules
+                )
+        except Exception as e2:
+            LOGGER.warning("[detail] 构建/写入失败 %s: %s", ts_code, e2)
         return (ts_code, None, (ts_code, ref_date, f"评分失败:{e}"))
+
 
 def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str) -> Tuple[int, Optional[str]]:
     """
@@ -622,6 +983,7 @@ def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str) -
             return int(s_bool.fillna(False).sum()), None
     except Exception as e:
         return 0, f"表达式错误: {e}"
+
 
 def build_attention_rank(start: Optional[str] = None,
                          end: Optional[str] = None,
@@ -699,6 +1061,7 @@ def build_attention_rank(start: Optional[str] = None,
     else:
         return out_df
 
+
 def backfill_attention_rolling(start: str,
                                end: Optional[str] = None,
                                source: Optional[str] = None,
@@ -720,18 +1083,20 @@ def backfill_attention_rolling(start: str,
     for e in days:
         try:
             build_attention_rank(start=None, end=e, source=source,
-                                 min_hits=min_hits, topN=topN, write=True, encoding="gb18030")
+                                 min_hits=min_hits, topN=topN, write=True)
             ok += 1
         except Exception as ex:
             fail += 1
             LOGGER.warning("[attention/backfill] 生成 %s 失败：%s", e, ex)
     LOGGER.info("[attention/backfill] 完成：成功 %d，失败 %d", ok, fail)
 
+
 # ------------------------- 名单缓存 I/O -------------------------
 def _ensure_dirs(ref_date: str):
     os.makedirs(os.path.join(SC_OUTPUT_DIR, "top"), exist_ok=True)
     os.makedirs(os.path.join(SC_OUTPUT_DIR, "details"), exist_ok=True)
     os.makedirs(os.path.join(SC_CACHE_DIR, ref_date), exist_ok=True)
+
 
 def _write_cache_lists(ref_date: str, whitelist: List[Tuple[str,str,str]], blacklist: List[Tuple[str,str,str]]):
     """
@@ -752,6 +1117,7 @@ def _write_cache_lists(ref_date: str, whitelist: List[Tuple[str,str,str]], black
     else:
         pd.DataFrame(columns=["ts_code","period","reason"]).to_csv(os.path.join(base, "blacklist.csv"), index=False, encoding="utf-8-sig")
 
+
 def _read_cache_list_codes(ref_date: str, list_name: str) -> List[str]:
     f = os.path.join(SC_CACHE_DIR, ref_date, f"{list_name}.csv")
     if not os.path.isfile(f):
@@ -763,6 +1129,7 @@ def _read_cache_list_codes(ref_date: str, list_name: str) -> List[str]:
     except Exception as e:
         LOGGER.warning(f"[名单读取失败] {f}: {e}")
     return []
+
 
 # ------------------------- 对外入口 -------------------------
 def run_for_date(ref_date: Optional[str] = None) -> str:
@@ -786,6 +1153,14 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
 
     # 3) 股票清单（来自分区目录文件名）
     codes = _list_codes_for_day(ref_date)
+    # —— 打分范围先过滤 —— 
+    codes0 = list(codes)
+    codes, src = _apply_universe_filter(codes0, ref_date, SC_UNIVERSE)
+    LOGGER.info("[范围] 评分 universe=%s 源=%s 原=%d -> %d",
+                str(SC_UNIVERSE), src, len(codes0), len(codes))
+    if not codes:
+        raise RuntimeError("评分范围为空：请检查 SC_UNIVERSE 或对应名单是否已生成")
+
     LOGGER.info(f"[UNIVERSE] {ref_date} 共 {len(codes)} 只股票")
 
     # 4/5) 并行处理
@@ -852,9 +1227,166 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
             LOGGER.warning("[attention] 生成特别关注榜失败：%s", e)
 
     if SC_ATTENTION_BACKFILL_ENABLE:
-        backfill_attention_rolling(start="today - 20d", end="today", source="top", min_hits=2, topN=200)
-
+        try:
+           # 取“参考日前 N 个交易日”作为 start（N 默认用 SC_ATTENTION_WINDOW_D）
+            root_daily = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
+            days = list_trade_dates(root_daily) or []
+            if ref_date in days:
+                i = days.index(ref_date)
+                n = int(SC_ATTENTION_WINDOW_D or 20)
+                start = days[max(0, i - n)]
+            else:
+                start = days[-int(SC_ATTENTION_WINDOW_D or 20)] if days else ref_date
+            backfill_attention_rolling(
+                start=start, end=ref_date, source=SC_ATTENTION_SOURCE,
+                min_hits=SC_ATTENTION_MIN_HITS, topN=SC_ATTENTION_TOP_K
+           )
+        except Exception as e:
+            LOGGER.warning("[attention] 回补生成失败：%s", e)
     return out_path
+
+
+# ======== 简易 TDX 风格选股 ========
+def _expr_mentions(expr: str, name: str) -> bool:
+    try:
+        pat = re.compile(rf"\b{name}\b", flags=re.IGNORECASE)
+        return bool(pat.search(expr or ""))
+    except Exception:
+        return False
+
+
+def _scan_cols_from_expr(expr: str) -> list[str]:
+    """
+    从通达信表达式里扫出可能需要的扩展列（如 j/vr），用于尽量按需裁列、并在缺失时兜底计算。
+    """
+    need = {"trade_date", "open", "high", "low", "close", "vol", "amount"}
+    if _expr_mentions(expr, "J"):
+        need.add("j")
+    if _expr_mentions(expr, "VR"):
+        need.add("vr")
+    return sorted(need)
+
+
+def _start_for_tf_window(ref_date: str, timeframe: str, window: int) -> str:
+    """
+    根据 timeframe + window 估算需要读取的日线尾部长度（加入缓冲），避免全量读。
+    D: window + 120；W: window*6 + 180；M: window*22 + 260
+    """
+    tf = (timeframe or "D").upper()
+    if tf == "D":
+        days = int(window) + 120
+    elif tf == "W":
+        days = int(window) * 6 + 180
+    else:  # "M"
+        days = int(window) * 22 + 260
+    start_dt = dt.datetime.strptime(ref_date, "%Y%m%d") - dt.timedelta(days=days)
+    return start_dt.strftime("%Y%m%d")
+
+
+def tdx_screen(
+    when: str,
+    *,
+    ref_date: str | None = None,
+    timeframe: str = "D",
+    window: int = 60,
+    scope: str = "ANY",          # 可用：LAST/ANY/ALL/COUNT>=k/CONSEC>=m
+    write_white: bool = True,    # 把命中写入白名单
+    write_black_rest: bool = False,  # 把未命中写入黑名单（谨慎）
+    universe: str | list[str] | None = "all",  # all/white/black/attention 或 代码清单
+    use_prescreen_first: bool = True,
+    return_df: bool = True
+):
+    """
+    类通达信“普通选股”：在给定 timeframe/window/scope 下，用 when 表达式筛股票。
+    - 自动列出参考日 universe（single 布局：按文件名；daily 布局：按 ref_date 分区）:contentReference[oaicite:1]{index=1}
+    - 读取最小必要列（若表达式包含 J/VR，会尝试兜底计算 KDJ J/成交量比 VR）
+    - 可选把命中写白名单、未命中写黑名单（写入 SC_CACHE_DIR/<ref_date>/ 下）:contentReference[oaicite:2]{index=2}
+    - 保持完整日志（score.log）
+    """
+    when = (when or "").strip()
+    if not when:
+        raise ValueError("when 不能为空")
+
+    ref = ref_date or _pick_ref_date()
+    tf = (timeframe or "D").upper()
+    win = int(window)
+    st = _start_for_tf_window(ref, tf, win)
+
+    codes0 = _list_codes_for_day(ref)
+    codes, src = _apply_universe_filter(list(codes0), ref, universe)
+    LOGGER.info("[screen][范围] universe=%s 源=%s 原=%d -> %d",
+                str(universe), src, len(codes0), len(codes))
+    if not codes:
+        LOGGER.warning("[screen] %s 无可用标的。", ref)
+        return pd.DataFrame() if return_df else None
+
+    cols = _scan_cols_from_expr(when)
+    LOGGER.info("[screen] 参考日=%s tf=%s window=%d scope=%s 宇宙=%d", ref, tf, win, scope, len(codes))
+    LOGGER.debug("[screen] 读取列=%s 起始=%s", cols, st)
+
+    hits: list[str] = []
+    whitelist_items: list[tuple[str, str, str]] = []
+    blacklist_items: list[tuple[str, str, str]] = []
+
+    for ts_code in codes:
+        try:
+            dfD = _read_stock_df(ts_code, st, ref, columns=cols)
+            if dfD.empty:
+                continue
+            # —— 先过一遍初选（硬惩罚规则），默认开启 —— 
+            pres = PrescreenResult(True, None, None)
+            if use_prescreen_first:
+                pres = _prescreen(dfD, ref)
+            if not pres.passed:
+                if write_black_rest:
+                    blacklist_items.append((ts_code, pres.period or ref, pres.reason or "prescreen"))
+                continue
+            # 若表达式涉及 J/VR，但数据中缺列，尝试兜底
+            need_j = _expr_mentions(when, "J") and ("j" not in dfD.columns)
+            need_vr = _expr_mentions(when, "VR") and ("vr" not in dfD.columns)
+            if need_j:
+                try:
+                    dfD = dfD.copy()
+                    dfD["j"] = kdj(dfD)
+                except Exception as e:
+                    LOGGER.debug("[screen][%s] 兜底计算J失败: %s", ts_code, e)
+            if need_vr and "vol" in dfD.columns:
+                try:
+                    # VR(26) 的一种常见实现（简化版）：近 N 天 成交量比
+                    n = 26
+                    v = pd.to_numeric(dfD["vol"], errors="coerce")
+                    dfD = dfD.copy()
+                    dfD["vr"] = (v / v.rolling(n).mean()).values
+                except Exception as e:
+                    LOGGER.debug("[screen][%s] 兜底计算VR失败: %s", ts_code, e)
+
+            dfTF = dfD if tf == "D" else _resample(dfD, tf)
+            win_df = _window_slice(dfTF, ref, win)
+            if win_df.empty:
+                continue
+            s_bool = evaluate_bool(when, win_df)
+            ok = _scope_hit(s_bool, scope)
+            if ok:
+                hits.append(ts_code)
+                if write_white:
+                    whitelist_items.append((ts_code, ref, f"screen:{tf}{win}:{scope}::{when}"))
+            else:
+                if write_black_rest:
+                    blacklist_items.append((ts_code, ref, f"screen_fail:{tf}{win}:{scope}::{when}"))
+        except Exception as e:
+            LOGGER.debug("[screen][%s] 忽略异常: %s", ts_code, e)
+            continue
+
+    # 写缓存名单
+    if write_white or write_black_rest:
+        _write_cache_lists(ref, whitelist_items, blacklist_items)
+        LOGGER.info("[screen] 写名单完成：白=%d 黑=%d", len(whitelist_items), len(blacklist_items))
+
+    # 结果 DataFrame（供可视化）
+    if return_df:
+        out = pd.DataFrame({"ts_code": sorted(hits)})
+        out["ref_date"] = ref
+        out["rule"] = f"{tf}{win}:{scope}::{when}"
+        return out
+    return None
 # ==========================================================
-if __name__ == "__main__":
-    run_for_date()

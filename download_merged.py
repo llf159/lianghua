@@ -116,7 +116,7 @@ warnings.filterwarnings(
 from config import *
 from tdx_compat import evaluate as tdx_eval
 import indicators as ind
-from utils import normalize_trade_date
+from utils import normalize_trade_date, normalize_ts
 
 
 # ------------- 基本检查 -------------
@@ -292,10 +292,34 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prew
     
     df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
     df2 = normalize_trade_date(df2)
+
+    need_price = ["pre_close","change","pct_chg"]
+    missing = [c for c in need_price if c not in df2.columns]
+    if missing:
+        logging.debug("[PRODUCT][%s] 缺列补齐: %s", ts_code, ",".join(missing))
+        # 严格逐票序列已排序，因此可用 shift 复原 pre_close
+        if "pre_close" not in df2.columns:
+            try:
+                df2["pre_close"] = df2["close"].shift(1)
+            except Exception:
+                df2["pre_close"] = pd.NA
+        if "change" not in df2.columns:
+            df2["change"] = df2["close"] - df2["pre_close"]
+        if "pct_chg" not in df2.columns:
+            EPS = 1e-12
+            df2["pct_chg"] = (df2["change"] / (df2["pre_close"] + EPS)) * 100.0
+        # 仅用于审计：首尾预览
+        try:
+            logging.debug("[PRODUCT][%s] 回填后检查: head=%s tail=%s",
+                          ts_code,
+                          df2[["trade_date","pre_close","change","pct_chg"]].head(2).to_dict("records"),
+                          df2[["trade_date","pre_close","change","pct_chg"]].tail(2).to_dict("records"))
+        except Exception:
+            pass
+
     price_cols = ["open", "high", "low", "close", "pre_close", "change"]
     # 只保留常用基础行情列（存在即取），作为不带指标的成品
-    base_cols = ["ts_code","trade_date","open","high","low","close","pre_close",
-                 "change","pct_chg","vol","amount"]
+    base_cols = ["ts_code","trade_date","open","high","low","close","pre_close","change","pct_chg","vol","amount"]
     cols = [c for c in base_cols if c in df2.columns]
     df_plain = df2[cols].copy() if cols else df2.copy()
 
@@ -323,70 +347,6 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prew
     if "csv" in SYMBOL_PRODUCT_FORMATS.get("plain", []):
         logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "csv" in SYMBOL_PRODUCT_FORMATS.get("plain", []) -> taken')
         merged_plain.to_csv(plain_csv, index=False, encoding="utf-8-sig")
-
-    # ---------- ind：带指标 ----------
-    # if WRITE_SYMBOL_INDICATORS:
-    #     # warm-up 增量（沿用原逻辑）
-    #     logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF WRITE_SYMBOL_INDICATORS -> taken')
-    #     ind_out_path_parquet = os.path.join(single_ind_dir, f"{ts_code}.parquet")
-    #     ind_out_path_csv     = os.path.join(single_ind_dir_csv, f"{ts_code}.csv")
-
-    #     warm_df = df2.copy()
-    #     warmup_start = None
-    #     if (os.path.exists(ind_out_path_parquet) or os.path.exists(ind_out_path_csv)):
-    #         logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF os.path.exists(ind_out_path_parquet) or os.path.exists(ind_out_path_csv) -> taken')
-    #         try:
-    #             # 优先读 parquet；若不存在再读 csv
-    #             if os.path.exists(ind_out_path_parquet):
-    #                 logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF os.path.exists(ind_out_path_parquet) -> taken')
-    #                 old = pd.read_parquet(ind_out_path_parquet)
-    #             else:
-    #                 logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | ELSE of IF os.path.exists(ind_out_path_parquet) -> taken')
-    #                 old = pd.read_csv(ind_out_path_csv, dtype=str)
-    #             if not old.empty:
-    #                 logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF not old.empty -> taken')
-    #                 old_td = pd.to_datetime(old["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
-    #                 last = old_td.max()
-    #                 warmup_start = (last - pd.Timedelta(days=SYMBOL_PRODUCT_WARMUP_DAYS))
-
-    #                 keep_old = old.loc[old_td < warmup_start].copy()
-    #                 keep_old = normalize_trade_date(keep_old)
-
-    #                 new_part = df2.loc[pd.to_datetime(df2["trade_date"].astype(str), format="%Y%m%d", errors="coerce") >= warmup_start].copy()
-    #                 new_part = normalize_trade_date(new_part)
-    #                 warm_df = pd.concat([keep_old, new_part], ignore_index=True)
-    #         except Exception as e:
-    #             logging.warning("[PRODUCT][%s] 读取旧(带指标)失败，按全量重算：%s", ts_code, e)
-
-    #     # 统一指标引擎计算 + 四舍五入
-    #     try:
-    #         names = (SYMBOL_PRODUCT_INDICATORS or "all")
-    #         names = list(ind.REGISTRY.keys()) if str(names).lower() == "all" else [x.strip() for x in str(names).split(",") if x.strip()]
-    #         warm_df = ind.compute(warm_df, names)
-    #     except Exception as e:
-    #         logging.exception("[PRODUCT][%s] 指标计算失败：%s", ts_code, e)
-    #         raise
-
-    #     decimals = ind.outputs_for(names)
-    #     for col, n in decimals.items():
-    #         if col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]):
-    #             logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]) -> taken')
-    #             warm_df[col] = warm_df[col].round(n)
-    #     for col in price_cols:
-    #         if col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]):
-    #             logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]) -> taken')
-    #             warm_df[col] = warm_df[col].round(2)
-
-    #     warm_df = normalize_trade_date(warm_df)
-    #     warm_df = warm_df.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-
-    #     if "parquet" in SYMBOL_PRODUCT_FORMATS.get("ind", []):
-    #         logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "parquet" in SYMBOL_PRODUCT_FORMATS.get("ind", []) -> taken')
-    #         warm_df.to_parquet(ind_out_path_parquet, index=False, engine=PARQUET_ENGINE)
-    #     if "csv" in SYMBOL_PRODUCT_FORMATS.get("ind", []):
-    #         logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "csv" in SYMBOL_PRODUCT_FORMATS.get("ind", []) -> taken')
-    #         warm_df.to_csv(ind_out_path_csv, index=False, encoding="utf-8-sig")
-    #     logging.debug("[PRODUCT][%s] 成品已写出 plain_dir=%s ind_dir=%s", ts_code, single_plain_dir, single_ind_dir)
 
     if WRITE_SYMBOL_INDICATORS:
         logging.debug("[PRODUCT][%s] 写带指标成品… prewarmed=%s", ts_code, prewarmed)
@@ -817,15 +777,15 @@ class BatchIncCache:
             loc.register("cutoff_df", have_base)
 
             # 只取指标需要的基础列（按需增删）
-            base_cols = ["ts_code","trade_date","open","high","low","close","vol","amount"]
+            base_cols = ["ts_code","trade_date","open","high","low","close","pre_close","change","pct_chg","vol","amount"]
             cols_sql = ", ".join(f"p.{c}" for c in base_cols)
 
             inc_all = loc.sql(f"""
                 SELECT {cols_sql}
                 FROM parquet_scan('{glob_src}', hive_partitioning=1) AS p
                 JOIN cutoff_df AS c ON p.ts_code = c.ts_code
-                WHERE p.trade_date >= '{start_inc}'  -- 全局下界，强力裁剪扫描的日分区
-                  AND p.trade_date > c.last_date     -- 逐股精确过滤
+                WHERE CAST(p.trade_date AS BIGINT) >= CAST('{start_inc}' AS BIGINT)  -- 强制同型比较
+                  AND CAST(p.trade_date AS BIGINT) >  CAST(c.last_date AS BIGINT)    -- 逐股精确过滤
             """).df()
 
             if inc_all is None or inc_all.empty:
@@ -1883,15 +1843,15 @@ def main():
     global end_date
     end_date = dt.date.today().strftime("%Y%m%d") if END_DATE.lower() == "today" else END_DATE
     assets = {a.lower() for a in ASSETS}
-
+    is_first_download = input("是否是第一次下载？(y/n)") == "y"
     logging.info(
         "=== 启动 mode=%s assets=%s 区间=%s-%s 原始数据复权=%s ===",
-        "FAST_INIT" if FAST_INIT_MODE else "NORMAL",
+        "FAST_INIT" if is_first_download else "NORMAL",
         sorted(assets), START_DATE, end_date, API_ADJ
     )
 
-    if FAST_INIT_MODE:
-        logging.debug('[BRANCH] def main | IF FAST_INIT_MODE -> taken')
+    if is_first_download:
+        logging.debug('[BRANCH] def main | IF is_first_download -> taken')
         fast_init_download(end_date)   # 这里 end_date 已经算好
         if DUCK_MERGE_DAY_LAG >= 0:  # 简单开关，可设 -1 跳过
             logging.debug('[BRANCH] def main | IF DUCK_MERGE_DAY_LAG >= 0 -> taken')
@@ -1899,10 +1859,12 @@ def main():
         if WRITE_SYMBOL_INDICATORS:
             logging.debug('[BRANCH] def main | IF WRITE_SYMBOL_INDICATORS -> taken')
             duckdb_merge_symbol_products_to_daily()
+        if "index" in assets:
+            sync_index_daily_fast(START_DATE, end_date, INDEX_WHITELIST)
     else:
         # ======= 日常增量模式 =======
         # 优先把 fastinit 缓存合并进 daily，避免全历史重拉
-        logging.debug('[BRANCH] def main | ELSE of IF FAST_INIT_MODE -> taken')
+        logging.debug('[BRANCH] def main | ELSE of IF is_first_download -> taken')
         if any(
             os.path.isdir(os.path.join(FAST_INIT_STOCK_DIR, d))
             and len(glob.glob(os.path.join(FAST_INIT_STOCK_DIR, d, "*.parquet"))) > 0

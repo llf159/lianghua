@@ -113,10 +113,26 @@ def _ensure_series(x):
         return x
     return pd.Series(x)
 
+# def CROSS(a, b):
+#     a = _ensure_series(a)
+#     b = _ensure_series(b)
+#     return (a > b) & (a.shift(1) <= b.shift(1))
+
+def _ensure_series(x):
+    if isinstance(x, pd.Series):
+        return x
+    return pd.Series(x)
+
 def CROSS(a, b):
     a = _ensure_series(a)
-    b = _ensure_series(b)
-    return (a > b) & (a.shift(1) <= b.shift(1))
+    if isinstance(b, pd.Series):
+        b = b.reindex_like(a)         # 对齐索引
+        b_prev = b.shift(1)
+    else:
+        # 标量/常数：让 pandas 做广播
+        b_prev = b
+    return (a > b) & (a.shift(1) <= b_prev)
+
 
 def SAFE_DIV(a, b):
     # 安全除法：b≈0 时避免 NaN/Inf
