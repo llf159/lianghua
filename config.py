@@ -114,6 +114,8 @@ INC_SKIP_OLD_READ = True                 # _WRITE_SYMBOL_INDICATORS 跳过旧文
 INC_RECALC_WORKERS = 32                  # None=自动(≈2×CPU)，也可设定具体整数
 
 # ===================== Scoring 系统 =====================
+SC_DO_TRACKING = False
+SC_DO_SURGE = False
 # 参考日：'today' 或 'YYYYMMDD'
 SC_REF_DATE = "today"
 # 打分窗口（日线）、初选窗口（多用于周/月线）
@@ -149,6 +151,24 @@ SC_BENCH_FEATURES = ["rs","exret","beta","corr"]  # 输出哪些特征：相对�
 
 # —— 打分范围：all / white / black / attention 或 直接给一个 ts_code 列表
 SC_UNIVERSE = "all"
+
+SC_HIDE_FORMULA = True   # details JSON 不写 when；UI 可选择显示（从 config 读取）
+
+# —— UI：Top-K 显示行数（仅用于前端展示，不影响计算）——
+SC_TOPK_ROWS = 30
+
+# ===================== Portfolio 模拟持仓（全局配置） =====================
+# 账本（可按需扩展）
+PF_LEDGER_NAME = "default"
+# 费率：以 BP 为单位（1bp = 0.01%）
+PF_FEE_BPS_BUY  = 15     # 买入费率
+PF_FEE_BPS_SELL = 15     # 卖出费率
+PF_MIN_FEE      = 0.0    # 最低费用（元）
+# 资金（初始总额与可用）
+PF_INIT_CASH    = 1_000_000.0
+PF_INIT_AVAILABLE = PF_INIT_CASH
+# 成交价模式：'next_open' 或 'close'
+PF_TRADE_PRICE_MODE = "next_open"
 
 # ========== 规则样例（你可随意增删改；支持 TDX 表达式 + scope/clauses） ==========
 SC_RULES = [

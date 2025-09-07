@@ -42,7 +42,6 @@ def normalize_trade_date(df: pd.DataFrame, col: str = "trade_date") -> pd.DataFr
     df[col] = td.dt.strftime("%Y%m%d")
     return df
 
-# utils.py
 import re
 
 def normalize_ts(ts_input: str, asset: str = "stock") -> str:
@@ -58,14 +57,14 @@ def normalize_ts(ts_input: str, asset: str = "stock") -> str:
     s = s.replace("_", ".")
     s = re.sub(r"\s+", "", s)
 
-    # 形如 SH600000 / SZ000001 / BJ430047
-    m = re.match(r"^(SH|SZ|BJ)[\.\-]?(\d{6})$", s)
+    # SH600000 / SZ000001 / BJ430047
+    m = re.match(r"^(SH|SZ|BJ)[\.-]?(\d{6})$", s)
     if m:
         ex, code = m.group(1), m.group(2)
         return f"{code}.{ex}"
 
-    # 形如 600000SH / 000001.SZ
-    m = re.match(r"^(\d{6})[\.\-]?(SH|SZ|BJ)$", s)
+    # 600000SH / 000001.SZ
+    m = re.match(r"^(\d{6})[\.-]?(SH|SZ|BJ)$", s)
     if m:
         code, ex = m.group(1), m.group(2)
         return f"{code}.{ex}"
@@ -74,7 +73,7 @@ def normalize_ts(ts_input: str, asset: str = "stock") -> str:
     if re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", s):
         return s
 
-    # 六位纯数字：仅在股票资产上补后缀
+    # 六位纯数字：仅对股票补后缀
     if asset == "stock" and re.fullmatch(r"\d{6}", s):
         code = s
         if code.startswith("8"):
@@ -85,5 +84,23 @@ def normalize_ts(ts_input: str, asset: str = "stock") -> str:
             ex = "SZ"
         return f"{code}.{ex}"
 
-    # 其它情况：返回清洗后的字符串（保持宽容）
     return s
+
+
+def market_label(ts_code: str) -> str:
+    """根据 ts_code 前缀粗分市场板块。"""
+    s = (ts_code or "").split(".")[0]
+    if s.startswith(("600","601","603","605")):
+        return "沪A"
+    if s.startswith(("000","001","002","003")):
+        return "深A"
+    if s.startswith(("300","301","302","303","304","305","306","307","308","309")):
+        return "创业板"
+    if s.startswith(("688","689")):
+        return "科创板"
+    if s.startswith((
+        "430","831","832","833","834","835","836","837","838","839",
+        "80","81","82","83","84","85","86","87","88","89"
+    )):
+        return "北交所"
+    return "其他"

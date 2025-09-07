@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 EPS = 1e-12
+EXTRA_CONTEXT: dict = {}   # 运行时可注入自定义函数/变量，比如 TS/REF_DATE/RANK_*
 
 COMP_RE = re.compile(r'(<=|>=|==|!=|<|>)')
 
@@ -113,16 +114,6 @@ def _ensure_series(x):
         return x
     return pd.Series(x)
 
-# def CROSS(a, b):
-#     a = _ensure_series(a)
-#     b = _ensure_series(b)
-#     return (a > b) & (a.shift(1) <= b.shift(1))
-
-def _ensure_series(x):
-    if isinstance(x, pd.Series):
-        return x
-    return pd.Series(x)
-
 def CROSS(a, b):
     a = _ensure_series(a)
     if isinstance(b, pd.Series):
@@ -132,7 +123,6 @@ def CROSS(a, b):
         # 标量/常数：让 pandas 做广播
         b_prev = b
     return (a > b) & (a.shift(1) <= b_prev)
-
 
 def SAFE_DIV(a, b):
     # 安全除法：b≈0 时避免 NaN/Inf
@@ -144,32 +134,28 @@ def RSV(C, H, L, n=9):
     hhv = HHV(H, n)
     return 100.0 * (C - llv) / (hhv - llv + EPS)
 
-# def MA(x, n):
-#     return x.rolling(int(n)).mean()
+def TS_PCT(x, n):
+    """返回与 x 同索引的序列：每日对应“该日值在最近 n 天窗口内的百分位（0..1）”"""
+    import numpy as np, pandas as pd
+    s = pd.Series(x)
+    def pct(arr):
+        last = arr[-1]
+        return float((arr <= last).sum()) / len(arr)
+    return s.rolling(int(n), min_periods=1).apply(lambda a: pct(a.values), raw=False)
 
-# def SUM(x, n):
-#     return x.rolling(int(n)).sum()
+def TS_RANK(x, n):
+    """返回每日对应“该日值在最近 n 天窗口内的名次（1..n）”"""
+    import numpy as np, pandas as pd
+    s = pd.Series(x)
+    def rk(arr):
+        import numpy as np
+        last = arr[-1]
+        return float((arr <= last).sum())
+    return s.rolling(int(n), min_periods=1).apply(lambda a: rk(a.values), raw=False)
 
-# def HHV(x, n):
-#     return x.rolling(int(n)).max()
-
-# def LLV(x, n):
-#     return x.rolling(int(n)).min()
-
-# def STD(x, n):
-#     return x.rolling(int(n)).std(ddof=0)
-
-# def IF(cond, a, b):
-#     return pd.Series(np.where(cond.astype(bool), a, b), index=a.index if isinstance(a, pd.Series) else b.index)
-
-# def COUNT(cond, n):
-#     cond_series = cond.astype(bool)
-#     return cond_series.rolling(int(n)).sum()
-
-# def BARSLAST(cond):
-#     cond = cond.astype(bool)
-#     idx = pd.Series(np.where(cond, np.arange(len(cond)), np.nan), index=cond.index).ffill()
-#     return pd.Series(np.arange(len(cond)), index=cond.index) - idx
+# 在评分流程里（score_engine 已经有 tdx.EXTRA_CONTEXT.update(...) 那块），把这俩也塞进去：
+EXTRA_CONTEXT["TS_PCT"] = TS_PCT
+EXTRA_CONTEXT["TS_RANK"] = TS_RANK
 
 VAR_MAP = {
     "C": "df['close']",
@@ -183,7 +169,7 @@ VAR_MAP = {
     "V": "df['vol']",
     "VOL": "df['vol']",
     "AMOUNT": "df['amount']",
-    "REFDATE": "REFDATE",
+    "REFDATE": "REF_DATE",
     "J": "df['j']",
     "VR": "df['vr']",
     "Z_SLOPE": "df['z_slope']",
@@ -272,6 +258,8 @@ def evaluate_bool(script: str, df, prefer_keys=("sig", "last_expr", "SIG", "LAST
     自动将 df 中现有列注入上下文（原名 + 全大写）。
     """
     extra_ctx = _extra_ctx_from_df_columns(df)
+    if EXTRA_CONTEXT:
+        extra_ctx.update(EXTRA_CONTEXT)
     res = evaluate(script, df, extra_context=extra_ctx)  # evaluate 会把 extra_context 合入 ctx 使用
     return _extract_bool_signal(res, df.index, prefer_keys=prefer_keys)
 

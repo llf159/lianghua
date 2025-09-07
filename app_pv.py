@@ -21,6 +21,10 @@ import json
 import datetime as dt
 import re
 
+# —— 强制本地不走代理 ——
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
+
 ROOT = Path(__file__).resolve().parent  # 当前脚本所在的根目录
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -567,7 +571,13 @@ def main():
 
     demo = build_ui(args.base)
     demo = _enable_queue_compat(demo)
-    demo.launch(share=args.share)
+    demo.launch(
+            share=False,                 # 强制本地，不去申请外网隧道
+            server_name="127.0.0.1",     # 只监听回环地址
+            server_port=None,            # 端口冲突时自动换
+            inbrowser=True,              # 自动在浏览器打开
+            show_error=True
+        )
 
 
 if __name__ == "__main__":

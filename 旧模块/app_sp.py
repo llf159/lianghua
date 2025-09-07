@@ -1,6 +1,11 @@
 import pandas as pd
 import plotly.express as px
 import gradio as gr
+import os
+# —— 强制本地不走代理 ——
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
+
 
 PROB_CSV = "./output/stats_prelaunch/prob_bins.csv"
 HDI_CSV = "./output/stats_prelaunch/stats_hdi.csv"
@@ -52,4 +57,10 @@ with gr.Blocks() as demo:
     if features:
         plot.value = plot_feature(features[0], rel_days_all[:1])
 
-demo.launch()
+demo.launch(
+        share=False,                 # 强制本地，不去申请外网隧道
+        server_name="127.0.0.1",     # 只监听回环地址
+        server_port=None,            # 端口冲突时自动换
+        inbrowser=True,              # 自动在浏览器打开
+        show_error=True
+    )

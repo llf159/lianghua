@@ -1,4 +1,4 @@
-# -*- coding: utf-8-sig -*-
+﻿# -*- coding: utf-8-sig -*-
 """
 score_engine.py — 单文件版“可编程打分系统”（无 CLI / 无可视化）
 依赖你现有工程：config.py、parquet_viewer.py、tdx_compat.py、indicators.py
@@ -14,11 +14,13 @@ from __future__ import annotations
 import os
 import re
 import math
+import json
 import datetime as dt
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 import glob
 import functools
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
@@ -27,6 +29,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import logging
 from logging.handlers import TimedRotatingFileHandler
+from functools import lru_cache
 
 from config import (
     PARQUET_BASE, PARQUET_ADJ, PARQUET_USE_INDICATORS,
@@ -42,33 +45,245 @@ from config import (
     SC_UNIVERSE, 
 )
 from parquet_viewer import asset_root, list_trade_dates, read_range
-from tdx_compat import evaluate_bool
 from indicators import kdj  # 用于兜底计算 J（若数据不含 j 列）
-from utils import normalize_ts
+from utils import normalize_ts, normalize_trade_date
+import tdx_compat as tdx
+from tdx_compat import evaluate_bool
+from stats_core import run_tracking, post_scoring, run_surge
+
+OUTPUT_DIR = Path("output/score")  # 按你现有目录习惯；若不同，改这里
+DETAIL_DIR = OUTPUT_DIR / "details"
+ALL_DIR = OUTPUT_DIR / "all"
+ALL_DIR.mkdir(parents=True, exist_ok=True)
 
 # ------------------------- 日志初始化 -------------------------
 def _init_logger():
     os.makedirs("./log", exist_ok=True)
     logger = logging.getLogger("score")
-    logger.setLevel(logging.DEBUG)  # 细到 DEBUG，输出筛选由 handler 控制
+    # logger.setLevel(logging.DEBUG)  # 细到 DEBUG，输出筛选由 handler 控制
+    # 从 config 读取级别；默认 WARNING（更轻量）
+    try:
+        import config as _cfg
+        level_name = getattr(_cfg, "LOG_LEVEL", "WARNING")
+    except Exception:
+        level_name = "WARNING"
+    level = getattr(logging, str(level_name).upper(), logging.WARNING)
+    logger.setLevel(level)
     # 轮转：每天一个，保留 7 个
     fh = TimedRotatingFileHandler("./log/score.log", when="midnight", interval=1, backupCount=7, encoding="utf-8-sig")
-    # 控制台：INFO 以上
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    fh.setLevel(logging.DEBUG)
+    fh.setLevel(level)
+    # 控制台仅 WARNING+，进一步减少噪音
+    ch.setLevel(max(level, logging.WARNING))
     formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
     fh.setFormatter(formatter)
     ch.setFormatter(formatter)
-    # 避免重复添加 handler
     if not logger.handlers:
         logger.addHandler(fh)
         logger.addHandler(ch)
+    logger.propagate = False
     return logger
 
 LOGGER = _init_logger()
 
+# ---- I/O helpers (cached) ----
+@lru_cache(maxsize=512)
+def _load_score_all_csv_cached(d: str, usecols_key: str = "ts_code,rank,trade_date") -> "pd.DataFrame":
+    usecols = [c for c in (usecols_key.split(",") if usecols_key else []) if c]
+    path = os.path.join(SC_OUTPUT_DIR, "all", f"score_all_{d}.csv")
+    # dtype that is stable and small
+    dtype = {"ts_code": str, "rank": "Int64", "trade_date": str}
+    try:
+        return pd.read_csv(path, usecols=usecols or None, dtype=dtype, engine="c")
+    except Exception as e:
+        LOGGER.warning("[attention] 读取失败 %s: %s", path, e)
+        return pd.DataFrame(columns=usecols or ["ts_code","rank","trade_date"])
+
+# ===== 内嵌 RANKER =====
+# 依赖你的 parquet 扫描工具（只读必要列，加速）
+from parquet_viewer import asset_root as _asset_root, scan_with_duckdb as _scan_with_duckdb
+# 本次 run 的全局上下文
+_RANK_G = {
+    "ref": None,           # 参考日 YYYYMMDD
+    "codes": [],           # 本次评分的股票清单
+    "base": None,          # PARQUET_BASE
+    "adj": None,           # PARQUET_ADJ
+    "default_N": 60,       # 不写 N 时的默认窗口
+}
+
+PROGRESS_HANDLER = None
+
+def set_progress_handler(fn):
+    """UI/CLI 可以注册一个回调：fn(phase, current=None, total=None, message=None, **extra)"""
+    global PROGRESS_HANDLER
+    PROGRESS_HANDLER = fn
+
+
+def _progress(phase: str, *, current: int | None = None, total: int | None = None,
+              message: str | None = None, **extra):
+    if PROGRESS_HANDLER:
+        try:
+            PROGRESS_HANDLER(phase=phase, current=current, total=total, message=message, **extra)
+        except Exception as e:
+            LOGGER.debug(f"[progress-cb-error] {e}")
+    # 顺手打一条 INFO，给日志/命令行看
+    m = f"{phase}"
+    if total is not None and current is not None:
+        m += f" {current}/{total}"
+    if message:
+        m += f" | {message}"
+    LOGGER.info(m)
+
+
+def init_rank_env(ref_date: str, universe_codes: List[str], base: str, adj: str, default_N: int = 60):
+    _RANK_G["ref"] = str(ref_date)
+    _RANK_G["codes"] = list(universe_codes or [])
+    _RANK_G["base"] = str(base)
+    _RANK_G["adj"]  = str(adj)
+    _RANK_G["default_N"] = int(default_N)
+
+
+def _load_last_n(_base: str, _adj: str, _codes: List[str], _ref: str, _N: int) -> pd.DataFrame:
+    """
+    读取全市场近 _N 天（含 _ref）的 O/H/L/C/V；只取必要列。
+    返回至少包含：['ts_code','trade_date','open','high','low','close','vol']。
+    """
+    root = _asset_root(_base, "stock", _adj)
+    cols = ["ts_code", "trade_date", "open", "high", "low", "close", "vol"]
+    # 给足冗余，按自然日回溯（停牌/周末）
+    start = (dt.datetime.strptime(_ref, "%Y%m%d") - dt.timedelta(days=_N*3)).strftime("%Y%m%d")
+    df = _scan_with_duckdb(root, None, start, _ref, columns=cols)
+    if not df.empty:
+        df["trade_date"] = df["trade_date"].astype(str)
+        if _codes:
+            df = df[df["ts_code"].astype(str).isin(set(_codes))]
+    return df
+
+
+def _rank_series(s: pd.Series, ascending: bool) -> pd.Series:
+    # 名次从 1 开始；相等取平均名次；缺失置为最大名次+1
+    r = s.rank(ascending=ascending, method="average")
+    mx = int(r.max()) if pd.notna(r.max()) else len(r)
+    return r.fillna(mx + 1)
+
+
+def _latest_row(df: pd.DataFrame, ref: str) -> pd.DataFrame:
+    return df[df["trade_date"] == ref].copy()
+
+
+def _ret_vs_prev_close(df: pd.DataFrame, ref: str) -> pd.Series:
+    """
+    以 ref 当日收盘相对前一交易日收盘的涨跌幅（%），索引为 ts_code。
+    """
+    df = df.sort_values(["ts_code", "trade_date"])
+    prev_close = df.groupby("ts_code")["close"].shift(1)
+    ret = (df["close"] - prev_close) / prev_close * 100.0
+    out = pd.DataFrame({"ts_code": df["ts_code"], "trade_date": df["trade_date"], "ret": ret})
+    ret_ref = out[out["trade_date"] == ref][["ts_code", "ret"]]
+    return ret_ref.set_index("ts_code")["ret"]
+
+
+# —— 对外：在 when 表达式里直接用的函数 —— #
+def RANK_VOL(N: int | None = None, K: Optional[int] = None) -> float:
+    """
+    成交量横截面名次（1 = 量最小，量越小名次越靠前）。
+    K：可选，仅在前 K 只里排名；省略=全评分范围。
+    """
+    ref, base, adj, codes = _RANK_G["ref"], _RANK_G["base"], _RANK_G["adj"], _RANK_G["codes"]
+    N = int(N or _RANK_G["default_N"])
+    df = _load_last_n(base, adj, codes, ref, N)
+    if df.empty:
+        return float("inf")
+    latest = _latest_row(df, ref)
+    s = latest.set_index("ts_code")["vol"]
+    if K and K > 0:
+        s = s.sort_values().head(int(K))
+    ranks = _rank_series(s, ascending=True)  # 量小→名次靠前
+    ts = str(tdx.EXTRA_CONTEXT.get("TS", ""))
+    return float(ranks.get(ts, float("inf")))
+
+
+def RANK_RET(N: int | None = None, K: Optional[int] = None, side: str = "up") -> float:
+    """
+    涨跌幅横截面名次：
+      side='up'   ：按涨幅从大到小排名（涨多名次靠前）；
+      side='down' ：按跌幅从大到小排名（跌多名次靠前）。
+    """
+    ref, base, adj, codes = _RANK_G["ref"], _RANK_G["base"], _RANK_G["adj"], _RANK_G["codes"]
+    N = int(N or _RANK_G["default_N"])
+    df = _load_last_n(base, adj, codes, ref, N)
+    if df.empty:
+        return float("inf")
+    s = _ret_vs_prev_close(df, ref)
+    if K and K > 0:
+        s = s.sort_values(ascending=False).head(int(K))
+    if str(side).lower().startswith("up"):
+        ranks = _rank_series(s, ascending=False)     # 涨多→名次靠前
+    else:
+        ranks = _rank_series(-s, ascending=False)    # 跌多→名次靠前
+    ts = str(tdx.EXTRA_CONTEXT.get("TS", ""))
+    return float(ranks.get(ts, float("inf")))
+
+
+def RANK_MATCH_COEF(N: int | None = None, K: Optional[int] = None) -> float:
+    """
+    量价匹配系数（0~1，越大匹配越强）：
+      - 涨幅榜应与“量大”（活跃）匹配；
+      - 跌幅榜应与“量小”（冷清）匹配。
+    做法：
+      - 计算：r_up = RANK_RET(...,'up'), r_dn = RANK_RET(...,'down')
+      - 量小名次：rv_small = RANK_VOL(...)
+      - 量大名次：rv_large = (Keff + 1 - rv_small)，Keff 为参与排名样本量
+      - 匹配度：min(r_up * rv_large, r_dn * rv_small) 的倒数归一（Keff / prod）
+    """
+    # 两边名次
+    r_up = RANK_RET(N, K, side="up")
+    r_dn = RANK_RET(N, K, side="down")
+    rv_small = RANK_VOL(N, K)
+    Keff = int(K or len(_RANK_G["codes"]) or 1)
+    rv_large = max(1.0, Keff + 1.0 - rv_small)
+    prod_up = r_up * rv_large
+    prod_dn = r_dn * rv_small
+    prod = min(prod_up, prod_dn)
+    coef = min(1.0, max(0.0, (Keff / max(prod, 1.0))))
+    return float(coef)
+
+
+def get_eval_env(ts_code: str, ref_date: str) -> Dict[str, object]:
+    """提供注入到 tdx_compat.EXTRA_CONTEXT 的函数映射"""
+    return {
+        "TS": str(ts_code),
+        "REF_DATE": str(ref_date),
+        "RANK_VOL": RANK_VOL,
+        "RANK_RET": RANK_RET,
+        "RANK_MATCH_COEF": RANK_MATCH_COEF,
+    }
+
+
+def get_rank_eval_env(ts_code: str) -> Dict[str, object]:
+    """简化版（_score_one 内部已知 ref_date，无需重复传）"""
+    return {
+        "TS": str(ts_code),
+        "RANK_VOL": RANK_VOL,
+        "RANK_RET": RANK_RET,
+        "RANK_MATCH_COEF": RANK_MATCH_COEF,
+    }
+
 # ------------------------- 工具函数 -------------------------
+def _last_true_date(win_df: pd.DataFrame, when: str) -> tuple[Optional[str], Optional[int]]:
+    """给窗口数据和 when 表达式，返回 (最近一次为 True 的日期YYYYMMDD, lag)"""
+    if not when:
+        return None, None
+    s_bool = evaluate_bool(when, win_df).astype(bool)
+    lag = _last_true_lag(s_bool)  # 已有函数
+    if lag is None:
+        return None, None
+    # win_df 已经是 _window_slice 后的 TF 级时间索引
+    idx = win_df.index if isinstance(win_df.index, pd.DatetimeIndex) else pd.to_datetime(win_df["trade_date"].astype(str))
+    hit_ts = idx[-1 - lag]
+    return hit_ts.strftime("%Y%m%d"), int(lag)
+
+
 def _single_root_dir() -> str:
     """
     single 布局根目录，例如：
@@ -85,6 +300,86 @@ def _has_single_dir() -> bool:
 
 def _today_str():
     return dt.datetime.now().strftime("%Y%m%d")
+
+
+def _make_time_weights(n: int,
+                       mode: str | None = None,
+                       half_life: float | None = None,
+                       linear_min: float | None = None,
+                       normalize: bool = True) -> list[float]:
+    """
+    生成长度为 n 的时间权重（索引从最早到最新）。
+      mode: none | exp | linear
+        - exp:  w = 0.5 ** (age/half_life)  （最新 age=0 权重大）
+        - linear: 从 linear_min 线性递增到 1.0
+      normalize: 归一化到均值=1（sum(weights)=n），避免窗口改变整体尺度。
+    """
+    if n <= 0:
+        return []
+    m = (mode or "none").lower()
+    if m in ("", "none"):
+        w = np.ones(n, float)
+    elif m.startswith("exp"):
+        hl = float(half_life or 5.0)
+        age = np.arange(n)[::-1]  # 最新 age=0
+        w = 0.5 ** (age / max(hl, 1e-6))
+    else:
+        lm = float(linear_min if linear_min is not None else 0.3)
+        lm = min(max(lm, 0.0), 1.0)
+        w = np.linspace(lm, 1.0, num=n)
+    if normalize:
+        s = float(w.mean())
+        if s > 0:
+            w = w / s
+    return w.tolist()
+
+# ---------------------------------------------------------------------------
+def _after_scoring(ref_date: str, df_all_scores: pd.DataFrame | None = None):
+    windows = [1,2,3,5,10,20]              # 或从 UI/配置读
+    benchmarks = ["000300.SH", "399006.SZ"]  # 只用“已下载”的指数
+    run_tracking(ref_date, windows, benchmarks, score_df=df_all_scores, group_by_board=True, save=True)
+
+
+def backfill_prev_n_days(ref_date: str | None = None,
+                         n: int = 20,
+                         include_today: bool = False,
+                         *,
+                         force: bool = False) -> list[Path]:
+    """
+    以 ref_date 为参照，自动取其前 n 个“交易日”窗口，补齐 score_all_*.csv。
+    include_today=False 表示窗口不包含参考日（“前 n 天”通常不含当天）。
+    """
+    # 1) 锚定参考日：无参则用 _pick_ref_date()
+    ref = ref_date or _pick_ref_date()
+
+    # 2) 读取交易日日历（daily 分区）
+    root_daily = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
+    days = list_trade_dates(root_daily) or []
+
+    if not days:
+        # 没有日历，退化为“只补当天”
+        return backfill_missing_ranks(ref, ref, force=force)
+
+    # 3) 找到 ref 在日历中的位置；若缺失则用最后一天作为 ref
+    if ref in days:
+        i = days.index(ref)
+    else:
+        i = len(days) - 1
+        ref = days[i]
+
+    # 4) 计算窗口：end 为 (ref 或 ref 前一日)，start 为向前 n 天（越界向 0 对齐）
+    end_idx = i if include_today else max(i - 1, 0)
+    start_idx = max(end_idx - int(n) + 1, 0)
+
+    if start_idx > end_idx:
+        # 极端情况：n=0 或 i=0 且不含当天 → 做一次空安全处理
+        start_idx, end_idx = end_idx, end_idx
+
+    start = days[start_idx]
+    end   = days[end_idx]
+
+    # 5) 复用旧函数做实际补算
+    return backfill_missing_ranks(start, end, force=force)
 
 
 def _pick_ref_date() -> str:
@@ -274,7 +569,7 @@ def _select_columns_for_rules() -> List[str]:
 
 def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: list[dict]):
     try:
-        base = os.path.join(SC_OUTPUT_DIR, "details")
+        base = os.path.join(SC_OUTPUT_DIR, "details", str(ref_date))
         os.makedirs(base, exist_ok=True)
         out_path = os.path.join(base, f"{ts_code}_{ref_date}.json")
         payload = {
@@ -290,6 +585,21 @@ def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: li
     except Exception as e:
         LOGGER.warning("[detail] 写明细失败 %s: %s", ts_code, e)
 
+
+
+def _list_true_dates(df: pd.DataFrame, expr: str, *, ref_date: str, window: int, timeframe: str) -> list[str]:
+    """返回窗口内所有命中日期（按 timeframe 重采样后对齐到日线索引）。"""
+    try:
+        dfTF = df if timeframe == "D" else _resample(df, timeframe)
+        win_df = _window_slice(dfTF, ref_date, window)
+        sig = evaluate_bool(expr, win_df)
+        if sig is None:
+            return []
+        idx = getattr(sig, "index", getattr(win_df, "index", []))
+        out = [str(i) for i, v in zip(idx, list(sig)) if bool(v)]
+        return out
+    except Exception:
+        return []
 
 def _build_per_rule_detail(df: pd.DataFrame, ref_date: str) -> list[dict]:
     rows = []
@@ -313,32 +623,56 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str) -> list[dict]:
                 period = ref_date
             if scope in {"EACH", "PERBAR", "EACH_TRUE"}:
                 cnt, err = _count_hits_perbar(df, rule, ref_date)
+                dfTF = df if tf=="D" else _resample(df, tf)
+                win_df = _window_slice(dfTF, ref_date, win)
+                cand_when = None
+                if "clauses" in rule and rule["clauses"]:
+                    for c in rule["clauses"]:
+                        if c.get("when"):
+                            cand_when = c["when"]; break
+                else:
+                    cand_when = rule.get("when")
+                hit_date = None
+                if not err and cand_when:
+                    _d, _ = _last_true_date(win_df, cand_when)
+                    hit_date = _d
                 ok = bool(cnt and cnt > 0 and err is None)
                 add = float(pts * int(cnt or 0))
+                rows.append({
+                    "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
+                    "points": pts, "ok": ok, "cnt": int(cnt or 0),
+                    "add": add,
+                    "hit_date": hit_date,
+                    "hit_dates": _list_true_dates(df, (cand_when or rule.get("when") or ""), ref_date=ref_date, window=win, timeframe=tf),
+                    "hit_count": int(cnt or 0),
+                    "explain": expl,
+                })
+                # 继续后续逻辑需要 when
                 if "clauses" in rule and rule["clauses"]:
                     for c in rule["clauses"]:
                         if c.get("when"):
                             when = c["when"]; break
                 else:
                     when = rule.get("when")
-            # else:
-            #     ok_eval, err_eval = _eval_rule(df, rule, ref_date)
-            #     ok  = bool(ok_eval and not err_eval)
-            #     err = err_eval
-            #     add = (pts if ok else 0.0)
-            #     when = rule.get("when")
             else:
                 # === RECENT / DIST / NEAR: 按最近一次命中距今天数计分 ===
                 if scope in {"RECENT", "DIST", "NEAR"}:
                     add, lag, err = _recent_points(df, rule, ref_date)
-                    ok  = bool(add != 0 and not err)
-                    when = rule.get("when")
+                    dfTF = df if tf=="D" else _resample(df, tf)
+                    win_df = _window_slice(dfTF, ref_date, win)
+                    hit_date = None
+                    if err is None and lag is not None:
+                        # lag=0 表示 ref_date，当 ref_date 不在索引里时用 window 尾
+                        idx = win_df.index if isinstance(win_df.index, pd.DatetimeIndex) else pd.to_datetime(win_df["trade_date"].astype(str))
+                        hit_idx = max(0, len(idx)-1-int(lag))
+                        hit_date = idx[hit_idx].strftime("%Y%m%d")
                     rows.append({
                         "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
-                        "when": when, "points": pts, "ok": ok, "cnt": None,
+                        "points": pts, "ok": ok, "cnt": None,
                         "add": add, "lag": (None if lag is None else int(lag)),
-                        "explain": expl, "error": err
+                        "hit_date": hit_date, "hit_dates": _list_true_dates(df, cand_when or (when or ""), ref_date=ref_date, window=win, timeframe=tf), "hit_count": int(cnt or 0), "explain": expl,
                     })
+
                     continue
                 # === 其余仍走原来的布尔命中路径 ===
                 ok_eval, err_eval = _eval_rule(df, rule, ref_date)
@@ -347,15 +681,153 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str) -> list[dict]:
                 add = (pts if ok else 0.0)
                 when = rule.get("when")
 
+
+            # === 追加：常规布尔规则命中日期信息 ===
+            hit_date = None
+            hit_dates = []
+            try:
+                if when:
+                    dfTF2 = df if tf=="D" else _resample(df, tf)
+                    win_df2 = _window_slice(dfTF2, ref_date, win)
+                    if not win_df2.empty:
+                        _d, _ = _last_true_date(win_df2, when)
+                        hit_date = _d
+                    hit_dates = _list_true_dates(df, when, ref_date=ref_date, window=win, timeframe=tf)
+            except Exception:
+                pass
+
         except Exception as e2:
             err = f"eval-exception: {e2}"
 
         rows.append({
             "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
-            "when": when, "points": pts, "ok": ok, "cnt": (None if cnt is None else int(cnt)),
-            "add": add, "explain": expl, "error": err
+            "points": pts, "ok": ok, "cnt": (None if cnt is None else int(cnt)),
+            "add": add, "hit_date": hit_date, "hit_dates": hit_dates, "hit_count": (len(hit_dates) if hit_dates else 0), "explain": expl, "error": err
         })
     return rows
+
+
+def _build_score_all_from_details(ref_date: str) -> Path | None:
+    """
+    尝试读取 output/score/details/<ref_date>/*.json 聚合出全市场排名，并写出 score_all_<ref>.csv
+    返回写出的文件路径；若该日没有 details，则返回 None
+    """
+    ddir = DETAIL_DIR / str(ref_date)
+    if not ddir.exists():
+        return None
+    rows = []
+    for p in ddir.glob("*.json"):
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8-sig"))
+            ts = obj.get("ts_code")
+            sm = obj.get("summary") or {}
+            score = sm.get("score")
+            tb = sm.get("tiebreak")
+            rows.append({"ts_code": ts, "score": float(score), "tiebreak_j": tb})
+        except Exception:
+            continue
+    if not rows:
+        return None
+    df = pd.DataFrame(rows).dropna(subset=["ts_code", "score"])
+    # 排序：总分降序、tiebreak 降序、代码升序
+    df = df.sort_values(["score", "tiebreak_j", "ts_code"], ascending=[False, False, True])
+    df["rank"] = np.arange(1, len(df) + 1)
+    df["trade_date"] = str(ref_date)
+    # 写全量排名文件
+    outp = ALL_DIR / f"score_all_{ref_date}.csv"
+    df.to_csv(outp, index=False, encoding="utf-8-sig")
+    return outp
+
+
+def ensure_score_all_for_date(ref_date: str, *, force: bool=False) -> Path:
+    """
+    确保某天存在 score_all_<ref>.csv：
+    1) 已存在且非强制 → 直接返回；
+    2) 尝试从 details 聚合写出；
+    3) 若 details 也没有 → 调用当天 run_for_date(ref_date) 先生成，再回到第2步聚合。
+    """
+    outp = ALL_DIR / f"score_all_{ref_date}.csv"
+    # 已存在且非强制，但若是 0 字节占位，仍视为“缺失”
+    if outp.exists() and outp.stat().st_size > 0 and not force:
+        return outp
+
+    # 先尝试从 details 聚合
+    built = _build_score_all_from_details(ref_date)
+    if built and built.exists():
+        return built
+
+    # 没有 details，就先跑一遍评分（使用当前配置与 universe）
+    # 注意：run_for_date 名称与签名按你文件里现有实现即可
+    try:
+        print(f"[backfill] run_for_date({ref_date}) ...")
+        run_for_date(ref_date)  # 如果你的函数签名有其它参数，这里照你的实际传入
+    except Exception as e:
+        print(f"[backfill] run_for_date 失败：{e}")
+
+    # 再聚合一次
+    built2 = _build_score_all_from_details(ref_date)
+    if built2 and built2.exists():
+        return built2
+
+    # 兜底：即便没有 details，也写一个空文件防止后续反复尝试
+    outp.touch()
+    return outp
+
+
+def backfill_missing_ranks(start_date: str, end_date: str, *, force: bool=False) -> list[Path]:
+    """
+    扫描 [start_date, end_date] 窗口内的交易日，补齐 score_all_*.csv
+    - force=True：无论已存在与否都重建（先删后建）
+    - force=False：仅对缺失的日期补建
+    交易日列表获取方式：以 details 目录和 all 目录下已有日期为准，若需要更严格的“全交易日”，可以在此改为读数据日历。
+    """
+    # # 推断窗口内可能的日期：用 details 与 all 下的目录/文件名并集；不严谨但实用
+    # cand = set()
+    # for p in DETAIL_DIR.glob("*"):
+    #     if p.is_dir():
+    #         cand.add(p.name)
+    # for p in ALL_DIR.glob("score_all_*.csv"):
+    #     cand.add(p.stem.replace("score_all_",""))
+    # # 简单按字符串范围过滤
+    # dates = sorted([d for d in cand if start_date <= d <= end_date])
+    # # 如果 dates 为空，直接用 start_date..end_date（可能用户还没跑过任何一天）
+    # if not dates:
+    #     dates = [start_date, end_date]
+
+    # 1) 优先用交易日日历生成完整日期序列
+    cal_root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
+    cal = list_trade_dates(cal_root) or []
+    if cal:
+        dates = [d for d in cal if start_date <= d <= end_date]
+    else:
+        # 2) 没有日历时再退化为：details+all 的并集；若仍为空，则按自然日铺满
+        cand = set()
+        for p in DETAIL_DIR.glob("*"):
+            if p.is_dir():
+                cand.add(p.name)
+        for p in ALL_DIR.glob("score_all_*.csv"):
+            cand.add(p.stem.replace("score_all_",""))
+        dates = sorted([d for d in cand if start_date <= d <= end_date])
+        if not dates:
+            # 自然日兜底（避免完全不跑）
+            s = dt.datetime.strptime(start_date, "%Y%m%d")
+            e = dt.datetime.strptime(end_date, "%Y%m%d")
+            dates = [(s + dt.timedelta(days=i)).strftime("%Y%m%d") for i in range((e-s).days + 1)]
+
+    written = []
+    for d in dates:
+        outp = ALL_DIR / f"score_all_{d}.csv"
+        # 把 0 字节当成“缺失”；force 时直接删掉再重建
+        if outp.exists():
+            if force:
+                try: outp.unlink()
+                except Exception: pass
+            elif outp.stat().st_size > 0:
+                continue
+        p = ensure_score_all_for_date(d, force=force)
+        written.append(p)
+    print(f"[backfill] done, wrote {len(written)} days.")
+    return written
 
 
 def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -806,6 +1278,7 @@ class ScoreDetail:
     score: float
     highlights: List[str]
     drawbacks: List[str]
+    opportunities: List[str]
     tiebreak: Optional[float]
 
 
@@ -815,21 +1288,47 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
       - (ts_code, detail 或 None, 黑名单项 或 None)
       若被初选淘汰，返回黑名单项 (ts_code, period, reason)；否则返回打分 detail。
     """
+    os.makedirs(os.path.join(SC_OUTPUT_DIR, "top"), exist_ok=True)
+    os.makedirs(os.path.join(SC_OUTPUT_DIR, "all"), exist_ok=True)
+
     try:
         df = _read_stock_df(ts_code, start_date, ref_date, columns)
         if df is None or df.empty:
             LOGGER.warning(f"[{ts_code}] 数据为空，跳过")
-            return (ts_code, None, ("", "", "数据为空"))
+            # return (ts_code, None, ("", "", "数据为空"))
+            return (ts_code, None, (ts_code, ref_date, "数据为空"))
         
         df = _inject_benchmark_features(df, start_date, ref_date)
-        
+        tdx.EXTRA_CONTEXT.update(get_eval_env(ts_code, ref_date))
+
         # 初选
         pres = _prescreen(df, ref_date)
         if not pres.passed:
             return (ts_code, None, (ts_code, pres.period or ref_date, pres.reason or "prescreen"))
         # 打分
         score = float(SC_BASE_SCORE)
-        highlights, drawbacks = [], []
+        highlights, drawbacks, opportunities = [], [], []
+        def _append_reason_by_rule(points: float, rule: dict, tag_text: str | None = None):
+            """
+            根据 rule 配置决定把“理由”放进哪一个桶：
+            - rule.get('as') 可选：'opportunity' | 'highlight' | 'drawback' | 'auto'(默认)
+            - rule.get('show_reason', True)：是否把 explain 文字展示在汇总里
+            """
+            exp = rule.get("explain")
+            show = bool(rule.get("show_reason", True))  # 你要求：规则不默认隐藏
+            if (not exp) or (not show):
+                return
+            bucket = (rule.get("as") or "auto").lower().strip()
+            if bucket == "auto":
+                bucket = "highlight" if float(points) >= 0 else "drawback"
+            text = str(tag_text) if tag_text else str(exp)
+            if bucket == "opportunity":
+                opportunities.append(text)
+            elif bucket == "highlight":
+                highlights.append(text)
+            else:
+                drawbacks.append(text)
+
 
         for rule in (SC_RULES or []):
             scope = str(rule.get("scope", "ANY")).upper().strip()
@@ -853,10 +1352,8 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
                     if cnt > 0 and pts != 0:
                         add = pts * int(cnt)
                         score += add
-                        expl = rule.get("explain")
-                        if expl:
-                            tag = f"{expl}×{cnt}"
-                            (highlights if pts >= 0 else drawbacks).append(tag)
+                        tag = f"{rule.get('explain')}×{cnt}" if rule.get('explain') else None
+                        _append_reason_by_rule(add, rule, tag_text=tag)
                         LOGGER.debug(f"[HIT][{ts_code}] {rule.get('name','<unnamed>')} EACH 命中 {cnt} 次，+{add} => {score}")
                     else:
                         LOGGER.debug(f"[MISS][{ts_code}] {rule.get('name','<unnamed>')} EACH 无命中")
@@ -868,10 +1365,8 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
                     LOGGER.warning(f"[{ts_code}] RECENT 解析异常：{rule.get('name')} -> {err}")
                 if add != 0:
                     score += add
-                    expl = rule.get("explain")
-                    if expl:
-                        tag = f"{expl}(距今{lag})"
-                        (highlights if add >= 0 else drawbacks).append(tag)
+                    tag = f"{rule.get('explain')}(距今{lag})" if rule.get('explain') else None
+                    _append_reason_by_rule(add, rule, tag_text=tag)
                     LOGGER.debug(f"[HIT][{ts_code}] {rule.get('name','<unnamed>')} RECENT lag={lag} +{add} => {score}")
                 else:
                     LOGGER.debug(f"[MISS][{ts_code}] {rule.get('name','<unnamed>')} RECENT 无匹配区间")
@@ -884,12 +1379,7 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
             if ok:
                 pts = float(rule.get("points", 0))
                 score += pts
-                expl = rule.get("explain")
-                if expl:
-                    if pts >= 0:
-                        highlights.append(str(expl))
-                    else:
-                        drawbacks.append(str(expl))
+                _append_reason_by_rule(pts, rule)
                 LOGGER.debug(f"[HIT][{ts_code}] {rule.get('name','<unnamed>')} +{pts} => {score}")
 
         score = max(score, float(SC_MIN_SCORE))
@@ -917,12 +1407,13 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
                     "tiebreak": tb,
                     "highlights": list(highlights),
                     "drawbacks": list(drawbacks),
+                    "opportunities": list(opportunities),
                 },
                 per_rules=per_rules
             )
         except Exception as e:
             LOGGER.warning("[detail] 写单票明细失败 %s: %s", ts_code, e)
-        return (ts_code, ScoreDetail(ts_code, score, highlights, drawbacks, tb), None)
+        return (ts_code, ScoreDetail(ts_code, score, highlights, drawbacks, opportunities, tb), None)
 
     except Exception as e:
         LOGGER.error(f"[{ts_code}] 评分失败：{e}")
@@ -990,11 +1481,18 @@ def build_attention_rank(start: Optional[str] = None,
                          source: Optional[str] = None,
                          min_hits: Optional[int] = None,
                          topN: Optional[int] = None,
-                         write: bool = True):
+                         write: bool = True,
+                         mode: str = "strength",
+                         weight_mode: Optional[str] = None,
+                         half_life: Optional[float] = None,
+                         linear_min: Optional[float] = None,
+                         topM: Optional[int] = None):
     """
-    统计某个来源('top'|'white'|'black')在[start, end]（按交易日）内的“上榜次数”并排序。
-    默认：窗口=最近 SC_ATTENTION_WINDOW_D 个交易日，以 end/ref_date 作为右端点。
-    返回 CSV 路径（write=True）或 DataFrame（write=False）。
+    特别关注榜（两种口径）：
+      - mode='strength'（默认）：最近窗口内“排名强度”（按每日横截面名次分位值累计）；
+      - mode='hits'           ：旧逻辑，按“上榜次数”统计。
+    窗口：若未给 start，则取最近 SC_ATTENTION_WINDOW_D 个交易日，以 end/ref_date 为右端点。
+    输出：attention_{source}_{span_start}_{span_end}.csv（会直接覆盖旧文件）。
     """
     end = end or _pick_ref_date()
     source = (source or SC_ATTENTION_SOURCE).lower()
@@ -1006,48 +1504,143 @@ def build_attention_rank(start: Optional[str] = None,
         LOGGER.warning("[attention] 交易日窗口为空，start=%s end=%s", start, end)
         return None
 
-    hit_cnt: Dict[str, int] = {}
-    first_last: Dict[str, Tuple[str,str]] = {}
-
-    for d in span:
-        if source == "top":
-            f = os.path.join(SC_OUTPUT_DIR, "top", f"score_top_{d}.csv")
-        elif source in ("white", "black"):
-            f = os.path.join(SC_CACHE_DIR, d, f"{'whitelist' if source=='white' else 'blacklist'}.csv")
-        else:
-            raise ValueError("source must be 'top' | 'white' | 'black'")
-
-        if not os.path.isfile(f):
-            continue
-        try:
-            df = pd.read_csv(f, dtype={"ts_code": str})
-            codes = df["ts_code"].astype(str).tolist() if "ts_code" in df.columns else []
-        except Exception as e:
-            LOGGER.warning("[attention] 读取失败 %s: %s", f, e)
-            continue
-
-        for c in codes:
-            hit_cnt[c] = hit_cnt.get(c, 0) + 1
-            if c not in first_last:
-                first_last[c] = (d, d)
+    mode = (mode or "strength").lower()
+    if mode == "hits" or source in ("white", "black"):
+        # ===== 旧口径：命中次数 =====
+        hit_cnt: Dict[str, int] = {}
+        first_last: Dict[str, Tuple[str,str]] = {}
+        for d in span:
+            if source == "top":
+                f = os.path.join(SC_OUTPUT_DIR, "top", f"score_top_{d}.csv")
+            elif source in ("white", "black"):
+                f = os.path.join(SC_CACHE_DIR, d, f"{'whitelist' if source=='white' else 'blacklist'}.csv")
             else:
-                first_last[c] = (first_last[c][0], d)
+                raise ValueError("source must be 'top' | 'white' | 'black'")
+            if not os.path.isfile(f):
+                continue
+            try:
+                df = pd.read_csv(f, usecols=lambda c: c in {"ts_code","trade_date","ref_date"} if isinstance(c, str) else True, dtype={"ts_code": str}, engine="c")
+                
+                if "trade_date" not in df.columns:
+                    # 有些版本写了 ref_date；如果也没有，就直接用文件名里的 date_str
+                    if "ref_date" in df.columns:
+                        df = df.rename(columns={"ref_date": "trade_date"})
+                    else:
+                        df["trade_date"] = str(date_str)
 
-    if not hit_cnt:
-        LOGGER.warning("[attention] %s~%s 内没有 '%s' 记录。", span[0], span[-1], source)
-        return None
-
-    rows = []
-    for c, n in hit_cnt.items():
-        if n >= min_hits:
-            f, l = first_last[c]
-            rows.append({"ts_code": c, "hits": n, "first": f, "last": l})
-    if not rows:
-        LOGGER.info("[attention] 命中数 >= %d 的为空。", min_hits)
-        return None
-
-    out_df = pd.DataFrame(rows).sort_values(["hits", "last", "ts_code"], ascending=[False, False, True])
-    out_df = out_df.head(topN)
+                df = normalize_trade_date(df, "trade_date")
+                df = df[df["trade_date"] == date_str]
+                codes = df["ts_code"].astype(str).tolist() if "ts_code" in df.columns else []
+            except Exception as e:
+                LOGGER.warning("[attention] 读取失败 %s: %s", f, e);
+                continue
+            for c in codes:
+                hit_cnt[c] = hit_cnt.get(c, 0) + 1
+                first_last[c] = (first_last.get(c, (d, d))[0], d)
+        if not hit_cnt:
+            LOGGER.warning("[attention] %s~%s 内没有 '%s' 记录。", span[0], span[-1], source)
+            return None
+        rows = [
+            {"ts_code": c, "hits": n, "first": first_last[c][0], "last": first_last[c][1]}
+            for c, n in hit_cnt.items() if n >= min_hits
+        ]
+        if not rows:
+            LOGGER.info("[attention] 命中数 >= %d 的为空。", min_hits); return None
+        out_df = pd.DataFrame(rows).sort_values(["hits", "last", "ts_code"], ascending=[False, False, True]).head(topN)
+    else:
+        # ===== 新口径：排名强度（带时间权重） =====
+        w_mode = (weight_mode or "none").lower()
+        hl = float(half_life if half_life is not None else 5)
+        lm = float(linear_min if linear_min is not None else 0.3)
+        weights = _make_time_weights(len(span), w_mode, hl, lm, normalize=True)
+        strength: Dict[str, float] = {}
+        sum_w: Dict[str, float] = {}
+        hits: Dict[str, int] = {}
+        best_rank: Dict[str, int] = {}
+        last_rank: Dict[str, int] = {}
+        first_last: Dict[str, Tuple[str,str]] = {}
+        for idx, d in enumerate(span):
+            w = float(weights[idx])
+            path_all = os.path.join(SC_OUTPUT_DIR, "all", f"score_all_{d}.csv")
+            df = None; total = 0
+            if os.path.isfile(path_all):
+                try:
+                    df = pd.read_csv(path_all, dtype={"ts_code": str})
+                    if df.empty or "rank" not in df.columns:
+                        df = None
+                    else:
+                        total = len(df)
+                        df = df[["ts_code","rank"]].copy()
+                        df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+                        df = df.dropna()
+                except Exception as e:
+                    LOGGER.warning("[attention] 读取全量排名失败 %s: %s", path_all, e)
+                    df = None
+            if df is None:
+                # 回退：仅有 Top-K 文件时，以其相对名次近似
+                path_top = os.path.join(SC_OUTPUT_DIR, "top", f"score_top_{d}.csv")
+                if not os.path.isfile(path_top):
+                    continue
+                try:
+                    df_top = pd.read_csv(path_top, dtype={"ts_code": str})
+                except Exception as e:
+                    LOGGER.warning("[attention] 读取 Top 失败 %s: %s", path_top, e); continue
+                total = len(df_top)
+                if total == 0:
+                    continue
+                df = df_top[["ts_code"]].copy()
+                df["rank"] = np.arange(1, total + 1)
+            if total <= 0 or df is None or df.empty:
+                continue
+            # 仅统计 TopM（可选）
+            if topM:
+                df = df[df["rank"].astype(int) <= int(topM)]
+                if df.empty:
+                    continue
+            # 分位强度（名次越靠前 -> p 越接近 1）
+            df["p"] = 1.0 - (df["rank"].astype(float) - 1.0) / float(total)            
+            # 使用向量化聚合，显著减少 Python 级循环开销
+            g = (df.groupby("ts_code", sort=False)
+                    .agg(rank_min=("rank","min"),
+                         rank_last=("rank","last"),
+                         p_sum=("p","sum"),
+                         hits_part=("rank","size"))
+                 )
+            # 累加至全局字典
+            # strength: 加权后的分位强度累计；sum_w: 对应权重累计；hits: 次数；best_rank: 全期最优；last_rank: 全期最后一次
+            for c, row in g.iterrows():
+                s_add = float(row["p_sum"]) * w
+                strength[c] = strength.get(c, 0.0) + s_add
+                sum_w[c] = sum_w.get(c, 0.0) + w
+                hits[c] = hits.get(c, 0) + int(row["hits_part"])
+                best_rank[c] = min(best_rank.get(c, 10**9), int(row["rank_min"]))
+                last_rank[c] = int(row["rank_last"])
+                # first/last 出现日期
+                fl = first_last.get(c, (d, d))
+                first_last[c] = (fl[0], d) if fl[0] <= d else (d, d)
+                
+        if not strength:
+            LOGGER.warning("[attention] %s~%s 无可计算的排名强度。", span[0], span[-1]); return None
+        rows = []
+        for c, s in strength.items():
+            n = hits.get(c, 0)
+            if n >= min_hits:
+                f, l = first_last.get(c, (span[0], span[-1]))
+                rows.append({
+                    "ts_code": c,
+                    "strength": round(float(s), 6),
+                    "mean_strength": round(float(s) / float(max(sum_w.get(c, 1.0), 1e-9)), 6),
+                    "hits": int(n),
+                    "best_rank": int(best_rank.get(c, 10**9)),
+                    "last_rank": int(last_rank.get(c, 10**9)),
+                    "first": f, "last": l
+                })
+        if not rows:
+            LOGGER.info("[attention] 强度口径下，命中数 >= %d 的为空。", min_hits); return None
+        out_df = (pd.DataFrame(rows)
+                  .sort_values(["strength", "last", "best_rank", "ts_code"],
+                               ascending=[False, False, True, True])
+                  .head(topN))
 
     out_dir = os.path.join(SC_OUTPUT_DIR, "attention")
     os.makedirs(out_dir, exist_ok=True)
@@ -1055,8 +1648,9 @@ def build_attention_rank(start: Optional[str] = None,
 
     if write:
         out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-        LOGGER.info("[特别关注] source=%s 窗口=%s~%s min_hits>=%d Top-%d -> %s",
-                    source, span[0], span[-1], min_hits, topN, out_path)
+        LOGGER.info("[特别关注][%s|w=%s] source=%s 窗口=%s~%s min_hits>=%d Top-%d -> %s",
+                    mode, (weight_mode or "none"), source, span[0], span[-1], min_hits, topN, out_path)
+
         return out_path
     else:
         return out_df
@@ -1066,9 +1660,14 @@ def backfill_attention_rolling(start: str,
                                end: Optional[str] = None,
                                source: Optional[str] = None,
                                min_hits: Optional[int] = None,
-                               topN: Optional[int] = None):
+                               topN: Optional[int] = None,
+                               mode: str = "strength",
+                               weight_mode: Optional[str] = None,
+                               half_life: Optional[float] = None,
+                               linear_min: Optional[float] = None,
+                               topM: Optional[int] = None):
     """
-    从 start 到 end（按交易日）逐日滚动补算“特别关注榜”：
+    从start到end（按交易日）逐日滚动补算“特别关注榜”：
     - 每个 end 日都会生成一份：窗口=最近 SC_ATTENTION_WINDOW_D 个交易日（与 build_attention_rank 保持一致）
     - source: 'top' | 'white' | 'black'
     """
@@ -1083,7 +1682,9 @@ def backfill_attention_rolling(start: str,
     for e in days:
         try:
             build_attention_rank(start=None, end=e, source=source,
-                                 min_hits=min_hits, topN=topN, write=True)
+                                min_hits=min_hits, topN=topN, write=True, mode=mode,
+                                weight_mode=weight_mode, half_life=half_life,
+                                linear_min=linear_min, topM=topM)
             ok += 1
         except Exception as ex:
             fail += 1
@@ -1095,6 +1696,7 @@ def backfill_attention_rolling(start: str,
 def _ensure_dirs(ref_date: str):
     os.makedirs(os.path.join(SC_OUTPUT_DIR, "top"), exist_ok=True)
     os.makedirs(os.path.join(SC_OUTPUT_DIR, "details"), exist_ok=True)
+    os.makedirs(os.path.join(SC_OUTPUT_DIR, "all"), exist_ok=True)
     os.makedirs(os.path.join(SC_CACHE_DIR, ref_date), exist_ok=True)
 
 
@@ -1146,9 +1748,11 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     # 1) 参考日
     if not ref_date:
         ref_date = _pick_ref_date()
+    _progress("select_ref_date", message=f"ref={ref_date}")
 
     # 2) 估算读取起始日
     start_date = _compute_read_start(ref_date)
+    _progress("compute_read_window", message=f"{start_date} ~ {ref_date}")
     LOGGER.info(f"[范围] 读取区间：{start_date} ~ {ref_date}")
 
     # 3) 股票清单（来自分区目录文件名）
@@ -1156,22 +1760,27 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     # —— 打分范围先过滤 —— 
     codes0 = list(codes)
     codes, src = _apply_universe_filter(codes0, ref_date, SC_UNIVERSE)
-    LOGGER.info("[范围] 评分 universe=%s 源=%s 原=%d -> %d",
-                str(SC_UNIVERSE), src, len(codes0), len(codes))
+    _progress("build_universe_done", total=len(codes0), current=len(codes),
+              message=f"src={src} universe={SC_UNIVERSE}")
+    # LOGGER.info("[范围] 评分 universe=%s 源=%s 原=%d -> %d",
+    #             str(SC_UNIVERSE), src, len(codes0), len(codes))
     if not codes:
         raise RuntimeError("评分范围为空：请检查 SC_UNIVERSE 或对应名单是否已生成")
 
     LOGGER.info(f"[UNIVERSE] {ref_date} 共 {len(codes)} 只股票")
-
+    init_rank_env(ref_date, codes, PARQUET_BASE, PARQUET_ADJ, default_N=60)
     # 4/5) 并行处理
     _ensure_dirs(ref_date)
     columns = _select_columns_for_rules()
-
     max_workers = SC_MAX_WORKERS or max(os.cpu_count() - 1, 1)
+    
     results: List[Tuple[str, Optional[ScoreDetail], Optional[Tuple[str,str,str]]]] = []
     whitelist_items: List[Tuple[str,str,str]] = []
     blacklist_items: List[Tuple[str,str,str]] = []
+    _progress("score_start", total=len(codes), current=0,
+              message=f"workers={max_workers}")
 
+    done = 0
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
         futures = []
         for code in codes:
@@ -1179,6 +1788,8 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
         for fut in tqdm(as_completed(futures), total=len(futures), desc=f"评分 {ref_date}"):
             r = fut.result()
             results.append(r)
+            done += 1
+            _progress("score_progress", total=len(futures), current=done)
 
     # 拆分黑白名单与评分详情
     scored: List[ScoreDetail] = []
@@ -1190,6 +1801,7 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
             scored.append(detail)
 
     # 写缓存名单
+    _progress("write_cache_lists", message=f"white={len(whitelist_items)} black={len(blacklist_items)}")
     _write_cache_lists(ref_date, whitelist_items, blacklist_items)
 
     # 排序：总分降序；Tie-break（KDJ J）升序；ts_code 升序兜底
@@ -1209,15 +1821,60 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
             "score": round(s.score, 3),
             "highlights": "；".join(s.highlights) if s.highlights else "",
             "drawbacks": "；".join(s.drawbacks) if s.drawbacks else "",
+            "opportunities": "；".join(s.opportunities) if s.opportunities else "",
             "ref_date": ref_date,
             "tiebreak_j": s.tiebreak
         } for s in topk]
     )
     out_path = os.path.join(SC_OUTPUT_DIR, "top", f"score_top_{ref_date}.csv")
     out_top.to_csv(out_path, index=False, encoding="utf-8-sig")
+    # —— 全量排名（用于“单票详情”显示名次） ——
+    rows_all = [{
+        "ts_code": s.ts_code,
+        "score": round(s.score, 3),
+        "ref_date": ref_date,
+        "tiebreak_j": s.tiebreak,
+        "rank": i + 1,                   # 按当前排序的绝对名次
+    } for i, s in enumerate(scored_sorted)]
+    out_all = pd.DataFrame(rows_all)
+    out_all["trade_date"] = str(ref_date)
+    all_path = os.path.join(SC_OUTPUT_DIR, "all", f"score_all_{ref_date}.csv")
+    out_all.to_csv(all_path, index=False, encoding="utf-8-sig")
 
+    try:
+        hooks_res = post_scoring(ref_date, df_all_scores=out_all)
+        LOGGER.info("[HOOKS] tracking/surge 已完成：%s", hooks_res)
+    except Exception as _e:
+        LOGGER.exception("[HOOKS] 执行失败：%s", _e)
     LOGGER.info(f"[完成] Top-{SC_TOP_K} 已写入：{out_path}")
-    LOGGER.info(f"[名单] 白名单 {len(whitelist_items)}，黑名单 {len(blacklist_items)}")
+    try:
+        ui_dir = OUTPUT_DIR / "meta"
+        ui_dir.mkdir(parents=True, exist_ok=True)
+        with open(ui_dir / "ui_hints.json", "w", encoding="utf-8-sig") as f:
+            json.dump({"topk_rows": int(globals().get("SC_TOPK_ROWS", 30))}, f, ensure_ascii=False, indent=2)
+    except Exception as _e:
+        LOGGER.warning("[UI] 写入 ui_hints.json 失败：%s", _e)
+        LOGGER.info(f"[名单] 白名单 {len(whitelist_items)}，黑名单 {len(blacklist_items)}")
+    # —— 回写 rank 到各自的明细 JSON（可选，但推荐启用） ——
+    try:
+        import json as _json
+        details_dir = os.path.join(SC_OUTPUT_DIR, "details", str(ref_date))
+        totalN = len(scored_sorted)
+        for i, s in enumerate(scored_sorted):
+            fp = os.path.join(details_dir, f"{s.ts_code}_{ref_date}.json")
+            if not os.path.isfile(fp):
+                continue
+            with open(fp, "r", encoding="utf-8-sig") as f:
+                obj = _json.load(f)
+            summ = obj.get("summary") or {}
+            summ["rank"] = int(i + 1)          # 绝对名次（1 开始）
+            summ["total"] = int(totalN)        # 当日样本总数
+            obj["summary"] = summ
+            with open(fp, "w", encoding="utf-8-sig") as f:
+                _json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        LOGGER.warning("[detail] 回写 rank 失败：%s", e)
+
         # —— 生成“特别关注榜” —— 
     if SC_ATTENTION_ENABLE:
         try:
