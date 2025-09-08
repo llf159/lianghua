@@ -1,0 +1,16 @@
+{
+  "pf_130004230": {
+    "id": "pf_130004230",
+    "name": "Demo",
+    "init_cash": 1000000.0,
+    "trade_price_mode": "next_open",
+    "fee_bps": 0.0
+  },
+  "pf_8695284265": {
+    "id": "pf_8695284265",
+    "name": "手工账本1",
+    "init_cash": 1000000.0,
+    "trade_price_mode": "close",
+    "fee_bps": 1.0
+  }
+}

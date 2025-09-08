@@ -106,159 +106,6 @@ dl_hdl.setLevel(logging.DEBUG)
 dl_hdl.setFormatter(file_fmt)
 root.addHandler(dl_hdl)
 
-# === 申万行业：本地缓存与合并 =================================================
-
-import os, time, tempfile
-import pandas as pd
-
-SW_DATA_FILE = os.getenv("SW_DATA_FILE", "./stock/sw_industry.parquet")
-
-def _ensure_parent_dir(path: str):
-    d = os.path.dirname(path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-
-
-def _read_parquet_safe(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        return pd.DataFrame(columns=[
-            "ts_code","l1_code","l1_name","l2_code","l2_name",
-            "l3_code","l3_name","in_date","out_date","is_new","snapshot_ts"
-        ])
-    return pd.read_parquet(path)
-
-
-def _atomic_write_parquet(df: pd.DataFrame, path: str):
-    _ensure_parent_dir(path)
-    # 写临时文件 -> 原子替换
-    dir_ = os.path.dirname(path) or "."
-    with tempfile.NamedTemporaryFile(dir=dir_, delete=False, suffix=".parquet") as tmp:
-        tmp_path = tmp.name
-    try:
-        df.to_parquet(tmp_path, index=False)
-        os.replace(tmp_path, path)
-    finally:
-        if os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except: pass
-
-
-def persist_sw_to_parquet(ts_code: str, info: dict):
-    """
-    把下载到的行业信息落到 ./stock/sw_industry.parquet
-    info 需要包含：
-      sw_l1_code/sw_l1_name/sw_l2_code/sw_l2_name/sw_l3_code/sw_l3_name
-      sw_in_date/sw_out_date/sw_is_new
-    """
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    row = pd.DataFrame([{
-        "ts_code": ts_code,
-        "l1_code": info.get("sw_l1_code") or "",
-        "l1_name": info.get("sw_l1_name") or "",
-        "l2_code": info.get("sw_l2_code") or "",
-        "l2_name": info.get("sw_l2_name") or "",
-        "l3_code": info.get("sw_l3_code") or "",
-        "l3_name": info.get("sw_l3_name") or "",
-        "in_date": info.get("sw_in_date") or "",
-        "out_date": info.get("sw_out_date") or "",
-        "is_new":  (info.get("sw_is_new") or "Y"),
-        "snapshot_ts": now,
-    }])
-
-    df = _read_parquet_safe(SW_DATA_FILE)
-
-    # 1) 历史维度去重：以 (ts_code, in_date) 唯一，保留 snapshot_ts 最新
-    df = pd.concat([df, row], ignore_index=True)
-    df["snapshot_ts_key"] = pd.to_datetime(df["snapshot_ts"], errors="coerce")
-    df.sort_values(["ts_code","in_date","snapshot_ts_key"], ascending=[True,True,False], inplace=True)
-    df = df.drop_duplicates(subset=["ts_code","in_date"], keep="first")
-    df.drop(columns=["snapshot_ts_key"], inplace=True)
-
-    # 2) 最新标识规范化：若新行 is_new='Y'，将该 ts_code 其他行的 is_new 强制置为 'N'
-    if row.iloc[0]["is_new"] == "Y":
-        mask_same = df["ts_code"].eq(ts_code)
-        df.loc[mask_same, "is_new"] = df.loc[mask_same].apply(
-            lambda r: "Y" if (r["in_date"] == row.iloc[0]["in_date"]) else "N", axis=1
-        )
-
-    _atomic_write_parquet(df, SW_DATA_FILE)
-
-
-def _normalize_ts_code(code: str) -> str:
-    if not isinstance(code, str):
-        return code
-    code = code.strip().upper().replace("SHSE", "SH").replace("SZSE", "SZ")
-    if "." in code:
-        return code
-    if len(code) == 6:
-        if code.startswith(("6","9")):
-            return f"{code}.SH"
-        else:
-            return f"{code}.SZ"
-    return code
-
-
-def _attach_sw_industry_columns(ts_code: str, df: pd.DataFrame) -> pd.DataFrame:
-    try:
-        ts_code = _normalize_ts_code(ts_code)
-        data = _read_parquet_safe(SW_DATA_FILE)
-        if data.empty:
-            return df
-        row = data[(data["ts_code"] == ts_code) & (data["is_new"] == "Y")]
-        if row.empty:
-            return df
-        row = row.iloc[0]
-        df["l1_code"] = row.get("l1_code", "")
-        df["l1_name"] = row.get("l1_name", "")
-        df["l2_code"] = row.get("l2_code", "")
-        df["l2_name"] = row.get("l2_name", "")
-        df["l3_code"] = row.get("l3_code", "")
-        df["l3_name"] = row.get("l3_name", "")
-        df["sw_in_date"]  = row.get("in_date", "")
-        df["sw_out_date"] = row.get("out_date", "")
-    except Exception as e:
-        logging.debug("[SW] 附加行业列失败 %s: %s", ts_code, e)
-    return df
-
-
-_SW_IO_LOCK = threading.Lock()
-def _fetch_and_persist_sw_once(ts_code: str):
-    """仅在 sw_industry.parquet 中没有该 ts_code 的“最新行”时，才打一次 index_member_all。"""
-    ts_code = _normalize_ts_code(ts_code)
-    # 先看本地是否已有最新
-    with _SW_IO_LOCK:
-        df_local = _read_parquet_safe(SW_DATA_FILE)
-        has_latest = (
-            not df_local.empty and
-            (df_local["ts_code"] == ts_code).any() and
-            (df_local.loc[df_local["ts_code"] == ts_code, "is_new"] == "Y").any()
-        )
-    if has_latest:
-        return  # 已有最新，跳过 API
-
-    # 拉一次 TuShare（默认 is_new='Y' 即最新；要历史可去掉 is_new 参数）
-    df_sw = _retry(lambda: pro.index_member_all(ts_code=ts_code), f"index_member_all_{ts_code}")
-    if df_sw is None or df_sw.empty:
-        return
-
-    # 只保留必要列并落盘（逐行 append；persist_sw_to_parquet 内部做了“同 ts_code+in_date 去重 + 最新行归一化”）
-    cols = ["l1_code","l1_name","l2_code","l2_name","l3_code","l3_name",
-            "ts_code","in_date","out_date","is_new"]
-    df_sw = df_sw[[c for c in cols if c in df_sw.columns]].copy()
-
-    for _, r in df_sw.iterrows():
-        persist_sw_to_parquet(ts_code, {
-            "sw_l1_code": r.get("l1_code",""),
-            "sw_l1_name": r.get("l1_name",""),
-            "sw_l2_code": r.get("l2_code",""),
-            "sw_l2_name": r.get("l2_name",""),
-            "sw_l3_code": r.get("l3_code",""),
-            "sw_l3_name": r.get("l3_name",""),
-            "sw_in_date": r.get("in_date",""),
-            "sw_out_date": r.get("out_date",""),
-            "sw_is_new":  r.get("is_new","Y") or "Y",
-        })
-
 # =======================================================================
 
 def _parse_indicators(arg: str):
@@ -375,28 +222,13 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prew
     df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
     df2 = normalize_trade_date(df2)
     # —— 统一数值化，确保可计算
-    for c in ["open","high","low","close","vol","amount","pre_close","change","pct_chg"]:
+    for c in ["open","high","low","close","vol","amount"]:
         if c in df2.columns:
             df2[c] = pd.to_numeric(df2[c], errors="coerce")
 
-    # —— 无条件从 close 推导（覆盖空值/错误值）
-    df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-    df2["pre_close"] = df2["close"].shift(1)
-    df2["change"]    = df2["close"] - df2["pre_close"]
-    df2["pct_chg"]   = (df2["change"] / (df2["pre_close"] + EPS)) * 100.0
-
-    # 审计日志（可留可去）
-    try:
-        logging.debug("[PRODUCT][%s] 价格三列回填检查: head=%s tail=%s",
-                      ts_code,
-                      df2[["trade_date","pre_close","change","pct_chg"]].head(2).to_dict("records"),
-                      df2[["trade_date","pre_close","change","pct_chg"]].tail(2).to_dict("records"))
-    except Exception:
-        pass
-
-    price_cols = ["open", "high", "low", "close", "pre_close", "change"]
+    price_cols = ["open", "high", "low", "close"]
     # 只保留常用基础行情列（存在即取），作为不带指标的成品
-    base_cols = ["ts_code","trade_date","open","high","low","close","pre_close","change","pct_chg","vol","amount"]
+    base_cols = ["ts_code","trade_date","open","high","low","close","vol","amount"]
     cols = [c for c in base_cols if c in df2.columns]
     df_plain = df2[cols].copy() if cols else df2.copy()
 
@@ -407,7 +239,7 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prew
             old_plain = pd.read_parquet(plain_parquet)
         elif os.path.exists(plain_csv):
             old_plain = pd.read_csv(plain_csv, dtype=str)            
-            for c in ["open","high","low","close","pre_close","change","pct_chg","vol","amount"]:
+            for c in ["open","high","low","close","vol","amount"]:
                 if c in old_plain.columns:
                     old_plain[c] = pd.to_numeric(old_plain[c], errors="coerce")
     except Exception as e:
@@ -421,17 +253,9 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prew
         merged_plain = pd.concat([old_plain, df_plain], ignore_index=True)
         merged_plain = merged_plain.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
 
-    merged_plain = merged_plain.sort_values("trade_date").reset_index(drop=True)
-    merged_plain["pre_close"] = merged_plain["close"].shift(1)
-    merged_plain["change"]    = merged_plain["close"] - merged_plain["pre_close"]
-    merged_plain["pct_chg"]   = (merged_plain["change"] / (merged_plain["pre_close"] + EPS)) * 100.0
-
-    for col in ["open","high","low","close","pre_close","change"]:
+    for col in ["open","high","low","close","vol","amount"]:
         if col in merged_plain.columns and pd.api.types.is_numeric_dtype(merged_plain[col]):
             merged_plain[col] = merged_plain[col].round(2)
-
-    # --- 附加申万行业（从本地缓存/akshare 自动构建） ---
-    merged_plain = _attach_sw_industry_columns(ts_code, merged_plain)
 
     if "parquet" in SYMBOL_PRODUCT_FORMATS.get("plain", []):
         logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "parquet" in SYMBOL_PRODUCT_FORMATS.get("plain", []) -> taken')
@@ -496,7 +320,7 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prew
             for col, n in decs.items():
                 if col in calc_all.columns and pd.api.types.is_numeric_dtype(calc_all[col]):
                     calc_all[col] = calc_all[col].round(n)
-            for col in ["open","high","low","close","pre_close","change","pct_chg","vol","amount"]:
+            for col in ["open","high","low","close","vol","amount"]:
                 if col in calc_all.columns and pd.api.types.is_numeric_dtype(calc_all[col]):
                     calc_all[col] = calc_all[col].round(2)
 
@@ -537,8 +361,6 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prew
         warm_df = normalize_trade_date(warm_df)
         warm_df = warm_df.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
 
-        # --- 附加申万行业（从本地缓存/akshare 自动构建） ---
-        warm_df = _attach_sw_industry_columns(ts_code, warm_df)
         if "parquet" in SYMBOL_PRODUCT_FORMATS.get("ind", []):
             warm_df.to_parquet(ind_out_path_parquet, index=False, engine=PARQUET_ENGINE)
         if "csv" in SYMBOL_PRODUCT_FORMATS.get("ind", []):
@@ -897,7 +719,7 @@ class BatchIncCache:
             loc.register("cutoff_df", have_base)
 
             # 只取指标需要的基础列（按需增删）
-            base_cols = ["ts_code","trade_date","open","high","low","close","pre_close","change","pct_chg","vol","amount"]
+            base_cols = ["ts_code","trade_date","open","high","low","close","vol","amount"]
             cols_sql = ", ".join(f"p.{c}" for c in base_cols)
 
             inc_all = loc.sql(f"""
@@ -1002,7 +824,7 @@ def _recalc_increment_inmem(ts_list, last_duck_str: str, end: str, threads: int 
 
         # ② 只读本次涉及股票 + 各自窗口的基础列（DuckDB 一把拉进内存）
         glob_src = os.path.join(src_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
-        base_cols = ["ts_code","trade_date","open","high","low","close","vol","amount","pre_close","pct_chg","change"]
+        base_cols = ["ts_code","trade_date","open","high","low","close","vol","amount"]
         cols_sql = ", ".join(f"p.{c}" for c in base_cols)
         # —— df_all 的 SQL：两端统一按整数比较 ——  （原来 warm_lower 是 str，end 也是 str）
         df_all = con.sql(f"""
@@ -1121,6 +943,7 @@ def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: i
                 logging.debug('[BRANCH] def sync_index_daily_fast > def fetch_one | IF df is None or df.empty -> taken')
                 return code, "empty"
             df = df.sort_values("trade_date")
+            df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
             write_partition(df)
             return code, "ok"
         except Exception as e:
@@ -1216,7 +1039,7 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
                 return ts_code, "empty"
             df = df.sort_values("trade_date")
             # —— 统一数值化（仅转型，不计算三列）
-            for c in ["open","high","low","close","vol","amount","pre_close","change","pct_chg"]:
+            for c in ["open","high","low","close","vol","amount"]:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -1252,18 +1075,11 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
                 seed["close"] = last_close
                 df = pd.concat([seed, df], ignore_index=True)
                 seeded = True
-
-            # —— 统一只计算一次三列
-            df["pre_close"] = df["close"].shift(1)
-            df["change"]    = df["close"] - df["pre_close"]
-            df["pct_chg"]   = (df["change"] / (df["pre_close"] + EPS)) * 100.0
-
             # —— 丢掉 seed 行（只在 seeded 时）
             if seeded:
                 df = df.iloc[1:].copy()
-
+            df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
             write_partition(df)
-
             return ts_code, "ok"
         except Exception as e:
             return ts_code, f"err:{e}"
@@ -1374,10 +1190,6 @@ def fast_init_download(end_date: str):
                 return (ts_code, 'empty', None)
             df = df.sort_values("trade_date")
             df.to_parquet(fpath, index=False)
-            try:
-                _fetch_and_persist_sw_once(ts_code)
-            except Exception as e:
-                logging.warning("[SW][%s] 拉取/落盘失败：%s", ts_code, e)
 
             if API_ADJ != "raw":
                 logging.debug('[BRANCH] def fast_init_download > def task | IF API_ADJ != "raw" -> taken')
@@ -1454,10 +1266,6 @@ def fast_init_download(end_date: str):
                     return (ts_code, 'empty')
                 df = df.sort_values("trade_date")
                 df.to_parquet(fpath, index=False)
-                try:
-                    _fetch_and_persist_sw_once(ts_code)
-                except Exception as e:
-                    logging.warning("[SW][%s] 拉取/落盘失败：%s", ts_code, e)
 
                 if API_ADJ != "raw":
                     _WRITE_SYMBOL_INDICATORS(ts_code, df, end_date)

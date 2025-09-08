@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8-sig -*-
+# -*- coding: utf-8-sig -*-
 """
 score_engine.py — 单文件版“可编程打分系统”（无 CLI / 无可视化）
 依赖你现有工程：config.py、parquet_viewer.py、tdx_compat.py、indicators.py
@@ -44,6 +44,7 @@ from config import (
     SC_BENCH_CODES, SC_BENCH_WINDOW, SC_BENCH_FILL, SC_BENCH_FEATURES,
     SC_UNIVERSE, 
 )
+    
 from parquet_viewer import asset_root, list_trade_dates, read_range
 from indicators import kdj  # 用于兜底计算 J（若数据不含 j 列）
 from utils import normalize_ts, normalize_trade_date
@@ -165,6 +166,47 @@ def _rank_series(s: pd.Series, ascending: bool) -> pd.Series:
     r = s.rank(ascending=ascending, method="average")
     mx = int(r.max()) if pd.notna(r.max()) else len(r)
     return r.fillna(mx + 1)
+
+
+def _rule_key(rule: dict) -> tuple:
+    name = str(rule.get("name", "")).strip()
+    tf = str(rule.get("timeframe", "D")).upper().strip()
+    win = int(rule.get("window", SC_LOOKBACK_D))
+    # Canonicalize 'when' / 'clauses'
+    if rule.get("clauses"):
+        # serialize relevant fields only
+        parts = []
+        for c in rule.get("clauses") or []:
+            parts.append(str(c.get("when") or "").strip())
+        when = "|".join(parts)
+    else:
+        when = str(rule.get("when") or "").strip()
+    return (name, tf, win, when)
+
+
+def _iter_unique_rules():
+    seen = set()
+    for r in (SC_RULES or []):
+        k = _rule_key(r)
+        if k in seen:
+            continue
+        seen.add(k)
+        yield r
+
+
+def _json_sanitize(x):
+    """Recursively replace NaN/Inf floats with None so that json.dump(..., allow_nan=False) never fails."""
+    # numpy scalar check
+    if np is not None and isinstance(x, (np.floating, np.integer)):
+        x = float(x)
+    if isinstance(x, float):
+        if math.isnan(x) or math.isinf(x):
+            return None
+    if isinstance(x, dict):
+        return {k: _json_sanitize(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, set)):
+        return [_json_sanitize(v) for v in list(x)]
+    return x
 
 
 def _latest_row(df: pd.DataFrame, ref: str) -> pd.DataFrame:
@@ -333,7 +375,50 @@ def _make_time_weights(n: int,
             w = w / s
     return w.tolist()
 
-# ---------------------------------------------------------------------------
+
+def _normalize_gate(rule: dict) -> dict | None:
+    """把 trigger/gate/require 归一成：{'clauses': [...]} 或 单子句 dict。"""
+    g = rule.get("trigger") or rule.get("gate") or rule.get("require")
+    if not g:
+        return None
+    if isinstance(g, str):
+        # 默认为当前规则的 TF/WIN，scope=LAST（仅参考日）
+        return {
+            "timeframe": str(rule.get("timeframe","D")).upper(),
+            "window": int(rule.get("window", SC_LOOKBACK_D)),
+            "scope": "LAST",
+            "when": g
+        }
+    if isinstance(g, dict):
+        return g
+    if isinstance(g, (list, tuple)):
+        return {"clauses": list(g)}
+    return None
+
+
+def _eval_gate(df: pd.DataFrame, rule: dict, ref_date: str) -> tuple[bool, str | None, dict | None]:
+    """
+    返回: (gate_ok, err, gate_norm)
+    gate 为空 → 视为 True
+    多子句（列表）= AND 关系
+    """
+    g = _normalize_gate(rule)
+    if not g:
+        return True, None, None
+    try:
+        if "clauses" in g:
+            for c in g["clauses"]:
+                ok, err = _eval_rule(df, c, ref_date)
+                if err or (not ok):
+                    return False, err, g
+            return True, None, g
+        else:
+            ok, err = _eval_rule(df, g, ref_date)
+            return (bool(ok and not err), err, g)
+    except Exception as e:
+        return False, f"gate-exception: {e}", g
+
+
 def _after_scoring(ref_date: str, df_all_scores: pd.DataFrame | None = None):
     windows = [1,2,3,5,10,20]              # 或从 UI/配置读
     benchmarks = ["000300.SH", "399006.SZ"]  # 只用“已下载”的指数
@@ -535,36 +620,62 @@ def _recent_points(dfD: pd.DataFrame, rule: dict, ref_date: str) -> tuple[float,
     return (float(pts) if pts is not None else 0.0), lag, None
 
 
+# def _select_columns_for_rules() -> List[str]:
+#     """
+#     尽量按需裁列，减少 IO。
+#     """
+#     need = {"trade_date", "open", "high", "low", "close", "vol", "amount"}
+#     # 规则文本中可能出现的列（如 j/vr）
+#     pattern = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\b')
+#     def scan(script: str):
+#         for name in pattern.findall(script):
+#             name_low = name.lower()
+#             # tdx 映射里常见的：C O H L V AMOUNT J VR ...
+#             if name_low in {"j","vr","bbi","z_score"}:
+#                 need.add(name_low)
+#     for rr in (SC_RULES or []):
+#         if "clauses" in rr:
+#             for c in rr["clauses"]:
+#                 if "when" in c:
+#                     scan(c["when"])
+#         else:
+#             if "when" in rr:
+#                 scan(rr["when"])
+#     for rr in (SC_PRESCREEN_RULES or []):
+#         if "clauses" in rr:
+#             for c in rr["clauses"]:
+#                 if "when" in c:
+#                     scan(c["when"])
+#         else:
+#             if "when" in rr:
+#                 scan(rr["when"])
+#     return sorted(need)
+
 def _select_columns_for_rules() -> List[str]:
-    """
-    尽量按需裁列，减少 IO。
-    """
     need = {"trade_date", "open", "high", "low", "close", "vol", "amount"}
-    # 规则文本中可能出现的列（如 j/vr）
     pattern = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\b')
     def scan(script: str):
-        for name in pattern.findall(script):
+        for name in pattern.findall(script or ""):
             name_low = name.lower()
-            # tdx 映射里常见的：C O H L V AMOUNT J VR ...
             if name_low in {"j","vr","bbi","z_score"}:
                 need.add(name_low)
-    for rr in (SC_RULES or []):
-        if "clauses" in rr:
-            for c in rr["clauses"]:
-                if "when" in c:
-                    scan(c["when"])
-        else:
-            if "when" in rr:
-                scan(rr["when"])
-    for rr in (SC_PRESCREEN_RULES or []):
-        if "clauses" in rr:
-            for c in rr["clauses"]:
-                if "when" in c:
-                    scan(c["when"])
-        else:
-            if "when" in rr:
-                scan(rr["when"])
+
+    def scan_rule(rr: dict):
+        # 主体
+        if rr.get("when"): scan(rr["when"])
+        for c in rr.get("clauses", []) or []:
+            if c.get("when"): scan(c["when"])
+        # gate
+        g = rr.get("gate") or {}
+        if isinstance(g, dict):
+            if g.get("when"): scan(g["when"])
+            for c in g.get("clauses", []) or []:
+                if c.get("when"): scan(c["when"])
+
+    for rr in (SC_RULES or []):           scan_rule(rr)
+    for rr in (SC_PRESCREEN_RULES or []): scan_rule(rr)
     return sorted(need)
+
 
 
 def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: list[dict]):
@@ -578,13 +689,12 @@ def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: li
             "summary": summary,      # {"score": float, "tiebreak": float|None, "highlights": [...], "drawbacks":[...]}
             "rules": per_rules       # 每条规则的细粒度命中情况（见下）
         }
-        with open(out_path, "w", encoding="utf-8-sig") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             import json
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+            json.dump(_json_sanitize(payload), f, ensure_ascii=False, indent=2, allow_nan=False)
         LOGGER.debug("[detail] %s -> %s", ts_code, out_path)
     except Exception as e:
         LOGGER.warning("[detail] 写明细失败 %s: %s", ts_code, e)
-
 
 
 def _list_true_dates(df: pd.DataFrame, expr: str, *, ref_date: str, window: int, timeframe: str) -> list[str]:
@@ -601,9 +711,11 @@ def _list_true_dates(df: pd.DataFrame, expr: str, *, ref_date: str, window: int,
     except Exception:
         return []
 
+
 def _build_per_rule_detail(df: pd.DataFrame, ref_date: str) -> list[dict]:
     rows = []
-    for rule in (SC_RULES or []):
+    gate_ok=False; gate_norm={}
+    for rule in _iter_unique_rules():
         name = str(rule.get("name", "<unnamed>"))
         scope = str(rule.get("scope", "ANY")).upper().strip()
         pts   = float(rule.get("points", 0))
@@ -638,6 +750,9 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str) -> list[dict]:
                     hit_date = _d
                 ok = bool(cnt and cnt > 0 and err is None)
                 add = float(pts * int(cnt or 0))
+                gate_ok, gate_err, gate_norm = _eval_gate(df, rule, ref_date)
+                if not gate_ok:
+                    add = 0.0
                 rows.append({
                     "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
                     "points": pts, "ok": ok, "cnt": int(cnt or 0),
@@ -645,15 +760,11 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str) -> list[dict]:
                     "hit_date": hit_date,
                     "hit_dates": _list_true_dates(df, (cand_when or rule.get("when") or ""), ref_date=ref_date, window=win, timeframe=tf),
                     "hit_count": int(cnt or 0),
+                    "gate_ok": bool(gate_ok),
+                    "gate_when": (gate_norm.get("when") if isinstance(gate_norm, dict) else None),
                     "explain": expl,
                 })
-                # 继续后续逻辑需要 when
-                if "clauses" in rule and rule["clauses"]:
-                    for c in rule["clauses"]:
-                        if c.get("when"):
-                            when = c["when"]; break
-                else:
-                    when = rule.get("when")
+                continue
             else:
                 # === RECENT / DIST / NEAR: 按最近一次命中距今天数计分 ===
                 if scope in {"RECENT", "DIST", "NEAR"}:
@@ -662,17 +773,24 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str) -> list[dict]:
                     win_df = _window_slice(dfTF, ref_date, win)
                     hit_date = None
                     if err is None and lag is not None:
-                        # lag=0 表示 ref_date，当 ref_date 不在索引里时用 window 尾
                         idx = win_df.index if isinstance(win_df.index, pd.DatetimeIndex) else pd.to_datetime(win_df["trade_date"].astype(str))
-                        hit_idx = max(0, len(idx)-1-int(lag))
-                        hit_date = idx[hit_idx].strftime("%Y%m%d")
+                        lag_i = int(lag)
+                        if 0 <= lag_i < len(idx):
+                            hit_date = idx[-1 - lag_i].strftime("%Y%m%d")
+                        else:
+                            # 理论不应发生；保守返回空，交由 UI 用 hit_dates 或其它信息展示
+                            hit_date = None
+
                     rows.append({
                         "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
                         "points": pts, "ok": ok, "cnt": None,
                         "add": add, "lag": (None if lag is None else int(lag)),
-                        "hit_date": hit_date, "hit_dates": _list_true_dates(df, cand_when or (when or ""), ref_date=ref_date, window=win, timeframe=tf), "hit_count": int(cnt or 0), "explain": expl,
+                        "hit_date": hit_date, "hit_dates": _list_true_dates(df, cand_when or (when or ""), ref_date=ref_date, window=win, timeframe=tf),
+                        "hit_count": int(cnt or 0),
+                        "explain": expl,
+                        "gate_ok": bool(gate_ok),
+                        "gate_when": (gate_norm.get("when") if isinstance(gate_norm, dict) else None),
                     })
-
                     continue
                 # === 其余仍走原来的布尔命中路径 ===
                 ok_eval, err_eval = _eval_rule(df, rule, ref_date)
@@ -685,6 +803,7 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str) -> list[dict]:
             # === 追加：常规布尔规则命中日期信息 ===
             hit_date = None
             hit_dates = []
+            gate_ok, gate_err, gate_norm = _eval_gate(df, rule, ref_date)
             try:
                 if when:
                     dfTF2 = df if tf=="D" else _resample(df, tf)
@@ -702,7 +821,11 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str) -> list[dict]:
         rows.append({
             "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
             "points": pts, "ok": ok, "cnt": (None if cnt is None else int(cnt)),
-            "add": add, "hit_date": hit_date, "hit_dates": hit_dates, "hit_count": (len(hit_dates) if hit_dates else 0), "explain": expl, "error": err
+            "add": add, "hit_date": hit_date, "hit_dates": hit_dates, "hit_count": (len(hit_dates) if hit_dates else 0),
+            "explain": expl, "error": err,
+            "gate_ok": bool(gate_ok),
+            "gate_when": (gate_norm.get("when") if isinstance(gate_norm, dict) else None),
+
         })
     return rows
 
@@ -1330,7 +1453,7 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
                 drawbacks.append(text)
 
 
-        for rule in (SC_RULES or []):
+        for rule in _iter_unique_rules():
             scope = str(rule.get("scope", "ANY")).upper().strip()
             if scope in {"EACH", "PERBAR", "EACH_TRUE"}:
                 pts = float(rule.get("points", 0))
@@ -1350,26 +1473,53 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
                         LOGGER.debug(f"[HIT][{ts_code}] {rule.get('name','<unnamed>')} +{pts} => {score}")
                 else:
                     if cnt > 0 and pts != 0:
-                        add = pts * int(cnt)
-                        score += add
-                        tag = f"{rule.get('explain')}×{cnt}" if rule.get('explain') else None
-                        _append_reason_by_rule(add, rule, tag_text=tag)
-                        LOGGER.debug(f"[HIT][{ts_code}] {rule.get('name','<unnamed>')} EACH 命中 {cnt} 次，+{add} => {score}")
+                        gate_ok, gate_err, _ = _eval_gate(df, rule, ref_date)
+                        if gate_ok:
+                            add = pts * int(cnt)
+                            score += add
+                            tag = f"{rule.get('explain')}×{cnt}" if rule.get('explain') else None
+                            _append_reason_by_rule(add, rule, tag_text=tag)
+                            LOGGER.debug(f"[HIT][{ts_code}] {rule.get('name','<unnamed>')} EACH 命中 {cnt} 次，+{add} => {score}")
+                        else:
+                            LOGGER.debug(f"[GATE][{ts_code}] {rule.get('name')} 被 gate 拦截: {gate_err or ''}")
                     else:
                         LOGGER.debug(f"[MISS][{ts_code}] {rule.get('name','<unnamed>')} EACH 无命中")
                 continue  # EACH 已处理完，下一条
             
             if scope in {"RECENT", "DIST", "NEAR"}:
                 add, lag, err = _recent_points(df, rule, ref_date)
-                if err:
-                    LOGGER.warning(f"[{ts_code}] RECENT 解析异常：{rule.get('name')} -> {err}")
-                if add != 0:
-                    score += add
-                    tag = f"{rule.get('explain')}(距今{lag})" if rule.get('explain') else None
-                    _append_reason_by_rule(add, rule, tag_text=tag)
-                    LOGGER.debug(f"[HIT][{ts_code}] {rule.get('name','<unnamed>')} RECENT lag={lag} +{add} => {score}")
-                else:
-                    LOGGER.debug(f"[MISS][{ts_code}] {rule.get('name','<unnamed>')} RECENT 无匹配区间")
+                dfTF = df if tf=="D" else _resample(df, tf)
+                win_df = _window_slice(dfTF, ref_date, win)
+                hit_date = None
+                if err is None and lag is not None:
+                    idx = win_df.index if isinstance(win_df.index, pd.DatetimeIndex) else pd.to_datetime(win_df["trade_date"].astype(str))
+                    lag_i = int(lag)
+                    if 0 <= lag_i < len(idx):
+                        hit_date = idx[-1 - lag_i].strftime("%Y%m%d")
+
+                # 供 hit_dates 使用的表达式
+                cand_when = None
+                if "clauses" in rule and rule["clauses"]:
+                    for c in rule["clauses"]:
+                        if c.get("when"): cand_when = c["when"]; break
+                when_for_hits = (cand_when or rule.get("when") or "")
+
+                # gate 同样参与详情
+                gate_ok, gate_err, gate_norm = _eval_gate(df, rule, ref_date)
+                add2 = float(add if gate_ok else 0.0)
+                ok2 = bool(add != 0)
+
+                rows.append({
+                    "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
+                    "points": pts, "ok": ok2, "cnt": None,
+                    "add": add2, "lag": (None if lag is None else int(lag)),
+                    "hit_date": hit_date,
+                    "hit_dates": _list_true_dates(df, when_for_hits, ref_date=ref_date, window=win, timeframe=tf),
+                    "hit_count": int(cnt or 0),
+                    "gate_ok": bool(gate_ok),
+                    "gate_when": (gate_norm.get("when") if isinstance(gate_norm, dict) else None),
+                    "explain": expl,
+                })
                 continue
             # —— 常规路径 ——
             ok, err = _eval_rule(df, rule, ref_date)
@@ -1377,10 +1527,16 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
                 LOGGER.warning(f"[{ts_code}] 规则异常：{rule.get('name')} -> {err}")
                 continue
             if ok:
-                pts = float(rule.get("points", 0))
-                score += pts
-                _append_reason_by_rule(pts, rule)
-                LOGGER.debug(f"[HIT][{ts_code}] {rule.get('name','<unnamed>')} +{pts} => {score}")
+                gate_ok, gate_err, _ = _eval_gate(df, rule, ref_date)
+                if gate_ok:
+                    pts = float(rule.get("points", 0))
+                    score += pts
+                    _append_reason_by_rule(pts, rule)
+                    LOGGER.debug(f"[HIT][{ts_code}] {rule.get('name','<unnamed>')} +{pts} => {score}")
+                else:
+                    LOGGER.debug(f"[GATE][{ts_code}] {rule.get('name')} 被 gate 拦截: {gate_err or ''}")
+            else:
+                LOGGER.debug(f"[MISS][{ts_code}] {rule.get('name','<unnamed>')}")
 
         score = max(score, float(SC_MIN_SCORE))
         # tiebreak: KDJ J（低的在前）
@@ -1398,13 +1554,24 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
             except Exception as e:
                 LOGGER.warning(f"[{ts_code}] 提取 J 失败：{e}")
                 tb = None
+        # sanitize tiebreak to avoid NaN/Inf in JSON
+        try:
+            import math as _math
+            if tb is None:
+                tb2 = None
+            elif isinstance(tb, float) and (_math.isnan(tb) or _math.isinf(tb)):
+                tb2 = None
+            else:
+                tb2 = float(tb)
+        except Exception:
+            tb2 = None
         try:
             per_rules = _build_per_rule_detail(df, ref_date)
             _write_detail_json(
                 ts_code, ref_date,
                 summary={
                     "score": float(score),
-                    "tiebreak": tb,
+                    "tiebreak": tb2,
                     "highlights": list(highlights),
                     "drawbacks": list(drawbacks),
                     "opportunities": list(opportunities),
@@ -1850,8 +2017,8 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     try:
         ui_dir = OUTPUT_DIR / "meta"
         ui_dir.mkdir(parents=True, exist_ok=True)
-        with open(ui_dir / "ui_hints.json", "w", encoding="utf-8-sig") as f:
-            json.dump({"topk_rows": int(globals().get("SC_TOPK_ROWS", 30))}, f, ensure_ascii=False, indent=2)
+        with open(ui_dir / "ui_hints.json", "w", encoding="utf-8") as f:
+            json.dump({"topk_rows": int(globals().get("SC_TOPK_ROWS", 30))}, f, ensure_ascii=False, indent=2, allow_nan=False)
     except Exception as _e:
         LOGGER.warning("[UI] 写入 ui_hints.json 失败：%s", _e)
         LOGGER.info(f"[名单] 白名单 {len(whitelist_items)}，黑名单 {len(blacklist_items)}")
@@ -1870,8 +2037,8 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
             summ["rank"] = int(i + 1)          # 绝对名次（1 开始）
             summ["total"] = int(totalN)        # 当日样本总数
             obj["summary"] = summ
-            with open(fp, "w", encoding="utf-8-sig") as f:
-                _json.dump(obj, f, ensure_ascii=False, indent=2)
+            with open(fp, "w", encoding="utf-8") as f:
+                _json.dump(_json_sanitize(obj), f, ensure_ascii=False, indent=2, allow_nan=False)
     except Exception as e:
         LOGGER.warning("[detail] 回写 rank 失败：%s", e)
 

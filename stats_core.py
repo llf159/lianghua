@@ -879,6 +879,8 @@ def _load_portfolios() -> Dict[str, Portfolio]:
         vv.pop("fee_bps", None)
         out[k] = Portfolio(**vv)
     return out
+
+
 def _save_portfolios(ps: Dict[str, Portfolio]) -> None:
     _ensure_dir(PORT_OUT_BASE)
     obj = {k: asdict(v) for k, v in ps.items()}

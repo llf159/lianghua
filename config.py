@@ -1,4 +1,4 @@
-import os
+﻿import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)) 
 # ================= backtest配置区 =====================
 # True 使用 Parquet，False 使用旧 CSV
@@ -48,10 +48,10 @@ CALLS_PER_MIN = 470
 RETRY_TIMES = 5
 PARQUET_ENGINE = "pyarrow"
 LOG_LEVEL = "INFO"
-STOCK_INC_THREADS = 40         # 增量下载线程数
+STOCK_INC_THREADS = 10         # 增量下载线程数
 
 # -------- FAST INIT(按股票多线程全历史回补) --------
-FAST_INIT_THREADS = 50                    # 并发线程数
+FAST_INIT_THREADS = 10                    # 并发线程数
 FAST_INIT_STOCK_DIR = os.path.join(DATA_ROOT, "fast_init_symbol")
 API_ADJ = "qfq"                           # qfq/hfq/raw
 # 若 FAST_INIT_MODE=True，可通过设置 API_ADJ 控制接口返回的复权方式：

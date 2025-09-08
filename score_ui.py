@@ -11,7 +11,7 @@ Score UI — 无侧栏版（中文）
 from __future__ import annotations
 import os, io, json, re
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict
 
 import pandas as pd
@@ -20,7 +20,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 from contextlib import contextmanager
 
-# ===== 尝试引擎模块 =====
+import download as dl
+import app_pv as apv
+
 try:
     import scoring_core as se
 except Exception as e:
@@ -43,6 +45,7 @@ from utils import normalize_ts, ensure_datetime_index, normalize_trade_date, mar
 from parquet_viewer import read_range, asset_root, list_trade_dates
 from config import PARQUET_BASE, PARQUET_ADJ
 st.set_page_config(page_title="ScoreApp", layout="wide")
+import tdx_compat as tdx
 
 # ===== 常量路径 =====
 SC_OUTPUT_DIR = Path(getattr(cfg, "SC_OUTPUT_DIR", "output/score"))
@@ -54,10 +57,92 @@ LOG_DIR  = Path("./log")
 for p in [TOP_DIR, ALL_DIR, DET_DIR, ATTN_DIR, LOG_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 
+def _today_str() -> str:
+    return datetime.date.today().strftime("%Y%m%d")
+
+def _apply_overrides(
+    base: str,
+    assets: List[str],
+    start: str,
+    end: str,
+    api_adj: str,
+    fast_threads: int,
+    inc_threads: int,
+    inc_ind_workers: int | None,
+):
+    """把 UI 输入同步到 download.py 的全局，以便其函数读取。"""
+    # download.py 内部多数直接使用模块级常量，这里原地覆写它们
+    dl.DATA_ROOT = base
+    dl.ASSETS = [a.lower() for a in assets]
+    dl.START_DATE = start
+    dl.END_DATE = end
+    dl.API_ADJ = api_adj.lower()
+    dl.FAST_INIT_THREADS = int(max(1, fast_threads))
+    dl.STOCK_INC_THREADS = int(max(1, inc_threads))
+    if inc_ind_workers is not None and int(inc_ind_workers) > 0:
+        dl.INC_RECALC_WORKERS = int(inc_ind_workers)
+
+    # 同步到 config，以便其他模块（如 parquet_viewer）看到一致的 base/adj
+    try:
+        cfg.PARQUET_BASE = base
+        cfg.DATA_ROOT = base
+        cfg.PARQUET_ADJ = api_adj.lower() if api_adj.lower() in {"daily","raw","qfq","hfq"} else getattr(cfg, "PARQUET_ADJ", "qfq")
+    except Exception:
+        pass
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _latest_trade_date(base: str, adj: str) -> str | None:
+    try:
+        from parquet_viewer import asset_root, list_trade_dates
+        root = asset_root(base, "stock", adj)
+        ds = list_trade_dates(root)
+        return ds[-1] if ds else None
+    except Exception:
+        return None
+
+# -------------------- 执行动作（封装 download.py） --------------------
+def _run_fast_init(end_use: str):
+    dl.fast_init_download(end_use)                       # 首次全量（单股缓存）
+    if getattr(dl, "DUCK_MERGE_DAY_LAG", 5) >= 0:
+        dl.duckdb_partition_merge()                     # 合并到 daily_*
+    if getattr(dl, "WRITE_SYMBOL_INDICATORS", True):
+        dl.duckdb_merge_symbol_products_to_daily()      # 合并指标到 daily_*_indicators
+
+
+def _run_increment(start_use: str, end_use: str, do_stock: bool, do_index: bool, do_indicators: bool):
+    # 若 fast_init 的缓存存在，先合并一次（与 main() 逻辑一致）
+    try:
+        if any(
+            os.path.isdir(os.path.join(dl.FAST_INIT_STOCK_DIR, d))
+            and any(f.endswith(".parquet") for f in os.listdir(os.path.join(dl.FAST_INIT_STOCK_DIR, d)))
+            for d in ("raw","qfq","hfq")
+        ):
+            dl.duckdb_partition_merge()
+    except Exception:
+        pass
+
+    if do_stock and ("stock" in set(dl.ASSETS)):
+        dl.sync_stock_daily_fast(start_use, end_use, threads=dl.STOCK_INC_THREADS)
+    if do_index and ("index" in set(dl.ASSETS)):
+        dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
+    if do_indicators:
+        workers = getattr(dl, "INC_RECALC_WORKERS", None) or ((os.cpu_count() or 4) * 2)
+        dl.recalc_symbol_products_for_increment(start_use, end_use, threads=workers)
+        
+
 # ===== 小工具 =====
 def _path_top(ref: str) -> Path: return TOP_DIR / f"score_top_{ref}.csv"
 def _path_all(ref: str) -> Path: return ALL_DIR / f"score_all_{ref}.csv"
 def _path_detail(ref: str, ts: str) -> Path: return DET_DIR / ref / f"{normalize_ts(ts)}_{ref}.json"
+def _today_str() -> str:
+    return date.today().strftime("%Y%m%d")
+
+@st.cache_data(show_spinner=False, hash_funcs={Path: lambda p: p.stat().st_mtime_ns})
+def _read_df(path: Path, usecols=None, dtype=None, encoding: str = "utf-8-sig") -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, usecols=usecols, dtype=dtype, encoding=encoding, engine="c")
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(show_spinner=False, ttl=600)
 def _cached_trade_dates(base: str, adj: str):
@@ -123,11 +208,30 @@ def _prev_ref_date(cur: str) -> Optional[str]:
             dates.append(m.group(1))
     return dates[-1] if dates else None
 
-def _read_df(path: Path) -> pd.DataFrame:
-    try:
-        return pd.read_csv(path)
-    except Exception:
-        return pd.DataFrame()
+# —— 小工具：把规则 JSON 转成 tdx_screen 所需参数 ——
+def _rule_to_screen_args(rule: dict):
+    """返回 (when_expr, timeframe, window, scope)"""
+    if rule.get("clauses"):
+        tfs = {str(c.get("timeframe","D")).upper() for c in rule["clauses"]}
+        wins = {int(c.get("window", 60)) for c in rule["clauses"]}
+        scopes = {str(c.get("scope","ANY")).upper() for c in rule["clauses"]}
+        whens = [f"({c.get('when','').strip()})" for c in rule["clauses"] if c.get("when","").strip()]
+        if not whens:
+            raise ValueError("复合规则缺少 when")
+        # 目前仅支持“相同 tf/window/scope”的复合规则；否则就无法一次性屏全市场
+        if len(tfs)==len(wins)==len(scopes)==1:
+            return " AND ".join(whens), list(tfs)[0], list(wins)[0], list(scopes)[0]
+        else:
+            raise ValueError("全市场跑目前仅支持各子句 tf/window/scope 完全一致的复合规则")
+    else:
+        when = (rule.get("when") or "").strip()
+        if not when:
+            raise ValueError("when 不能为空")
+        tf = str(rule.get("timeframe","D")).upper()
+        win = int(rule.get("window", 60))
+        scope = str(rule.get("scope","ANY")).upper()
+        return when, tf, win, scope
+
 
 def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
     p = _path_detail(ref, ts)
@@ -243,13 +347,13 @@ if "export_pref" not in st.session_state:
 st.title("ScoreApp")
 
 # ===== 顶层页签 =====
-tab_rank, tab_detail, tab_rules, tab_attn, tab_screen, tab_tools, tab_port, tab_stats, tab_logs = st.tabs(
-    ["排名（运行+浏览）", "个股详情", "规则编辑", "强度榜", "普通选股", "工具箱", "组合模拟/持仓", "统计", "日志"]
+tab_rank, tab_detail, tab_rules, tab_attn, tab_data, tab_screen, tab_tools, tab_port, tab_stats, tab_logs = st.tabs(
+    ["排名", "个股详情", "规则编辑", "强度榜", "数据下载/浏览", "普通选股", "工具箱", "组合模拟/持仓", "统计", "日志"]
 )
 
-# ================== 排名（运行+浏览） ==================
+# ================== 排名 ==================
 with tab_rank:
-    st.subheader("① 排名（运行 + 浏览）")
+    st.subheader("① 排名")
     with st.expander("参数设置（运行前请确认）", expanded=True):
         c1, c2, c3, c4 = st.columns([1,1,1,1])
         with c1:
@@ -264,12 +368,11 @@ with tab_rank:
             # maxw = st.number_input("最大并行数", min_value=1, max_value=64, value=int(getattr(cfg, "SC_MAX_WORKERS", 8)))
             maxw = st.number_input("最大并行数", min_value=1, max_value=64, value=cfg_int("SC_MAX_WORKERS", 8))
         with c3:
-            # attn_on = st.checkbox("评分后生成关注榜", value=bool(getattr(cfg, "SC_ATTENTION_ENABLE", True)))
-            attn_on = st.checkbox("评分后生成关注榜", value=cfg_bool("SC_ATTENTION_ENABLE", True))
             universe = st.selectbox("评分范围", ["全市场","仅白名单","仅黑名单","仅特别关注榜"], index=0)
-        with c4:
             style = st.selectbox("TXT 导出格式", ["空格分隔", "一行一个"], index=0)
-            with_suffix = st.checkbox("导出带交易所后缀（.SZ/.SH）", value=True)
+        with c4:
+            attn_on = st.checkbox("评分后生成关注榜", value=cfg_bool("SC_ATTENTION_ENABLE", False))
+            with_suffix = st.checkbox("导出带交易所后缀（.SZ/.SH）", value=False)
         st.session_state["export_pref"] = {"style": "space" if style=="空格分隔" else "lines",
                                            "with_suffix": with_suffix}
         run_col1, run_col2 = st.columns([1,1])
@@ -330,9 +433,9 @@ with tab_rank:
             st.caption("暂无 Top-K 数据")
 
 
-# ================== 个股详情（含命中信号日期查询） ==================
+# ================== 个股详情 ==================
 with tab_detail:
-    st.subheader("② 个股详情（融合版）")
+    st.subheader("② 个股详情")
 
     # —— 选择参考日 + 代码（支持从 Top-K 下拉选择） ——
     c0, c1 = st.columns([1,2])
@@ -347,7 +450,7 @@ with tab_detail:
         options_codes = []
     with c1:
         code_from_list = st.selectbox("从 Top-K 选择（可选）", options=options_codes or [], index=0 if options_codes else None, placeholder="也可手动输入 ↓")
-    code_typed = st.text_input("或手动输入股票代码（如 000001.SZ / 600000.SH）", value=(code_from_list or ""), key="detail_code_input")
+    code_typed = st.text_input("或手动输入股票代码", value=(code_from_list or ""), key="detail_code_input")
     code_norm = normalize_ts(code_typed) if code_typed else ""
 
     # —— 渲染详情（含 old 版功能） ——
@@ -370,15 +473,28 @@ with tab_detail:
                 all_path = _path_all(ref_real)
                 if all_path.exists():
                     try:
-                        df_allx = pd.read_csv(all_path, dtype={"ts_code": str}, encoding="utf-8-sig")
-                        row = df_allx.loc[df_allx["ts_code"].astype(str) == str(ts)]
-                        if not row.empty and "rank" in row.columns:
-                            rank_display = f"{int(row['rank'].iloc[0])} / {len(df_allx)}"
+                        df_allx = _read_df(all_path, dtype={"ts_code": str}, encoding="utf-8-sig")
+                        if not df_allx.empty:
+                            row = df_allx.loc[df_allx["ts_code"].astype(str) == str(ts)]
+                            if not row.empty and "rank" in row.columns:
+                                rank_display = f"{int(row['rank'].iloc[0])} / {len(df_allx)}"
                     except Exception:
                         pass
+                # 2) 若全量无果，回退到 Top 文件：按行号近似名次
                 if rank_display == "—":
                     top_path = _path_top(ref_real)
                     if top_path.exists():
+                        try:
+                            df_topx = _read_df(top_path, dtype={"ts_code": str}, encoding="utf-8-sig")
+                            if not df_topx.empty:
+                                if "rank" not in df_topx.columns:
+                                    df_topx = df_topx.reset_index(drop=True)
+                                    df_topx["rank"] = np.arange(1, len(df_topx) + 1)
+                                row = df_topx.loc[df_topx["ts_code"].astype(str) == str(ts)]
+                                if not row.empty and "rank" in row.columns:
+                                    rank_display = f"{int(row['rank'].iloc[0])} / {len(df_topx)}"
+                        except Exception:
+                            pass
                         try:
                             df_topx = pd.read_csv(top_path, dtype={"ts_code": str}, encoding="utf-8-sig")
                             pos = df_topx.index[df_topx["ts_code"].astype(str) == str(ts)]
@@ -407,7 +523,7 @@ with tab_detail:
 
             # 交易性机会
             ops = (summary.get("opportunities") or [])
-            with st.expander("交易性机会", expanded=False):
+            with st.expander("交易性机会", expanded=True):
                 if ops:
                     for t in ops:
                         st.write("• " + str(t))
@@ -422,18 +538,27 @@ with tab_detail:
             import re as _re
 
             if not rules.empty:
-                # 展示最近命中信息：优先使用 lag（RECENT/DIST/NEAR），否则用 hit_date 计算天数
-                def _days_from_ref(d):
-                    if isinstance(d, str) and _re.fullmatch(r"\d{8}", d):
+                
+                def _days_from_ref(d: str | None) -> int | None:
+                    if isinstance(d, str) and re.fullmatch(r"\d{8}", d):
                         return (datetime.strptime(ref_real, "%Y%m%d") - datetime.strptime(d, "%Y%m%d")).days
                     return None
-                if "lag" in rules.columns:
-                    rules["last_hit_days"] = rules["lag"]
-                elif "hit_date" in rules.columns:
-                    rules["last_hit_days"] = rules["hit_date"].map(_days_from_ref)
-                # 优先列顺序调优（加入 hit_dates）
-                prefer = [c for c in ["name","add","points","cnt","ok","hit_date","hit_dates","lag","last_hit_days","explain"] if c in rules.columns]
-                rules = rules[prefer + [c for c in rules.columns if c not in prefer]]
+
+                if not rules.empty:
+                    def _pick_last_hit_days(row):
+                        # 先看 lag 是否有值（仅 RECENT/DIST/NEAR）
+                        lag = row.get("lag")
+                        if pd.notna(lag):
+                            try:
+                                return int(lag)
+                            except Exception:
+                                pass
+                        # 否则回落到 hit_date → 天数
+                        return _days_from_ref(row.get("hit_date"))
+
+                    rules["last_hit_days"] = rules.apply(_pick_last_hit_days, axis=1)
+                    # 可选：显示更干净（支持空值）
+                    rules["last_hit_days"] = rules["last_hit_days"].astype("Int64")
             try:
                 for r in (getattr(se, "SC_RULES", []) or []):
                     if "clauses" in r and r["clauses"]:
@@ -452,65 +577,79 @@ with tab_detail:
             else:
                 st.info("无规则明细。")
 
-            # —— 命中信号日期查询（保留并增强） ——
-            st.markdown("**命中信号日期查询**")
-            all_rules = sorted(set(rules["name"])) if not rules.empty and "name" in rules.columns else []
-            c3, c4, c5 = st.columns([1.2, 1, 1])
-            with c3:
-                chosen_rule = st.multiselect("选择规则（留空=全部）", all_rules, default=[])
-            with c4:
-                recent_n = st.number_input("最近 N 次（若>0则优先生效）", min_value=0, max_value=200, value=20, key="hits_recent_n")
-            with c5:
-                date_rng = st.text_input("起止日期（YYYYMMDD-YYYYMMDD，留空=自动范围）", value="", key="detail_hits_range")
+            with st.expander("按触发某规则筛选（当日全市场）", expanded=True):
+                st.caption("说明：基于当日 details JSON，筛出‘命中该规则’的股票；按 Score 降序（得分相同则按代码升序）。")
+                # 规则名下拉：默认列出当前票当日详情里的规则名，方便选择
+                rule_names = [r.get("name") for r in (data.get("rules") or []) if r.get("name")]
+                chosen_rule_name = st.selectbox("选择规则（指标）", options=sorted(set(rule_names)) if rule_names else [], 
+                                                index=0 if rule_names else None, placeholder="请选择一个规则名")
+                colL, colR = st.columns([1,1])
+                with colL:
+                    only_topk = st.checkbox("仅限当日 Top-K 范围", value=True)
+                with colR:
+                    run_filter = st.button("筛选当日命中标的", use_container_width=True)
 
-            hit_rows = []
-            if not date_rng:
-                end_d = ref_real
-                start_d = (datetime.strptime(ref_real, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
-            else:
-                m = re.match(r"(\d{8})\s*-\s*(\d{8})", date_rng)
-                if not m:
-                    st.error("起止日期格式错误，应为 YYYYMMDD-YYYYMMDD")
-                    start_d, end_d = None, None
-                else:
-                    start_d, end_d = m.group(1), m.group(2)
+                if run_filter:
+                    if not ref_real:
+                        st.error("未能确定参考日。")
+                    elif not chosen_rule_name:
+                        st.warning("请先选择一个规则名。")
+                    else:
+                        # 读取当日全市场 details，挑出命中 chosen_rule_name 的股票
+                        rows = []
+                        ddir = DET_DIR / ref_real
+                        try:
+                            # 可选：用 All 文件限制 universe（Top-K）
+                            allow_set = None
+                            if only_topk:
+                                df_allx = _read_df(_path_all(ref_real), dtype={"ts_code": str}, encoding="utf-8-sig")
+                                if not df_allx.empty:
+                                    # 若有 rank 列，默认 All 即全市场；若你希望严格 Top-K，可在这里进一步 head(K)
+                                    allow_set = set(df_allx["ts_code"].astype(str))
+                            if ddir.exists():
+                                for p in ddir.glob("*.json"):
+                                    try:
+                                        j = json.loads(p.read_text(encoding="utf-8-sig"))
+                                    except Exception:
+                                        continue
+                                    ts2 = str(j.get("ts_code", "")).strip()
+                                    if not ts2:
+                                        continue
+                                    if (allow_set is not None) and (ts2 not in allow_set):
+                                        continue
+                                    sm = j.get("summary") or {}
+                                    sc = float(sm.get("score", 0.0))
+                                    hit = False
+                                    for rr in j.get("rules", []) or []:
+                                        # 命中标准：该规则名相等，且当日加分>0 或 ok=True
+                                        if rr.get("name") == chosen_rule_name and (float(rr.get("add", 0.0)) > 0.0 or bool(rr.get("ok"))):
+                                            hit = True
+                                            break
+                                    if hit:
+                                        rows.append({"ts_code": ts2, "score": sc})
+                            df_hit = pd.DataFrame(rows)
+                            if df_hit.empty:
+                                st.info("当日无标的命中该规则。")
+                            else:
+                                # 排序：score 降序；分数相同按代码升序（作为最终 tiebreak）
+                                df_hit = df_hit.sort_values(["score", "ts_code"], ascending=[False, True]).reset_index(drop=True)
+                                st.dataframe(df_hit, use_container_width=True, height=420)
+                                # 导出 & 复制
+                                codes = df_hit["ts_code"].astype(str).tolist()
+                                txt = _codes_to_txt(codes, st.session_state["export_pref"]["style"], st.session_state["export_pref"]["with_suffix"])
+                                copy_txt_button(txt, label="📋 复制筛选结果（按当前预览）", key=f"copy_rulehits_{ref_real}_{chosen_rule_name}")
+                                _download_txt("导出筛选结果 TXT", txt, f"rulehits_{normalize_ts(chosen_rule_name)}_{ref_real}.txt", key="dl_rule_hits")
+                        except Exception as e:
+                            st.error(f"筛选失败：{e}")
 
-            if ref_real and (start_d and end_d):
-                for d in _scan_date_range(start_d, end_d):
-                    p = _path_detail(d, ts)
-                    if not p.exists(): 
-                        continue
-                    try:
-                        j = json.loads(p.read_text(encoding="utf-8-sig"))
-                        for r in j.get("rules", []):
-                            name = r.get("name")
-                            if chosen_rule and name not in chosen_rule:
-                                continue
-                            add = r.get("add", None)
-                            if add is None:
-                                continue
-                            hit_rows.append({
-                                "规则": name,
-                                "命中日期": d,
-                                "分数贡献": add,
-                                "距参考日天数": (datetime.strptime(ref_real,"%Y%m%d") - datetime.strptime(d,"%Y%m%d")).days
-                            })
-                    except Exception:
-                        pass
-                hit_df = pd.DataFrame(hit_rows).sort_values(["命中日期","规则"], ascending=[False, True])
-                if recent_n and not hit_df.empty:
-                    hit_df = hit_df.head(int(recent_n))
-                st.dataframe(hit_df, use_container_width=True)
-                if not hit_df.empty:
-                    txt = "\n".join([f"{r['规则']} | {r['命中日期']} | {r['分数贡献']}" for _, r in hit_df.iterrows()])
-                    _download_txt("导出命中列表 TXT", txt, f"hits_{normalize_ts(ts)}.txt", key="dl_hits")
+
 # ================== 规则编辑 ==================
 with tab_rules:
     st.subheader("③ 规则编辑（仅当前进程临时生效，保存不会改 config.py）")
     colL, colR = st.columns([2,1])
     default_text = json.dumps(st.session_state["rules_obj"], ensure_ascii=False, indent=2)
     with colL:
-        text = st.text_area("规则 JSON（含 prescreen / rules）", value=default_text, height=420)
+        text = st.text_area("规则 JSON（含 prescreen / rules）", value=default_text, height=300)
     with colR:
         up = st.file_uploader("从文件载入 JSON", type=["json"])
         if up:
@@ -547,6 +686,203 @@ with tab_rules:
                 "rules": getattr(cfg, "SC_RULES", []),
             }
             st.experimental_rerun()
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 🧪 策略测试器（单条规则）")
+        with st.expander("使用方法 / 字段说明", expanded=False):
+            st.markdown("**必填字段**")
+            st.markdown(
+                "- `name`：规则名称\n"
+                "- `when`：通达信风格布尔表达式\n"
+                "- `timeframe`：`D`/`W`/`M`\n"
+                "- `window`：回看窗口（整数）\n"
+                "- `scope`：命中口径（如 `ANY`/`ALL`/`LAST`/`COUNT>=k`/`CONSEC>=m`/`ANY_5`/`ALL_3`/`EACH`/`RECENT`/`DIST`/`NEAR` 等)"
+            )
+
+            st.markdown("**可选字段**")
+            st.markdown(
+                "- `points`：命中加分（`EACH/PERBAR` 为“每K * points”）\n"
+                "- `explain`：命中理由文案（默认展示；可用 `show_reason=false` 隐藏）\n"
+                "- `dist_points`：`RECENT/DIST/NEAR` 的距离计分表，支持两种等价写法："
+            )
+            st.caption("列表写法")
+            st.code('[[0,0,3], [1,2,2], [3,5,1]]', language="json")
+            st.caption("字典写法")
+            st.code('[{"min":0,"max":0,"points":3}, {"min":1,"max":2,"points":2}, {"min":3,"max":5,"points":1}]', language="json")
+            st.markdown("- `clauses`：复合子句（与逻辑），子句里也可单独设置 `timeframe/window/scope/when`")
+
+            st.markdown("**命中日期口径差异（很重要）**")
+            st.markdown(
+                "- `EACH/PERBAR`：逐K计数；`hit_date` 取窗口内最后一次为真；`hit_dates` 为窗口内所有为真。\n"
+                "- `RECENT/DIST/NEAR`：先算最近一次命中的 `lag`，再由索引回推 `hit_date`；同时列出 `hit_dates`。\n"
+                "- 其它（`ANY/ALL/LAST/COUNT/CONSEC/ANY_n/ALL_n` 等）：按布尔命中；`hit_dates` 为窗口内所有为真。"
+            )
+        # —— 临时指标编辑窗（默认给一条可用模板） ——
+        default_rule = {
+            "name": "测试：近3日放量并站上MA20",
+            "timeframe": "D",
+            "window": 60,
+            "scope": "RECENT",
+            "when": "VOL>MA(VOL,5) AND CLOSE>MA(CLOSE,20)",
+            "points": 3,
+            "dist_points": [
+                {"min": 0, "max": 0, "points": 3},
+                {"min": 1, "max": 2, "points": 2},
+                {"min": 3, "max": 5, "points": 1}
+            ],
+            "explain": "近N日放量且站上MA20"
+        }
+        rule_raw = st.text_area("临时规则（JSON）", value=json.dumps(default_rule, ensure_ascii=False, indent=2),
+                                height=260, key="tester_rule_json")
+
+        colA, colB, colC = st.columns([1.2, 1.2, 1.2])
+        with colA:
+            ref_in = st.text_input("参考日（留空=自动最新）", value="")
+        with colB:
+            ts_in = st.text_input("个股代码", value="")
+        with colC:
+            uni_choice = st.selectbox("名单", ["全市场","仅白名单","仅黑名单","仅特别关注榜"], index=0, key="tester_uni")
+        _uni_map = {"全市场":"all", "仅白名单":"white", "仅黑名单":"black", "仅特别关注榜":"attention"}
+        
+        colD, colE = st.columns([1,1])
+        with colD:
+            run_btn = st.button("在个股中运行", use_container_width=True)
+        with colE:
+            run_all_btn = st.button("在名单中运行", use_container_width=True, key="tester_run_all")
+
+        refD_all = ref_in.strip() or _pick_latest_ref_date() or ""
+        if run_all_btn:
+            try:
+                rule = json.loads(rule_raw)
+                when_expr, tf, win, scope = _rule_to_screen_args(rule)
+
+                # 2) 调 tdx_screen，注意不写黑白名单，仅预览
+                df_sel = se.tdx_screen(
+                    when_expr,
+                    ref_date=refD_all.strip() or None,
+                    timeframe=tf,
+                    window=int(win),
+                    scope=scope,                              # 支持 LAST/ANY/ALL/COUNT>=k/CONSEC>=m/ANY_n/ALL_n:contentReference[oaicite:7]{index=7}
+                    universe=_uni_map.get(uni_choice,"all"),  # all/white/black/attention
+                    write_white=False,
+                    write_black_rest=False,
+                    return_df=True
+                )
+                # 3) 友好列
+                if not df_sel.empty:
+                    df_sel["board"] = df_sel["ts_code"].map(market_label)
+                    st.success(f"命中 {len(df_sel)} 只；参考日：{df_sel['ref_date'].iloc[0] if 'ref_date' in df_sel.columns and len(df_sel)>0 else (refD_all or '自动')}")
+                    st.dataframe(df_sel, use_container_width=True, height=480)
+                    # 导出
+                    csv_bytes = df_sel.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button("导出结果 CSV", data=csv_bytes, file_name="tester_screen_all.csv", mime="text/csv", use_container_width=True)
+                else:
+                    st.info("未命中。")
+
+                # 4) （可选）点名看“单票明细” —— 和上面明细页同口径
+                st.markdown("###### 查看某只股票的明细（与单票测试相同口径）")
+                ts_pick_ori = st.text_input("输入 ts_code 查看（如 000001.SZ）", value="")
+                ts_pick = normalize_ts((ts_pick_ori or "").strip())
+                if ts_pick:
+                    # 根据规则窗口估算最小读取区间，然后读单票数据
+                    ref = (df_sel["ref_date"].iloc[0] if (not df_sel.empty and "ref_date" in df_sel.columns) else (refD_all or None)) or se._pick_ref_date()
+                    start = se._compute_read_start(ref)  # 保证窗口足够:contentReference[oaicite:9]{index=9}:contentReference[oaicite:10]{index=10}
+                    dfD = se._read_stock_df(ts_pick.strip(), start, ref, columns=["trade_date","open","high","low","close","vol","amount"])
+                    per_rows = se._build_per_rule_detail(dfD, ref)  # 返回含 ok/add/cnt/lag/hit_date/hit_dates 等字段:contentReference[oaicite:11]{index=11}
+                    df_detail = pd.DataFrame(per_rows)
+                    # 只显示当前这条规则（按 name 或 when 关键字都可以）
+                    name_key = str(rule.get("name","")).strip()
+                    if name_key:
+                        df_detail = df_detail[df_detail["name"] == name_key]
+                    st.dataframe(df_detail, use_container_width=True)
+            except Exception as e:
+                st.error(f"运行失败：{e}")
+
+        if run_btn:
+            try:
+                rule = json.loads(rule_raw or "{}")
+            except Exception as e:
+                st.error(f"规则 JSON 解析失败：{e}")
+                st.stop()
+
+            ts_code = normalize_ts((ts_in or "").strip())
+            if not ts_code:
+                st.error("请填写测试代码")
+                st.stop()
+
+            # 暂存并临时替换全局规则集，只跑这一条
+            bak_rules = getattr(se, "SC_RULES", None)
+            bak_pres  = getattr(se, "SC_PRESCREEN_RULES", None)
+            try:
+                setattr(se, "SC_RULES", [rule])
+                setattr(se, "SC_PRESCREEN_RULES", [])
+
+                # 参考日 & 读取窗口 / 列裁剪
+                ref_use = (ref_in or "").strip() or (_pick_latest_ref_date() or "")
+                if not ref_use:
+                    st.error("未找到参考日：请先在“排名”页签跑一次或手填。")
+                    st.stop()
+
+                # 估算读取起点（按本条规则的 timeframe+window）
+                start = se._start_for_tf_window(ref_use, str(rule.get("timeframe", "D")), int(rule.get("window", getattr(se, "SC_LOOKBACK_D", 60))))
+                # 按需裁列（会扫描 when 里的列名，例如 j/vr）：
+                columns = se._select_columns_for_rules()
+
+                # 读取单票数据
+                df = se._read_stock_df(ts_code, start, ref_use, columns)
+                if df is None or df.empty:
+                    st.warning("数据为空或读取失败。")
+                    st.stop()
+
+                # 保持与正式评分一致的表达式上下文
+                try:
+                    if tdx is not None:
+                        tdx.EXTRA_CONTEXT.update(se.get_eval_env(ts_code, ref_use))
+                except Exception:
+                    pass
+
+                # 直接用与“详情页”一致的构造函数得到逐规则明细
+                rows = se._build_per_rule_detail(df, ref_use)
+                if not rows:
+                    st.info("未产生任何命中/细节。")
+                    st.stop()
+
+                import pandas as pd, numpy as np
+                df_rules = pd.DataFrame(rows).copy()
+
+                # —— “最后命中距今天数” 与详情页一致的口径：优先用 lag，其次 hit_date，再退 hit_dates 最末 —— 
+                ref_dt = pd.to_datetime(ref_use)
+                def _last_days(row: dict):
+                    lag = row.get("lag")
+                    if isinstance(lag, (int, float)) and not pd.isna(lag):
+                        return int(lag)
+                    hd = row.get("hit_date")
+                    if isinstance(hd, str) and hd:
+                        try: return int((ref_dt - pd.to_datetime(hd)).days)
+                        except Exception: return None
+                    hds = row.get("hit_dates") or []
+                    if isinstance(hds, list) and hds:
+                        try: return int((ref_dt - pd.to_datetime(hds[-1])).days)
+                        except Exception: return None
+                    return None
+
+                df_rules["last_hit_days"] = [ _last_days(r) for r in df_rules.to_dict("records") ]
+
+                # 展示列（存在才展示）
+                show_cols = [c for c in [
+                    "name","scope","timeframe","window","period","ok","points","add","cnt","lag",
+                    "hit_date","hit_count","hit_dates","last_hit_days","gate_ok","gate_when","explain"
+                ] if c in df_rules.columns]
+
+                st.markdown(f"**测试代码：{ts_code} · 参考日：{ref_use}**")
+                st.dataframe(df_rules[show_cols], use_container_width=True, height=420)
+
+            except Exception as e:
+                st.error(f"测试失败：{e}")
+            finally:
+                # 还原全局
+                if bak_rules is not None: setattr(se, "SC_RULES", bak_rules)
+                if bak_pres  is not None: setattr(se, "SC_PRESCREEN_RULES", bak_pres)
 # ================== 强度榜 ==================
 with tab_attn:
     st.subheader("④ 强度榜")
@@ -598,6 +934,135 @@ with tab_attn:
         except Exception as e:
             st.error(f"生成失败：{e}")
 
+
+with tab_data:
+    st.subheader("数据下载 / 浏览检查")
+    # —— 参数区 ——
+    with st.expander("参数设置", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            base = st.text_input("数据根目录 DATA_ROOT", value=str(getattr(cfg, "DATA_ROOT", getattr(cfg, "PARQUET_BASE", "./data"))))
+            assets = st.multiselect("资产 ASSETS", ["stock","index"], default=list(getattr(dl, "ASSETS", ["stock","index"])) or ["stock","index"])            
+        with c2:
+            api_adj = st.selectbox("复权 API_ADJ", ["qfq","hfq","raw"], index={"qfq":0,"hfq":1,"raw":2}.get(str(getattr(dl,"API_ADJ","qfq")).lower(),0))
+            start_in = st.text_input("起始日 START_DATE (YYYYMMDD)", value=str(getattr(dl, "START_DATE", "20200101")))
+        with c3:
+            end_default = str(getattr(dl, "END_DATE", "today"))
+            end_in = st.text_input("结束日 END_DATE ('today' 或 YYYYMMDD)", value=end_default)
+            latest = _latest_trade_date(base, api_adj)
+            if latest:
+                st.caption(f"当前 {api_adj} 最近交易日：{latest}")
+        with c4:
+            fast_threads = st.number_input("FAST_INIT 并发", min_value=1, max_value=64, value=int(getattr(dl,"FAST_INIT_THREADS",8)))
+            inc_threads  = st.number_input("增量下载线程", min_value=1, max_value=64, value=int(getattr(dl,"STOCK_INC_THREADS",8)))
+            ind_workers  = st.number_input("指标重算线程(可选)", min_value=0, max_value=128, value=int(getattr(dl,"INC_RECALC_WORKERS", 32)))
+
+        # 额外开关
+        colx1, colx2 = st.columns(2)
+        with colx1:
+            do_plain = st.checkbox("写入单股(不带指标)", value=bool(getattr(dl, "WRITE_SYMBOL_PLAIN", True)))
+        with colx2:
+            do_ind   = st.checkbox("写入单股(含指标)", value=bool(getattr(dl, "WRITE_SYMBOL_INDICATORS", True)))
+
+    # 将参数落到模块
+    end_use = _today_str() if str(end_in).strip().lower() == "today" else str(end_in).strip()
+    start_use = str(start_in).strip()
+    _apply_overrides(base, assets, start_use, end_use, api_adj, int(fast_threads), int(inc_threads), int(ind_workers) if ind_workers else None)
+    dl.WRITE_SYMBOL_PLAIN = bool(do_plain)
+    dl.WRITE_SYMBOL_INDICATORS = bool(do_ind)
+
+    # —— 按钮区 ——
+    tab_dl, tab_view = st.tabs(["下载/同步", "浏览/检查(app_pv)"])
+
+    # === 下载/同步 ===
+    with tab_dl:
+        mode = st.radio("运行模式", ["首次建库(FAST_INIT)", "日常增量(NORMAL)"], index=0 if not _latest_trade_date(base, api_adj) else 1, horizontal=True)
+        st.markdown(
+            """
+            - **FAST_INIT**：按股票并发全历史抓取 → 合并到 `stock/daily/*` →（可选）合并指标目录 →（可选）指数。
+            - **NORMAL**：先合并 fast_init 缓存 → 股票增量 → 指数增量 → 指标增量重算与合并。
+            """
+        )
+
+        # 一键
+        c1, c2 = st.columns(2)
+        with c1:
+            run_all = st.button("🚀 一键运行", use_container_width=True, type="primary")
+        with c2:
+            dry = st.checkbox("仅打印日志（不执行）", value=False, help="仅用于预览参数")
+
+        # 单步按钮
+        st.markdown("—— 或按步骤执行 ——")
+        s1, s2, s3, s4, s5 = st.columns(5)
+        with s1: b_fast = st.button("① 首次建库")
+        with s2: b_merge = st.button("② Fast→Daily 合并")
+        with s3: b_stock = st.button("③ 股票增量")
+        with s4: b_index = st.button("④ 指数增量")
+        with s5: b_indic = st.button("⑤ 指标合并/重算")
+
+        # 执行逻辑
+        if run_all or b_fast or b_merge or b_stock or b_index or b_indic:
+            if dry:
+                st.info(f"[DRY-RUN] base={base} assets={assets} adj={api_adj} range={start_use}~{end_use} fast_threads={fast_threads} inc_threads={inc_threads}")
+            else:
+                with st.status("执行中…", expanded=True) as status:
+                    try:
+                        if run_all:
+                            if mode.startswith("首次"):
+                                status.update(label="FAST_INIT 全量…")
+                                _run_fast_init(end_use)
+                                if "index" in set(assets):
+                                    status.update(label="指数全量/补齐…")
+                                    dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
+                            else:
+                                status.update(label="合并 FastInit 缓存…")
+                                _run_increment(start_use, end_use, do_stock=True, do_index=True, do_indicators=True)
+                            status.update(label="完成", state="complete")
+                            st.success("✅ 完成")
+                        else:
+                            # 单步
+                            if b_fast:
+                                status.update(label="首次建库（FAST_INIT）…")
+                                _run_fast_init(end_use)
+                            if b_merge:
+                                status.update(label="合并 Fast→Daily …")
+                                dl.duckdb_partition_merge()
+                            if b_stock:
+                                status.update(label="股票增量…")
+                                dl.sync_stock_daily_fast(start_use, end_use, threads=dl.STOCK_INC_THREADS)
+                            if b_index:
+                                status.update(label="指数增量…")
+                                dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
+                            if b_indic:
+                                status.update(label="指标重算并合并…")
+                                workers = getattr(dl, "INC_RECALC_WORKERS", None) or ((os.cpu_count() or 4) * 2)
+                                dl.recalc_symbol_products_for_increment(start_use, end_use, threads=workers)
+                            status.update(label="完成", state="complete")
+                            st.success("✅ 完成")
+                    except Exception as e:
+                        st.error(f"运行失败：{e}")
+
+    # === 浏览/检查（集成 app_pv 的核心功能） ===
+    with tab_view:
+        st.markdown("#### 概览 & 诊断 (来自 app_pv)")
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            try:
+                df = apv.overview_table(base, api_adj)
+                st.dataframe(df, use_container_width=True, height=360)
+            except Exception as e:
+                st.error(f"概览失败：{e}")
+        with c2:
+            try:
+                info = apv.get_info(base, api_adj)
+                st.text_area("概览（文本）", value=str(info), height=180)
+                adv = apv.overview_advice(base, api_adj)
+                st.markdown(adv)
+            except Exception as e:
+                st.error(f"诊断失败：{e}")
+
+        st.markdown("---")
+        st.caption("数据浏览由 parquet_viewer 支持，可在其他页或命令行使用更丰富的功能。")
 
 # ================== 普通选股（TDX表达式） ==================
 with tab_screen:
@@ -686,7 +1151,7 @@ with tab_tools:
             except Exception as e:
                 st.error(f"处理失败：{e}")
     st.markdown("---")
-    with st.expander("查看已有数据（Top / All / Details / 日历）", expanded=False):
+    with st.expander("查看已有数据（Top / All / Details / 日历）", expanded=True):
         if "scan_inventory_loaded" not in st.session_state:
             st.session_state["scan_inventory_loaded"] = False
         col0, col1 = st.columns([1,3])
@@ -787,7 +1252,7 @@ with tab_port:
     with st.expander("全局配置（默认用于新建组合；来自 config.PF_*）", expanded=True):
         colA, colB, colC, colD = st.columns(4)
         with colA:
-            st.text_input("账本名称", value=cfg_str("PF_LEDGER_NAME", "default"), key="pf_ledger")
+            st.text_input("账本名称", value=cfg_str("PF_LEDGER_NAME", "账本1"), key="pf_ledger")
             st.number_input("初始资金（总额）", min_value=0.0, value=float(getattr(cfg, "PF_INIT_CASH", 1_000_000.0)), key="pf_init_cash")
         with colB:
             st.number_input("初始可用资金", min_value=0.0, value=float(getattr(cfg, "PF_INIT_AVAILABLE", getattr(cfg, "PF_INIT_CASH", 1_000_000.0))), key="pf_init_avail")
