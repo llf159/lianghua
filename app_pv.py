@@ -222,7 +222,7 @@ def overview_df(base: str, adj_kind: str='qfq') -> pd.DataFrame:
         dates = _date_list(root)
         if not dates:
             item.update(first=None, last=None, days=0, gap_cnt=None, gap_samples=None,
-                        latest_date=None, latest_rows=None, expected_rows=stock_base,
+                        latest_date=None, latest_rows=None, expected_rows=(None if name.startswith("index/") else stock_base),
                         files_latest=None, status="EMPTY", reason="无分区")
             rows.append(item)
             continue
@@ -264,7 +264,7 @@ def overview_df(base: str, adj_kind: str='qfq') -> pd.DataFrame:
             gap_samples="; ".join(gaps[:3]) if gaps else "",
             latest_date=latest_date,
             latest_rows=latest_rows,
-            expected_rows=stock_base,
+            expected_rows=(None if name.startswith("index/") else stock_base),
             files_latest=files_latest,
             ind_lag=ind_lag,
         )

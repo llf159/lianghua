@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 py — 将“跟踪(Tracking) / 大涨单子(Surge)”统一接入 score_engine 的钩子
 
@@ -463,6 +463,31 @@ class SurgeResult:
     group_files: Optional[Dict[str, Path]] = None
 
 
+
+def _board_group(ts_code: str, split: str) -> str:
+    """
+    根据 split 口径返回分组名。
+    - combo3：三组合（"600组" / "000组" / "科创北组"），其余归为 "其他"
+    - main_vs_others：主板 vs 其他
+    - per_board：按板块（market_label）
+    """
+    s = str(ts_code or "")
+    s = s.strip()
+    if split == "combo3":
+        if s.endswith(".SH") and s.startswith(("600","601","603","605")):
+            return "600组"
+        if s.endswith(".SZ") and s.startswith(("000",)):
+            return "000组"
+        if (s.endswith(".SH") and s.startswith("688")) or (s.endswith(".SZ") and s.startswith("300")) or s.endswith(".BJ"):
+            return "科创北组"
+        return "其他"
+    if split == "per_board":
+        return market_label(s)
+    # 默认主板 vs 其他
+    if (s.endswith(".SH") and not s.startswith("688")) or (s.endswith(".SZ") and s.startswith(("000","001","002","003"))):
+        return "主板"
+    return "其他"
+
 def run_surge(
     *,
     ref_date: str,
@@ -470,7 +495,7 @@ def run_surge(
     rolling_days: int = 5,
     selection: Dict = None,           # {"type": "top_n"|"top_pct", "value": 200|10}
     retro_days: Sequence[int] = (1,2,3,4,5),
-    split: str = "main_vs_others",    # "main_vs_others" | "per_board"
+    split: str = "main_vs_others",    # "main_vs_others" | "per_board" | "combo3"
     score_df: Optional[pd.DataFrame] = None,
     save: bool = True,
 ) -> SurgeResult:

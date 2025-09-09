@@ -1487,6 +1487,13 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
                 continue  # EACH 已处理完，下一条
             
             if scope in {"RECENT", "DIST", "NEAR"}:
+                tf  = str(rule.get("timeframe", "D")).upper()
+                win = int(rule.get("window", SC_LOOKBACK_D))
+                try:
+                    period = _period_for_clause(df, rule, ref_date)
+                except Exception:
+                    period = ref_date
+
                 add, lag, err = _recent_points(df, rule, ref_date)
                 dfTF = df if tf=="D" else _resample(df, tf)
                 win_df = _window_slice(dfTF, ref_date, win)
@@ -1509,17 +1516,6 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
                 add2 = float(add if gate_ok else 0.0)
                 ok2 = bool(add != 0)
 
-                rows.append({
-                    "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
-                    "points": pts, "ok": ok2, "cnt": None,
-                    "add": add2, "lag": (None if lag is None else int(lag)),
-                    "hit_date": hit_date,
-                    "hit_dates": _list_true_dates(df, when_for_hits, ref_date=ref_date, window=win, timeframe=tf),
-                    "hit_count": int(cnt or 0),
-                    "gate_ok": bool(gate_ok),
-                    "gate_when": (gate_norm.get("when") if isinstance(gate_norm, dict) else None),
-                    "explain": expl,
-                })
                 continue
             # —— 常规路径 ——
             ok, err = _eval_rule(df, rule, ref_date)

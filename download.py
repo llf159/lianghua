@@ -35,6 +35,27 @@ import threading
 _TLS = threading.local()
 from utils import normalize_trade_date, normalize_ts
 
+_pro = None  # 真正的客户端放这里
+
+def _require_pro():
+    """只有在确实需要 Pro 接口时才初始化；否则不触发任何 token 读取。"""
+    global _pro
+    if _pro is None:
+        token = os.getenv("TUSHARE_TOKEN")
+        if not token:
+            # 明确报错，帮助定位谁在误用 Pro 接口
+            raise RuntimeError("Tushare Pro 未配置，但代码路径请求了 Pro 接口。请避免调用或设置 TUSHARE_TOKEN。")
+        ts.set_token(token)
+        _pro = ts.pro_api()
+    return _pro
+
+# 保持原有 `pro.xxx` 的调用习惯：只有访问属性时才会初始化
+class _LazyPro:
+    def __getattr__(self, name):
+        return getattr(_require_pro(), name)
+
+pro = _LazyPro()
+
 # --- 不走系统代理：仅对本进程生效 ---
 for k in ("http_proxy","https_proxy","all_proxy","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY"):
     os.environ.pop(k, None)
@@ -57,7 +78,6 @@ except ImportError:
     sys.exit(1)
 
 ts.set_token(TOKEN)
-pro = ts.pro_api()
 
 os.makedirs(DATA_ROOT, exist_ok=True)
 
@@ -1189,6 +1209,7 @@ def fast_init_download(end_date: str):
                 logging.debug('[BRANCH] def fast_init_download > def task | IF df is None or df.empty -> taken')
                 return (ts_code, 'empty', None)
             df = df.sort_values("trade_date")
+            df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
             df.to_parquet(fpath, index=False)
 
             if API_ADJ != "raw":
@@ -1265,6 +1286,7 @@ def fast_init_download(end_date: str):
                     logging.debug('[BRANCH] def fast_init_download > def retry_task | IF df is None or df.empty -> taken')
                     return (ts_code, 'empty')
                 df = df.sort_values("trade_date")
+                df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
                 df.to_parquet(fpath, index=False)
 
                 if API_ADJ != "raw":
