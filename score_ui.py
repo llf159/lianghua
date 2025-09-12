@@ -19,6 +19,9 @@ import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 from contextlib import contextmanager
+import shutil
+import uuid
+import time
 
 import download as dl
 import app_pv as apv
@@ -35,7 +38,6 @@ except Exception as e:
     st.error(f"无法导入 config：{e}")
     st.stop()
 
-# 统计模块可选
 try:
     import stats_core as stats
 except Exception:
@@ -54,11 +56,9 @@ ALL_DIR  = SC_OUTPUT_DIR / "all"
 DET_DIR  = SC_OUTPUT_DIR / "details"
 ATTN_DIR = SC_OUTPUT_DIR / "attention"
 LOG_DIR  = Path("./log")
+
 for p in [TOP_DIR, ALL_DIR, DET_DIR, ATTN_DIR, LOG_DIR]:
     p.mkdir(parents=True, exist_ok=True)
-
-def _today_str() -> str:
-    return datetime.date.today().strftime("%Y%m%d")
 
 def _apply_overrides(
     base: str,
@@ -329,6 +329,98 @@ def cfg_bool(name: str, default: bool) -> bool:
         return False
     return bool(default)
 
+# 通用多阶段进度器（统一管理单次任务的进度条+状态日志）
+class Stepper:
+    """
+    用法：
+        steps = ["准备环境", "下载源数据", "合并增量", "写出导出", "自动排名"]
+        sp = Stepper("下载/同步", steps, key_prefix="dl_sync")  # 每次点击都会生成独立 run_id
+        sp.start()
+
+        sp.step("准备环境")     # 做准备...
+        sp.tick(0.3, "校验目标目录")
+        sp.tick(1.0)           # 本步骤收尾
+
+        sp.step("下载源数据")   # 具体下载...
+        sp.step("合并增量")
+        sp.step("写出导出")
+        sp.step("自动排名", visible=auto_rank)  # 支持按条件显示/跳过
+        sp.finish(success=True, note="全部完成")
+    """
+    def __init__(self, title, steps, key_prefix="stepper"):
+        self.title = title
+        self.steps_all = steps[:]  # 文案列表（可含 None）
+        self.steps = [s for s in steps if s]  # 实际参与统计的步骤
+        self.total = len(self.steps)
+        self.key = f"{key_prefix}_{uuid.uuid4().hex[:8]}"
+        self._init_state()
+
+    def _init_state(self):
+        import streamlit as st
+        st.session_state[self.key] = {
+            "idx": 0,        # 已完成到第几个（从 0 开始）
+            "run_id": self.key,
+        }
+
+    def start(self):
+        import streamlit as st
+        self.status = st.status(
+            label=f"{self.title}：开始（0/{self.total}）",
+            state="running",
+        )
+        self.prog = st.progress(0, text="准备中…")
+        with self.status:
+            st.write("🟡 开始任务…")
+
+    def _update_prog(self, idx, label):
+        import streamlit as st
+        pct = 0 if self.total == 0 else int(idx / self.total * 100)
+        self.prog.progress(pct, text=f"{idx}/{self.total}：{label}")
+
+    def step(self, label, visible=True, info=None):
+        """进入下一主步骤；visible=False 时，仅记录日志，不纳入进度比例"""
+        import streamlit as st
+        if not visible:
+            # 仅追加日志提示
+            with self.status:
+                st.write(f"⏭️ 跳过：{label}")
+            return
+
+        state = st.session_state[self.key]
+        state["idx"] += 1
+        idx = min(state["idx"], self.total)
+        text = label if not info else f"{label}｜{info}"
+
+        with self.status:
+            st.write(f"▶️ {text}")
+        self._update_prog(idx, text)
+
+    def tick(self, delta_ratio, info=None):
+        """在当前步骤中显示细粒度推进（例如循环/分批处理）"""
+        import streamlit as st
+        state = st.session_state[self.key]
+        # 按当前主步骤位置 + 细分比例 合成一个更平滑的百分比展示
+        base = min(state["idx"], self.total - 1)
+        now = min(1.0, max(0.0, float(delta_ratio)))
+        overall = int(((base + now) / self.total) * 100) if self.total else 0
+        self.prog.progress(overall, text=info or "处理中…")
+        # 在日志里也可打点
+        if info:
+            with self.status:
+                st.write(f"… {info}")
+
+    def finish(self, success=True, note=None):
+        if success:
+            self.status.update(
+                label=f"{self.title}：完成（{self.total}/{self.total}）",
+                state="complete",
+            )
+            self.prog.progress(100, text=note or "完成")
+        else:
+            self.status.update(
+                label=f"{self.title}：失败",
+                state="error",
+            )
 
 # ===== 会话状态 =====
 if "rules_obj" not in st.session_state:
@@ -901,10 +993,10 @@ with tab_attn:
         method = st.selectbox("方法", ["强度（带权）","次数（不带权）"], index=0)
     with c2:
         win_n = st.number_input("窗口天数 N", min_value=1, max_value=365, value=60)
-        top_m = st.number_input("Top-M 过滤（仅统计前 M 名）", min_value=1, max_value=2000, value=50)
+        top_m = st.number_input("Top-M 过滤（仅统计前 M 名）", min_value=1, max_value=5000, value=3000)
     with c3:
-        weight = st.selectbox("时间权重", ["不加权","指数半衰","线性最小值"], index=0)
-        out_n = st.number_input("输出 Top-N", min_value=1, max_value=1000, value=200)
+        weight = st.selectbox("时间权重", ["不加权","指数半衰","线性最小值"], index=1)
+        out_n = st.number_input("输出 Top-N", min_value=1, max_value=1000, value=100)
     with c4:
         # date_end = st.text_input("结束日（YYYYMMDD；留空=自动最新）", value="")
         date_end = st.text_input("结束日（YYYYMMDD；留空=自动最新）", value="", key="attn_end_date")
@@ -937,9 +1029,72 @@ with tab_attn:
                 mode=mode_map[method], weight_mode=w_map[weight],
                 topM=int(top_m)
             )
-            st.success(f"关注榜已生成：{csv_path}")
+            st.success(f"强度榜已生成：{csv_path}")
             df_a = pd.read_csv(csv_path)
             st.dataframe(df_a, use_container_width=True, height=480)
+            try:
+                if df_a is not None and not df_a.empty:
+                    # 识别代码列（优先 ts_code）
+                    code_col = None
+                    for cand in ["ts_code", "code", "ts", "symbol"]:
+                        if cand in df_a.columns:
+                            code_col = cand
+                            break
+
+                    if code_col:
+                        codes = df_a[code_col].astype(str).tolist()
+                        txt = _codes_to_txt(
+                            codes,
+                            st.session_state["export_pref"]["style"],
+                            st.session_state["export_pref"]["with_suffix"]
+                        )
+                        # 复制按钮（使用已有的 copy_txt_button）
+                        copy_txt_button(
+                            txt,
+                            label="📋 复制强度榜（按当前输出）",
+                            key=f"copy_attn_{end}_{src}"
+                        )
+                        # TXT 导出（文件名含参数，便于追溯）
+                        _download_txt(
+                            "导出强度榜 TXT",
+                            txt,
+                            f"attention_{src}_{mode_map[method]}_{w_map[weight]}_{start}_{end}.txt",
+                            key="dl_attention_txt"
+                        )
+                    else:
+                        st.caption("未找到代码列（期望列名：ts_code）。")
+            except Exception as e:
+                st.warning(f"导出/复制失败：{e}")
+                
+            # —— 以下为“强度榜落盘（CSV/TXT，含清晰文件名）” ——  # NEW
+            try:
+                # 统一、可追溯的文件名前缀
+                fname_base = f"attention_{src}_{mode_map[method]}_{w_map[weight]}_win{int(win_n)}_topM{int(top_m)}_{start}_{end}_topN{int(out_n)}"
+                # 目标路径
+                dest_csv = ATTN_DIR / f"{fname_base}.csv"
+                dest_txt = ATTN_DIR / f"{fname_base}.txt"
+
+                # 1) CSV：把 scoring_core 返回的 csv_path 复制一份到规范化文件名
+                try:
+                    if str(csv_path) != str(dest_csv):
+                        shutil.copyfile(csv_path, dest_csv)
+                    else:
+                        # 若 scoring_core 已是同名，可忽略
+                        pass
+                except Exception as _e:
+                    st.warning(f"CSV 落盘失败（不影响页面预览）：{_e}")
+
+                # 2) TXT：把上面生成的 codes 文本也落盘
+                try:
+                    dest_txt.write_text(txt, encoding="utf-8-sig")
+                except Exception as _e:
+                    st.warning(f"TXT 落盘失败（不影响页面预览）：{_e}")
+
+                st.caption(f"已落盘：{dest_csv.name} / {dest_txt.name}（目录：{ATTN_DIR}）")
+            except Exception as _e:
+                st.warning(f"强度榜落盘出现异常：{_e}")
+            # —— “强度榜落盘”结束 ——  # NEW
+
         except Exception as e:
             st.error(f"生成失败：{e}")
 
@@ -961,18 +1116,14 @@ with tab_data:
             latest = _latest_trade_date(base, api_adj)
             do_plain = st.checkbox("写入单股(不带指标)", value=bool(getattr(dl, "WRITE_SYMBOL_PLAIN", True)))
             do_ind   = st.checkbox("写入单股(含指标)", value=bool(getattr(dl, "WRITE_SYMBOL_INDICATORS", True)))
+            auto_rank = st.checkbox("完成后自动排名（Top/All/Details）", value=True)  # NEW
         with c4:
-            fast_threads = st.number_input("FAST_INIT 并发", min_value=1, max_value=64, value=int(getattr(dl,"FAST_INIT_THREADS",8)))
-            inc_threads  = st.number_input("增量下载线程", min_value=1, max_value=64, value=int(getattr(dl,"STOCK_INC_THREADS",8)))
+            fast_threads = st.number_input("FAST_INIT 并发", min_value=1, max_value=64, value=int(getattr(dl,"FAST_INIT_THREADS",16)))
+            inc_threads  = st.number_input("增量下载线程", min_value=1, max_value=64, value=int(getattr(dl,"STOCK_INC_THREADS",16)))
             ind_workers  = st.number_input("指标重算线程(可选)", min_value=0, max_value=128, value=int(getattr(dl,"INC_RECALC_WORKERS", 32)))
         if latest:
             st.caption(f"当前 {api_adj} 最近交易日：{latest}")
-        # # 额外开关
-        # colx1, colx2 = st.columns(2)
-        # with colx1:
-            
-        # with colx2:
-        
+
     # 将参数落到模块
     end_use = _today_str() if str(end_in).strip().lower() == "today" else str(end_in).strip()
     start_use = str(start_in).strip()
@@ -1009,47 +1160,174 @@ with tab_data:
         with s4: b_index = st.button("④ 指数增量")
         with s5: b_indic = st.button("⑤ 指标合并/重算")
 
-        # 执行逻辑
+        # 执行逻辑（统一用 Stepper 展示阶段进度）
         if run_all or b_fast or b_merge or b_stock or b_index or b_indic:
             if dry:
                 st.info(f"[DRY-RUN] base={base} assets={assets} adj={api_adj} range={start_use}~{end_use} fast_threads={fast_threads} inc_threads={inc_threads}")
             else:
-                with st.status("执行中…", expanded=True) as status:
-                    try:
-                        if run_all:
-                            if mode.startswith("首次"):
-                                status.update(label="FAST_INIT 全量…")
-                                _run_fast_init(end_use)
-                                if "index" in set(assets):
-                                    status.update(label="指数全量/补齐…")
-                                    dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
-                            else:
-                                status.update(label="合并 FastInit 缓存…")
-                                _run_increment(start_use, end_use, do_stock=True, do_index=True, do_indicators=True)
-                            status.update(label="完成", state="complete")
-                            st.success("✅ 完成")
-                        else:
-                            # 单步
-                            if b_fast:
-                                status.update(label="首次建库（FAST_INIT）…")
-                                _run_fast_init(end_use)
-                            if b_merge:
-                                status.update(label="合并 Fast→Daily …")
-                                dl.duckdb_partition_merge()
-                            if b_stock:
-                                status.update(label="股票增量…")
-                                dl.sync_stock_daily_fast(start_use, end_use, threads=dl.STOCK_INC_THREADS)
-                            if b_index:
-                                status.update(label="指数增量…")
+                try:
+                    # —— 一键运行 —— 
+                    if run_all:
+                        if mode.startswith("首次"):
+                            steps = [
+                                "准备环境",
+                                "FAST_INIT 全量/合并",
+                                "指数全量/补齐" if "index" in set(assets) else None,
+                                "自动排名（Top/All/Details）" if auto_rank else None,
+                                "清理与校验",
+                            ]
+                            sp = Stepper("下载/同步 · 一键运行（FAST_INIT）", steps, key_prefix="dl_all")
+                            sp.start()
+                            sp.step("准备环境")
+                            sp.step("FAST_INIT 全量/合并")
+                            _run_fast_init(end_use)
+                            sp.step("指数全量/补齐", visible=("index" in set(assets)))
+                            if "index" in set(assets):
                                 dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
-                            if b_indic:
-                                status.update(label="指标重算并合并…")
-                                workers = getattr(dl, "INC_RECALC_WORKERS", None) or ((os.cpu_count() or 4) * 2)
-                                dl.recalc_symbol_products_for_increment(start_use, end_use, threads=workers)
-                            status.update(label="完成", state="complete")
-                            st.success("✅ 完成")
-                    except Exception as e:
-                        st.error(f"运行失败：{e}")
+                            sp.step("自动排名（Top/All/Details）", visible=auto_rank)
+                            if auto_rank:
+                                try:
+                                    top_path = se.run_for_date(None)
+                                    st.success(f"✅ 已自动完成排名：{top_path}")
+                                except Exception as ee:
+                                    st.warning(f"自动排名失败：{ee}")
+                            sp.step("清理与校验")
+                            sp.finish(True, "所有步骤完成")
+                        else:
+                            steps = [
+                                "准备环境",
+                                "合并 FastInit 缓存 & 增量同步（股/指/指标）",
+                                "自动排名（Top/All/Details）" if auto_rank else None,
+                                "清理与校验",
+                            ]
+                            sp = Stepper("下载/同步 · 一键运行（NORMAL）", steps, key_prefix="dl_all")
+                            sp.start()
+                            sp.step("准备环境")
+                            sp.step("合并 FastInit 缓存 & 增量同步（股/指/指标）")
+                            _run_increment(start_use, end_use, do_stock=True, do_index=True, do_indicators=True)
+                            sp.step("自动排名（Top/All/Details）", visible=auto_rank)
+                            if auto_rank:
+                                try:
+                                    top_path = se.run_for_date(None)
+                                    st.success(f"✅ 已自动完成排名：{top_path}")
+                                except Exception as ee:
+                                    st.warning(f"自动排名失败：{ee}")
+                            sp.step("清理与校验")
+                            sp.finish(True, "所有步骤完成")
+                    # —— 单步运行 —— 
+                    else:
+                        if b_fast:
+                            steps = ["准备环境", "首次建库（FAST_INIT）", "清理与校验"]
+                            sp = Stepper("下载/同步 · 首次建库", steps, key_prefix="dl_fast")
+                            sp.start()
+                            sp.step("准备环境")
+                            sp.step("首次建库（FAST_INIT）")
+                            _run_fast_init(end_use)
+                            sp.step("清理与校验")
+                            sp.finish(True, "该步骤完成")
+                        if b_merge:
+                            steps = ["准备环境", "合并 Fast→Daily", "清理与校验"]
+                            sp = Stepper("下载/同步 · 合并", steps, key_prefix="dl_merge")
+                            sp.start()
+                            sp.step("准备环境")
+                            sp.step("合并 Fast→Daily")
+                            dl.duckdb_partition_merge()
+                            sp.step("清理与校验")
+                            sp.finish(True, "该步骤完成")
+                        if b_stock:
+                            steps = ["准备环境", "股票增量", "清理与校验"]
+                            sp = Stepper("下载/同步 · 股票增量", steps, key_prefix="dl_stock")
+                            sp.start()
+                            sp.step("准备环境")
+                            sp.step("股票增量")
+                            dl.sync_stock_daily_fast(start_use, end_use, threads=dl.STOCK_INC_THREADS)
+                            sp.step("清理与校验")
+                            sp.finish(True, "该步骤完成")
+                        if b_index:
+                            steps = ["准备环境", "指数增量", "清理与校验"]
+                            sp = Stepper("下载/同步 · 指数增量", steps, key_prefix="dl_index")
+                            sp.start()
+                            sp.step("准备环境")
+                            sp.step("指数增量")
+                            dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
+                            sp.step("清理与校验")
+                            sp.finish(True, "该步骤完成")
+                        if b_indic:
+                            steps = ["准备环境", "指标重算并合并", "自动排名（Top/All/Details）" if auto_rank else None, "清理与校验"]
+                            sp = Stepper("下载/同步 · 指标合并/重算", steps, key_prefix="dl_indic")
+                            sp.start()
+                            sp.step("准备环境")
+                            sp.step("指标重算并合并")
+                            workers = getattr(dl, "INC_RECALC_WORKERS", None) or ((os.cpu_count() or 4) * 2)
+                            dl.recalc_symbol_products_for_increment(start_use, end_use, threads=workers)
+                            sp.step("自动排名（Top/All/Details）", visible=auto_rank)
+                            if auto_rank:
+                                try:
+                                    top_path = se.run_for_date(None)
+                                    st.success(f"✅ 已自动完成排名：{top_path}")
+                                except Exception as ee:
+                                    st.warning(f"自动排名失败：{ee}")
+                            sp.step("清理与校验")
+                            sp.finish(True, "该步骤完成")
+                except Exception as e:
+                    st.error(f"运行失败：{e}")
+                    
+        # # 执行逻辑
+        # if run_all or b_fast or b_merge or b_stock or b_index or b_indic:
+        #     if dry:
+        #         st.info(f"[DRY-RUN] base={base} assets={assets} adj={api_adj} range={start_use}~{end_use} fast_threads={fast_threads} inc_threads={inc_threads}")
+        #     else:
+        #         with st.status("执行中…", expanded=True) as status:
+        #             try:
+        #                 if run_all:
+        #                     if mode.startswith("首次"):
+        #                         status.update(label="FAST_INIT 全量…")
+        #                         _run_fast_init(end_use)
+        #                         if "index" in set(assets):
+        #                             status.update(label="指数全量/补齐…")
+        #                             dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
+        #                     else:
+        #                         status.update(label="合并 FastInit 缓存…")
+        #                         _run_increment(start_use, end_use, do_stock=True, do_index=True, do_indicators=True)
+        #                         if auto_rank:
+        #                             status.update(label="自动排名（Top/All/Details）…")
+        #                             try:
+        #                                 top_path = se.run_for_date(None)  # None=自动取最新参考日
+        #                                 st.success(f"✅ 已自动完成排名：{top_path}")
+        #                             except Exception as ee:
+        #                                 st.warning(f"自动排名失败：{ee}")
+        #                     status.update(label="完成", state="complete")
+        #                     st.success("✅ 完成")
+        #                 else:
+        #                     # 单步
+        #                     if b_fast:
+        #                         status.update(label="首次建库（FAST_INIT）…")
+        #                         _run_fast_init(end_use)
+        #                     if b_merge:
+        #                         status.update(label="合并 Fast→Daily …")
+        #                         dl.duckdb_partition_merge()
+        #                     if b_stock:
+        #                         status.update(label="股票增量…")
+        #                         dl.sync_stock_daily_fast(start_use, end_use, threads=dl.STOCK_INC_THREADS)
+        #                     if b_index:
+        #                         status.update(label="指数增量…")
+        #                         dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
+        #                     if b_indic:
+        #                         status.update(label="指标重算并合并…")
+        #                         workers = getattr(dl, "INC_RECALC_WORKERS", None) or ((os.cpu_count() or 4) * 2)
+        #                         dl.recalc_symbol_products_for_increment(start_use, end_use, threads=workers)
+        #                     if auto_rank:
+        #                         status.update(label="自动排名（Top/All/Details）…")
+        #                         try:
+        #                             top_path = se.run_for_date(None)  # None=自动取最新参考日
+        #                             st.success(f"✅ 已自动完成排名：{top_path}")
+        #                         except Exception as ee:
+        #                             st.warning(f"自动排名失败：{ee}")
+
+        #                     status.update(label="完成", state="complete")
+        #                     st.success("✅ 完成")
+        #             except Exception as e:
+        #                 st.error(f"运行失败：{e}")
 
     # === 浏览/检查（集成 app_pv 的核心功能） ===
     with tab_view:
@@ -1396,17 +1674,33 @@ with tab_stats:
     # --- Tracking ---
     with sub_tabs[0]:
         refT = st.text_input("参考日", value=_pick_latest_ref_date() or "", key="ref_1")
-        wins = st.text_input("窗口集合（逗号）", value="1,2,3,5,10,20")
-        bench = st.text_input("基准代码（逗号，可留空）", value="")
+        wins = st.text_input("未来收益窗口N（天，逗号分隔）", value="1,2,3,5,10,20")
+        bench = st.text_input("对比指数基准代码（逗号，可留空）", value="")
+        retrosT = st.text_input("附加回看天数", value="1,3,5")
+        only_detail = st.checkbox("仅导出明细（不显示均值/标准差/胜率/分位数汇总）", value=True)
         gb_board = st.checkbox("分板块汇总", value=True)
         if st.button("运行 Tracking", use_container_width=True):
             try:
                 from stats_core import run_tracking
                 wlist = [int(x) for x in wins.split(",") if x.strip().isdigit()]
                 blist = [s.strip() for s in bench.split(",") if s.strip()] or None
-                tr = run_tracking(refT, wlist, benchmarks=blist, score_df=None, group_by_board=gb_board, save=True)
-                st.dataframe(tr.summary, use_container_width=True, height=420)
-                st.caption("已落盘到 output/tracking/<ref>/ ，明细 detail 可据此深挖。")
+                # tr = run_tracking(refT, wlist, benchmarks=blist, score_df=None, group_by_board=gb_board, save=True)
+                # st.dataframe(tr.summary, use_container_width=True, height=420)
+                # st.caption("已落盘到 output/tracking/<ref>/ ，明细 detail 可据此深挖。")
+                rlist = [int(x) for x in retrosT.split(",") if x.strip().isdigit()]
+                tr = run_tracking(refT, wlist, benchmarks=blist, score_df=None,
+                                  group_by_board=gb_board, save=True, retro_days=rlist, do_summary=(not only_detail))
+                # 展示
+                if only_detail:
+                    show_cols = [c for c in ["ts_code","rank",*sorted([c for c in tr.detail.columns if c.startswith("rank_tminus_")]),
+                                             *sorted([c for c in tr.detail.columns if c.startswith("score_tminus_")]),
+                                             *[c for c in tr.detail.columns if c.startswith("ret_fwd_")]]
+                                 if c in tr.detail.columns]
+                    st.dataframe(tr.detail.sort_values(["rank"]).reset_index(drop=True)[show_cols],
+                                 use_container_width=True, height=460)
+                else:
+                    st.dataframe(tr.summary, use_container_width=True, height=420)
+                st.caption("已落盘到 output/tracking/<ref>/ ，detail 已包含 rank/score_tminus_d（如填写）。")               
             except Exception as e:
                 st.error(f"Tracking 失败：{e}")
         # === 跟踪增强：前日排行 / 名单 / 指标是否触发 / 后续涨幅 ===
@@ -1499,8 +1793,8 @@ with tab_stats:
     # --- Surge ---
     with sub_tabs[1]:
         refS = st.text_input("参考日", value=_pick_latest_ref_date() or "", key="surge_ref")
-        mode = st.selectbox("模式", ["today","rolling"], index=1, key="mode_1")
-        rolling_days = st.number_input("rolling 天数", min_value=2, max_value=20, value=5, key="rolling_1")
+        mode = st.selectbox("榜单口径", ["today","rolling"], index=1, key="mode_1")
+        rolling_days = st.number_input("rolling模式统计天数", min_value=2, max_value=20, value=5, key="rolling_1")
         sel_type = st.selectbox("选样", ["top_n","top_pct"], index=0)
         sel_val = st.number_input("阈值（N或%）", min_value=1, max_value=1000, value=200)
         retros = st.text_input("回看天数集合（逗号）", value="1,2,3,4,5")
@@ -1562,19 +1856,35 @@ with tab_stats:
     # --- Commonality ---
     with sub_tabs[2]:
         refC = st.text_input("参考日", value=_pick_latest_ref_date() or "", key="common_ref")
-        retro_day = st.number_input("观察日前移 d（retro）", min_value=1, max_value=20, value=1)
+        # retro_day = st.number_input("观察日前移 d（retro）", min_value=1, max_value=20, value=1)
+        retrosC = st.text_input("统计前 n 日集合（观察日前移 d，逗号）", value="1,3,5")
         modeC = st.selectbox("模式", ["rolling","today"], index=0, key="mode_2")
         rollingC = st.number_input("rolling 天数", min_value=2, max_value=20, value=5, key="rolling_2")
         selC = st.number_input("样本 Top-N", min_value=10, max_value=1000, value=200)
         splitC = st.selectbox("分组口径", ["main_vs_others","per_board"], index=0, key="split_2")
         bg = st.selectbox("背景集", ["all","same_group"], index=0)
+        countStrat = st.checkbox("统计每个策略的触发次数（策略分析）", value=True)
         if st.button("运行 Commonality", use_container_width=True):
             try:
                 from stats_core import run_commonality
-                cr = run_commonality(ref_date=refC, retro_day=int(retro_day), mode=modeC,
-                                     rolling_days=int(rollingC), selection={"type":"top_n","value":int(selC)},
-                                     split=splitC, background=bg, save=True)
-                st.dataframe(cr.dataset.head(200), use_container_width=True, height=420)
+                # cr = run_commonality(ref_date=refC, retro_day=int(retro_day), mode=modeC,
+                #                      rolling_days=int(rollingC), selection={"type":"top_n","value":int(selC)},
+                #                      split=splitC, background=bg, save=True)
+                # st.dataframe(cr.dataset.head(200), use_container_width=True, height=420)
+                rlist = [int(x) for x in retrosC.split(",") if x.strip().isdigit()]
+                cr = run_commonality(ref_date=refC, retro_day=(rlist[0] if rlist else 1), retro_days=rlist,
+                                     mode=modeC, rolling_days=int(rollingC),
+                                     selection={"type":"top_n","value":int(selC)},
+                                     split=splitC, background=bg, save=True,
+                                     count_strategy=countStrat)
+                # 展示策略触发计数（若开启）
+                if countStrat and "strategy_triggers" in (cr.reports or {}):
+                    st.dataframe(cr.reports["strategy_triggers"].sort_values(["obs_date","trigger_count"], ascending=[True, False]),
+                                 use_container_width=True, height=420)
+                    st.caption("按规则名统计触发次数/覆盖率，支持多观察日（前 n 日）并列。")
+                else:
+                    st.dataframe(cr.dataset.head(200), use_container_width=True, height=420)
+                    
                 st.caption("分析集/报告已写入 output/commonality/<ref>/ ...")
             except Exception as e:
                 st.error(f"Commonality 失败：{e}")

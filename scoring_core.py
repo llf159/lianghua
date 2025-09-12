@@ -620,37 +620,6 @@ def _recent_points(dfD: pd.DataFrame, rule: dict, ref_date: str) -> tuple[float,
     return (float(pts) if pts is not None else 0.0), lag, None
 
 
-# def _select_columns_for_rules() -> List[str]:
-#     """
-#     尽量按需裁列，减少 IO。
-#     """
-#     need = {"trade_date", "open", "high", "low", "close", "vol", "amount"}
-#     # 规则文本中可能出现的列（如 j/vr）
-#     pattern = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\b')
-#     def scan(script: str):
-#         for name in pattern.findall(script):
-#             name_low = name.lower()
-#             # tdx 映射里常见的：C O H L V AMOUNT J VR ...
-#             if name_low in {"j","vr","bbi","z_score"}:
-#                 need.add(name_low)
-#     for rr in (SC_RULES or []):
-#         if "clauses" in rr:
-#             for c in rr["clauses"]:
-#                 if "when" in c:
-#                     scan(c["when"])
-#         else:
-#             if "when" in rr:
-#                 scan(rr["when"])
-#     for rr in (SC_PRESCREEN_RULES or []):
-#         if "clauses" in rr:
-#             for c in rr["clauses"]:
-#                 if "when" in c:
-#                     scan(c["when"])
-#         else:
-#             if "when" in rr:
-#                 scan(rr["when"])
-#     return sorted(need)
-
 def _select_columns_for_rules() -> List[str]:
     need = {"trade_date", "open", "high", "low", "close", "vol", "amount"}
     pattern = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\b')
@@ -675,7 +644,6 @@ def _select_columns_for_rules() -> List[str]:
     for rr in (SC_RULES or []):           scan_rule(rr)
     for rr in (SC_PRESCREEN_RULES or []): scan_rule(rr)
     return sorted(need)
-
 
 
 def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: list[dict]):
@@ -1673,6 +1641,7 @@ def build_attention_rank(start: Optional[str] = None,
         hit_cnt: Dict[str, int] = {}
         first_last: Dict[str, Tuple[str,str]] = {}
         for d in span:
+            date_str = str(d)
             if source == "top":
                 f = os.path.join(SC_OUTPUT_DIR, "top", f"score_top_{d}.csv")
             elif source in ("white", "black"):
@@ -1682,14 +1651,14 @@ def build_attention_rank(start: Optional[str] = None,
             if not os.path.isfile(f):
                 continue
             try:
-                df = pd.read_csv(f, usecols=lambda c: c in {"ts_code","trade_date","ref_date"} if isinstance(c, str) else True, dtype={"ts_code": str}, engine="c")
+                df = pd.read_csv(f, usecols=lambda c: c in {"ts_code", "ref_date"} if isinstance(c, str) else True, dtype={"ts_code": str}, engine="c")
                 
                 if "trade_date" not in df.columns:
                     # 有些版本写了 ref_date；如果也没有，就直接用文件名里的 date_str
                     if "ref_date" in df.columns:
                         df = df.rename(columns={"ref_date": "trade_date"})
                     else:
-                        df["trade_date"] = str(date_str)
+                        df["trade_date"] = date_str
 
                 df = normalize_trade_date(df, "trade_date")
                 df = df[df["trade_date"] == date_str]

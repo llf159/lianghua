@@ -37,17 +37,23 @@ from utils import normalize_trade_date, normalize_ts
 
 _pro = None  # 真正的客户端放这里
 
+
 def _require_pro():
-    """只有在确实需要 Pro 接口时才初始化；否则不触发任何 token 读取。"""
+    """只有在确实需要 Pro 接口时才初始化；否则不触发任何 token 读取。
+    优先使用 config.TOKEN，其次回退到环境变量 TUSHARE_TOKEN。
+    """
     global _pro
     if _pro is None:
-        token = os.getenv("TUSHARE_TOKEN")
-        if not token:
-            # 明确报错，帮助定位谁在误用 Pro 接口
-            raise RuntimeError("Tushare Pro 未配置，但代码路径请求了 Pro 接口。请避免调用或设置 TUSHARE_TOKEN。")
+        # TOKEN 来自 `from config import *`
+        token = str(globals().get("TOKEN", "")).strip() or os.getenv("TUSHARE_TOKEN", "").strip()
+        if not token or token.startswith("在这里"):
+            # 明确报错，指导两种正确的配置方式
+            raise RuntimeError("Tushare Pro 未配置：请在 config.TOKEN 或环境变量 TUSHARE_TOKEN 中设置有效 token。")
+        # 再次设置一次 token 以保证 pro_api 使用到正确的 token（幂等）
         ts.set_token(token)
         _pro = ts.pro_api()
     return _pro
+
 
 # 保持原有 `pro.xxx` 的调用习惯：只有访问属性时才会初始化
 class _LazyPro:
@@ -66,11 +72,6 @@ os.environ.setdefault("no_proxy", os.environ["NO_PROXY"])
 
 EPS = 1e-12
 # ------------- 基本检查 -------------
-if TOKEN.startswith("在这里"):
-    logging.debug('[BRANCH] <module> | IF TOKEN.startswith("在这里") -> taken')
-    sys.stderr.write("请先在 TOKEN 中填写你的 Tushare Token.\n")
-    sys.exit(1)
-
 try:
     import tushare as ts
 except ImportError:
@@ -95,7 +96,7 @@ _CALL_TS_LOCK = threading.Lock()
 # root.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.DEBUG))
 root = logging.getLogger()
 # 始终开 DEBUG，让各 Handler 决定往哪儿输出；控制台仍用 LOG_LEVEL 过滤
-root.setLevel(logging.DEBUG)
+root.setLevel(logging.INFO)
 
 
 # 文件 Handler(轮换)
@@ -110,7 +111,7 @@ file_hdl = TimedRotatingFileHandler(
 )
 file_fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
 file_hdl.setFormatter(file_fmt)
-file_hdl.setLevel(logging.DEBUG)
+file_hdl.setLevel(logging.INFO)
 root.addHandler(file_hdl)
 
 # 终端 Handler
@@ -121,10 +122,6 @@ root.addHandler(console_hdl)
 log_dir = os.path.join(".", "log")
 os.makedirs(log_dir, exist_ok=True)
 log_path = os.path.join(log_dir, "download.log")
-dl_hdl = logging.FileHandler(log_path, encoding="utf-8")
-dl_hdl.setLevel(logging.DEBUG)
-dl_hdl.setFormatter(file_fmt)
-root.addHandler(dl_hdl)
 
 # =======================================================================
 
@@ -478,7 +475,7 @@ def _save_partition(df: pd.DataFrame, root: str):
     for dt, sub in df.groupby("trade_date"):
         pdir = os.path.join(root, f"trade_date={dt}")
         os.makedirs(pdir, exist_ok=True)
-        fname = os.path.join(pdir, f"part-{int(time.time()*1e6)}.parquet")
+        fname = os.path.join(pdir, f"data_{int(time.time()*1e6)}.parquet")
         sub.to_parquet(fname, index=False, engine=PARQUET_ENGINE)
 
 
@@ -613,7 +610,7 @@ def _need_duck_merge(daily_dir: str) -> bool:
 
     con = duckdb.connect()    # 内存连接足够
     try:
-        glob_path = os.path.join(daily_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
+        glob_path = os.path.join(daily_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
         last_duck = con.sql(
             f"SELECT max(trade_date) FROM parquet_scan('{glob_path}')"
         ).fetchone()[0]
@@ -623,12 +620,12 @@ def _need_duck_merge(daily_dir: str) -> bool:
     if last_duck is not None:
         logging.debug('[BRANCH] def _need_duck_merge | IF last_duck is not None -> taken')
         pattern_new = (
-            f"{Path(daily_dir).as_posix()}/trade_date={int(last_duck)+1}%/part-*.parquet"
+            f"{Path(daily_dir).as_posix()}/trade_date={int(last_duck)+1}%/data_*.parquet"
         )
         next_str = str(int(last_duck) + 1).zfill(8)
         try:                                              # ← 加入 try‑except
             new_rows = con.sql(
-                f"SELECT count(*) FROM parquet_scan('{daily_dir}/trade_date={next_str}%/part-*.parquet')"
+                f"SELECT count(*) FROM parquet_scan('{daily_dir}/trade_date={next_str}%/data_*.parquet')"
             ).fetchone()[0] or 0
         except duckdb.IOException:                        # 分区还没生成 → 说明需要合并
             return True
@@ -732,7 +729,7 @@ class BatchIncCache:
             loc.execute("PRAGMA enable_object_cache;")  # 允许文件元数据缓存
 
             glob_src = os.path.join(
-                DATA_ROOT, "stock", "daily", f"daily_{self.target_adj}", "trade_date=*/part-*.parquet"
+                DATA_ROOT, "stock", "daily", f"daily_{self.target_adj}", "trade_date=*/data_*.parquet"
             ).replace("\\", "/")
 
             # 只扫最近分区 + 逐股 last_date 过滤
@@ -803,7 +800,7 @@ def _recalc_increment_inmem(ts_list, last_duck_str: str, end: str, threads: int 
 
         # ① 估每股 last_date（只从“指标分区”回看近 N 天，避免全库扫）
         con.register("ts_list", pd.DataFrame({"ts_code": ts_list}))
-        glob_dst = os.path.join(dst_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
+        glob_dst = os.path.join(dst_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
         cutoff_back = int(INC_INMEM_CUTOFF_BACK_DAYS or 365)
         _base = pd.to_datetime(str(last_duck_str), format="%Y%m%d", errors="coerce")
         if pd.isna(_base):  # 指标分区尚未建成，或拿到'00000000'
@@ -843,7 +840,7 @@ def _recalc_increment_inmem(ts_list, last_duck_str: str, end: str, threads: int 
         con.register("cutoff_df", cutoff)
 
         # ② 只读本次涉及股票 + 各自窗口的基础列（DuckDB 一把拉进内存）
-        glob_src = os.path.join(src_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
+        glob_src = os.path.join(src_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
         base_cols = ["ts_code","trade_date","open","high","low","close","vol","amount"]
         cols_sql = ", ".join(f"p.{c}" for c in base_cols)
         # —— df_all 的 SQL：两端统一按整数比较 ——  （原来 warm_lower 是 str，end 也是 str）
@@ -900,7 +897,7 @@ def _recalc_increment_inmem(ts_list, last_duck_str: str, end: str, threads: int 
 # ========== 按交易日批量模式(原有日常增量) ==========
 def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: int = 8):
     """
-    按“指数代码”一次性拉取区间数据(并发)，写出到 data/index/daily/trade_date=YYYYMMDD/part-*.parquet
+    按“指数代码”一次性拉取区间数据(并发)，写出到 data/index/daily/trade_date=YYYYMMDD/data_*.parquet
     比原来“按交易日 × 指数”快一个数量级以上。
     """
     import threading
@@ -931,7 +928,7 @@ def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: i
                 continue
             pdir = os.path.join(root, f"trade_date={dt}")
             os.makedirs(pdir, exist_ok=True)
-            fname = os.path.join(pdir, f"part-{int(time.time()*1e6)}.parquet")
+            fname = os.path.join(pdir, f"data_{int(time.time()*1e6)}.parquet")
             # IO 上锁，避免极端情况下文件名撞车
             with lock_io:
                 sub.to_parquet(fname, index=False, engine=PARQUET_ENGINE)
@@ -987,7 +984,7 @@ def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: i
 def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
     """
     按“股票代码(ts_code)”一次性并发拉取区间(日线)，
-    写出到 data/stock/daily/trade_date=YYYYMMDD/part-*.parquet
+    写出到 data/stock/daily/trade_date=YYYYMMDD/data_*.parquet
     """
     adj = _decide_symbol_adj_for_fast_init()  # 返回 'raw' | 'qfq' | 'hfq'
     adj_dir_map = {
@@ -1018,7 +1015,7 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
                 continue
             pdir = os.path.join(dst_dir, f"trade_date={dt}")
             os.makedirs(pdir, exist_ok=True)
-            fname = os.path.join(pdir, f"part-{int(time.time()*1e6)}.parquet")
+            fname = os.path.join(pdir, f"data_{int(time.time()*1e6)}.parquet")
             with lock_io:
                 sub.to_parquet(fname, index=False, engine=PARQUET_ENGINE)
 
@@ -1063,41 +1060,6 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
 
-            # —— 只给“增量段第一天”做 warm-up：从既有日分区里取上一交易日的 close
-            last_close = None
-            try:
-                import duckdb, os
-                con = duckdb.connect()
-                con.execute(f"PRAGMA threads={DUCKDB_THREADS};")
-                con.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}';")
-                con.execute("PRAGMA preserve_insertion_order=false;")
-                os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
-                con.execute(f"PRAGMA temp_directory='{DUCKDB_TEMP_DIR}'")
-
-                glob_prev = os.path.join(dst_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
-                sql = f"""
-                    SELECT max_by(close, trade_date) AS last_close
-                    FROM parquet_scan('{glob_prev}')
-                    WHERE ts_code = '{ts_code}' AND trade_date < '{actual_start}'
-                """
-                row = con.sql(sql).fetchone()
-                con.close()
-                last_close = row[0] if row else None
-            except Exception:
-                # 查询不到（新股/首次建库）或 parquet 尚不存在时，保持 NaN，语义正确
-                last_close = None
-
-            # —— 若有 last_close，则 seed 一行放到最前面（trade_date 取 actual_start 的前一天即可，稍后会丢掉）
-            seeded = False
-            if (last_close is not None) and not df.empty:
-                seed = df.iloc[[0]].copy()
-                seed['trade_date'] = (pd.to_datetime(actual_start) - pd.Timedelta(days=1)).strftime('%Y%m%d')   # 或替换为真实上一个交易日
-                seed["close"] = last_close
-                df = pd.concat([seed, df], ignore_index=True)
-                seeded = True
-            # —— 丢掉 seed 行（只在 seeded 时）
-            if seeded:
-                df = df.iloc[1:].copy()
             df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
             write_partition(df)
             return ts_code, "ok"
@@ -1227,18 +1189,12 @@ def fast_init_download(end_date: str):
             ts_code, status, msg = fut.result()
             with lock_stats:
                 if status == 'ok':
-                    logging.debug("[BRANCH] def fast_init_download | IF status == 'ok' -> taken")
                     ok += 1
                 elif status == 'skip':
-                    logging.debug("[BRANCH] def fast_init_download | IF status == 'skip' -> taken")
-                    logging.debug("[BRANCH] def fast_init_download | ELIF status == 'skip' -> taken")
                     skip += 1
                 elif status == 'empty':
-                    logging.debug("[BRANCH] def fast_init_download | IF status == 'empty' -> taken")
-                    logging.debug("[BRANCH] def fast_init_download | ELIF status == 'empty' -> taken")
                     empty += 1
                 else:
-                    logging.debug("[BRANCH] def fast_init_download | ELSE of IF status == 'empty' -> taken")
                     err += 1
                     failed.append((ts_code, msg))
                     pbar.close()
@@ -1290,8 +1246,6 @@ def fast_init_download(end_date: str):
                 df.to_parquet(fpath, index=False)
 
                 if API_ADJ != "raw":
-                    _WRITE_SYMBOL_INDICATORS(ts_code, df, end_date)
-                if API_ADJ != "raw":
                     logging.debug('[BRANCH] def fast_init_download > def retry_task | IF API_ADJ != "raw" -> taken')
                     _WRITE_SYMBOL_INDICATORS(ts_code, df, end_date)
                 return (ts_code, 'ok')
@@ -1305,23 +1259,12 @@ def fast_init_download(end_date: str):
             for fut in pbar2:
                 c, st = fut.result()
                 if st == 'ok':
-                    logging.debug("[BRANCH] def fast_init_download | IF st == 'ok' -> taken")
                     ok2 += 1
                 elif st == 'empty':
-                    logging.debug("[BRANCH] def fast_init_download | IF st == 'empty' -> taken")
-                    logging.debug("[BRANCH] def fast_init_download | ELIF st == 'empty' -> taken")
                     empty2 += 1
                 elif st == 'exists':
-                    logging.debug("[BRANCH] def fast_init_download | IF st == 'exists' -> taken")
-                    logging.debug("[BRANCH] def fast_init_download | ELIF st == 'exists' -> taken")
-                    logging.debug("[BRANCH] def fast_init_download | IF st == 'exists' -> taken")
-                    logging.debug("[BRANCH] def fast_init_download | ELIF st == 'exists' -> taken")
                     exists2 += 1
                 else:
-                    logging.debug("[BRANCH] def fast_init_download | ELSE of IF st == 'exists' -> taken")
-                    logging.debug("[BRANCH] def fast_init_download | ELSE of IF st == 'exists' -> taken")
-                    logging.debug("[BRANCH] def fast_init_download | ELSE of IF st == 'exists' -> taken")
-                    logging.debug("[BRANCH] def fast_init_download | ELSE of IF st == 'exists' -> taken")
                     err2 += 1
                 pbar2.set_postfix(ok=ok2, empty=empty2, exists=exists2, err=err2)
             pbar2.close()
@@ -1365,7 +1308,7 @@ def duckdb_merge_symbol_products_to_daily(batch_days:int=30):
 
     # 目标端已有的最大日期
     try:
-        glob_dst = os.path.join(dst_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
+        glob_dst = os.path.join(dst_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
         glob_dst_sql = glob_dst.replace("'", "''")
         last_duck = con.sql(f"SELECT max(trade_date) FROM parquet_scan('{glob_dst_sql}')").fetchone()[0] or 0
     except duckdb.Error:
@@ -1431,7 +1374,7 @@ def duckdb_merge_symbol_products_to_daily_subset(ts_codes: list[str], batch_days
 
     # 目标端已有的最大日期
     try:
-        glob_dst = os.path.join(dst_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
+        glob_dst = os.path.join(dst_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
         last_duck = con.sql(f"SELECT max(trade_date) FROM parquet_scan('{glob_dst}')").fetchone()[0] or 0
     except duckdb.Error:
         last_duck = 0
@@ -1524,7 +1467,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
     
     # ① 目的端已有最大交易日
     try:
-        glob_dst = os.path.join(dst_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
+        glob_dst = os.path.join(dst_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
         glob_dst_sql = glob_dst.replace("'", "''")  # 防止路径中含有单引号
         val = con.sql(f"SELECT max(trade_date) FROM parquet_scan('{glob_dst_sql}')").fetchone()[0]
         last_duck = int(val) if val is not None else 0
@@ -1537,7 +1480,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
 
     # 如果目的端还没有数据，用源端的最新日 - 1 与 start 取最大值做下限
     if last_duck <= 0:
-        glob_src = os.path.join(src_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
+        glob_src = os.path.join(src_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
         glob_src_sql = glob_src.replace("'", "''")
         try:
             val = con.sql(f"SELECT max(trade_date) FROM parquet_scan('{glob_src_sql}')").fetchone()[0]
@@ -1549,7 +1492,7 @@ def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0)
         last_duck_str = str(last_duck).zfill(8)
 
     # ② 源端新增日期涉及的 ts_code
-    glob_src = os.path.join(src_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
+    glob_src = os.path.join(src_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
     glob_src_sql = glob_src.replace("'", "''")
 
     try:
@@ -1609,7 +1552,7 @@ def duckdb_partition_merge(batch_days:int=30):
 
         # 目标端已有的最大 trade_date
         try:
-            glob_dst = os.path.join(dst_dir, "trade_date=*/part-*.parquet").replace("\\", "/")
+            glob_dst = os.path.join(dst_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
             last_duck = con.sql(
                 f"SELECT max(trade_date) FROM parquet_scan('{glob_dst}')"
             ).fetchone()[0] or 0
@@ -1692,7 +1635,7 @@ def streaming_merge_after_download():
                 df_day = pd.concat(lst, ignore_index=True)
                 pdir = os.path.join(daily_root, f"trade_date={dt}")
                 os.makedirs(pdir, exist_ok=True)
-                fname = os.path.join(pdir, f"part-merge-{int(time.time()*1e6)}.parquet")
+                fname = os.path.join(pdir, f"data_merge-{int(time.time()*1e6)}.parquet")
                 df_day.to_parquet(fname, index=False)
             logging.info("[STREAM_MERGE][%s] flush: %s 写出日期数=%d", mode_label, reason, len(buffer))
             buffer = {}
@@ -1705,29 +1648,19 @@ def streaming_merge_after_download():
                 logging.warning("[STREAM_MERGE][%s] 读失败 %s (%s)", mode_label, f, e)
                 continue
             if df is None or df.empty:
-                logging.debug('[BRANCH] def streaming_merge_after_download | IF df is None or df.empty -> taken')
                 continue
             for dt, sub in df.groupby("trade_date"):
                 buffer.setdefault(dt, []).append(sub)
             processed += 1
 
             if len(buffer) >= STREAM_FLUSH_DATE_BATCH:
-                logging.debug('[BRANCH] def streaming_merge_after_download | IF len(buffer) >= STREAM_FLUSH_DATE_BATCH -> taken')
                 flush(f"date_batch>= {STREAM_FLUSH_DATE_BATCH}")
             elif processed % STREAM_FLUSH_STOCK_BATCH == 0:
-                logging.debug('[BRANCH] def streaming_merge_after_download | IF processed % STREAM_FLUSH_STOCK_BATCH == 0 -> taken')
-                logging.debug('[BRANCH] def streaming_merge_after_download | ELIF processed % STREAM_FLUSH_STOCK_BATCH == 0 -> taken')
                 flush(f"stock_batch {STREAM_FLUSH_STOCK_BATCH}")
             elif time.time() - last_flush_time > 60:
-                logging.debug('[BRANCH] def streaming_merge_after_download | IF time.time() - last_flush_time > 60 -> taken')
-                logging.debug('[BRANCH] def streaming_merge_after_download | ELIF time.time() - last_flush_time > 60 -> taken')
-                logging.debug('[BRANCH] def streaming_merge_after_download | IF time.time() - last_flush_time > 60 -> taken')
-                logging.debug('[BRANCH] def streaming_merge_after_download | ELIF time.time() - last_flush_time > 60 -> taken')
                 flush("time>60s")
                 last_flush_time = time.time()
-
             if processed % STREAM_LOG_EVERY == 0:
-                logging.debug('[BRANCH] def streaming_merge_after_download | IF processed % STREAM_LOG_EVERY == 0 -> taken')
                 pbar.set_postfix(proc=processed, pct=f"{processed/total_files*100:.1f}%")
 
         flush("final")

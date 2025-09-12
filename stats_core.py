@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 py — 将“跟踪(Tracking) / 大涨单子(Surge)”统一接入 score_engine 的钩子
 
@@ -32,21 +32,37 @@ py — 将“跟踪(Tracking) / 大涨单子(Surge)”统一接入 score_engine 
 """
 from __future__ import annotations
 
-from typing import Optional, Sequence, Dict, Any
-
 import logging
 import traceback
-import pandas as pd
 
 try:
     import config as _cfg
 except Exception:  # pragma: no cover
     _cfg = None
 
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+import math
+import json
+import numpy as np
+import pandas as pd
+import importlib
+from config import PARQUET_BASE, PARQUET_ADJ
+from parquet_viewer import asset_root, read_range, list_trade_dates
+
+from typing import Iterable, Sequence, Dict, List, Optional, Callable, Any, Literal
+
+from utils import normalize_ts, normalize_trade_date, market_label
+
+SCORE_ALL_DIR = Path("output/score/all")
+SURGE_OUT_BASE = Path("output/surge_lists")
+COMMON_OUT_BASE = Path("output/commonality")
+TRACKING_OUT_BASE = Path("output/tracking")
+PORT_OUT_BASE = Path("output/portfolio")
 LOG = logging.getLogger("score.hooks")
 
 # --------- 读取可选配置（容错） ---------
-
 def _get(name: str, default):
     if _cfg and hasattr(_cfg, name):
         try:
@@ -56,7 +72,6 @@ def _get(name: str, default):
     return default
 
 # --------- 主钩子 ---------
-
 def post_scoring(ref_date: str, *, df_all_scores: Optional[pd.DataFrame] = None) -> dict:
     """在 run_for_date() 写完 all/top 后调用。
     返回所有子任务的状态与落盘路径，失败的子任务会返回异常简述。
@@ -100,21 +115,6 @@ def post_scoring(ref_date: str, *, df_all_scores: Optional[pd.DataFrame] = None)
 
     return result
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable, Sequence, Dict, List, Optional
-
-import numpy as np
-import pandas as pd
-
-from config import PARQUET_BASE, PARQUET_ADJ
-from utils import normalize_ts, normalize_trade_date, market_label
-from parquet_viewer import asset_root, list_trade_dates, read_range
-
-# ------------------------- 常量 -------------------------
-SCORE_ALL_DIR = Path("output/score/all")
-TRACKING_OUT_BASE = Path("output/tracking")
-
 # ------------------------- 数据模型 -------------------------
 @dataclass
 class TrackingResult:
@@ -124,6 +124,43 @@ class TrackingResult:
     summary_path: Optional[Path] = None
 
 # ------------------------- 工具 -------------------------
+def _count_strategy_triggers(obs_date: str, codes_sample: Sequence[str]) -> pd.DataFrame:
+    """
+    统计某观察日 obs_date 在样本集合 codes_sample 内每个策略（规则名）的触发次数/覆盖率。
+    触发判定：per_rules 里 ok=True 或 hit_date==obs_date 或 obs_date ∈ hit_dates。
+    """
+    ddir = Path("output/score/details") / str(obs_date)
+    if not ddir.exists():
+        return pd.DataFrame(columns=["name","trigger_count","n_sample","coverage"])
+    codes_set = set(str(c) for c in (codes_sample or []))
+    acc: dict[str, set] = {}
+    n_sample = len(codes_set) if codes_set else 0
+    for fp in ddir.glob("*.json"):
+        try:
+            obj = json.loads(fp.read_text(encoding="utf-8-sig"))
+        except Exception:
+            continue
+        ts = str(obj.get("ts_code",""))
+        if codes_set and ts not in codes_set:
+            continue
+        for r in (obj.get("per_rules") or []):
+            name = str(r.get("name") or "")
+            if not name:
+                continue
+            ok = bool(r.get("ok"))
+            hd = str(r.get("hit_date") or "")
+            hds = [str(x) for x in (r.get("hit_dates") or [])]
+            trig = ok or (hd == str(obs_date)) or (str(obs_date) in hds)
+            if trig:
+                acc.setdefault(name, set()).add(ts)
+    rows = []
+    for name, st in acc.items():
+        rows.append({"name": name,
+                     "trigger_count": int(len(st)),
+                     "n_sample": int(n_sample),
+                     "coverage": (len(st) / n_sample if n_sample else 0.0)})
+    return pd.DataFrame(rows).sort_values(["trigger_count","name"], ascending=[False, True]).reset_index(drop=True)
+
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
@@ -262,6 +299,14 @@ class ScoreTrackingPlugin:
         self.outdir = Path(outdir or TRACKING_OUT_BASE)
 
     # ---- 主入口：从 DataFrame（优先）或 score_all 文件计算 ----
+    # def run(self,
+    #         ref_date: str,
+    #         windows: Sequence[int],
+    #         benchmarks: Sequence[str] | None = None,
+    #         *,
+    #         score_df: Optional[pd.DataFrame] = None,
+    #         group_by_board: bool = True,
+    #         save: bool = True) -> TrackingResult:
     def run(self,
             ref_date: str,
             windows: Sequence[int],
@@ -269,7 +314,9 @@ class ScoreTrackingPlugin:
             *,
             score_df: Optional[pd.DataFrame] = None,
             group_by_board: bool = True,
-            save: bool = True) -> TrackingResult:
+            save: bool = True,
+            retro_days: Sequence[int] = (),
+            do_summary: bool = True) -> TrackingResult:
         """
         参数：
           - ref_date：交易日 YYYYMMDD
@@ -335,7 +382,12 @@ class ScoreTrackingPlugin:
                     detail[col_alpha] = detail[f"ret_fwd_{N}"] - detail[col_alpha]
 
         # 4) 汇总（长表）
-        summary = _to_long_summary(detail, windows, benchmarks, group_by_board=group_by_board)
+        summary = _to_long_summary(detail, windows, benchmarks, group_by_board=group_by_board) if do_summary else pd.DataFrame()
+
+        retro_list = sorted({int(d) for d in (retro_days or []) if int(d) > 0})
+        if retro_list:
+            retro = _build_retro_cols(ref_date, detail["ts_code"].tolist(), retro_list)
+            detail = detail.merge(retro, on="ts_code", how="left")
 
         # 5) 落地
         out_dir = self.outdir / ref_date
@@ -364,30 +416,15 @@ def get_tracking_plugin() -> ScoreTrackingPlugin:
     return _plugin_singleton
 
 
-def run_tracking(ref_date: str, windows: Sequence[int], benchmarks: Sequence[str] | None = None, *, score_df: Optional[pd.DataFrame] = None, group_by_board: bool = True, save: bool = True) -> TrackingResult:
+def run_tracking(ref_date: str, windows: Sequence[int], benchmarks: Sequence[str] | None = None,
+                 *, score_df: Optional[pd.DataFrame] = None, group_by_board: bool = True, save: bool = True,
+                 retro_days: Sequence[int] = (), do_summary: bool = True) -> TrackingResult:
     """无状态快捷函数，便于在 score_engine 内部直接调用。"""
-    return get_tracking_plugin().run(ref_date, windows, benchmarks, score_df=score_df, group_by_board=group_by_board, save=save)
-
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Sequence, Dict, List, Optional
-
-import math
-import numpy as np
-import pandas as pd
-
-from config import PARQUET_BASE, PARQUET_ADJ
-from utils import normalize_ts, normalize_trade_date
-from parquet_viewer import asset_root, list_trade_dates, read_range
-
-SCORE_ALL_DIR = Path("output/score/all")
-SURGE_OUT_BASE = Path("output/surge_lists")
+    plugin = get_tracking_plugin()
+    return plugin.run(ref_date, windows, benchmarks, score_df=score_df, group_by_board=group_by_board, save=save,
+                      retro_days=retro_days, do_summary=do_summary)
 
 # ------------------------- 工具 -------------------------
-
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
 
 def _pick_trade_dates(ref_date: str, back: int) -> List[str]:
     """返回 [ref_date-back, ..., ref_date] 范围内的交易日列表，用于价格与回看。"""
@@ -463,7 +500,6 @@ class SurgeResult:
     group_files: Optional[Dict[str, Path]] = None
 
 
-
 def _board_group(ts_code: str, split: str) -> str:
     """
     根据 split 口径返回分组名。
@@ -487,6 +523,7 @@ def _board_group(ts_code: str, split: str) -> str:
     if (s.endswith(".SH") and not s.startswith("688")) or (s.endswith(".SZ") and s.startswith(("000","001","002","003"))):
         return "主板"
     return "其他"
+
 
 def run_surge(
     *,
@@ -593,27 +630,7 @@ def run_surge(
 
     return SurgeResult(table=table, out_path=out_path if save else None, group_files=group_files or None)
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable, Sequence, Dict, List, Optional, Any
-
-import importlib
-import math
-import numpy as np
-import pandas as pd
-
-from config import PARQUET_BASE, PARQUET_ADJ
-from utils import normalize_trade_date, normalize_ts
-from parquet_viewer import asset_root, list_trade_dates
-
-COMMON_OUT_BASE = Path("output/commonality")
-SCORE_ALL_DIR = Path("output/score/all")
-
 # ------------------------- 小工具 -------------------------
-
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
 
 def _load_callable(spec_or_fn: str | Callable) -> Callable:
     if callable(spec_or_fn):
@@ -695,6 +712,8 @@ def run_commonality(
     feature_providers: Sequence[str|Callable] = (),
     analyzers: Sequence[str|Callable] = (), # 留空则使用 analyzer_basic
     save: bool = True,
+    retro_days: Sequence[int] = (),
+    count_strategy: bool = False,
 ) -> CommonalityResult:
     """构建大涨样本（在 ref_date 的前 retro_day 天观察）并运行 analyzers。
     返回 dataset（带 label）与 reports（由 analyzers 返回）。
@@ -710,11 +729,12 @@ def run_commonality(
         raise RuntimeError("大涨样本为空")
 
     # 2) 观察日（大涨日前 d 天）
-    obs_date = _prev_trade_date(ref_date, retro_day)
+    retro_list = sorted({int(retro_day)} | {int(x) for x in (retro_days or [])})
+    obs_dates = [_prev_trade_date(ref_date, d) for d in retro_list]
 
     # 3) 读取观察日全市场打分
-    df_all = _read_score_all(obs_date)
-
+    df_all_map = {d: _read_score_all(d) for d in obs_dates}
+    
     # 4) 背景集选择
     if background == "same_group" and "group" in surge.columns and "ts_code" in surge.columns:
         # 仅取与各样本同组的股票集合；我们按组分别做，然后合并
@@ -742,10 +762,16 @@ def run_commonality(
         else:
             bg_df = df_all
 
-        # 5.1 基础视图：score/rank + label
-        base = bg_df[[c for c in ["ts_code","trade_date","score","rank","board"] if c in bg_df.columns]].copy()
-        base["label"] = base["ts_code"].isin(set(g_pick)).astype(int)
+        # # 5.1 基础视图：score/rank + label
+        # base = bg_df[[c for c in ["ts_code","trade_date","score","rank","board"] if c in bg_df.columns]].copy()
+        # base["label"] = base["ts_code"].isin(set(g_pick)).astype(int)
 
+        # 5.1 建 base（pos/ref）——对每个观察日分别做
+        #     这里只以第一个观察日构建 dataset；策略计数则会对 obs_dates 全部生成
+        first_obs = obs_dates[0]
+        df_all = df_all_map[first_obs]
+        base = _build_base_dataset(df_all, surge, group=grp, background=background)
+        
         # 5.2 追加自定义特征
         feats: List[pd.DataFrame] = []
         for prov in feature_providers:
@@ -795,6 +821,18 @@ def run_commonality(
             key = f"{k}__{g}"
             reports_all[key] = v
 
+        # 5.5 可选：策略触发计数（对每个观察日）
+        if count_strategy:
+            counts = []
+            for od in obs_dates:
+                codes_sample = pos_df["ts_code"].tolist()
+                cnt = _count_strategy_triggers(od, codes_sample)
+                if not cnt.empty:
+                    cnt["obs_date"] = od
+                    cnt["group"] = grp
+                counts.append(cnt)
+            if counts:
+                g_reports["strategy_triggers"] = pd.concat([c for c in counts if c is not None], ignore_index=True)
     dataset_all = pd.concat(datasets, ignore_index=True) if datasets else pd.DataFrame()
 
     # 6) 落地
@@ -828,21 +866,6 @@ def run_commonality(
 
     return CommonalityResult(dataset=dataset_all, reports=reports_all, out_dir=out_dir)
 
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Optional, Sequence, Dict, List, Literal
-
-import math
-import json
-import numpy as np
-import pandas as pd
-
-from config import PARQUET_BASE, PARQUET_ADJ
-from parquet_viewer import asset_root, read_range, list_trade_dates
-from utils import normalize_trade_date, normalize_ts
-
-PORT_OUT_BASE = Path("output/portfolio")
-
 # ------------------------- 数据类 -------------------------
 @dataclass
 class Portfolio:
@@ -858,6 +881,7 @@ class Portfolio:
     fee_bps_sell: float = 0.0
     min_fee: float = 0.0
 
+
 @dataclass
 class Trade:
     portfolio_id: str
@@ -869,10 +893,7 @@ class Trade:
     price: Optional[float] = None    # 若指定则使用该价格（覆盖 price_mode）
     note: str = "manual"
 
-# positions/nav 用 DataFrame 存盘，不单独建类
-
 # ------------------------- 工具 -------------------------
-
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
@@ -927,7 +948,6 @@ def _read_px(codes, start, end, *, asset="stock", cols=("open","close")) -> pd.D
     if codes:
         df = df[df["ts_code"].isin(set(codes))]
     return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
-
 
 # ------------------------- 管理器 -------------------------
 class PortfolioManager:
@@ -1217,5 +1237,3 @@ class PortfolioManager:
         self.write_positions(pid, pos_df)
         self.write_nav(pid, nav_df)
         return {"positions_path": self._positions_path(pid), "nav_path": self._nav_path(pid)}
-
-# === END MERGED MODULE: score_portfolio.py ===
