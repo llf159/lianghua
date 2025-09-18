@@ -43,19 +43,6 @@ REGISTRY: Dict[str, IndMeta] = {
         py_func=lambda df, **kw: bbi(df),
         tags=["product","prelaunch"]
     ),
-    "bupiao": IndMeta(
-        name="bupiao",
-        out={"bupiao_short": 2, "bupiao_long": 2},
-        tdx="""
-            LLV3 := LLV(L, 3); HHV3 := HHV(C, 3);
-            BUPIAO_SHORT := SAFE_DIV(100*(C-LLV3), (HHV3-LLV3+EPS));
-            LLV21 := LLV(L, 21); HHV21 := HHV(C, 21);
-            BUPIAO_LONG := SAFE_DIV(100*(C-LLV21), (HHV21-LLV21+EPS));
-        """,
-        py_func=lambda df, **kw: bupiao(df, **kw),
-        kwargs={"n1": 3, "n2": 21},
-        tags=["product","prelaunch"]
-    ),
     "rsi": IndMeta(
         name="rsi",
         out={"rsi": 2},  # 小数位数
@@ -67,8 +54,17 @@ REGISTRY: Dict[str, IndMeta] = {
         py_func=lambda df, **kw: rsi(df['close'], **kw),
         kwargs={"period": 14},  # Python 兜底参数
         tags=["product","prelaunch"]
-),
-
+    ),
+    "DIFF": IndMeta(
+        name="DIFF",
+        out={"diff": 2},
+        tdx="""
+            DIFF := EMA(CLOSE, 12) - EMA(CLOSE, 26);
+        """,
+        py_func=lambda df, **kw: macd_diff(df['close'], **kw),
+        kwargs={"fast": 12, "slow": 26},
+        tags=["product","prelaunch"]
+    ),
 }
 
 # —— 统一计算入口：优先 TDX，失败回退 Python —— 
@@ -129,8 +125,10 @@ def outputs_for(names: List[str]) -> Dict[str, int]:
             out.update(meta.out)
     return out
 
+
 def names_by_tag(tag: str) -> List[str]:
     return [n for n,m in REGISTRY.items() if tag in m.tags]
+
 
 # =================== python兼容层 ==========================
 def moving_average(series, window):
@@ -139,13 +137,8 @@ def moving_average(series, window):
 def ema(series, span):
     return series.ewm(span=span, adjust=False).mean()
 
-def macd(series, fast=12, slow=26, signal=9):
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = ema(macd_line, signal)
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+def macd_diff(close, fast=12, slow=26, **kw):
+    return ema(close, fast) - ema(close, slow)
 
 def rsi(series, period=14):
     from tdx_compat import SMA
@@ -177,23 +170,6 @@ def volume_ratio(df, n=20):
     vr = df['vol'] / avg_volume
     return vr
 
-def bupiao(df, n1=3, n2=21):
-    """计算短期/中期/中长期/长期动量指标"""
-    C = df['close']
-    L = df['low']
-
-    def calc_momentum(n):
-        llv = L.rolling(n).min()
-        hhv = C.rolling(n).max()
-        return 100 * (C - llv) / (hhv - llv)
-
-    short = calc_momentum(n1)
-    mid = calc_momentum(10)
-    midlong = calc_momentum(20)
-    long = calc_momentum(n2)
-
-    return short, long
-
 def cci(df, n=14):
     tp = (df["high"] + df["low"] + df["close"]) / 3
     ma = tp.rolling(n).mean()
@@ -207,3 +183,4 @@ def bbi(df):
     ma24 = df['close'].rolling(24).mean()
 
     return (ma3 + ma6 + ma12 + ma24) / 4
+

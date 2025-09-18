@@ -14,6 +14,23 @@ from pathlib import Path
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict
 
+import logging
+
+class _DropMissingCtx(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        return "missing ScriptRunContext" not in msg and "bare mode" not in msg
+
+# 根 logger 过滤（覆盖一切向上冒泡的记录）
+logging.getLogger().addFilter(_DropMissingCtx())
+# 再对 streamlit 系列 logger 加一层
+for name in (
+    "streamlit",
+    "streamlit.runtime.scriptrunner",
+    "streamlit.runtime.scriptrunner.script_run_context",
+):
+    logging.getLogger(name).addFilter(_DropMissingCtx())
+
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -26,29 +43,20 @@ import time
 import download as dl
 import app_pv as apv
 
-try:
-    import scoring_core as se
-except Exception as e:
-    st.error(f"无法导入 scoring_core：{e}")
-    st.stop()
+import scoring_core as se
 
-try:
-    import config as cfg
-except Exception as e:
-    st.error(f"无法导入 config：{e}")
-    st.stop()
-
+import config as cfg
 try:
     import stats_core as stats
 except Exception:
     stats = None
-    
 from utils import normalize_ts, ensure_datetime_index, normalize_trade_date, market_label
 from parquet_viewer import read_range, asset_root, list_trade_dates
 from config import PARQUET_BASE, PARQUET_ADJ
-st.set_page_config(page_title="ScoreApp", layout="wide")
 import tdx_compat as tdx
+from stats_core import _pick_trade_dates, _prev_trade_date
 
+st.set_page_config(page_title="ScoreApp", layout="wide")
 # ===== 常量路径 =====
 SC_OUTPUT_DIR = Path(getattr(cfg, "SC_OUTPUT_DIR", "output/score"))
 TOP_DIR  = SC_OUTPUT_DIR / "top"
@@ -56,6 +64,7 @@ ALL_DIR  = SC_OUTPUT_DIR / "all"
 DET_DIR  = SC_OUTPUT_DIR / "details"
 ATTN_DIR = SC_OUTPUT_DIR / "attention"
 LOG_DIR  = Path("./log")
+
 
 for p in [TOP_DIR, ALL_DIR, DET_DIR, ATTN_DIR, LOG_DIR]:
     p.mkdir(parents=True, exist_ok=True)
@@ -93,7 +102,7 @@ def _apply_overrides(
 @st.cache_data(show_spinner=False, ttl=300)
 def _latest_trade_date(base: str, adj: str) -> str | None:
     try:
-        from parquet_viewer import asset_root, list_trade_dates
+
         root = asset_root(base, "stock", adj)
         ds = list_trade_dates(root)
         return ds[-1] if ds else None
@@ -144,7 +153,6 @@ def _read_df(path: Path, usecols=None, dtype=None, encoding: str = "utf-8-sig") 
 
 @st.cache_data(show_spinner=False, ttl=600)
 def _cached_trade_dates(base: str, adj: str):
-    from parquet_viewer import asset_root, list_trade_dates
     root = asset_root(base, "stock", adj)
     return list_trade_dates(root) or []
 
@@ -205,6 +213,45 @@ def _prev_ref_date(cur: str) -> Optional[str]:
         if m and m.group(1) < cur:
             dates.append(m.group(1))
     return dates[-1] if dates else None
+
+def _from_last_hints(days: list[int] | None = None,
+                     base: str = PARQUET_BASE, adj: str = PARQUET_ADJ,
+                     last: str | None = None):
+    """
+    基于“最新交易日 last（缺省=本地数据的最后一天）”，返回：
+      - 文本提示串（含星期），用于展示；
+      - 映射 dict: {n: d8}，n 个交易日前对应的 yyyymmdd 字符串。
+    """
+    try:
+        root = asset_root(base, "stock", adj)
+        ds = list_trade_dates(root) or []
+        if not ds:
+            return "", {}
+        last = last or ds[-1]
+        if last not in ds:
+            return "", {}
+
+        idx = ds.index(last)
+        days = sorted({int(x) for x in (days or []) if int(x) >= 1})
+
+        from datetime import date as _d
+        def _fmt(d8: str) -> str:
+            y, m, d = int(d8[:4]), int(d8[4:6]), int(d8[6:])
+            wk = "一二三四五六日"[_d(y, m, d).weekday()]
+            return f"{y:04d}-{m:02d}-{d:02d}(周{wk})"
+
+        parts = [f"最新={_fmt(last)}"]
+        mapping = {}
+        for n in days:
+            j = idx - n
+            if j >= 0:
+                mapping[n] = ds[j]
+                parts.append(f"{n}个交易日前={_fmt(ds[j])}")
+            else:
+                parts.append(f"{n}个交易日前=--（数据不足）")
+        return " · ".join(parts), mapping
+    except Exception:
+        return "", {}
 
 def _rule_to_screen_args(rule: dict):
     """返回 (when_expr, timeframe, window, scope)"""
@@ -283,6 +330,30 @@ def _scan_date_range(start_yyyymmdd: str, end_yyyymmdd: str) -> List[str]:
         s += timedelta(days=1)
     return out
 
+def _fmt_retcols_percent(df):
+    try:
+        import pandas as _pd
+        import numpy as _np
+    except Exception:
+        return df
+    df = df.copy()
+    cols = [c for c in df.columns if str(c).startswith("ret_fwd_")]
+    if not cols:
+        return df
+    for c in cols:
+        # 转成数值
+        s = _pd.to_numeric(df[c], errors="coerce")
+        finite = s[_np.isfinite(s)]
+        if finite.shape[0] == 0:
+            continue
+        q95 = finite.abs().quantile(0.95)
+        # 小于等于 0.5 说明是小数（例如 0.034），需要×100
+        if _pd.notna(q95) and q95 <= 0.5:
+            s = s * 100.0
+        # 统一两位小数 + 百分号
+        df[c] = s.map(lambda x: (f"{x:.2f}%" if _pd.notna(x) else None))
+    return df
+
 def _apply_runtime_overrides(rules_obj: dict,
                              topk: int, tie_break: str, max_workers: int,
                              attn_on: bool, universe: str|List[str]):
@@ -295,9 +366,46 @@ def _apply_runtime_overrides(rules_obj: dict,
     setattr(se, "SC_TOP_K", int(topk))
     setattr(se, "SC_TIE_BREAK", str(tie_break))
     setattr(se, "SC_MAX_WORKERS", int(max_workers))
-    setattr(se, "SC_ATTENTION_ENABLE", bool(attn_on))
+    # setattr(se, "SC_ATTENTION_ENABLE", bool(attn_on))
     setattr(se, "SC_UNIVERSE", universe)
-    
+
+# ==== 强度榜文件定位====
+def _pick_latest_attn_date() -> Optional[str]:
+    """
+    扫描 attention 目录所有 CSV。
+    规则：把“文件名里最后一次出现的 8 位数字”视为该文件的结束日；
+         若同一结束日有多份，则按文件修改时间(mtime)取最新那份的结束日。
+    """
+    best_key = None
+    best_ref = None
+    for p in ATTN_DIR.glob("*.csv"):
+        ms = re.findall(r"(\d{8})", p.name)
+        if not ms:
+            continue
+        end = ms[-1]  # 视为结束日（最后 8 位）
+        key = (end, p.stat().st_mtime)  # 先比日期，再比修改时间
+        if best_key is None or key > best_key:
+            best_key, best_ref = key, end
+    return best_ref
+
+def _find_attn_file_by_date(ref: str) -> Optional[Path]:
+    """
+    根据结束日 ref 定位文件：
+    - 先收集所有包含该 ref 的 attention CSV；
+    - 优先“规范化命名”的文件（以 attention_ 开头且包含 _win/_topM/_topN 这些关键字）；
+    - 其余则按修改时间倒序作为次序。
+    """
+    cands = list(ATTN_DIR.glob(f"*attention*{ref}*.csv"))
+    if not cands:
+        return None
+
+    def _score(p: Path):
+        nm = p.name
+        normalized = nm.startswith("attention_") and ("_win" in nm or nm == f"attention_{ref}.csv")
+        return (1 if normalized else 0, p.stat().st_mtime)
+
+    return sorted(cands, key=_score, reverse=True)[0]
+
 # ---- 读取 config 的稳健工具 ----
 def cfg_int(name: str, default: int) -> int:
     val = getattr(cfg, name, default)
@@ -356,14 +464,12 @@ class Stepper:
         self._init_state()
 
     def _init_state(self):
-        import streamlit as st
         st.session_state[self.key] = {
             "idx": 0,        # 已完成到第几个（从 0 开始）
             "run_id": self.key,
         }
 
     def start(self):
-        import streamlit as st
         self.status = st.status(
             label=f"{self.title}：开始（0/{self.total}）",
             state="running",
@@ -373,13 +479,11 @@ class Stepper:
             st.write("🟡 开始任务…")
 
     def _update_prog(self, idx, label):
-        import streamlit as st
         pct = 0 if self.total == 0 else int(idx / self.total * 100)
         self.prog.progress(pct, text=f"{idx}/{self.total}：{label}")
 
     def step(self, label, visible=True, info=None):
         """进入下一主步骤；visible=False 时，仅记录日志，不纳入进度比例"""
-        import streamlit as st
         if not visible:
             # 仅追加日志提示
             with self.status:
@@ -397,7 +501,6 @@ class Stepper:
 
     def tick(self, delta_ratio, info=None):
         """在当前步骤中显示细粒度推进（例如循环/分批处理）"""
-        import streamlit as st
         state = st.session_state[self.key]
         # 按当前主步骤位置 + 细分比例 合成一个更平滑的百分比展示
         base = min(state["idx"], self.total - 1)
@@ -435,31 +538,27 @@ if "export_pref" not in st.session_state:
 st.title("ScoreApp")
 
 # ===== 顶层页签 =====
-tab_rank, tab_detail, tab_rules, tab_attn, tab_data, tab_screen, tab_tools, tab_port, tab_stats, tab_logs = st.tabs(
-    ["排名", "个股详情", "规则编辑", "强度榜", "数据下载/浏览", "普通选股", "工具箱", "组合模拟/持仓", "统计", "日志"]
+tab_rank, tab_detail, tab_position, tab_rules, tab_attn, tab_data, tab_screen, tab_tools, tab_port, tab_stats, tab_logs = st.tabs(
+    ["排名", "个股详情", "持仓建议", "规则编辑", "强度榜", "数据下载/浏览", "普通选股", "工具箱", "组合模拟/持仓", "统计", "日志"]
 )
 
 # ================== 排名 ==================
 with tab_rank:
-    st.subheader("① 排名")
+    st.subheader("排名")
     with st.expander("参数设置（运行前请确认）", expanded=True):
         c1, c2, c3, c4 = st.columns([1,1,1,1])
         with c1:
-            # ref_inp = st.text_input("参考日（YYYYMMDD；留空=自动取最新）", value="")
             ref_inp = st.text_input("参考日（YYYYMMDD；留空=自动取最新）", value="", key="rank_ref_input")
-            # topk = st.number_input("Top-K", min_value=1, max_value=2000, value=int(getattr(cfg, "SC_TOP_K", 50)))
             topk = st.number_input("Top-K", min_value=1, max_value=2000, value=cfg_int("SC_TOP_K", 50))
         with c2:
-            # tie = st.selectbox("同分排序（Tie-break）", ["none", "kdj_j_asc"], index=0 if str(getattr(cfg,"SC_TIE_BREAK","none")).lower()=="none" else 1)
             tie_default = cfg_str("SC_TIE_BREAK", "none").lower()
             tie = st.selectbox("同分排序（Tie-break）", ["none", "kdj_j_asc"], index=0 if tie_default=="none" else 1)
-            # maxw = st.number_input("最大并行数", min_value=1, max_value=64, value=int(getattr(cfg, "SC_MAX_WORKERS", 8)))
             maxw = st.number_input("最大并行数", min_value=1, max_value=64, value=cfg_int("SC_MAX_WORKERS", 8))
         with c3:
-            universe = st.selectbox("评分范围", ["全市场","仅白名单","仅黑名单","仅特别关注榜"], index=0)
+            universe = st.selectbox("评分范围", ["全市场","仅白名单","仅黑名单"], index=0)
             style = st.selectbox("TXT 导出格式", ["空格分隔", "一行一个"], index=0)
         with c4:
-            attn_on = st.checkbox("评分后生成关注榜", value=cfg_bool("SC_ATTENTION_ENABLE", False))
+            attn_on = False
             with_suffix = st.checkbox("导出带交易所后缀（.SZ/.SH）", value=False)
         st.session_state["export_pref"] = {"style": "space" if style=="空格分隔" else "lines",
                                            "with_suffix": with_suffix}
@@ -494,7 +593,7 @@ with tab_rank:
 
     # ---- 统一的 Top 预览区块（无论 run 或 读取最近一次） ----
     if ref_to_use:
-        st.markdown(f"**参考日：{ref_to_use}**")
+        st.markdown(f"**当前最新排名：{ref_to_use}**")
         df_all = _read_df(_path_all(ref_to_use))
     else:
         st.info("未找到任何 Top 文件，请先运行评分或检查输出目录。")
@@ -522,7 +621,7 @@ with tab_rank:
 
 # ================== 个股详情 ==================
 with tab_detail:
-    st.subheader("② 个股详情")
+    st.subheader("个股详情")
 
     # —— 选择参考日 + 代码（支持从 Top-K 下拉选择） ——
     c0, c1 = st.columns([1,2])
@@ -729,9 +828,13 @@ with tab_detail:
                         except Exception as e:
                             st.error(f"筛选失败：{e}")
 
+# ================== 持仓建议 ==================
+with tab_position:
+    st.subheader("持仓建议")
+
 # ================== 规则编辑 ==================
 with tab_rules:
-    st.subheader("③ 规则编辑（仅当前进程临时生效，保存不会改 config.py）")
+    st.subheader("规则编辑（仅当前进程临时生效，保存不会改 config.py）")
     colL, colR = st.columns([2,1])
     default_text = json.dumps(st.session_state["rules_obj"], ensure_ascii=False, indent=2)
     with colL:
@@ -776,33 +879,67 @@ with tab_rules:
     with st.container(border=True):
         st.markdown("### 🧪 策略测试器（单条规则）")
         with st.expander("使用方法 / 字段说明", expanded=False):
-            st.markdown("**必填字段**")
-            st.markdown(
-                "- `name`：规则名称\n"
-                "- `when`：通达信风格布尔表达式\n"
-                "- `timeframe`：`D`/`W`/`M`\n"
-                "- `window`：回看窗口（整数）\n"
-                "- `scope`：命中口径（如 `ANY`/`ALL`/`LAST`/`COUNT>=k`/`CONSEC>=m`/`ANY_5`/`ALL_3`/`EACH`/`RECENT`/`DIST`/`NEAR` 等)"
-            )
+            st.markdown(r"""###规则系统与表达式
+- **必填**
+- `name`：规则名称
+- `when`：通达信风格布尔表达式（见下第 4 节）
+- `timeframe`：`D` / `W` / `M`（周线按 `W-FRI` 聚合；月线按自然月聚合）
+- `window`：回看窗口（整数，按 `timeframe` 计）
+- `scope`：命中口径（见下一节）
+- **可选**
+- `points`：命中加分。`EACH/PERBAR` 为“**每根K线** * points”。
+- `explain`：命中理由文案；`show_reason`（默认 `true`）控制是否在汇总中展示；`as` 可选 `opportunity` / `highlight` / `drawback` / `auto`（按正负分自动归类）。
+- `clauses`：复合子句数组，**与逻辑**。每个子句可单独设置 `timeframe/window/scope/when`。
+- `gate` / `require` / `trigger`：可选的“闸门/必要条件/触发条件”（布尔表达式或子句集），用于放/拦加分（常用于 `EACH` 或 `RECENT` 类规则的二次过滤）。
+- `dist_points`（或 `distance_points`）：**`RECENT`/`DIST`/`NEAR`** 的“距离计分表”。两种等价写法：
+    - 列表：`[[min, max, points], ...]`  
+    - 字典：`[{"min":0,"max":0,"points":3}, {"min":1,"max":2,"points":2}]`
+- 其它：`universe`（"all"/"white"/"black"/"attention"/或自定义代码列表）等（在普通筛选器与策略测试器中可选）。
 
-            st.markdown("**可选字段**")
-            st.markdown(
-                "- `points`：命中加分（`EACH/PERBAR` 为“每K * points”）\n"
-                "- `explain`：命中理由文案（默认展示；可用 `show_reason=false` 隐藏）\n"
-                "- `dist_points`：`RECENT/DIST/NEAR` 的距离计分表，支持两种等价写法："
-            )
-            st.caption("列表写法")
-            st.code('[[0,0,3], [1,2,2], [3,5,1]]', language="json")
-            st.caption("字典写法")
-            st.code('[{"min":0,"max":0,"points":3}, {"min":1,"max":2,"points":2}, {"min":3,"max":5,"points":1}]', language="json")
-            st.markdown("- `clauses`：复合子句（与逻辑），子句里也可单独设置 `timeframe/window/scope/when`")
+#### 4) `scope` 口径（命中判定）
+- 基本：`LAST` / `ANY` / `ALL` / `COUNT>=k` / `CONSEC>=m`。
+- 扩展：`ANY_n` / `ALL_n`（长度为 n 的**连续子窗口**上，任一/全部为真）。
+- 逐K计数：`EACH` / `PERBAR` / `EACH_TRUE`（窗口内每一根 K 线满足时按次计分）。
+- 最近距离：`RECENT` / `DIST` / `NEAR`（先求最近一次 `when` 为真距今天数 `lag`，再查表计分；支持 `hit_date` / `hit_dates` 取数）。
 
-            st.markdown("**命中日期口径差异（很重要）**")
-            st.markdown(
-                "- `EACH/PERBAR`：逐K计数；`hit_date` 取窗口内最后一次为真；`hit_dates` 为窗口内所有为真。\n"
-                "- `RECENT/DIST/NEAR`：先算最近一次命中的 `lag`，再由索引回推 `hit_date`；同时列出 `hit_dates`。\n"
-                "- 其它（`ANY/ALL/LAST/COUNT/CONSEC/ANY_n/ALL_n` 等）：按布尔命中；`hit_dates` 为窗口内所有为真。"
-            )
+**命中日期与展示口径（重要）：**
+- `EACH/PERBAR`：逐K计数；`hit_date` 为窗口内**最后一次为真**；`hit_dates` 是**窗口内所有为真**。  
+- `RECENT/DIST/NEAR`：先算 `lag`，由索引回推 `hit_date`；同时列出 `hit_dates`。  
+- 其它（`ANY/ALL/LAST/COUNT/CONSEC/ANY_n/ALL_n`）：按布尔命中；`hit_dates` 为窗口内所有为真。
+
+#### 5) `when` 表达式（TDX 兼容）
+**可用变量（部分）**：`C/CLOSE`、`O/OPEN`、`H/HIGH`、`L/LOW`、`V/VOL`、`AMOUNT`、`REFDATE`（参考日）、`J`（KDJ·J）、`VR`、以及数据列自动别名（原名与全大写，如 `z_score` / `Z_SCORE`）。  
+**可用函数（部分）**：`REF/MA/EMA/SMA/SUM/HHV/LLV/STD/ABS/MAX/MIN/IF/COUNT/CROSS/BARSLAST/SAFE_DIV/RSV`，以及序列工具 `TS_PCT/TS_RANK`。  
+**标签工具**：`ANY_TAG("关键词|正则", shift)`、`TAG_HITS(...)`、`ANY_TAG_AT_LEAST(...)`、`YDAY_TAG_HITS(...)`、`YDAY_ANY_TAG_AT_LEAST(...)`。  
+**注入函数**：`RANK_VOL(ts, n)`、`RANK_RET(ts, n)`、`RANK_MATCH_COEF(ts, n)` 可由系统注入到表达式环境（见“策略测试器”与明细计算）。
+
+示例：
+```text
+VOL>MA(VOL,5) AND CLOSE>MA(CLOSE,20)                {放量并站上MA20}
+CROSS(CLOSE, MA(CLOSE, 60))                          {收盘上穿MA60}
+COUNT(C>O, 5) >= 3 AND CONSEC>=2                     {近5日至少3天收阳且出现2连阳}
+TS_PCT(Z_SCORE, 120) >= 0.95                         {120日分位 >= 95%}
+```
+
+#### 6) 周/月线与窗口
+- 周线 `W` 与月线 `M` 由日线**重采样**：`open/close/high/low/vol/amount` 分别按“首/末/极值/求和”聚合，扩展列（如 `j/vr`）默认取**最后值**；窗口在采样后的索引上截取。
+
+#### 7) 策略测试器（单条规则）
+- 输入一条规则（JSON），可在**个股**或**名单**上快速试跑；并对命中细节给出与“详情页一致”的口径（含 `lag/hit_date/hit_dates` 的处理）。
+- 支持选择名单：全市场/白名单/黑名单/特别关注（榜单从 `output/attention` 下自动选择参考期 ≤ 参考日的**最新一份**）。
+- 参考日留空将自动推断为**分区最新交易日**（若环境变量设置了 `SC_REF_DATE` 也会尊重）。
+
+#### 8) `RECENT/DIST/NEAR` 的计分表写法
+- 列表：`[[0,0,3], [1,2,2], [3,5,1]]`
+- 字典：`[{"min":0,"max":0,"points":3}, {"min":1,"max":2,"points":2}, {"min":3,"max":5,"points":1}]`
+
+#### 9) 导出与文件
+- **明细**：`output/score/details/<YYYYMMDD>/<ts_code>_<YYYYMMDD>.json`（含 `summary` 与 per-rule 明细）。
+- **全量排名**：`output/score/all/score_all_<YYYYMMDD>.csv`（按分数降序 → tiebreak(J) 降序 → 代码升序）。
+- **特别关注**：`output/attention/attention_{source}_{start}_{end}.csv`（自动择最新且 `end <= 参考日` 的一份）。
+
+> 小贴士：表达式扫描会**按需裁列**（若 `when` 用到 `j/vr` 等扩展列会自动补读）；`COUNT` 在样本不足时按“已有样本”计数，`NaN` 统一按 False 处理，避免误判。""")
+
 
         # 1) 首次进入时给一个默认模板
         if "tester_rule_json" not in st.session_state:
@@ -826,7 +963,7 @@ with tab_rules:
             st.button("🧹 一键清空", use_container_width=True, on_click=_clear_tester_rule)
             ref_in = st.text_input("参考日（留空=自动最新）", value="")
             ts_in = st.text_input("个股代码", value="")
-            uni_choice = st.selectbox("名单", ["全市场","仅白名单","仅黑名单","仅特别关注榜"], index=0, key="tester_uni")
+            uni_choice = st.selectbox("名单", ["全市场","仅白名单","仅黑名单"], index=0, key="tester_uni")
             _uni_map = {"全市场":"all", "仅白名单":"white", "仅黑名单":"black", "仅特别关注榜":"attention"}
 
         with colleft:
@@ -912,6 +1049,7 @@ with tab_rules:
 
             # 暂存并临时替换全局规则集，只跑这一条
             bak_rules = getattr(se, "SC_RULES", None)
+            setattr(se, "SC_RULES", [rule])
             bak_pres  = getattr(se, "SC_PRESCREEN_RULES", None)
             try:
                 setattr(se, "SC_RULES", [rule])
@@ -925,8 +1063,37 @@ with tab_rules:
 
                 # 估算读取起点（按本条规则的 timeframe+window）
                 start = se._start_for_tf_window(ref_use, str(rule.get("timeframe", "D")), int(rule.get("window", getattr(se, "SC_LOOKBACK_D", 60))))
-                # 按需裁列（会扫描 when 里的列名，例如 j/vr）：
-                columns = se._select_columns_for_rules()
+
+                # 1) 当前测试规则所需的起始日与列
+                tf_curr = str(rule.get("timeframe","D"))
+                win_curr = int(rule.get("window", getattr(se, "SC_LOOKBACK_D", 60)))
+                start_curr = se._start_for_tf_window(ref_use, tf_curr, win_curr)
+                cols_curr = set(se._select_columns_for_rules())
+
+                # 2) 扫整份 config（尤其是 as=... 的标签规则）所需的“最早起始日 + 列”
+                cfg_cols = set()
+                cfg_start = start_curr
+                if bak_rules:
+                    se.SC_RULES = bak_rules
+                    try:
+                        cfg_cols = set(se._select_columns_for_rules())
+                        # 仅考虑带 as 的规则（机会/亮点/瑕疵标签），估算它们各自所需的起始日，取最早
+                        cfg_starts = []
+                        for r in (bak_rules or []):
+                            if str(r.get("as") or "").strip():
+                                tf_r = str(r.get("timeframe","D"))
+                                win_r = int(r.get("window", getattr(se, "SC_LOOKBACK_D", 60)))
+                                cfg_starts.append(se._start_for_tf_window(ref_use, tf_r, win_r))
+                        if cfg_starts:
+                            cfg_start = min([start_curr] + cfg_starts)
+                    finally:
+                        # 复位回单条测试
+                        se.SC_RULES = [rule]
+                        se.SC_PRESCREEN_RULES = []
+
+                # 并集合并：读更早的起始日 + 更全的列
+                start = cfg_start
+                columns = sorted(cols_curr | cfg_cols)
 
                 # 读取单票数据
                 df = se._read_stock_df(ts_code, start, ref_use, columns)
@@ -935,9 +1102,51 @@ with tab_rules:
                     st.stop()
 
                 # 保持与正式评分一致的表达式上下文
+                # 3) 兜底补齐标签规则常用指标（如 j/vr），以免注入失败
+                try:
+                    need_j = False
+                    need_vr = False
+                    if bak_rules:
+                        for r in bak_rules:
+                            if not str(r.get("as") or "").strip():
+                                continue
+                            texts = [str(r.get("when") or "")]
+                            texts += [str(c.get("when") or "") for c in r.get("clauses",[])]
+                            s = " ".join(texts).lower()
+                            need_j = need_j or (" j" in f" {s}")  # 粗略包含判断
+                            need_vr = need_vr or (" vr" in f" {s}")
+                    if need_j and ("j" not in df.columns):
+                        try:
+                            from indicators import kdj
+                            df = df.copy()
+                            df["j"] = kdj(df)
+                        except Exception:
+                            pass
+                    if need_vr and ("vr" not in df.columns) and ("vol" in df.columns):
+                        try:
+                            import pandas as pd
+                            v = pd.to_numeric(df["vol"], errors="coerce")
+                            n = 26
+                            df = df.copy()
+                            df["vr"] = (v / v.rolling(n).mean()).values
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # 4) 明确注入 config 标签到 CUSTOM_TAGS（与正式链路对齐）
                 try:
                     if tdx is not None:
+                        # tdx.EXTRA_CONTEXT.clear()
                         tdx.EXTRA_CONTEXT.update(se.get_eval_env(ts_code, ref_use))
+                        if bak_rules:
+                            se.SC_RULES = bak_rules
+                            try:
+                                se._inject_config_tags(df, ref_use)  # 这里用日线 df 注入标签
+                            finally:
+                                se.SC_RULES = [rule]
+                        else:
+                            se._inject_config_tags(df, ref_use)
                 except Exception:
                     pass
 
@@ -986,7 +1195,7 @@ with tab_rules:
 
 # ================== 强度榜 ==================
 with tab_attn:
-    st.subheader("④ 强度榜")
+    st.subheader("强度榜")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         src = st.selectbox("来源", ["top","white","black","attention"], index=0)
@@ -1005,8 +1214,6 @@ with tab_attn:
     if gen_btn:
         try:
             # 1) 计算 start/end（按交易日）
-            from parquet_viewer import asset_root, list_trade_dates
-            from config import PARQUET_BASE, PARQUET_ADJ
             root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
             days = _cached_trade_dates(PARQUET_BASE, PARQUET_ADJ)
             end = (date_end or (days[-1] if days else None))
@@ -1066,37 +1273,97 @@ with tab_attn:
             except Exception as e:
                 st.warning(f"导出/复制失败：{e}")
                 
-            # —— 以下为“强度榜落盘（CSV/TXT，含清晰文件名）” ——  # NEW
-            try:
-                # 统一、可追溯的文件名前缀
-                fname_base = f"attention_{src}_{mode_map[method]}_{w_map[weight]}_win{int(win_n)}_topM{int(top_m)}_{start}_{end}_topN{int(out_n)}"
-                # 目标路径
-                dest_csv = ATTN_DIR / f"{fname_base}.csv"
-                dest_txt = ATTN_DIR / f"{fname_base}.txt"
-
-                # 1) CSV：把 scoring_core 返回的 csv_path 复制一份到规范化文件名
+            # —— 以下为“强度榜落盘（CSV/TXT，含清晰文件名）” 
+            save_extra = cfg_bool("SC_ATTENTION_SAVE_EXTRA", False)
+            if save_extra:
                 try:
-                    if str(csv_path) != str(dest_csv):
-                        shutil.copyfile(csv_path, dest_csv)
-                    else:
-                        # 若 scoring_core 已是同名，可忽略
-                        pass
-                except Exception as _e:
-                    st.warning(f"CSV 落盘失败（不影响页面预览）：{_e}")
+                    fname_base = f"attention_{src}_{mode_map[method]}_{w_map[weight]}_win{int(win_n)}_topM{int(top_m)}_{start}_{end}_topN{int(out_n)}"
+                    dest_csv = ATTN_DIR / f"{fname_base}.csv"
+                    dest_txt = ATTN_DIR / f"{fname_base}.txt"
 
-                # 2) TXT：把上面生成的 codes 文本也落盘
-                try:
-                    dest_txt.write_text(txt, encoding="utf-8-sig")
-                except Exception as _e:
-                    st.warning(f"TXT 落盘失败（不影响页面预览）：{_e}")
+                    # 1) 复制 CSV（若名字不同）
+                    try:
+                        if str(csv_path) != str(dest_csv):
+                            shutil.copyfile(csv_path, dest_csv)
+                    except Exception as _e:
+                        st.warning(f"CSV 落盘失败（不影响页面预览）：{_e}")
 
-                st.caption(f"已落盘：{dest_csv.name} / {dest_txt.name}（目录：{ATTN_DIR}）")
-            except Exception as _e:
-                st.warning(f"强度榜落盘出现异常：{_e}")
-            # —— “强度榜落盘”结束 ——  # NEW
+                    # 2) 写 TXT（只有前面生成过 txt 才写）
+                    if 'txt' in locals():
+                        try:
+                            dest_txt.write_text(txt, encoding="utf-8-sig")
+                        except Exception as _e:
+                            st.warning(f"TXT 落盘失败（不影响页面预览）：{_e}")
+
+                    st.caption(f"已落盘：{dest_csv.name} / {dest_txt.name}（目录：{ATTN_DIR}）")
+                except Exception as _e:
+                    st.warning(f"强度榜落盘出现异常：{_e}")
 
         except Exception as e:
             st.error(f"生成失败：{e}")
+            
+    st.subheader("本地读取")
+
+    c1, c2 = st.columns([1,1])
+    with c1:
+        ref_inp_attn = st.text_input("参考日（YYYYMMDD；留空=自动取最新）", value="", key="attn_ref_input")
+    with c2:
+        sort_key = st.selectbox("排序依据", ["score ↓", "rank ↑", "保持原文件顺序"], index=0, key="attn_sort_key")
+    topn_attn = st.number_input("Top-K 显示行数", min_value=5, max_value=1000, value=cfg_int("SC_ATTENTION_TOP_K", 50), key="attn_topn")
+    # 决定参考日与文件路径
+    ref_attn = (ref_inp_attn.strip() or _pick_latest_attn_date())
+    if not ref_attn:
+        st.info("未在 attention 目录发现任何 CSV，请先产出强度榜或检查输出路径。")
+
+    attn_path = _find_attn_file_by_date(ref_attn)
+    st.caption(f"参考日：{ref_attn}")
+    if not attn_path or (not attn_path.exists()):
+        st.warning("未找到该日的强度榜文件（请确认 attention 目录与命名）。")
+
+    # 读取强度榜
+    df_attn = _read_df(attn_path)
+    if df_attn is None or df_attn.empty:
+        st.warning("强度榜文件为空或无法读取。")
+
+    # 统一/容错排序：默认优先按 score 降序；没有 score 则按 rank 升序；否则保持原顺序
+    def _auto_sort(df: pd.DataFrame) -> pd.DataFrame:
+        if "score" in df.columns:
+            return df.sort_values(["score", "ts_code"], ascending=[False, True])
+        if "rank" in df.columns:
+            return df.sort_values(["rank", "ts_code"], ascending=[True, True])
+        return df
+
+    if sort_key == "score ↓" and "score" in df_attn.columns:
+        df_attn = df_attn.sort_values(["score", "ts_code"], ascending=[False, True])
+    elif sort_key == "rank ↑" and "rank" in df_attn.columns:
+        df_attn = df_attn.sort_values(["rank", "ts_code"], ascending=[True, True])
+    # “保持原文件顺序” 就不动
+
+    # 预览 + 导出/复制，行为与“排名”页尽量一致
+    st.divider()
+    with st.container(border=True):
+        rows_eff = int(topn_attn)
+        st.markdown("**强度榜 Top-N 预览**")
+        st.dataframe(df_attn.head(rows_eff), use_container_width=True, height=420)
+
+        # TXT 复制（按你的导出偏好）
+        if "ts_code" in df_attn.columns:
+            codes = df_attn["ts_code"].astype(str).head(rows_eff).tolist()
+            txt = _codes_to_txt(
+                codes,
+                st.session_state["export_pref"]["style"],
+                st.session_state["export_pref"]["with_suffix"]
+            )
+            copy_txt_button(txt, label="复制以上", key=f"copy_attn_{ref_attn}")
+
+        # # CSV 下载（Top-N）
+        # st.download_button(
+        #     "⬇️ 导出 Top-N（CSV）",
+        #     data=df_attn.head(rows_eff).to_csv(index=False).encode("utf-8-sig"),
+        #     file_name=f"attention_top{rows_eff}_{ref_attn}.csv",
+        #     use_container_width=True,
+        #     key=f"dl_attn_{ref_attn}"
+        # )
 
 # ================= 数据下载 ==================
 with tab_data:
@@ -1271,63 +1538,6 @@ with tab_data:
                             sp.finish(True, "该步骤完成")
                 except Exception as e:
                     st.error(f"运行失败：{e}")
-                    
-        # # 执行逻辑
-        # if run_all or b_fast or b_merge or b_stock or b_index or b_indic:
-        #     if dry:
-        #         st.info(f"[DRY-RUN] base={base} assets={assets} adj={api_adj} range={start_use}~{end_use} fast_threads={fast_threads} inc_threads={inc_threads}")
-        #     else:
-        #         with st.status("执行中…", expanded=True) as status:
-        #             try:
-        #                 if run_all:
-        #                     if mode.startswith("首次"):
-        #                         status.update(label="FAST_INIT 全量…")
-        #                         _run_fast_init(end_use)
-        #                         if "index" in set(assets):
-        #                             status.update(label="指数全量/补齐…")
-        #                             dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
-        #                     else:
-        #                         status.update(label="合并 FastInit 缓存…")
-        #                         _run_increment(start_use, end_use, do_stock=True, do_index=True, do_indicators=True)
-        #                         if auto_rank:
-        #                             status.update(label="自动排名（Top/All/Details）…")
-        #                             try:
-        #                                 top_path = se.run_for_date(None)  # None=自动取最新参考日
-        #                                 st.success(f"✅ 已自动完成排名：{top_path}")
-        #                             except Exception as ee:
-        #                                 st.warning(f"自动排名失败：{ee}")
-        #                     status.update(label="完成", state="complete")
-        #                     st.success("✅ 完成")
-        #                 else:
-        #                     # 单步
-        #                     if b_fast:
-        #                         status.update(label="首次建库（FAST_INIT）…")
-        #                         _run_fast_init(end_use)
-        #                     if b_merge:
-        #                         status.update(label="合并 Fast→Daily …")
-        #                         dl.duckdb_partition_merge()
-        #                     if b_stock:
-        #                         status.update(label="股票增量…")
-        #                         dl.sync_stock_daily_fast(start_use, end_use, threads=dl.STOCK_INC_THREADS)
-        #                     if b_index:
-        #                         status.update(label="指数增量…")
-        #                         dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
-        #                     if b_indic:
-        #                         status.update(label="指标重算并合并…")
-        #                         workers = getattr(dl, "INC_RECALC_WORKERS", None) or ((os.cpu_count() or 4) * 2)
-        #                         dl.recalc_symbol_products_for_increment(start_use, end_use, threads=workers)
-        #                     if auto_rank:
-        #                         status.update(label="自动排名（Top/All/Details）…")
-        #                         try:
-        #                             top_path = se.run_for_date(None)  # None=自动取最新参考日
-        #                             st.success(f"✅ 已自动完成排名：{top_path}")
-        #                         except Exception as ee:
-        #                             st.warning(f"自动排名失败：{ee}")
-
-        #                     status.update(label="完成", state="complete")
-        #                     st.success("✅ 完成")
-        #             except Exception as e:
-        #                 st.error(f"运行失败：{e}")
 
     # === 浏览/检查（集成 app_pv 的核心功能） ===
     with tab_view:
@@ -1353,7 +1563,7 @@ with tab_data:
 
 # ================== 普通选股（TDX表达式） ==================
 with tab_screen:
-    st.subheader("⑤ 普通选股（类TDX 表达式）")
+    st.subheader("普通选股（类TDX 表达式）")
     # exp = st.text_input("表达式（示例：CLOSE>MA(CLOSE,20) AND VOL>MA(VOL,5)）", value="")
     exp = st.text_input("表达式（示例：CLOSE>MA(CLOSE,20) AND VOL>MA(VOL,5)）", value="", key="screen_expr")
     c1, c2, c3, c4 = st.columns(4)
@@ -1365,7 +1575,7 @@ with tab_screen:
         scope_logic = st.selectbox("命中范围(scope)", ["LAST","ANY","ALL","COUNT>=k","CONSEC>=m"], index=0)
     with c4:
         refD = st.text_input("参考日（可选，YYYYMMDD）", value="")
-    uni_choice = st.selectbox("选股范围", ["全市场","仅白名单","仅黑名单","仅特别关注榜"], index=0)
+    uni_choice = st.selectbox("选股范围", ["全市场","仅白名单","仅黑名单"], index=0)
     _uni_map = {"全市场":"all", "仅白名单":"white", "仅黑名单":"black", "仅特别关注榜":"attention"}
     run_screen = st.button("运行筛选并预览", use_container_width=True)
 
@@ -1397,14 +1607,12 @@ with tab_screen:
 
 # ================== 工具箱 ==================
 with tab_tools:
-    st.subheader("⑥ 工具箱")
+    st.subheader("工具箱")
     colA, colB = st.columns(2)
 
     with colA:
         st.markdown("**自动补算最近 N 个交易日**")
         n_back = st.number_input("天数 N", min_value=1, max_value=100, value=20)
-        # inc_today = st.checkbox("包含参考日当天", value=False,
-        #                         help="勾选后窗口包含参考日（例如 N=5 → [ref-(N-1), ref]；未勾选则 [ref-N, ref-1]）")
         inc_today = st.checkbox("包含参考日当天", value=True,
                                  help="勾选后窗口包含参考日（例如 N=5 → [ref-(N-1), ref]；未勾选则 [ref-N, ref-1]）")
         do_force = st.checkbox("强制重建（覆盖已有）", value=False,
@@ -1531,7 +1739,7 @@ with tab_tools:
 
 # ================== 组合模拟 / 持仓 ==================
 with tab_port:
-    st.subheader("⑦ 组合模拟 / 持仓")
+    st.subheader("组合模拟 / 持仓")
     from stats_core import PortfolioManager
     pm = PortfolioManager()
 
@@ -1668,43 +1876,26 @@ with tab_port:
 
 # ================== 统计（普通页签） ==================
 with tab_stats:
-    st.subheader("⑧ 统计")
+    st.subheader("统计")
     sub_tabs = st.tabs(["跟踪（Tracking）", "异动（Surge）", "共性（Commonality）"])
 
     # --- Tracking ---
     with sub_tabs[0]:
-        refT = st.text_input("参考日", value=_pick_latest_ref_date() or "", key="ref_1")
+        refT = st.text_input("参考日", value="", key="ref_1")
+        # 参考日/回看窗口的提示：告诉用户 t-n 是哪天
+        _back_choices = [1, 3, 5, 10, 20]
+        _hint_text, _n2d = _from_last_hints(_back_choices)
+        if _hint_text:
+            st.caption("按最新交易日回推： " + _hint_text)
+
         wins = st.text_input("未来收益窗口N（天，逗号分隔）", value="1,2,3,5,10,20")
         bench = st.text_input("对比指数基准代码（逗号，可留空）", value="")
         retrosT = st.text_input("附加回看天数", value="1,3,5")
         only_detail = st.checkbox("仅导出明细（不显示均值/标准差/胜率/分位数汇总）", value=True)
         gb_board = st.checkbox("分板块汇总", value=True)
-        if st.button("运行 Tracking", use_container_width=True):
-            try:
-                from stats_core import run_tracking
-                wlist = [int(x) for x in wins.split(",") if x.strip().isdigit()]
-                blist = [s.strip() for s in bench.split(",") if s.strip()] or None
-                # tr = run_tracking(refT, wlist, benchmarks=blist, score_df=None, group_by_board=gb_board, save=True)
-                # st.dataframe(tr.summary, use_container_width=True, height=420)
-                # st.caption("已落盘到 output/tracking/<ref>/ ，明细 detail 可据此深挖。")
-                rlist = [int(x) for x in retrosT.split(",") if x.strip().isdigit()]
-                tr = run_tracking(refT, wlist, benchmarks=blist, score_df=None,
-                                  group_by_board=gb_board, save=True, retro_days=rlist, do_summary=(not only_detail))
-                # 展示
-                if only_detail:
-                    show_cols = [c for c in ["ts_code","rank",*sorted([c for c in tr.detail.columns if c.startswith("rank_tminus_")]),
-                                             *sorted([c for c in tr.detail.columns if c.startswith("score_tminus_")]),
-                                             *[c for c in tr.detail.columns if c.startswith("ret_fwd_")]]
-                                 if c in tr.detail.columns]
-                    st.dataframe(tr.detail.sort_values(["rank"]).reset_index(drop=True)[show_cols],
-                                 use_container_width=True, height=460)
-                else:
-                    st.dataframe(tr.summary, use_container_width=True, height=420)
-                st.caption("已落盘到 output/tracking/<ref>/ ，detail 已包含 rank/score_tminus_d（如填写）。")               
-            except Exception as e:
-                st.error(f"Tracking 失败：{e}")
+
         # === 跟踪增强：前日排行 / 名单 / 指标是否触发 / 后续涨幅 ===
-        with st.expander("可选：选择要打勾的指标（来自打分规则；仅用于打勾，不影响样本）", expanded=False):
+        with st.expander("可选：选择要打勾的指标（来自打分规则；仅用于打勾，不影响样本）", expanded=True):
             import scoring_core as se
             # 规则名列表（去重）
             try:
@@ -1712,18 +1903,23 @@ with tab_stats:
                 rule_names = sorted(list(dict.fromkeys(rule_names)))
             except Exception:
                 rule_names = []
-            track_rule_names = st.multiselect("指标（可多选）", options=rule_names, default=rule_names[:3] if rule_names else [])
+            track_rule_names = st.multiselect("指标（可多选）", options=rule_names, default=[])
             track_max_json = st.number_input("最多读取明细JSON（按当日排名排序）", min_value=50, max_value=5000, value=300, step=50, key="track_max_json")
 
 
-        if st.button("生成跟踪表（含前日排行/名单/指标勾选/后续涨幅）", use_container_width=True):
+        if st.button("生成跟踪表（含前日排行/名单/指标勾选/后续涨幅）", key="btn_run_tracking", use_container_width=True):
             try:
                 from stats_core import run_tracking
                 import scoring_core as se
                 # 1) 基础 tracking 明细
                 wlist = [int(x) for x in wins.split(",") if x.strip().isdigit()]
                 blist = [s.strip() for s in bench.split(",") if s.strip()] or None
-                tr2 = run_tracking(refT, wlist, benchmarks=blist, score_df=None, group_by_board=gb_board, save=True)
+                rlist = [int(x) for x in retrosT.split(",") if x.strip().isdigit()]
+                tr2 = run_tracking(
+                    refT, wlist, benchmarks=blist, score_df=None,
+                    group_by_board=gb_board, save=True,
+                    retro_days=rlist, do_summary=(not only_detail)
+                )
                 detail = tr2.detail.copy()
 
                 # 2) 合并前日 rank
@@ -1783,80 +1979,89 @@ with tab_stats:
                     *[c for c in detail.columns if str(c).startswith("hit:")],
                     *[c for c in detail.columns if c.startswith("ret_fwd_")]
                 ] if c in detail.columns]
-                st.dataframe(detail[show_cols].sort_values(["rank"]).reset_index(drop=True),
+                detail_fmt2 = _fmt_retcols_percent(detail)
+                st.dataframe(detail_fmt2[show_cols].sort_values(["rank"]).reset_index(drop=True),
                              use_container_width=True, height=460)
                 st.caption("ret_fwd_N = 未来 N 日涨幅（Tracking 已计算）；名单列来自 cache/attention；hit:<规则名> 为所选排名规则在参考日是否触发。")
             except Exception as e:
                 st.error(f"生成失败：{e}")
 
-
     # --- Surge ---
     with sub_tabs[1]:
         refS = st.text_input("参考日", value=_pick_latest_ref_date() or "", key="surge_ref")
-        mode = st.selectbox("榜单口径", ["today","rolling"], index=1, key="mode_1")
-        rolling_days = st.number_input("rolling模式统计天数", min_value=2, max_value=20, value=5, key="rolling_1")
-        sel_type = st.selectbox("选样", ["top_n","top_pct"], index=0)
-        sel_val = st.number_input("阈值（N或%）", min_value=1, max_value=1000, value=200)
-        retros = st.text_input("回看天数集合（逗号）", value="1,2,3,4,5")
-        split_label = st.selectbox("分组口径", ["600/000/科创北(3组)", "主vs其他", "各板块"], index=0, key="split_1")
+        mode = st.selectbox("榜单口径", ["today","rolling"], index=1, key="surge_mode")
+        rolling_days = st.number_input("rolling模式统计天数", min_value=2, max_value=20, value=5, key="surge_rolling")
+        sel_type = st.selectbox("选样", ["top_n","top_pct"], index=0, key="surge_sel_type")
+        sel_val = st.number_input("阈值（N或%）", min_value=1, max_value=1000, value=200, key="surge_sel_val")
+        retros = st.text_input("回看天数集合（逗号）", value="1,2,3,4,5", key="surge_retros")
+        split_label = st.selectbox("分组口径", ["600/000/科创北(3组)", "主vs其他", "各板块"], index=0, key="surge_split_label")
         split = {"600/000/科创北(3组)":"combo3", "主vs其他":"main_vs_others", "各板块":"per_board"}[split_label]
-        if st.button("运行 Surge", use_container_width=True):
+
+        with st.expander("可选：对当日样本按规则打勾（来自排名规则）", expanded=False):
+            import scoring_core as se
             try:
-                from stats_core import run_surge
-                rlist = [int(x) for x in retros.split(",") if x.strip().isdigit()]
-                sr = run_surge(ref_date=refS, mode=mode, rolling_days=int(rolling_days),
-                               selection={"type":sel_type,"value":int(sel_val)},
-                               retro_days=rlist, split=split, score_df=None, save=True)
-                
-                # 可选：对当日样本做指标勾选
-                # 可选：按打分规则对当日样本打勾
-                with st.expander("可选：对当日样本按规则打勾（来自排名规则）", expanded=False):
-                    import scoring_core as se
-                    try:
-                        rule_names = [str(r.get("name") or f"RULE_{i}") for i, r in enumerate(getattr(se, "SC_RULES", []) or [])]
-                        rule_names = sorted(list(dict.fromkeys(rule_names)))
-                    except Exception:
-                        rule_names = []
-                    surge_rule_names = st.multiselect("指标（可多选）", options=rule_names, default=rule_names[:3] if rule_names else [], key="surge_rule_names")
-                    surge_max_json = st.number_input("最多读取明细JSON（仅对样本内股票）", min_value=50, max_value=5000, value=600, step=50, key="surge_max_json")
-                    try:
-                        sel_rules2 = surge_rule_names if isinstance(surge_rule_names, list) else []
-                        hit_cols2 = [f"hit:{name}" for name in sel_rules2]
-                        for col in hit_cols2:
-                            table[col] = False
-                        if sel_rules2 and "ts_code" in table.columns:
-                            pick_n2 = int(surge_max_json)
-                            codes2 = table["ts_code"].astype(str).head(pick_n2).tolist()
-                            def _read_hits_one2(ts):
-                                obj = _load_detail_json(str(refS), str(ts))
-                                res = {}
-                                if not obj:
-                                    return res
-                                rules = obj.get("rules") or []
-                                for rr in rules:
-                                    nm = str(rr.get("name") or "")
-                                    if nm in sel_rules2:
-                                        res[nm] = bool(rr.get("ok", False))
-                                return res
-                            for ts in codes2:
-                                hits_map2 = _read_hits_one2(ts)
-                                for nm in sel_rules2:
-                                    col = f"hit:{nm}"
-                                    if nm in hits_map2:
-                                        table.loc[table["ts_code"].astype(str) == ts, col] = bool(hits_map2[nm])
-                    except Exception:
-                        pass
+                rule_names = [str(r.get("name") or f"RULE_{i}") for i, r in enumerate(getattr(se, "SC_RULES", []) or [])]
+                rule_names = sorted(list(dict.fromkeys(rule_names)))
+            except Exception:
+                rule_names = []
+            surge_rule_names = st.multiselect("指标（可多选）", options=rule_names, default=[] if rule_names else [], key="surge_rule_names")
+            surge_max_json = st.number_input("最多读取明细JSON（仅对样本内股票）", min_value=50, max_value=5000, value=100, step=50, key="surge_max_json")
 
-                st.dataframe(table, use_container_width=True, height=420)
+        if st.button("运行 Surge", key="btn_run_surge", use_container_width=True):
+            with st.spinner("生成 Surge 榜单中…"):
+                try:
+                    from stats_core import run_surge
+                    rlist = [int(x) for x in (retros or "").split(",") if x.strip().isdigit()]
+                    sr = run_surge(
+                        ref_date=str(refS).strip(),
+                        mode=mode,
+                        rolling_days=int(rolling_days),
+                        selection={"type": sel_type, "value": int(sel_val)},
+                        retro_days=rlist,
+                        split=split,
+                        score_df=None,
+                        save=True,
+                    )
+                    table = sr.table.copy()
 
-                st.caption("各分组文件已写入 output/surge_lists/<ref>/ 。")
-            except Exception as e:
-                st.error(f"Surge 失败：{e}")
+                    # 命中打勾（可选）
+                    if surge_rule_names:
+                        codes2 = table["ts_code"].astype(str).unique().tolist()
+                        if mode == "today":
+                            obs_date = _prev_trade_date(str(refS), 1)  # t-1
+                        else:
+                            first_date = _pick_trade_dates(str(refS), int(rolling_days))[0]  # t-K
+                            obs_date = _prev_trade_date(first_date, 1)                      # t-K-1
+                        st.caption(f"命中口径：使用『{obs_date}』的 details 作为“启动前”判断。")
 
+                        # 预创建列
+                        for nm in surge_rule_names:
+                            table[f"hit:{nm}"] = False
+
+                        # 读取 JSON（限额）
+                        for ts in codes2[:int(surge_max_json)]:
+                            obj = _load_detail_json(str(obs_date), str(ts)) or {}
+                            rules = obj.get("rules") or []
+                            hits_map = {
+                                str(rr.get("name") or ""): (float(rr.get("add", 0.0)) > 0.0) or bool(rr.get("ok"))
+                                for rr in rules
+                            }
+                            for nm in surge_rule_names:
+                                col = f"hit:{nm}"
+                                if nm in hits_map:
+                                    table.loc[table["ts_code"].astype(str) == ts, col] = bool(hits_map[nm])
+
+                except Exception as e:
+                    st.error(f"Surge 失败：{e}")
+                else:
+                    table_fmt = _fmt_retcols_percent(table)
+                    st.dataframe(table_fmt, use_container_width=True, height=420)
+                    st.caption("各分组文件已写入 output/surge_lists/<ref>/ 。")
+
+    
     # --- Commonality ---
     with sub_tabs[2]:
         refC = st.text_input("参考日", value=_pick_latest_ref_date() or "", key="common_ref")
-        # retro_day = st.number_input("观察日前移 d（retro）", min_value=1, max_value=20, value=1)
         retrosC = st.text_input("统计前 n 日集合（观察日前移 d，逗号）", value="1,3,5")
         modeC = st.selectbox("模式", ["rolling","today"], index=0, key="mode_2")
         rollingC = st.number_input("rolling 天数", min_value=2, max_value=20, value=5, key="rolling_2")
@@ -1864,34 +2069,124 @@ with tab_stats:
         splitC = st.selectbox("分组口径", ["main_vs_others","per_board"], index=0, key="split_2")
         bg = st.selectbox("背景集", ["all","same_group"], index=0)
         countStrat = st.checkbox("统计每个策略的触发次数（策略分析）", value=True)
+        scopeC = st.selectbox("触发统计范围", ["仅样本(大涨)","同组全体","两者对比"], index=0, help="仅样本：只看大涨票；同组全体：样本+同组非样本；两者对比：同时输出两个口径")
+        w_en = st.checkbox("对大涨样本加权（用于“同组全体/两者对比”口径）", value=False)
+        w_pos = st.slider("样本权重", min_value=1.0, max_value=5.0, value=2.0, step=0.5, help="仅在“同组全体/两者对比”下生效")
+
         if st.button("运行 Commonality", use_container_width=True):
             try:
                 from stats_core import run_commonality
-                # cr = run_commonality(ref_date=refC, retro_day=int(retro_day), mode=modeC,
-                #                      rolling_days=int(rollingC), selection={"type":"top_n","value":int(selC)},
-                #                      split=splitC, background=bg, save=True)
-                # st.dataframe(cr.dataset.head(200), use_container_width=True, height=420)
                 rlist = [int(x) for x in retrosC.split(",") if x.strip().isdigit()]
-                cr = run_commonality(ref_date=refC, retro_day=(rlist[0] if rlist else 1), retro_days=rlist,
-                                     mode=modeC, rolling_days=int(rollingC),
-                                     selection={"type":"top_n","value":int(selC)},
-                                     split=splitC, background=bg, save=True,
-                                     count_strategy=countStrat)
-                # 展示策略触发计数（若开启）
-                if countStrat and "strategy_triggers" in (cr.reports or {}):
-                    st.dataframe(cr.reports["strategy_triggers"].sort_values(["obs_date","trigger_count"], ascending=[True, False]),
-                                 use_container_width=True, height=420)
-                    st.caption("按规则名统计触发次数/覆盖率，支持多观察日（前 n 日）并列。")
-                else:
-                    st.dataframe(cr.dataset.head(200), use_container_width=True, height=420)
-                    
-                st.caption("分析集/报告已写入 output/commonality/<ref>/ ...")
+                cr = run_commonality(
+                    ref_date=refC,
+                    retro_day=(rlist[0] if rlist else 1),
+                    retro_days=rlist,
+                    mode=modeC,
+                    rolling_days=int(rollingC),
+                    selection={"type":"top_n","value":int(selC)},
+                    split=splitC,
+                    background=bg,
+                    save=True,
+                    count_strategy=countStrat,
+                    count_strategy_scope=("pos" if scopeC=="仅样本(大涨)" else ("group" if scopeC=="同组全体" else "both")),
+                    strategy_pos_weight=(float(w_pos) if w_en else 1.0),
+                )
+
+                if countStrat:
+                    import pandas as pd
+                    trig = None
+                    if isinstance(cr.reports, dict):
+                        trig = cr.reports.get("strategy_triggers")
+                        if trig is None:
+                            ks = [k for k in cr.reports if str(k).startswith("strategy_triggers__")]
+                            if ks:
+                                trig = pd.concat([cr.reports[k] for k in ks if hasattr(cr.reports[k], "copy")], ignore_index=True, sort=False)
+                    if isinstance(trig, pd.DataFrame) and not trig.empty:
+                        if "trigger_count" not in trig.columns:
+                            for alt in ("count","n","num"):
+                                if alt in trig.columns:
+                                    trig = trig.rename(columns={alt: "trigger_count"})
+                                    break
+                            else:
+                                trig["trigger_count"] = 0
+                        order_cols = [c for c in ["obs_date","scope","trigger_weighted","trigger_count","name"] if c in trig.columns]
+                        if order_cols:
+                            trig = trig.sort_values(order_cols, ascending=[True, True, False, False, True][:len(order_cols)])
+                        st.dataframe(trig, use_container_width=True, height=420)
+
+                        # —— 对比视图 ——
+                        show_pivot = st.checkbox("按组/口径对比（透视表）", value=True)
+                        if show_pivot:
+                            
+                            # 指标映射：改成「英文 -> 中文」更稳
+                            _metric_map = {
+                                "trigger_count": "触发次数",
+                                "coverage": "覆盖率",
+                                "trigger_weighted": "加权触发次数",
+                                "coverage_weighted": "加权覆盖率",
+                            }
+                            options_en = [en for en in _metric_map if en in trig.columns]
+
+                            # —— 持久化当前选择（按英文列名）——
+                            _pref_key = "pivot_metric_en"
+                            default_en = "coverage_weighted" if "coverage_weighted" in options_en else (options_en[0] if options_en else None)
+                            if default_en is not None:
+                                if _pref_key not in st.session_state or st.session_state[_pref_key] not in options_en:
+                                    st.session_state[_pref_key] = default_en
+
+                            # 选择框：显示中文，值为英文
+                            metric_en = st.selectbox(
+                                "选择对比指标",
+                                options_en,
+                                key=_pref_key,
+                                format_func=lambda en: _metric_map.get(en, en),
+                            )
+
+                            # 后续用 metric_en 直接做透视；若需要中文名可用：
+                            pick_metric_cn = _metric_map.get(metric_en, metric_en)
+                            pick_metric = metric_en
+
+                            scopes_avail = sorted(trig["scope"].dropna().unique().tolist()) if "scope" in trig.columns else []
+                            scope_pick = st.selectbox("选择口径", options=(scopes_avail or ["pos"]), index=0, key="pivot_scope")
+                            dfp = trig.copy()
+                            if "scope" in dfp.columns and scope_pick in scopes_avail:
+                                dfp = dfp[dfp["scope"]==scope_pick]
+                            if "group" in dfp.columns:
+                                pv = dfp.pivot_table(index="name", columns="group", values=pick_metric, aggfunc="max")
+                                st.dataframe(pv, use_container_width=True, height=420)
+
+                    # —— 每票命中条数分布 ——
+                    ks_hist_single = [k for k in (cr.reports.keys() if isinstance(cr.reports, dict) else []) if str(k).startswith("hits_histogram_single__")]
+                    ks_hist_each   = [k for k in (cr.reports.keys() if isinstance(cr.reports, dict) else []) if str(k).startswith("hits_histogram_each__")]
+                    import pandas as pd
+                    if ks_hist_single:
+                        st.markdown("**单次型（ANY/LAST 等）命中条数分布**")
+                        hist_single = pd.concat([cr.reports[k] for k in ks_hist_single], ignore_index=True, sort=False)
+                        scopes_hist = sorted(hist_single["scope"].dropna().unique().tolist()) if "scope" in hist_single.columns else []
+                        scope_show = st.selectbox("选择口径（单次型）", options=(scopes_hist or ["pos"]), index=0, key="hist_scope_single")
+                        show = hist_single[hist_single["scope"]==scope_show] if scopes_hist else hist_single
+                        if not show.empty:
+                            pv2 = show.pivot_table(index="n_single_rules_hit", columns="group", values="ratio", aggfunc="max")
+                            st.dataframe(pv2, use_container_width=True, height=280)
+                    if ks_hist_each:
+                        st.markdown("**多次型（EACH）命中条数分布**")
+                        hist_each = pd.concat([cr.reports[k] for k in ks_hist_each], ignore_index=True, sort=False)
+                        scopes_hist2 = sorted(hist_each["scope"].dropna().unique().tolist()) if "scope" in hist_each.columns else []
+                        scope_show2 = st.selectbox("选择口径（多次型）", options=(scopes_hist2 or ["pos"]), index=0, key="hist_scope_each")
+                        show2 = hist_each[hist_each["scope"]==scope_show2] if scopes_hist2 else hist_each
+                        if not show2.empty:
+                            pv3 = show2.pivot_table(index="n_each_rules_hit", columns="group", values="ratio", aggfunc="max")
+                            st.dataframe(pv3, use_container_width=True, height=280)
+
+
+                st.caption("分析集/报告已写入 output/commonality/<ref>/ （包括 strategy_triggers__*.parquet, hits_by_stock__*.parquet, hits_histogram__*.parquet）。")
+
             except Exception as e:
                 st.error(f"Commonality 失败：{e}")
 
 # ================== 日志 ==================
 with tab_logs:
-    st.subheader("⑨ 日志")
+    st.subheader("日志")
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**score.log（尾部 400 行）**")

@@ -23,7 +23,7 @@ def _wrap_comparisons_for_bitwise(expr: str) -> str:
             depth += 1
         elif ch == ')':
             depth -= 1
-        if depth == 0 and ch in '&|':
+        if ch in '&|':
             flush()
             out.append(ch)
         else:
@@ -45,14 +45,6 @@ def _extract_bool_signal(res: dict, index, prefer_keys=("sig", "last_expr", "SIG
             return pd.Series(s, index=index).fillna(False).astype(bool)
 
     return pd.Series(False, index=index)
-
-# def evaluate_bool(script: str, df, prefer_keys=("sig", "last_expr", "SIG", "LAST_EXPR")):
-#     """
-#     便捷入口：直接返回一个布尔 Series（与 df.index 对齐）。
-#     不改变原有 evaluate 的行为；这是新增接口，纯增量、可并存。
-#     """
-#     res = evaluate(script, df)  # 仍然返回“多输出”的 dict（键名依旧会被小写化）
-#     return _extract_bool_signal(res, df.index, prefer_keys=prefer_keys)
 
 # 统一把条件转成布尔并把 NaN 当 False
 def _as_bool(cond):
@@ -153,9 +145,216 @@ def TS_RANK(x, n):
         return float((arr <= last).sum())
     return s.rolling(int(n), min_periods=1).apply(lambda a: rk(a.values), raw=False)
 
-# 在评分流程里（score_engine 已经有 tdx.EXTRA_CONTEXT.update(...) 那块），把这俩也塞进去：
+def _iter_custom_tag_series(pattern: str, df_index):
+    """从 EXTRA_CONTEXT['CUSTOM_TAGS'] 里按名称匹配，取出与 df_index 对齐的布尔序列"""
+    import re, pandas as pd
+    tags = EXTRA_CONTEXT.get("CUSTOM_TAGS", {})
+    if not isinstance(tags, dict) or not tags:
+        return []
+    pat = pattern.strip()
+    is_regex = bool(re.search(r"[.^$*+?{}\[\]|()]", pat))
+    if not is_regex and "|" in pat:
+        keys = [k.strip() for k in pat.split("|") if k.strip()]
+        names = [k for k in tags.keys() if any(kk.lower() in str(k).lower() for kk in keys)]
+    else:
+        if is_regex:
+            rx = re.compile(pat, flags=re.IGNORECASE)
+            names = [k for k in tags.keys() if rx.search(str(k))]
+        else:
+            names = [k for k in tags.keys() if pat.lower() in str(k).lower()]
+    out = []
+    for name in names:
+        try:
+            s = tags.get(name)
+            if s is None: 
+                continue
+            s2 = _coerce_bool_series(s)
+            if df_index is not None:
+                # s2 = s2.reindex(df_index).fillna(False)
+                s2 = s2.reindex(df_index, fill_value=False).infer_objects().astype(bool)
+            out.append((name, s2))
+        except Exception:
+            continue
+    return out
+
+def _coerce_bool_series(x):
+    import numpy as np, pandas as pd
+    s = pd.Series(x)
+    if s.dtype == bool:
+        return s.fillna(False)
+    # 数值/字符串等：非零/非空视为 True
+    if np.issubdtype(s.dtype, np.number):
+        return s.fillna(0) != 0
+    return s.astype(object).apply(lambda v: bool(v) if v is not None and v == v else False)
+
+# —— 根据“标签”文本，自动搜列名并 OR 到一起；shift 可表示引用历史（1=昨日）——
+def ANY_TAG(pattern: str, shift: int = 0):
+    """
+    pattern: 子串或正则（自动识别）。多个关键词可用竖线 '|' 写在一起（视为“或”）。
+    shift  : 0=当日，1=昨日，2=前日...
+    规则：在 df.columns 里寻找“列名包含 pattern（不区分大小写）”的列，逐列转布尔后做 OR。
+    """
+    import re, pandas as pd
+    df = EXTRA_CONTEXT.get("DF", None)
+    if df is None or getattr(df, "empty", True):
+        # 兜底：给一个全 False 的布尔序列
+        return pd.Series(False, index=getattr(df, "index", None))
+
+    pat = pattern.strip()
+    # 自动判断是否按正则：含有正则元字符就按正则匹配，否则按不区分大小写的子串匹配
+    is_regex = bool(re.search(r"[.^$*+?{}\[\]|()]", pat))
+    if not is_regex and "|" in pat:
+        # 多关键字 OR：拆开做子串匹配
+        keys = [k.strip() for k in pat.split("|") if k.strip()]
+        cols = [c for c in df.columns
+                if any(k.lower() in str(c).lower() for k in keys)]
+    else:
+        if is_regex:
+            rx = re.compile(pat, flags=re.IGNORECASE)
+            cols = [c for c in df.columns if rx.search(str(c))]
+        else:
+            cols = [c for c in df.columns if pat.lower() in str(c).lower()]
+
+    if not cols:
+        return pd.Series(False, index=df.index)
+
+    custom = _iter_custom_tag_series(pat, getattr(df, 'index', None))
+    if not cols and not custom:
+        return pd.Series(False, index=df.index)
+    
+    agg = None
+    for c in cols:
+        try:
+            s = _coerce_bool_series(df[c])
+        except Exception:
+            continue
+        agg = s if agg is None else (agg | s)
+    for name, s in custom:
+        try:
+            s = _coerce_bool_series(s)
+        except Exception:
+            continue
+        agg = s if agg is None else (agg | s)
+
+    if agg is None:
+        agg = pd.Series(False, index=df.index)
+
+    if int(shift) != 0:
+        agg = agg.shift(int(shift)).fillna(False)
+
+    return agg
+
+# 语义糖：专指“昨日任意匹配标签为 True”
+def YDAY_ANY_TAG(pattern: str):
+    return ANY_TAG(pattern, shift=1)
+
+# —— 统计匹配标签的“当日命中个数”，以及“是否至少命中 k 个” —— 
+def TAG_HITS(pattern: str, shift: int = 0):
+    """
+    计数“命中标签”的个数。优先按 bucket 精确匹配 CUSTOM_TAGS；
+    若无则回落到列名匹配 / 自定义标签名匹配；最后支持 shift（1=昨日）。
+    """
+    import re, pandas as pd
+
+    df = EXTRA_CONTEXT.get("DF", None)
+    # 先拿到 index；若 DF 没列/为空，尝试从 CUSTOM_TAGS 的任一序列推断
+    idx = getattr(df, "index", None)
+    if idx is None or len(idx) == 0:
+        tags = EXTRA_CONTEXT.get("CUSTOM_TAGS", {}) or {}
+        for ser in tags.values():
+            try:
+                cand = getattr(ser, "index", None)
+                if cand is not None and len(cand) > 0:
+                    idx = cand
+                    break
+            except Exception:
+                pass
+    if idx is None or len(idx) == 0:
+        return pd.Series(dtype=int)  # 实在没有 index 就返回空序列
+
+    pat = pattern.strip()
+    is_regex = bool(re.search(r"[.^$*+?{}\[\]|()]", pat))
+    hits = None
+
+    # ① bucket 精确匹配（pattern 为普通词且不含 '|'）
+    if pat and not is_regex and "|" not in pat:
+        tags = EXTRA_CONTEXT.get("CUSTOM_TAGS", {}) or {}
+        want = pat.lower()
+        for key, ser in tags.items():
+            try:
+                parts = str(key).split("::", 2)  # ["CFG_TAG", bucket, name]
+                if len(parts) >= 2 and (parts[1] or "").lower() == want:
+                    # s = _coerce_bool_series(ser).reindex(idx).fillna(0).astype(int)
+                    s = (_coerce_bool_series(ser)
+                        .reindex(idx, fill_value=False)
+                        .infer_objects()
+                        .astype(int))
+                    hits = s if hits is None else (hits + s)
+            except Exception:
+                continue
+
+    # ② 列名匹配（仅当 df 存在且有列时才尝试）
+    if hits is None and df is not None and hasattr(df, "columns") and len(df.columns) > 0:
+        cols = list(df.columns)
+        if pat and "|" in pat and not is_regex:
+            keys = [k.strip() for k in pat.split("|") if k.strip()]
+            names = [c for c in cols if any(kk.lower() in str(c).lower() for kk in keys)]
+        elif is_regex:
+            rx = re.compile(pat, flags=re.IGNORECASE)
+            names = [c for c in cols if rx.search(str(c))]
+        else:
+            names = [c for c in cols if pat.lower() in str(c).lower()] if pat else []
+        if names:
+            s = sum((_coerce_bool_series(df[n]).astype(int) for n in names), start=pd.Series(0, index=idx, dtype=int))
+            hits = s
+
+    # ③ 自定义标签名称匹配（regex/子串）
+    if hits is None:
+        parts = list(_iter_custom_tag_series(pat, idx))
+        if parts:
+            # s = sum((_coerce_bool_series(ser).reindex(idx).fillna(0).astype(int) for ser in parts),
+            #         start=pd.Series(0, index=idx, dtype=int))
+            s = sum(
+                ( _coerce_bool_series(ser)
+                    .reindex(idx, fill_value=False)
+                    .infer_objects()
+                    .astype(int)
+                for _, ser in parts),
+                start=pd.Series(0, index=idx, dtype=int)
+                )
+            hits = s
+
+    # ④ 兜底 + 位移
+    if hits is None:
+        hits = pd.Series(0, index=idx, dtype=int)
+    if int(shift) != 0:
+        hits = hits.shift(int(shift)).fillna(0).astype(int)
+    return hits
+
+
+def ANY_TAG_AT_LEAST(pattern: str, k: int, shift: int = 0):
+    k = int(k)
+    return TAG_HITS(pattern, shift=shift) >= k
+
+# 语义糖（昨日）
+def YDAY_TAG_HITS(pattern: str):
+    return TAG_HITS(pattern, shift=1)
+
+
+def YDAY_ANY_TAG_AT_LEAST(pattern: str, k: int):
+    return ANY_TAG_AT_LEAST(pattern, k, shift=1)
+
+# 注册到额外上下文，供表达式直接调用
 EXTRA_CONTEXT["TS_PCT"] = TS_PCT
 EXTRA_CONTEXT["TS_RANK"] = TS_RANK
+EXTRA_CONTEXT.update({
+    "ANY_TAG": ANY_TAG,
+    "YDAY_ANY_TAG": YDAY_ANY_TAG,
+    "TAG_HITS": TAG_HITS,
+    "ANY_TAG_AT_LEAST": ANY_TAG_AT_LEAST,
+    "YDAY_TAG_HITS": YDAY_TAG_HITS,
+    "YDAY_ANY_TAG_AT_LEAST": YDAY_ANY_TAG_AT_LEAST,
+})
 
 VAR_MAP = {
     "C": "df['close']",
@@ -176,6 +375,7 @@ VAR_MAP = {
     "BBI": "df['bbi']",
     "BUPIAO_SHORT": "df['bupiao_short']",
     "BUPIAO_LONG": "df['bupiao_long']",
+    
 }
 
 FUNC_MAP = {
@@ -194,6 +394,7 @@ FUNC_MAP = {
     "COUNT": "COUNT",
     "CROSS": "CROSS",
     "BARSLAST": "BARSLAST",
+    "TS_RANK": "TS_RANK",
 }
 
 IGNORE_FUNCS = {
@@ -222,8 +423,6 @@ ASSIGN_RE = re.compile(r'^\s*([^\W\d]\w*)\s*:?=\s*(.+?)\s*$', flags=re.UNICODE)
 COMMENT_RE = re.compile(r'^\s*[{].*?[}]\s*$')
 INLINE_COMMENT_RE = re.compile(r'\{.*?\}')
 SEMICOL_SPLIT_RE = re.compile(r';(?=(?:[^"]*"[^"]*")*[^"]*$)')
-
-# tdx_compat.py 追加/替换
 
 import logging
 LOG = logging.getLogger("tdx")
@@ -326,6 +525,7 @@ def compile_script(script):
 
 
 def evaluate(script, df, extra_context=None):
+    EXTRA_CONTEXT["DF"] = df
     program = compile_script(script)
     ctx = {
         "np": np,
@@ -337,6 +537,7 @@ def evaluate(script, df, extra_context=None):
         "EPS": EPS,
         "SAFE_DIV": SAFE_DIV,
         "RSV": RSV,
+        "TS_RANK": TS_RANK,
     }
     if extra_context:
         ctx.update(extra_context) 

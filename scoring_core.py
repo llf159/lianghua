@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import glob
 import functools
 from pathlib import Path
-
+from contextlib import contextmanager
 import pandas as pd
 import numpy as np
 
@@ -37,8 +37,7 @@ from config import (
     SC_TOP_K, SC_TIE_BREAK, SC_MAX_WORKERS, SC_READ_TAIL_DAYS,
     SC_OUTPUT_DIR, SC_CACHE_DIR,
     SC_RULES, SC_PRESCREEN_RULES,
-    SC_WRITE_WHITELIST, SC_WRITE_BLACKLIST,
-    SC_ATTENTION_ENABLE, SC_ATTENTION_SOURCE,
+    SC_WRITE_WHITELIST, SC_WRITE_BLACKLIST, SC_ATTENTION_SOURCE,
     SC_ATTENTION_WINDOW_D, SC_ATTENTION_MIN_HITS, SC_ATTENTION_TOP_K,
     SC_ATTENTION_BACKFILL_ENABLE,
     SC_BENCH_CODES, SC_BENCH_WINDOW, SC_BENCH_FILL, SC_BENCH_FEATURES,
@@ -299,24 +298,21 @@ def get_eval_env(ts_code: str, ref_date: str) -> Dict[str, object]:
         "RANK_VOL": RANK_VOL,
         "RANK_RET": RANK_RET,
         "RANK_MATCH_COEF": RANK_MATCH_COEF,
-    }
-
-
-def get_rank_eval_env(ts_code: str) -> Dict[str, object]:
-    """简化版（_score_one 内部已知 ref_date，无需重复传）"""
-    return {
-        "TS": str(ts_code),
-        "RANK_VOL": RANK_VOL,
-        "RANK_RET": RANK_RET,
-        "RANK_MATCH_COEF": RANK_MATCH_COEF,
-    }
+        "ANY_TAG": tdx.ANY_TAG,
+        "YDAY_ANY_TAG": tdx.YDAY_ANY_TAG,
+        "TAG_HITS": tdx.TAG_HITS,
+        "ANY_TAG_AT_LEAST": tdx.ANY_TAG_AT_LEAST,
+        "YDAY_TAG_HITS": tdx.YDAY_TAG_HITS,
+        "YDAY_ANY_TAG_AT_LEAST": tdx.YDAY_ANY_TAG_AT_LEAST,
+        }
 
 # ------------------------- 工具函数 -------------------------
 def _last_true_date(win_df: pd.DataFrame, when: str) -> tuple[Optional[str], Optional[int]]:
     """给窗口数据和 when 表达式，返回 (最近一次为 True 的日期YYYYMMDD, lag)"""
     if not when:
         return None, None
-    s_bool = evaluate_bool(when, win_df).astype(bool)
+    with _ctx_df(win_df):
+        s_bool = evaluate_bool(when, win_df).astype(bool)
     lag = _last_true_lag(s_bool)  # 已有函数
     if lag is None:
         return None, None
@@ -596,8 +592,8 @@ def _recent_points(dfD: pd.DataFrame, rule: dict, ref_date: str) -> tuple[float,
     win_df = _window_slice(dfTF, ref_date, window)
     if win_df.empty:
         return 0.0, None, None
-
-    s_bool = evaluate_bool(when, win_df).astype(bool)
+    with _ctx_df(win_df):
+        s_bool = evaluate_bool(when, win_df).astype(bool)
     lag = _last_true_lag(s_bool)
     if lag is None:
         return 0.0, None, None
@@ -670,7 +666,9 @@ def _list_true_dates(df: pd.DataFrame, expr: str, *, ref_date: str, window: int,
     try:
         dfTF = df if timeframe == "D" else _resample(df, timeframe)
         win_df = _window_slice(dfTF, ref_date, window)
-        sig = evaluate_bool(expr, win_df)
+        # sig = evaluate_bool(expr, win_df)
+        with _ctx_df(win_df):
+            sig = evaluate_bool(expr, win_df)
         if sig is None:
             return []
         idx = getattr(sig, "index", getattr(win_df, "index", []))
@@ -680,9 +678,93 @@ def _list_true_dates(df: pd.DataFrame, expr: str, *, ref_date: str, window: int,
         return []
 
 
+def _inject_config_tags(dfD: pd.DataFrame, ref_date: str):
+    dfD_dt = _ensure_datetime_index(dfD)
+    old = tdx.EXTRA_CONTEXT.get("CUSTOM_TAGS", {}) or {}
+    computed = {}
+    for rule in _iter_unique_rules():
+        bucket = str(rule.get("as") or "").strip()
+        if not bucket:
+            continue
+        if str(rule.get("timeframe","D")).upper() != "D":
+            continue
+
+        try:
+            # 收集该 as 规则涉及的表达式
+            exprs = []
+            if rule.get("clauses"):
+                exprs.extend([(c.get("when") or "").strip() for c in rule["clauses"]])
+            else:
+                exprs.append((rule.get("when") or "").strip())
+            exprs = [e for e in exprs if e]
+            if not exprs:
+                continue
+
+            # —— 缺列兜底：J / VR —— #
+            df_calc = dfD_dt
+            need_j  = any(_expr_mentions(e, "J")  for e in exprs) and ("j"  not in df_calc.columns)
+            need_vr = any(_expr_mentions(e, "VR") for e in exprs) and ("vr" not in df_calc.columns)
+            if need_j:
+                from indicators import kdj
+                df_calc = df_calc.copy()
+                df_calc["j"] = kdj(df_calc)
+            if need_vr and "vol" in df_calc.columns:
+                v = pd.to_numeric(df_calc["vol"], errors="coerce")
+                df_calc = df_calc.copy()
+                df_calc["vr"] = (v / v.rolling(26).mean()).values
+
+            # 让 as 规则之间可以互看已算出的标签
+            temp_tags = dict(old); temp_tags.update(computed)
+            tdx.EXTRA_CONTEXT["CUSTOM_TAGS"] = temp_tags
+
+            # 计算 sig（多子句 AND）
+            with _ctx_df(df_calc):
+                if rule.get("clauses"):
+                    s_all = None
+                    for e in exprs:
+                        s = evaluate_bool(e, df_calc).astype(bool)
+                        s_all = s if s_all is None else (s_all & s)
+                    sig = s_all
+                else:
+                    sig = evaluate_bool(exprs[0], df_calc).astype(bool)
+
+            if sig is None:
+                continue
+            # sig = pd.Series(sig, index=df_calc.index).reindex(dfD.index).fillna(False).astype(bool)
+            sig = pd.Series(sig, index=df_calc.index)
+            sig = sig.reindex(dfD_dt.index, fill_value=False).astype(bool)  # ✨ 用 dfD 的 DatetimeIndex 对齐
+            name = str(rule.get("name") or "<unnamed>")
+            key  = f"CFG_TAG::{bucket}::{name}"
+            computed[key] = sig
+
+        except Exception as e:
+            LOGGER.warning(f"[inject-tags] 跳过 as='{bucket}' 规则 {rule.get('name')}: {e}")
+            continue
+
+    # 一次性回写
+    tdx.EXTRA_CONTEXT["CUSTOM_TAGS"] = computed
+
+@contextmanager
+def _ctx_df(win_df):
+    """确保 tdx.ANY_TAG* 在当前窗口下工作"""
+    old = tdx.EXTRA_CONTEXT.get("DF", None)
+    tdx.EXTRA_CONTEXT["DF"] = win_df
+    try:
+        yield
+    finally:
+        if old is None:
+            tdx.EXTRA_CONTEXT.pop("DF", None)
+        else:
+            tdx.EXTRA_CONTEXT["DF"] = old
+
+
 def _build_per_rule_detail(df: pd.DataFrame, ref_date: str) -> list[dict]:
     rows = []
     gate_ok=False; gate_norm={}
+    try:
+        _inject_config_tags(df, ref_date)   # 让 TAG_HITS/ANY_TAG 能拿到 CUSTOM_TAGS
+    except Exception:
+        pass
     for rule in _iter_unique_rules():
         name = str(rule.get("name", "<unnamed>"))
         scope = str(rule.get("scope", "ANY")).upper().strip()
@@ -872,19 +954,6 @@ def backfill_missing_ranks(start_date: str, end_date: str, *, force: bool=False)
     - force=False：仅对缺失的日期补建
     交易日列表获取方式：以 details 目录和 all 目录下已有日期为准，若需要更严格的“全交易日”，可以在此改为读数据日历。
     """
-    # # 推断窗口内可能的日期：用 details 与 all 下的目录/文件名并集；不严谨但实用
-    # cand = set()
-    # for p in DETAIL_DIR.glob("*"):
-    #     if p.is_dir():
-    #         cand.add(p.name)
-    # for p in ALL_DIR.glob("score_all_*.csv"):
-    #     cand.add(p.stem.replace("score_all_",""))
-    # # 简单按字符串范围过滤
-    # dates = sorted([d for d in cand if start_date <= d <= end_date])
-    # # 如果 dates 为空，直接用 start_date..end_date（可能用户还没跑过任何一天）
-    # if not dates:
-    #     dates = [start_date, end_date]
-
     # 1) 优先用交易日日历生成完整日期序列
     cal_root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
     cal = list_trade_dates(cal_root) or []
@@ -1111,7 +1180,8 @@ def _eval_clause(dfD: pd.DataFrame, clause: dict, ref_date: str) -> Tuple[bool, 
         win_df = _window_slice(dfTF, ref_date, window)
         if win_df.empty:
             return False, f"窗口数据为空: tf={tf}, window={window}"
-        s_bool = evaluate_bool(when, win_df)
+        with _ctx_df(win_df):
+            s_bool = evaluate_bool(when, win_df)
         hit = _scope_hit(s_bool, scope)
         return hit, None
     except Exception as e:
@@ -1392,6 +1462,11 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
         df = _inject_benchmark_features(df, start_date, ref_date)
         tdx.EXTRA_CONTEXT.update(get_eval_env(ts_code, ref_date))
 
+        # 注入基于 config 的自定义标签（仅 D 级别）
+        try:
+            _inject_config_tags(df, ref_date)
+        except Exception:
+            pass
         # 初选
         pres = _prescreen(df, ref_date)
         if not pres.passed:
@@ -1563,6 +1638,42 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
         return (ts_code, None, (ts_code, ref_date, f"评分失败:{e}"))
 
 
+def _screen_one(ts_code, st, ref, tf, win, when, scope, use_prescreen_first):
+    try:
+        dfD = _read_stock_df(ts_code, st, ref, columns=_scan_cols_from_expr(when))
+        if dfD is None or dfD.empty:
+            return (ts_code, False, None, None)
+        if use_prescreen_first:
+            pres = _prescreen(dfD, ref)
+            if not pres.passed:
+                return (ts_code, False, (ts_code, pres.period or ref, pres.reason or "prescreen"), None)
+
+        # 兜底 J/VR（与原逻辑一致）
+        need_j = _expr_mentions(when, "J") and ("j" not in dfD.columns)
+        need_vr = _expr_mentions(when, "VR") and ("vr" not in dfD.columns)
+        if need_j:
+            dfD = dfD.copy(); dfD["j"] = kdj(dfD)
+        if need_vr and "vol" in dfD.columns:
+            v = pd.to_numeric(dfD["vol"], errors="coerce")
+            dfD = dfD.copy(); dfD["vr"] = (v / v.rolling(26).mean()).values
+
+        dfTF = dfD if tf == "D" else _resample(dfD, tf)
+        win_df = _window_slice(dfTF, ref, win)
+        if win_df.empty:
+            return (ts_code, False, None, None)
+        tdx.EXTRA_CONTEXT.update(get_eval_env(ts_code, ref))
+
+        _inject_config_tags(dfD, ref)      # 忽略异常同原逻辑
+        tdx.EXTRA_CONTEXT["DF"] = win_df
+        ok = _scope_hit(evaluate_bool(when, win_df), scope)
+        if ok:
+            return (ts_code, True, (ts_code, ref, "pass"), None)
+        else:
+            return (ts_code, False, None, None)
+    except Exception as e:
+        return (ts_code, False, None, f"{e}")
+
+
 def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str) -> Tuple[int, Optional[str]]:
     """
     统计“窗口内逐K命中次数”（用于 scope=EACH / PERBAR）。
@@ -1588,7 +1699,8 @@ def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str) -
                 when = (c.get("when") or "").strip()
                 if not when:
                     return 0, "空 when 表达式"
-                s = evaluate_bool(when, win_df).astype(bool)
+                with _ctx_df(win_df):
+                    s = evaluate_bool(when, win_df).astype(bool)
                 s_all = s if s_all is None else (s_all & s)
             return int(s_all.fillna(False).sum()), None
         else:
@@ -1601,7 +1713,8 @@ def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str) -
             win_df = _window_slice(dfTF, ref_date, window)
             if win_df.empty:
                 return 0, None
-            s_bool = evaluate_bool(when, win_df).astype(bool)
+            with _ctx_df(win_df):
+                s_bool = evaluate_bool(when, win_df).astype(bool)
             return int(s_bool.fillna(False).sum()), None
     except Exception as e:
         return 0, f"表达式错误: {e}"
@@ -1894,8 +2007,6 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     codes, src = _apply_universe_filter(codes0, ref_date, SC_UNIVERSE)
     _progress("build_universe_done", total=len(codes0), current=len(codes),
               message=f"src={src} universe={SC_UNIVERSE}")
-    # LOGGER.info("[范围] 评分 universe=%s 源=%s 原=%d -> %d",
-    #             str(SC_UNIVERSE), src, len(codes0), len(codes))
     if not codes:
         raise RuntimeError("评分范围为空：请检查 SC_UNIVERSE 或对应名单是否已生成")
 
@@ -2007,14 +2118,6 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     except Exception as e:
         LOGGER.warning("[detail] 回写 rank 失败：%s", e)
 
-        # —— 生成“特别关注榜” —— 
-    if SC_ATTENTION_ENABLE:
-        try:
-            build_attention_rank(start=None, end=ref_date, source=SC_ATTENTION_SOURCE,
-                                 min_hits=SC_ATTENTION_MIN_HITS, topN=SC_ATTENTION_TOP_K, write=True)
-        except Exception as e:
-            LOGGER.warning("[attention] 生成特别关注榜失败：%s", e)
-
     if SC_ATTENTION_BACKFILL_ENABLE:
         try:
            # 取“参考日前 N 个交易日”作为 start（N 默认用 SC_ATTENTION_WINDOW_D）
@@ -2074,37 +2177,29 @@ def _start_for_tf_window(ref_date: str, timeframe: str, window: int) -> str:
 
 def tdx_screen(
     when: str,
-    *,
     ref_date: str | None = None,
     timeframe: str = "D",
     window: int = 60,
-    scope: str = "ANY",          # 可用：LAST/ANY/ALL/COUNT>=k/CONSEC>=m
-    write_white: bool = True,    # 把命中写入白名单
-    write_black_rest: bool = False,  # 把未命中写入黑名单（谨慎）
-    universe: str | list[str] | None = "all",  # all/white/black/attention 或 代码清单
+    scope: str = "ANY",
+    write_white: bool = True,
+    write_black_rest: bool = False,
+    universe: str | list[str] | None = "all",
     use_prescreen_first: bool = True,
     return_df: bool = True
 ):
-    """
-    类通达信“普通选股”：在给定 timeframe/window/scope 下，用 when 表达式筛股票。
-    - 自动列出参考日 universe（single 布局：按文件名；daily 布局：按 ref_date 分区）:contentReference[oaicite:1]{index=1}
-    - 读取最小必要列（若表达式包含 J/VR，会尝试兜底计算 KDJ J/成交量比 VR）
-    - 可选把命中写白名单、未命中写黑名单（写入 SC_CACHE_DIR/<ref_date>/ 下）:contentReference[oaicite:2]{index=2}
-    - 保持完整日志（score.log）
-    """
     when = (when or "").strip()
     if not when:
         raise ValueError("when 不能为空")
 
     ref = ref_date or _pick_ref_date()
-    tf = (timeframe or "D").upper()
+    tf  = (timeframe or "D").upper()
     win = int(window)
-    st = _start_for_tf_window(ref, tf, win)
+    st  = _start_for_tf_window(ref, tf, win)
 
+    # 选范围 + 只读必要列（J/VR 会在 _screen_one 里兜底）
     codes0 = _list_codes_for_day(ref)
     codes, src = _apply_universe_filter(list(codes0), ref, universe)
-    LOGGER.info("[screen][范围] universe=%s 源=%s 原=%d -> %d",
-                str(universe), src, len(codes0), len(codes))
+    LOGGER.info("[screen][范围] universe=%s 源=%s 原=%d -> %d", str(universe), src, len(codes0), len(codes))
     if not codes:
         LOGGER.warning("[screen] %s 无可用标的。", ref)
         return pd.DataFrame() if return_df else None
@@ -2117,65 +2212,38 @@ def tdx_screen(
     whitelist_items: list[tuple[str, str, str]] = []
     blacklist_items: list[tuple[str, str, str]] = []
 
-    for ts_code in codes:
-        try:
-            dfD = _read_stock_df(ts_code, st, ref, columns=cols)
-            if dfD.empty:
-                continue
-            # —— 先过一遍初选（硬惩罚规则），默认开启 —— 
-            pres = PrescreenResult(True, None, None)
-            if use_prescreen_first:
-                pres = _prescreen(dfD, ref)
-            if not pres.passed:
-                if write_black_rest:
-                    blacklist_items.append((ts_code, pres.period or ref, pres.reason or "prescreen"))
-                continue
-            # 若表达式涉及 J/VR，但数据中缺列，尝试兜底
-            need_j = _expr_mentions(when, "J") and ("j" not in dfD.columns)
-            need_vr = _expr_mentions(when, "VR") and ("vr" not in dfD.columns)
-            if need_j:
-                try:
-                    dfD = dfD.copy()
-                    dfD["j"] = kdj(dfD)
-                except Exception as e:
-                    LOGGER.debug("[screen][%s] 兜底计算J失败: %s", ts_code, e)
-            if need_vr and "vol" in dfD.columns:
-                try:
-                    # VR(26) 的一种常见实现（简化版）：近 N 天 成交量比
-                    n = 26
-                    v = pd.to_numeric(dfD["vol"], errors="coerce")
-                    dfD = dfD.copy()
-                    dfD["vr"] = (v / v.rolling(n).mean()).values
-                except Exception as e:
-                    LOGGER.debug("[screen][%s] 兜底计算VR失败: %s", ts_code, e)
+    max_workers = (SC_MAX_WORKERS or max(os.cpu_count() - 1, 1))
 
-            dfTF = dfD if tf == "D" else _resample(dfD, tf)
-            win_df = _window_slice(dfTF, ref, win)
-            if win_df.empty:
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(_screen_one, c, st, ref, tf, win, when, scope, use_prescreen_first)
+                for c in codes]
+        for fut in tqdm(as_completed(futs), total=len(futs), desc=f"选股 {ref}"):
+            ts_code, ok, list_item, err = fut.result()
+            if err:
+                LOGGER.debug("[screen][%s] 忽略异常: %s", ts_code, err)
                 continue
-            s_bool = evaluate_bool(when, win_df)
-            ok = _scope_hit(s_bool, scope)
             if ok:
                 hits.append(ts_code)
                 if write_white:
                     whitelist_items.append((ts_code, ref, f"screen:{tf}{win}:{scope}::{when}"))
             else:
+                # 预筛淘汰会带 period/reason；常规未命中则写一个统一 reason
                 if write_black_rest:
-                    blacklist_items.append((ts_code, ref, f"screen_fail:{tf}{win}:{scope}::{when}"))
-        except Exception as e:
-            LOGGER.debug("[screen][%s] 忽略异常: %s", ts_code, e)
-            continue
+                    if list_item:  # 预筛失败时 _screen_one 已给出 (ts_code, period, reason)
+                        blacklist_items.append(list_item)
+                    else:
+                        blacklist_items.append((ts_code, ref, f"screen_fail:{tf}{win}:{scope}::{when}"))
 
-    # 写缓存名单
+    # 写缓存名单（沿用原语义）
     if write_white or write_black_rest:
         _write_cache_lists(ref, whitelist_items, blacklist_items)
         LOGGER.info("[screen] 写名单完成：白=%d 黑=%d", len(whitelist_items), len(blacklist_items))
 
-    # 结果 DataFrame（供可视化）
     if return_df:
         out = pd.DataFrame({"ts_code": sorted(hits)})
         out["ref_date"] = ref
         out["rule"] = f"{tf}{win}:{scope}::{when}"
         return out
     return None
+
 # ==========================================================

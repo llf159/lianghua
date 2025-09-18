@@ -48,10 +48,10 @@ CALLS_PER_MIN = 470
 RETRY_TIMES = 5
 PARQUET_ENGINE = "pyarrow"
 LOG_LEVEL = "INFO"
-STOCK_INC_THREADS = 10         # 增量下载线程数
+STOCK_INC_THREADS = 8         # 增量下载线程数
 
 # -------- FAST INIT(按股票多线程全历史回补) --------
-FAST_INIT_THREADS = 10                    # 并发线程数
+FAST_INIT_THREADS = 8                    # 并发线程数
 FAST_INIT_STOCK_DIR = os.path.join(DATA_ROOT, "fast_init_symbol")
 API_ADJ = "qfq"                           # qfq/hfq/raw
 # 若 FAST_INIT_MODE=True，可通过设置 API_ADJ 控制接口返回的复权方式：
@@ -137,7 +137,6 @@ SC_CACHE_DIR  = os.path.join(BASE_DIR, "cache", "scorelists")
 SC_WRITE_WHITELIST = True   # 写白名单 cache/…/whitelist.csv
 SC_WRITE_BLACKLIST = True   # 写黑名单 cache/…/blacklist.csv
 # —— 特别关注榜（周期上榜次数统计）——
-SC_ATTENTION_ENABLE    = True          # run_for_date 完成后自动生成关注榜
 SC_ATTENTION_SOURCE    = "top"         # 统计来源：'top' | 'white' | 'black'
 SC_ATTENTION_WINDOW_D  = 20            # 统计窗口：最近 N 个“交易日”
 SC_ATTENTION_MIN_HITS  = 2             # 至少上榜次数
@@ -202,6 +201,52 @@ SC_RULES = [
 #         "points": +8,
 #         "explain": "日线放量突破且周线均线多头排列"
 #     },
+    # {
+    #     "name": "当日机会",
+    #     "timeframe": "D",
+    #     "window": 2,
+    #     "when": "TAG_HITS('opportunity') > 3",
+    #     "scope": "LAST",
+    #     "points": +15,
+    #     "explain": "b1plus"
+    # },
+    # {
+    #     "name": "相对强于深证",
+    #     "timeframe": "D",
+    #     "window": 20,
+    #     "when": "RS_399001_SZ_3 > 1.02",   # 20日RS>1.02（强于基准≈2%）
+    #     "scope": "ANY",
+    #     "points": +4,
+    #     "explain": "20日跑赢深证"
+    # },
+    # {
+    #     "name": "当日振幅≥5%",
+    #     "timeframe": "D",
+    #     "window": 10,
+    #     "when": "SAFE_DIV(H - L, REF(C,1)) >= 0.05 AND SAFE_DIV(ABS(C - REF(C,1)), REF(C,1)) <= 0.02",
+    #     "scope": "EACH",
+    #     "points": -5,
+    #     "explain": "大波动"
+    # },
+    # {
+    #     "name": "健康缩量",
+    #     "timeframe": "D",
+    #     "window": 60,
+    #     "when": "(COUNT( (CROSS(C, HHV(H, 60)) AND V <= 1.5 * MA(V, 20)), 5 ) >= 1) AND (TS_PCT(V, 20) <= 0.35)",
+    #     "scope": "ANY",
+    #     "points": +5,
+    #     "explain": "健康缩量",
+    #     "show_reason": False
+    # },
+    # {
+    #     "name": "3/4 阴量线",
+    #     "timeframe": "D",
+    #     "window": 20,
+    #     "when": "REF(TS_PCT(C,20),1) > 0.9 AND (C < O) AND (C < REF(C, 1)) AND (SAFE_DIV(V, REF(V, 1)) >= 0.6) AND (SAFE_DIV(V, REF(V, 1)) <= 0.8)",
+    #     "scope": "ANY",
+    #     "points": -15,
+    #     "explain": "3/4 阴量线",
+    # },
 ]
 
 # 初选（硬淘汰）样例：命中任一即淘汰，并写入 blacklist.csv

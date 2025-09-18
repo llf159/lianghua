@@ -124,17 +124,26 @@ class TrackingResult:
     summary_path: Optional[Path] = None
 
 # ------------------------- 工具 -------------------------
-def _count_strategy_triggers(obs_date: str, codes_sample: Sequence[str]) -> pd.DataFrame:
+
+def _count_strategy_triggers(obs_date: str, codes_sample: Sequence[str], *, weights_map: dict[str, float] | None = None) -> pd.DataFrame:
     """
     统计某观察日 obs_date 在样本集合 codes_sample 内每个策略（规则名）的触发次数/覆盖率。
     触发判定：per_rules 里 ok=True 或 hit_date==obs_date 或 obs_date ∈ hit_dates。
+    可选：weights_map 提供 ts_code -> 权重，用于“加权触发次数”和“加权覆盖率”。
+    返回列：name, trigger_count, n_sample, coverage, trigger_weighted, sample_weight, coverage_weighted
     """
     ddir = Path("output/score/details") / str(obs_date)
     if not ddir.exists():
-        return pd.DataFrame(columns=["name","trigger_count","n_sample","coverage"])
+        return pd.DataFrame(columns=["name","trigger_count","n_sample","coverage","trigger_weighted","sample_weight","coverage_weighted"])
     codes_set = set(str(c) for c in (codes_sample or []))
-    acc: dict[str, set] = {}
+    weights_map = {str(k): float(v) for k,v in (weights_map or {}).items()}
     n_sample = len(codes_set) if codes_set else 0
+    sample_weight = sum(weights_map.get(ts, 1.0) for ts in codes_set) if codes_set else 0.0
+
+    # 每个策略名 -> {命中的 ts_code 集合, 加权和}
+    acc_set: dict[str, set] = {}
+    acc_w  : dict[str, float] = {}
+
     for fp in ddir.glob("*.json"):
         try:
             obj = json.loads(fp.read_text(encoding="utf-8-sig"))
@@ -143,7 +152,8 @@ def _count_strategy_triggers(obs_date: str, codes_sample: Sequence[str]) -> pd.D
         ts = str(obj.get("ts_code",""))
         if codes_set and ts not in codes_set:
             continue
-        for r in (obj.get("per_rules") or []):
+        rules = (obj.get("per_rules") or obj.get("rules") or [])
+        for r in rules:
             name = str(r.get("name") or "")
             if not name:
                 continue
@@ -152,14 +162,89 @@ def _count_strategy_triggers(obs_date: str, codes_sample: Sequence[str]) -> pd.D
             hds = [str(x) for x in (r.get("hit_dates") or [])]
             trig = ok or (hd == str(obs_date)) or (str(obs_date) in hds)
             if trig:
-                acc.setdefault(name, set()).add(ts)
+                acc_set.setdefault(name, set()).add(ts)
+                acc_w[name] = acc_w.get(name, 0.0) + float(weights_map.get(ts, 1.0))
+
     rows = []
-    for name, st in acc.items():
-        rows.append({"name": name,
-                     "trigger_count": int(len(st)),
-                     "n_sample": int(n_sample),
-                     "coverage": (len(st) / n_sample if n_sample else 0.0)})
-    return pd.DataFrame(rows).sort_values(["trigger_count","name"], ascending=[False, True]).reset_index(drop=True)
+    for name, st in acc_set.items():
+        cnt = int(len(st))
+        cov = (cnt / n_sample if n_sample else 0.0)
+        wsum = float(acc_w.get(name, 0.0))
+        cov_w = (wsum / sample_weight if sample_weight else 0.0)
+        rows.append({
+            "name": name,
+            "trigger_count": cnt,
+            "n_sample": int(n_sample),
+            "coverage": cov,
+            "trigger_weighted": wsum,
+            "sample_weight": sample_weight,
+            "coverage_weighted": cov_w,
+        })
+
+    df = pd.DataFrame(rows, columns=["name","trigger_count","n_sample","coverage","trigger_weighted","sample_weight","coverage_weighted"])
+    if not df.empty:
+        # 优先按加权命中降序，再按未加权、再按名称升序
+        sort_cols = [c for c in ["trigger_weighted","trigger_count","name"] if c in df.columns]
+        df = df.sort_values(sort_cols, ascending=[False, False, True][:len(sort_cols)]).reset_index(drop=True)
+    return df
+
+
+def _count_hits_per_stock(obs_date: str, codes_sample: Sequence[str]) -> pd.DataFrame:
+    """
+    统计某观察日 obs_date 在样本集合 codes_sample 内每只股票**按规则模式**的命中条数：
+      - 单次型（any/last 等，一条规则当日至多命中一次）
+      - 多次型（each 等，可视作“可多次命中”的规则类型）
+    返回列：ts_code, n_single_rules_hit, n_each_rules_hit, single_rule_names, each_rule_names
+    说明：无法获取更细粒度“同一规则在同一日命中多次”的次数时，按“规则项数量”近似计数。
+    """
+    ddir = Path("output/score/details") / str(obs_date)
+    if not ddir.exists():
+        return pd.DataFrame(columns=["ts_code","n_single_rules_hit","n_each_rules_hit","single_rule_names","each_rule_names"])
+    codes_set = set(str(c) for c in (codes_sample or []))
+    recs = []
+    for fp in ddir.glob("*.json"):
+        try:
+            obj = json.loads(fp.read_text(encoding="utf-8-sig"))
+        except Exception:
+            continue
+        ts = str(obj.get("ts_code",""))
+        if codes_set and ts not in codes_set:
+            continue
+
+        single_names = set()
+        each_names = set()
+
+        rules_iter = (obj.get("per_rules") or obj.get("rules") or [])
+        for r in rules_iter:
+            name = str(r.get("name") or "").strip()
+            if not name:
+                continue
+            ok = bool(r.get("ok"))
+            hd = str(r.get("hit_date") or "")
+            hds = [str(x) for x in (r.get("hit_dates") or [])]
+            trig = ok or (hd == str(obs_date)) or (str(obs_date) in hds)
+            if not trig:
+                continue
+            # 规则模式识别
+            mode = str(r.get("mode") or r.get("run_mode") or r.get("match") or r.get("type") or "").lower()
+            if mode in ("each","multi","multiple"):
+                each_names.add(name)
+            else:
+                # 统一把 any/last/first/once/空值 都视为单次型
+                single_names.add(name)
+
+        recs.append({
+            "ts_code": ts,
+            "n_single_rules_hit": int(len(single_names)),
+            "n_each_rules_hit": int(len(each_names)),
+            "single_rule_names": ",".join(sorted(single_names)) if single_names else "",
+            "each_rule_names": ",".join(sorted(each_names)) if each_names else "",
+        })
+
+    df = pd.DataFrame(recs)
+    if not df.empty:
+        df = df.sort_values(["n_each_rules_hit","n_single_rules_hit","ts_code"], ascending=[False, False, True]).reset_index(drop=True)
+    return df
 
 
 def _ensure_dir(p: Path) -> None:
@@ -213,7 +298,6 @@ def _read_index_prices(index_codes: Sequence[str], start: str, end: str) -> pd.D
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=["index_code", "trade_date", "close"]) 
     df = normalize_trade_date(df, "trade_date")
-    # df = df[df["ts_code"].isin(set(codes))].rename(columns={"ts_code": "index_code"})
     df = df[df["ts_code"].isin(set(index_codes))].rename(columns={"ts_code": "index_code"})
     return df.sort_values(["index_code", "trade_date"]).reset_index(drop=True)
 
@@ -299,14 +383,6 @@ class ScoreTrackingPlugin:
         self.outdir = Path(outdir or TRACKING_OUT_BASE)
 
     # ---- 主入口：从 DataFrame（优先）或 score_all 文件计算 ----
-    # def run(self,
-    #         ref_date: str,
-    #         windows: Sequence[int],
-    #         benchmarks: Sequence[str] | None = None,
-    #         *,
-    #         score_df: Optional[pd.DataFrame] = None,
-    #         group_by_board: bool = True,
-    #         save: bool = True) -> TrackingResult:
     def run(self,
             ref_date: str,
             windows: Sequence[int],
@@ -492,6 +568,59 @@ def _build_retro_cols(ref_date: str, codes: Sequence[str], retro_days: Sequence[
         out = out.merge(df, on="ts_code", how="outer")
     return out
 
+
+# ---------- Commonality helper: build base dataset ----------
+def _infer_split_from_surge(surge: pd.DataFrame) -> str:
+    """根据 surge 表里的 group 值推断 split 口径。"""
+    if surge is None or "group" not in surge.columns:
+        return "per_board"
+    gs = set(str(x) for x in surge["group"].dropna().unique().tolist())
+    if gs.issubset({"600组","000组","科创北组","其他"}):
+        return "combo3"
+    if gs.issubset({"主板","其他"}):
+        return "main_vs_others"
+    return "per_board"
+
+
+def _build_base_dataset(
+    df_all: pd.DataFrame, surge: pd.DataFrame, *, group: str = "all", background: str = "all"
+) -> pd.DataFrame:
+    """
+    以观察日全市场打分 df_all 为基，打上 label（surge=1，其他=0）；
+    若 background='same_group' 则仅保留与正样本同组的股票。
+    输出列：trade_date, ts_code, score, rank, board, label（必要列有则保留）
+    """
+    if df_all is None or len(df_all) == 0:
+        return pd.DataFrame(columns=["trade_date","ts_code","score","rank","board","label"])
+
+    df = df_all.copy()
+    df["ts_code"] = df["ts_code"].astype(str).map(lambda s: normalize_ts(s, asset="stock"))
+    if "board" not in df.columns:
+        df["board"] = df["ts_code"].map(market_label)
+
+    # 正样本：surge 里的代码
+    if surge is not None and "ts_code" in surge.columns:
+        if "group" in surge.columns and group != "all":
+            pos = surge[surge["group"] == group]["ts_code"]
+        else:
+            pos = surge["ts_code"]
+        pos_set = set(pos.astype(str).map(lambda s: normalize_ts(s, asset="stock")).unique().tolist())
+    else:
+        pos_set = set()
+
+    # 负样本背景范围
+    if background == "same_group" and group != "all":
+        split_mode = _infer_split_from_surge(surge)
+        df["group"] = df["ts_code"].map(lambda s: _board_group(str(s), split_mode))
+        df = df[df["group"] == group].copy()
+
+    df["label"] = df["ts_code"].isin(pos_set).astype(int)
+
+    keep = [c for c in ["trade_date","ts_code","score","rank","board","label"] if c in df.columns]
+    if "group" in df.columns and "group" not in keep:   # 仅用于检查/调试，不参与分析
+        keep.append("group")
+    return df[keep].reset_index(drop=True)
+
 # ------------------------- 主入口 -------------------------
 @dataclass
 class SurgeResult:
@@ -583,9 +712,22 @@ def run_surge(
     # 末日 close
     px_t = px[px["trade_date"] == last_date][["ts_code", "close"]].rename(columns={"close": "close_t"})
     # 起点 close（t-1 或 t-K）
-    px_0 = px[px["trade_date"] == (dates[-2] if mode == "today" else first_date)][["ts_code", "close"]].rename(columns={"close": "close_0"})
+    # px_0 = px[px["trade_date"] == (dates[-2] if mode == "today" else first_date)][["ts_code", "close"]].rename(columns={"close": "close_0"})
+    if mode == "today":
+        base_date = dates[-2] if len(dates) >= 2 else dates[-1]
+    else:
+        base_date = first_date
+    px_0 = (
+        px[px["trade_date"] == base_date][["ts_code", "close"]]
+          .rename(columns={"close": "close_0"})
+    )
     uni = df_score[["ts_code"]].merge(px_t, on="ts_code", how="left").merge(px_0, on="ts_code", how="left")
-    uni["metric"] = (uni["close_t"] / uni["close_0"]) - 1.0
+    # uni["metric"] = (uni["close_t"] / uni["close_0"]) - 1.0
+    uni["metric"] = np.where(
+        pd.notna(uni["close_t"]) & pd.notna(uni["close_0"]) & (uni["close_0"] != 0),
+        (uni["close_t"] / uni["close_0"]) - 1.0,
+        np.nan
+    )
     uni["board"] = uni["ts_code"].map(market_label)
     uni["group"] = uni["ts_code"].map(lambda s: _board_group(s, split))
 
@@ -617,10 +759,12 @@ def run_surge(
             table.to_parquet(out_path, index=False)
         except Exception:
             out_path = out_path.with_suffix(".csv")
-            table.to_csv(out_path, index=False, encoding="utf-8-sig")
-        # 组内单独文件（可选）
+            table.to_csv(out_path, index=False, encoding="utf-8-sig")  
+        def _sanitize_filename(s: str) -> str:
+            return re.sub(r'[\\\\/:*?"<>|]+', "_", str(s or ""))
         for g, gdf in table.groupby("group", dropna=False):
-            gfile = out_dir / f"{g}_surge_{mode}_{selection.get('type','top_n')}{selection.get('value')}.parquet"
+            safe_g = _sanitize_filename(g)
+            gfile = out_dir / f"{safe_g}_surge_{mode}_{selection.get('type','top_n')}{selection.get('value')}.parquet"
             try:
                 gdf.to_parquet(gfile, index=False)
             except Exception:
@@ -714,6 +858,8 @@ def run_commonality(
     save: bool = True,
     retro_days: Sequence[int] = (),
     count_strategy: bool = False,
+    count_strategy_scope: str = "pos",
+    strategy_pos_weight: float = 1.0,
 ) -> CommonalityResult:
     """构建大涨样本（在 ref_date 的前 retro_day 天观察）并运行 analyzers。
     返回 dataset（带 label）与 reports（由 analyzers 返回）。
@@ -749,28 +895,9 @@ def run_commonality(
 
     for g in groups:
         g_pick = surge[surge["group"] == g]["ts_code"].astype(str).map(lambda s: normalize_ts(s, asset="stock")).unique().tolist()
-        if background == "same_group" and g != "all":
-            # 背景集 = 观察日里同组所有股票
-            # 简易映射同 score_surge:
-            def _grp(ts: str) -> str:
-                if ts.startswith("8"): return "北交所"
-                if ts.startswith("68"): return "科创"
-                if ts.startswith("30"): return "创业"
-                if ts.startswith("00") or ts.startswith("60"): return "主板"
-                return "其他"
-            bg_df = df_all[df_all["ts_code"].astype(str).map(lambda s: _grp(s) if isinstance(s,str) else "其他") == ("主板" if g=="主板" else ("其他板" if g=="其他板" else g))]
-        else:
-            bg_df = df_all
-
-        # # 5.1 基础视图：score/rank + label
-        # base = bg_df[[c for c in ["ts_code","trade_date","score","rank","board"] if c in bg_df.columns]].copy()
-        # base["label"] = base["ts_code"].isin(set(g_pick)).astype(int)
-
-        # 5.1 建 base（pos/ref）——对每个观察日分别做
-        #     这里只以第一个观察日构建 dataset；策略计数则会对 obs_dates 全部生成
-        first_obs = obs_dates[0]
-        df_all = df_all_map[first_obs]
-        base = _build_base_dataset(df_all, surge, group=grp, background=background)
+        obs_date = obs_dates[0]
+        df_all = df_all_map[obs_date]
+        base = _build_base_dataset(df_all, surge, group=g, background=background)
         
         # 5.2 追加自定义特征
         feats: List[pd.DataFrame] = []
@@ -821,19 +948,103 @@ def run_commonality(
             key = f"{k}__{g}"
             reports_all[key] = v
 
+        # 
         # 5.5 可选：策略触发计数（对每个观察日）
         if count_strategy:
-            counts = []
-            for od in obs_dates:
-                codes_sample = pos_df["ts_code"].tolist()
-                cnt = _count_strategy_triggers(od, codes_sample)
-                if not cnt.empty:
+            # 统计范围：
+            #   - "pos"  ：仅样本（大涨票）
+            #   - "group": 组内全体（样本 + 非样本），可选对样本加权
+            #   - "both" ：两者都算，便于对比
+            scopes = [count_strategy_scope] if count_strategy_scope in ("pos","group") else ["pos","group"]
+            for sc in scopes:
+                counts = []
+                hits_rows = []
+                for od in obs_dates:
+                    if sc == "pos":
+                        codes_sample = pos_df["ts_code"].tolist()
+                        weights_map = None
+                    else:
+                        # 组内全体
+                        codes_sample = base["ts_code"].tolist()
+                        # 加权：样本权重 strategy_pos_weight，非样本为 1.0
+                        pos_set = set(pos_df["ts_code"].astype(str).tolist())
+                        weights_map = {str(ts): (float(strategy_pos_weight) if str(ts) in pos_set else 1.0) for ts in codes_sample}
+                    # 1) 按策略聚合
+                    cnt = _count_strategy_triggers(od, codes_sample, weights_map=weights_map).copy()
                     cnt["obs_date"] = od
-                    cnt["group"] = grp
-                counts.append(cnt)
-            if counts:
-                g_reports["strategy_triggers"] = pd.concat([c for c in counts if c is not None], ignore_index=True)
-    dataset_all = pd.concat(datasets, ignore_index=True) if datasets else pd.DataFrame()
+                    cnt["group"] = g
+                    cnt["scope"] = sc
+                    counts.append(cnt)
+                    # 2) 按股票聚合：每票命中多少条规则
+                    bystk = _count_hits_per_stock(od, codes_sample).copy()
+                    bystk["obs_date"] = od
+                    bystk["group"] = g
+                    bystk["scope"] = sc
+                    hits_rows.append(bystk)
+                if counts:
+                    df_counts = pd.concat(counts, ignore_index=True, sort=False)
+                    key = f"strategy_triggers__{g}__{sc}"
+                    reports_all[key] = df_counts
+                    g_reports[key] = df_counts
+                if hits_rows:
+                    df_hits = pd.concat(hits_rows, ignore_index=True, sort=False)
+                    
+                    # 直方分布（两类）：
+                    #   1) 单次型命中条数分布（any/last 等）
+                    #   2) 多次型命中条数分布（each 等）
+                    # 单次型
+                    hist_single = (df_hits.groupby(["obs_date","group","scope","n_single_rules_hit"])["ts_code"]
+                                         .count().reset_index(name="n_stocks"))
+                    try:
+                        denom_map = df_hits.groupby(["obs_date","group","scope"])["ts_code"].nunique().to_dict()
+                        hist_single["ratio"] = hist_single.apply(lambda r: (r["n_stocks"] / denom_map.get((r["obs_date"],r["group"],r["scope"]), 1)) if denom_map else 0.0, axis=1)
+                    except Exception:
+                        pass
+                    # 多次型
+                    hist_each = (df_hits.groupby(["obs_date","group","scope","n_each_rules_hit"])["ts_code"]
+                                       .count().reset_index(name="n_stocks"))
+                    try:
+                        denom_map2 = denom_map if 'denom_map' in locals() else df_hits.groupby(["obs_date","group","scope"])["ts_code"].nunique().to_dict()
+                        hist_each["ratio"] = hist_each.apply(lambda r: (r["n_stocks"] / denom_map2.get((r["obs_date"],r["group"],r["scope"]), 1)) if denom_map2 else 0.0, axis=1)
+                    except Exception:
+                        pass
+
+                    key_hist_single = f"hits_histogram_single__{g}__{sc}"
+                    key_hist_each   = f"hits_histogram_each__{g}__{sc}"
+                    key_hits = f"hits_by_stock__{g}__{sc}"
+                    reports_all[key_hist_single] = hist_single
+                    reports_all[key_hist_each]   = hist_each
+                    reports_all[key_hits]        = df_hits
+                    g_reports[key_hist_single] = hist_single
+                    g_reports[key_hist_each]   = hist_each
+                    g_reports[key_hits]        = df_hits
+
+
+        # 5.6 汇总：将所有分组的 strategy_triggers 合并为一个无后缀表
+# ，方便 UI 直接使用
+        try:
+            keys = [k for k in reports_all.keys() if str(k).startswith("strategy_triggers__")]
+            if keys:
+                merged = pd.concat(
+                    [reports_all[k] for k in keys if isinstance(reports_all.get(k), pd.DataFrame)],
+                    ignore_index=True, sort=False
+                ).copy()
+                # 列名兜底：trigger_count 等关键列保证存在
+                if "trigger_count" not in merged.columns:
+                    for alt in ("count","n","num"):
+                        if alt in merged.columns:
+                            merged = merged.rename(columns={alt: "trigger_count"})
+                            break
+                    else:
+                        merged["trigger_count"] = 0
+                for col in ["name","n_sample","coverage","obs_date","group"]:
+                    if col not in merged.columns:
+                        merged[col] = None
+                reports_all["strategy_triggers"] = merged
+        except Exception as e:
+            print(f"[commonality] merge strategy_triggers failed: {e}")
+        # 统一得到 dataset_all（循环后再做一次，避免中途覆盖）
+        dataset_all = pd.concat(datasets, ignore_index=True) if datasets else pd.DataFrame()
 
     # 6) 落地
     out_dir = COMMON_OUT_BASE / ref_date / f"commonality_{mode}_{selection.get('type','top_n')}{selection.get('value')}_d{retro_day}"
@@ -1212,10 +1423,6 @@ class PortfolioManager:
                 if t.side == "BUY":
                     holdings[t.ts_code] = holdings.get(t.ts_code, 0) + int(t.qty)
                     cash -= (amt + fee)
-                # else:
-                #     sell_qty = min(int(t.qty), holdings.get(t.ts_code, 0))
-                #     holdings[t.ts_code] = holdings.get(t.ts_code, 0) - sell_qty
-                #     cash += (sell_qty * t.exec_price - fee)
                 else:
                     sell_qty = min(int(t.qty), holdings.get(t.ts_code, 0))
                     holdings[t.ts_code] = holdings.get(t.ts_code, 0) - sell_qty

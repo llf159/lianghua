@@ -1,28 +1,28 @@
-2025-09-12 20:46:39,270 WARNING [root] [DUCK MERGE][raw] 源目录不存在，跳过
-2025-09-12 20:46:41,304 INFO [root] [DUCK MERGE][qfq] 已最新，跳过
-2025-09-12 20:46:41,361 WARNING [root] [DUCK MERGE][hfq] 源目录不存在，跳过
-2025-09-12 20:46:41,369 INFO [root] [stock][FAST] 准备并发拉取 股票数=5429 区间=20220101~20250912 起点=20250912
-2025-09-12 21:21:45,643 INFO [root] [stock][FAST] 完成 ok=5424 empty=5 err=0 区间=20220101~20250912 起点=20250912
-2025-09-12 21:21:45,918 INFO [root] [index][FAST] 完成 ok=7 empty=0 err=0 区间=20220101~20250912 起点=20250912
-2025-09-12 21:21:49,288 INFO [root] [INC_IND] 需要补的股票数=5424 (last_ind_date=20250911)
-2025-09-12 21:21:52,564 INFO [root] [INC_IND][MEM] 使用线程数：32
-2025-09-12 21:30:07,507 INFO [root] [INC_IND][MEM] 单股写入完成：OK=5424 FAIL=0
-2025-09-12 21:31:24,901 INFO [root] [DUCK MERGE IND][subset] 完成，新增日期数=897 涉及股票数=5424
-2025-09-12 22:45:10,524 WARNING [root] [DUCK MERGE][raw] 源目录不存在，跳过
-2025-09-12 22:45:10,524 WARNING [root] [DUCK MERGE][raw] 源目录不存在，跳过
-2025-09-12 22:45:13,279 INFO [root] [DUCK MERGE][qfq] 已最新，跳过
-2025-09-12 22:45:13,279 INFO [root] [DUCK MERGE][qfq] 已最新，跳过
-2025-09-12 22:45:13,317 WARNING [root] [DUCK MERGE][hfq] 源目录不存在，跳过
-2025-09-12 22:45:13,317 WARNING [root] [DUCK MERGE][hfq] 源目录不存在，跳过
-2025-09-12 22:45:13,318 INFO [root] [stock][FAST] 日线已最新 (last=20250912)
-2025-09-12 22:45:13,318 INFO [root] [stock][FAST] 日线已最新 (last=20250912)
-2025-09-12 22:45:13,319 INFO [root] [index][FAST] 日线已最新 (last=20250912)
-2025-09-12 22:45:13,319 INFO [root] [index][FAST] 日线已最新 (last=20250912)
-2025-09-12 22:45:15,906 INFO [root] [INC_IND] 需要补的股票数=5424 (last_ind_date=20250911)
-2025-09-12 22:45:15,906 INFO [root] [INC_IND] 需要补的股票数=5424 (last_ind_date=20250911)
-2025-09-12 22:45:18,279 INFO [root] [INC_IND][MEM] 使用线程数：32
-2025-09-12 22:45:18,279 INFO [root] [INC_IND][MEM] 使用线程数：32
-2025-09-12 22:49:18,405 INFO [root] [INC_IND][MEM] 单股写入完成：OK=5424 FAIL=0
-2025-09-12 22:49:18,405 INFO [root] [INC_IND][MEM] 单股写入完成：OK=5424 FAIL=0
-2025-09-12 22:50:37,656 INFO [root] [DUCK MERGE IND][subset] 完成，新增日期数=897 涉及股票数=5424
-2025-09-12 22:50:37,656 INFO [root] [DUCK MERGE IND][subset] 完成，新增日期数=897 涉及股票数=5424
+2025-09-18 00:01:58,273 WARNING [root] [DUCK MERGE][raw] 源目录不存在，跳过
+2025-09-18 00:02:01,565 INFO [root] [DUCK MERGE][qfq] 已最新，跳过
+2025-09-18 00:02:01,565 INFO [root] [DUCK MERGE][qfq] 已最新，跳过
+2025-09-18 00:02:01,565 INFO [root] [DUCK MERGE][qfq] 已最新，跳过
+2025-09-18 00:02:01,654 WARNING [root] [DUCK MERGE][hfq] 源目录不存在，跳过
+2025-09-18 00:02:01,654 WARNING [root] [DUCK MERGE][hfq] 源目录不存在，跳过
+2025-09-18 00:02:01,654 WARNING [root] [DUCK MERGE][hfq] 源目录不存在，跳过
+2025-09-18 00:02:01,663 INFO [root] [stock][FAST] 准备并发拉取 股票数=5429 区间=20220101~20250918 起点=20250917
+2025-09-18 00:02:01,663 INFO [root] [stock][FAST] 准备并发拉取 股票数=5429 区间=20220101~20250918 起点=20250917
+2025-09-18 00:02:01,663 INFO [root] [stock][FAST] 准备并发拉取 股票数=5429 区间=20220101~20250918 起点=20250917
+2025-09-18 00:13:09,133 INFO [root] [stock][FAST] 完成 ok=5421 empty=8 err=0 区间=20220101~20250918 起点=20250917
+2025-09-18 00:13:09,133 INFO [root] [stock][FAST] 完成 ok=5421 empty=8 err=0 区间=20220101~20250918 起点=20250917
+2025-09-18 00:13:09,133 INFO [root] [stock][FAST] 完成 ok=5421 empty=8 err=0 区间=20220101~20250918 起点=20250917
+2025-09-18 00:13:09,332 INFO [root] [index][FAST] 完成 ok=7 empty=0 err=0 区间=20220101~20250918 起点=20250917
+2025-09-18 00:13:09,332 INFO [root] [index][FAST] 完成 ok=7 empty=0 err=0 区间=20220101~20250918 起点=20250917
+2025-09-18 00:13:09,332 INFO [root] [index][FAST] 完成 ok=7 empty=0 err=0 区间=20220101~20250918 起点=20250917
+2025-09-18 00:13:12,429 INFO [root] [INC_IND] 需要补的股票数=5421 (last_ind_date=20250916)
+2025-09-18 00:13:12,429 INFO [root] [INC_IND] 需要补的股票数=5421 (last_ind_date=20250916)
+2025-09-18 00:13:12,429 INFO [root] [INC_IND] 需要补的股票数=5421 (last_ind_date=20250916)
+2025-09-18 00:13:25,677 INFO [root] [INC_IND][MEM] 使用线程数：32
+2025-09-18 00:13:25,677 INFO [root] [INC_IND][MEM] 使用线程数：32
+2025-09-18 00:13:25,677 INFO [root] [INC_IND][MEM] 使用线程数：32
+2025-09-18 00:24:24,288 INFO [root] [INC_IND][MEM] 单股写入完成：OK=5421 FAIL=0
+2025-09-18 00:24:24,288 INFO [root] [INC_IND][MEM] 单股写入完成：OK=5421 FAIL=0
+2025-09-18 00:24:24,288 INFO [root] [INC_IND][MEM] 单股写入完成：OK=5421 FAIL=0
+2025-09-18 00:24:28,880 INFO [root] [DUCK MERGE IND][subset] 完成，新增日期数=1 涉及股票数=5421
+2025-09-18 00:24:28,880 INFO [root] [DUCK MERGE IND][subset] 完成，新增日期数=1 涉及股票数=5421
+2025-09-18 00:24:28,880 INFO [root] [DUCK MERGE IND][subset] 完成，新增日期数=1 涉及股票数=5421
