@@ -24,12 +24,13 @@ from pathlib import Path
 from contextlib import contextmanager
 import pandas as pd
 import numpy as np
-
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from functools import lru_cache
+import threading, queue
+import logging as _logging
 
 from config import (
     PARQUET_BASE, PARQUET_ADJ, PARQUET_USE_INDICATORS,
@@ -39,7 +40,6 @@ from config import (
     SC_RULES, SC_PRESCREEN_RULES,
     SC_WRITE_WHITELIST, SC_WRITE_BLACKLIST, SC_ATTENTION_SOURCE,
     SC_ATTENTION_WINDOW_D, SC_ATTENTION_MIN_HITS, SC_ATTENTION_TOP_K,
-    SC_ATTENTION_BACKFILL_ENABLE,
     SC_BENCH_CODES, SC_BENCH_WINDOW, SC_BENCH_FILL, SC_BENCH_FEATURES,
     SC_UNIVERSE, 
 )
@@ -51,7 +51,7 @@ import tdx_compat as tdx
 from tdx_compat import evaluate_bool
 from stats_core import run_tracking, post_scoring, run_surge
 
-OUTPUT_DIR = Path("output/score")  # 按你现有目录习惯；若不同，改这里
+OUTPUT_DIR = Path(SC_OUTPUT_DIR)
 DETAIL_DIR = OUTPUT_DIR / "details"
 ALL_DIR = OUTPUT_DIR / "all"
 ALL_DIR.mkdir(parents=True, exist_ok=True)
@@ -122,17 +122,17 @@ def set_progress_handler(fn):
 def _progress(phase: str, *, current: int | None = None, total: int | None = None,
               message: str | None = None, **extra):
     if PROGRESS_HANDLER:
+        _cwd = os.getcwd()
         try:
             PROGRESS_HANDLER(phase=phase, current=current, total=total, message=message, **extra)
         except Exception as e:
             LOGGER.debug(f"[progress-cb-error] {e}")
-    # 顺手打一条 INFO，给日志/命令行看
-    m = f"{phase}"
-    if total is not None and current is not None:
-        m += f" {current}/{total}"
-    if message:
-        m += f" | {message}"
-    LOGGER.info(m)
+        finally:
+            # 防止回调改了工作目录，影响后续/子进程
+            try:
+                os.chdir(_cwd)
+            except Exception:
+                pass
 
 
 def init_rank_env(ref_date: str, universe_codes: List[str], base: str, adj: str, default_N: int = 60):
@@ -2118,23 +2118,6 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     except Exception as e:
         LOGGER.warning("[detail] 回写 rank 失败：%s", e)
 
-    if SC_ATTENTION_BACKFILL_ENABLE:
-        try:
-           # 取“参考日前 N 个交易日”作为 start（N 默认用 SC_ATTENTION_WINDOW_D）
-            root_daily = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
-            days = list_trade_dates(root_daily) or []
-            if ref_date in days:
-                i = days.index(ref_date)
-                n = int(SC_ATTENTION_WINDOW_D or 20)
-                start = days[max(0, i - n)]
-            else:
-                start = days[-int(SC_ATTENTION_WINDOW_D or 20)] if days else ref_date
-            backfill_attention_rolling(
-                start=start, end=ref_date, source=SC_ATTENTION_SOURCE,
-                min_hits=SC_ATTENTION_MIN_HITS, topN=SC_ATTENTION_TOP_K
-           )
-        except Exception as e:
-            LOGGER.warning("[attention] 回补生成失败：%s", e)
     return out_path
 
 
@@ -2205,7 +2188,7 @@ def tdx_screen(
         return pd.DataFrame() if return_df else None
 
     cols = _scan_cols_from_expr(when)
-    LOGGER.info("[screen] 参考日=%s tf=%s window=%d scope=%s 宇宙=%d", ref, tf, win, scope, len(codes))
+    ("[screen] 参考日=%s tf=%s window=%d scope=%s 宇宙=%d", ref, tf, win, scope, len(codes))
     LOGGER.debug("[screen] 读取列=%s 起始=%s", cols, st)
 
     hits: list[str] = []
@@ -2217,10 +2200,14 @@ def tdx_screen(
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
         futs = [ex.submit(_screen_one, c, st, ref, tf, win, when, scope, use_prescreen_first)
                 for c in codes]
+        _progress("screen_start", total=len(codes), current=0, message=f"workers={max_workers}")
+        done = 0
         for fut in tqdm(as_completed(futs), total=len(futs), desc=f"选股 {ref}"):
             ts_code, ok, list_item, err = fut.result()
+            done += 1
+            _progress("screen_progress", total=len(futs), current=done)
             if err:
-                LOGGER.debug("[screen][%s] 忽略异常: %s", ts_code, err)
+                LOGGER.warning("[screen][%s] 忽略异常: %s", ts_code, err)
                 continue
             if ok:
                 hits.append(ts_code)
@@ -2233,7 +2220,7 @@ def tdx_screen(
                         blacklist_items.append(list_item)
                     else:
                         blacklist_items.append((ts_code, ref, f"screen_fail:{tf}{win}:{scope}::{when}"))
-
+    _progress("screen_done", total=len(codes), current=done, message=f"hits={len(hits)}")
     # 写缓存名单（沿用原语义）
     if write_white or write_black_rest:
         _write_cache_lists(ref, whitelist_items, blacklist_items)
@@ -2247,3 +2234,94 @@ def tdx_screen(
     return None
 
 # ==========================================================
+# ==== Progress bus (thread/process safe) ====
+try:
+    _PROGRESS_Q
+except NameError:
+    _PROGRESS_Q = queue.Queue()
+    _PROG_CB_RAW = None  # UI-provided consumer (optional)
+    _PROG_THROTTLE_MS = 0  # set >0 to limit enqueue rate
+
+def _has_streamlit_ctx() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+def _on_main_thread() -> bool:
+    try:
+        return threading.current_thread() is threading.main_thread()
+    except Exception:
+        return threading.current_thread().name == "MainThread"
+
+def drain_progress_events(consumer=None, max_batch: int = 256):
+    """
+    Called from the UI main thread to consume events and update UI.
+    If `consumer` is None, falls back to the one set by set_progress_handler(...).
+    Each event is a dict passed as kwargs.
+    """
+    cb = consumer or _PROG_CB_RAW
+    n = 0
+    while n < max_batch:
+        try:
+            ev = _PROGRESS_Q.get_nowait()
+        except Exception:
+            break
+        try:
+            if cb:
+                cb(**ev)
+        except Exception as e:
+            try:
+                _logging.getLogger(__name__).debug(f"[progress-consumer-error] {e}")
+            except Exception:
+                pass
+        n += 1
+    return n
+
+# Public API expected by UI/engine
+PROGRESS_HANDLER = None
+
+def set_progress_handler(fn):
+    """
+    Register a UI consumer. Engine threads will NEVER call this fn directly;
+    they only enqueue events. The consumer will be called from drain_progress_events(...).
+    """
+    global PROGRESS_HANDLER, _PROG_CB_RAW
+    _PROG_CB_RAW = fn
+
+    def _enqueue_only(**kwargs):
+        try:
+            _PROGRESS_Q.put_nowait(dict(kwargs))
+        except Exception as e:
+            try:
+                _logging.getLogger(__name__).debug(f"[progress-enqueue-error] {e}")
+            except Exception:
+                pass
+
+    PROGRESS_HANDLER = _enqueue_only
+    return True
+
+def _progress(phase: str, *, current: int | None = None, total: int | None = None,
+              message: str | None = None, **extra):
+    """
+    Engine-side progress reporting. Safe to call from worker threads/processes.
+    """
+    ev = dict(phase=phase, current=current, total=total, message=message)
+    if extra:
+        ev.update(extra)
+    try:
+        if PROGRESS_HANDLER:
+            PROGRESS_HANDLER(**ev)
+        # Also print a concise log line for CLI visibility
+        msg = f"{phase}"
+        if total is not None and current is not None:
+            msg += f" {current}/{total}"
+        if message:
+            msg += f" | {message}"
+        LOGGER.debug(msg)
+    except Exception as e:
+        try:
+            _logging.getLogger(__name__).debug(f"[progress-cb-error] {e}")
+        except Exception:
+            pass

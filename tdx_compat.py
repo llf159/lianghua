@@ -188,40 +188,84 @@ def _coerce_bool_series(x):
     return s.astype(object).apply(lambda v: bool(v) if v is not None and v == v else False)
 
 # —— 根据“标签”文本，自动搜列名并 OR 到一起；shift 可表示引用历史（1=昨日）——
+# def ANY_TAG(pattern: str, shift: int = 0):
+#     """
+#     pattern: 子串或正则（自动识别）。多个关键词可用竖线 '|' 写在一起（视为“或”）。
+#     shift  : 0=当日，1=昨日，2=前日...
+#     规则：在 df.columns 里寻找“列名包含 pattern（不区分大小写）”的列，逐列转布尔后做 OR。
+#     """
+#     import re, pandas as pd
+#     df = EXTRA_CONTEXT.get("DF", None)
+#     if df is None or getattr(df, "empty", True):
+#         # 兜底：给一个全 False 的布尔序列
+#         return pd.Series(False, index=getattr(df, "index", None))
+
+#     pat = pattern.strip()
+#     # 自动判断是否按正则：含有正则元字符就按正则匹配，否则按不区分大小写的子串匹配
+#     is_regex = bool(re.search(r"[.^$*+?{}\[\]|()]", pat))
+#     if not is_regex and "|" in pat:
+#         # 多关键字 OR：拆开做子串匹配
+#         keys = [k.strip() for k in pat.split("|") if k.strip()]
+#         cols = [c for c in df.columns
+#                 if any(k.lower() in str(c).lower() for k in keys)]
+#     else:
+#         if is_regex:
+#             rx = re.compile(pat, flags=re.IGNORECASE)
+#             cols = [c for c in df.columns if rx.search(str(c))]
+#         else:
+#             cols = [c for c in df.columns if pat.lower() in str(c).lower()]
+
+#     if not cols:
+#         return pd.Series(False, index=df.index)
+
+#     custom = _iter_custom_tag_series(pat, getattr(df, 'index', None))
+#     if not cols and not custom:
+#         return pd.Series(False, index=df.index)
+    
+#     agg = None
+#     for c in cols:
+#         try:
+#             s = _coerce_bool_series(df[c])
+#         except Exception:
+#             continue
+#         agg = s if agg is None else (agg | s)
+#     for name, s in custom:
+#         try:
+#             s = _coerce_bool_series(s)
+#         except Exception:
+#             continue
+#         agg = s if agg is None else (agg | s)
+
+#     if agg is None:
+#         agg = pd.Series(False, index=df.index)
+
+#     if int(shift) != 0:
+#         agg = agg.shift(int(shift)).fillna(False)
+
+#     return agg
+
 def ANY_TAG(pattern: str, shift: int = 0):
-    """
-    pattern: 子串或正则（自动识别）。多个关键词可用竖线 '|' 写在一起（视为“或”）。
-    shift  : 0=当日，1=昨日，2=前日...
-    规则：在 df.columns 里寻找“列名包含 pattern（不区分大小写）”的列，逐列转布尔后做 OR。
-    """
     import re, pandas as pd
     df = EXTRA_CONTEXT.get("DF", None)
     if df is None or getattr(df, "empty", True):
-        # 兜底：给一个全 False 的布尔序列
         return pd.Series(False, index=getattr(df, "index", None))
 
     pat = pattern.strip()
-    # 自动判断是否按正则：含有正则元字符就按正则匹配，否则按不区分大小写的子串匹配
     is_regex = bool(re.search(r"[.^$*+?{}\[\]|()]", pat))
+    # 先确定 df 列匹配
     if not is_regex and "|" in pat:
-        # 多关键字 OR：拆开做子串匹配
         keys = [k.strip() for k in pat.split("|") if k.strip()]
-        cols = [c for c in df.columns
-                if any(k.lower() in str(c).lower() for k in keys)]
+        cols = [c for c in df.columns if any(k.lower() in str(c).lower() for k in keys)]
     else:
-        if is_regex:
-            rx = re.compile(pat, flags=re.IGNORECASE)
-            cols = [c for c in df.columns if rx.search(str(c))]
-        else:
-            cols = [c for c in df.columns if pat.lower() in str(c).lower()]
+        cols = [c for c in df.columns if (re.compile(pat, re.I).search(str(c)) if is_regex else pat.lower() in str(c).lower())]
 
-    if not cols:
-        return pd.Series(False, index=df.index)
-
+    # 再取自定义标签（与 df.index 对齐）
     custom = _iter_custom_tag_series(pat, getattr(df, 'index', None))
+
+    # 两者都空，才返回空序列
     if not cols and not custom:
         return pd.Series(False, index=df.index)
-    
+
     agg = None
     for c in cols:
         try:
@@ -229,7 +273,7 @@ def ANY_TAG(pattern: str, shift: int = 0):
         except Exception:
             continue
         agg = s if agg is None else (agg | s)
-    for name, s in custom:
+    for _, s in custom:
         try:
             s = _coerce_bool_series(s)
         except Exception:
@@ -238,10 +282,8 @@ def ANY_TAG(pattern: str, shift: int = 0):
 
     if agg is None:
         agg = pd.Series(False, index=df.index)
-
     if int(shift) != 0:
         agg = agg.shift(int(shift)).fillna(False)
-
     return agg
 
 # 语义糖：专指“昨日任意匹配标签为 True”
