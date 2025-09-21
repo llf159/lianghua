@@ -6,7 +6,7 @@
 import pandas as pd
 import os
 import logging
-
+import re
 
 def ensure_datetime_index(df, file_path=None):
     for date_col in ['trade_date', 'date', '交易日期', 'datetime']:
@@ -42,7 +42,6 @@ def normalize_trade_date(df: pd.DataFrame, col: str = "trade_date") -> pd.DataFr
     df[col] = td.dt.strftime("%Y%m%d")
     return df
 
-import re
 
 def normalize_ts(ts_input: str, asset: str = "stock") -> str:
     """

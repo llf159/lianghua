@@ -1,35 +1,4 @@
 ﻿# -*- coding: utf-8 -*-
-"""
-py — 将“跟踪(Tracking) / 大涨单子(Surge)”统一接入 score_engine 的钩子
-
-用法：在你的 score_engine.py 的 run_for_date(...) 里，写完
-    - output/score/top/score_top_<ref>.csv
-    - output/score/all/score_all_<ref>.csv
-后，调用：
-# [merged] 
-    from stats_core import post_scoring  # removed import due to merge
-    post_scoring(ref_date, df_all_scores=out_all)  # out_all 为你刚写盘的全市场 DataFrame
-
-本模块会：
-  1) 按 config 中（若无则使用内置默认）的参数调用“跟踪”与“Surge 单子”；
-  2) 所有步骤都 try/except 防护，不影响原打分流程；
-  3) 产出文件落在：
-        output/tracking/<ref>/tracking_{detail,summary}.{parquet|csv}
-        output/surge_lists/<ref>/*.{parquet|csv}
-
-可配项（从 config 读取，不存在则用默认）：
-  SC_DO_TRACKING: bool = True
-  SC_TRACKING_WINDOWS: list[int] = [1,2,3,5,10,20]
-  SC_TRACKING_BENCHMARKS: list[str] = []
-  SC_TRACKING_GROUP_BY_BOARD: bool = True
-
-  SC_DO_SURGE: bool = True
-  SC_SURGE_MODE: str = "rolling"          # "today" | "rolling"
-  SC_SURGE_ROLLING_DAYS: int = 5
-  SC_SURGE_SELECTION: dict = {"type":"top_n","value":200}
-  SC_SURGE_RETRO_DAYS: list[int] = [1,2,3,4,5]
-  SC_SURGE_SPLIT: str = "main_vs_others"   # 或 "per_board"
-"""
 from __future__ import annotations
 
 import logging
@@ -80,7 +49,7 @@ def post_scoring(ref_date: str, *, df_all_scores: Optional[pd.DataFrame] = None)
 
     # 1) 跟踪（Tracking）
     try:
-        if _get("SC_DO_TRACKING", True):
+        if _get("SC_DO_TRACKING", False):
             wins = _get("SC_TRACKING_WINDOWS", [1,2,3,5,10,20])
             bench = _get("SC_TRACKING_BENCHMARKS", [])
             gb_board = bool(_get("SC_TRACKING_GROUP_BY_BOARD", True))
@@ -96,7 +65,7 @@ def post_scoring(ref_date: str, *, df_all_scores: Optional[pd.DataFrame] = None)
 
     # 2) Surge 单子 + 回看
     try:
-        if _get("SC_DO_SURGE", True):
+        if _get("SC_DO_SURGE", False):
             mode = _get("SC_SURGE_MODE", "rolling")
             k = int(_get("SC_SURGE_ROLLING_DAYS", 5))
             sel = _get("SC_SURGE_SELECTION", {"type": "top_n", "value": 200})
@@ -775,7 +744,6 @@ def run_surge(
     return SurgeResult(table=table, out_path=out_path if save else None, group_files=group_files or None)
 
 # ------------------------- 小工具 -------------------------
-
 def _load_callable(spec_or_fn: str | Callable) -> Callable:
     if callable(spec_or_fn):
         return spec_or_fn
@@ -801,7 +769,6 @@ def _prev_trade_date(ref_date: str, d: int) -> str:
     return cal[j]
 
 # ------------------------- 默认 Analyzer（可选用） -------------------------
-
 def analyzer_basic(pos_df: pd.DataFrame, ref_df: pd.DataFrame, meta: dict) -> dict:
     """轻量统计：对数值列给出 pos/ref 的均值、P25/50/75、差值与比值。
     仅作为示例，若你提供自定义 analyzers，可不使用本函数。
@@ -1021,7 +988,7 @@ def run_commonality(
 
 
         # 5.6 汇总：将所有分组的 strategy_triggers 合并为一个无后缀表
-# ，方便 UI 直接使用
+        # ，方便 UI 直接使用
         try:
             keys = [k for k in reports_all.keys() if str(k).startswith("strategy_triggers__")]
             if keys:

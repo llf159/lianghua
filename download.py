@@ -144,6 +144,8 @@ def _decide_symbol_adj_for_fast_init() -> str:
     except Exception:
         pass
     return (API_ADJ).lower()
+
+
 def _maybe_compact(dirpath: str):
     mode = str(DUCKDB_ENABLE_COMPACT_AFTER).lower()
     if mode in ("false", "0", "off", "none"):
@@ -1286,6 +1288,7 @@ def fast_init_download(end_date: str):
         logging.debug('[BRANCH] def fast_init_download | ELSE of IF FAILED_RETRY_ONCE and failed_codes -> taken')
         logging.info("[FAST_INIT] 无需补抓或无失败股票。")
 
+
 def duckdb_merge_symbol_products_to_daily(batch_days:int=30):
     import duckdb, os
     from math import ceil
@@ -1441,6 +1444,8 @@ def _with_api_adj(temp_api_adj: str, fn, *args, **kwargs):
                 pass
         else:
             _TLS.adj_override = prev
+
+
 def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0):
     """
     NORMAL(日常增量)的核心补全：
