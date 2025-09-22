@@ -734,7 +734,12 @@ if _in_streamlit():
         except Exception:
             options_codes = []
         with c1:
-            code_from_list = st.selectbox("从 Top-K 选择（可选）", options=options_codes or [], index=0 if options_codes else None, placeholder="也可手动输入 ↓")
+            # code_from_list = st.selectbox("从 Top-K 选择（可选）", options=options_codes or [], index=0 if options_codes else None, placeholder="也可手动输入 ↓")
+            code_from_list = st.selectbox("从 Top-K 选择（可选）", options=options_codes or [],
+                                        index=0 if options_codes else None,
+                                        placeholder="也可手动输入 ↓", key="detail_code_from_top")
+
+                    
         code_typed = st.text_input("或手动输入股票代码", value=(code_from_list or ""), key="detail_code_input")
         code_norm = normalize_ts(code_typed) if code_typed else ""
 
@@ -861,20 +866,39 @@ if _in_streamlit():
                     st.dataframe(rules, use_container_width=True, height=420)
                 else:
                     st.info("无规则明细。")
-
+                # st.markdown('<div id="rank_rule_anchor"></div>', unsafe_allow_html=True)
+                st.markdown('<div id="detail_rule_anchor_detail"></div>', unsafe_allow_html=True)
                 with st.expander("按触发某规则筛选（当日全市场）", expanded=True):
-                    st.caption("说明：基于当日 details JSON，筛出‘命中该规则’的股票；按 Score 降序（得分相同则按代码升序）。")
-                    # 规则名下拉：默认列出当前票当日详情里的规则名，方便选择
-                    rule_names = [r.get("name") for r in (data.get("rules") or []) if r.get("name")]
-                    chosen_rule_name = st.selectbox("选择规则（指标）", options=sorted(set(rule_names)) if rule_names else [], 
-                                                    index=0 if rule_names else None, placeholder="请选择一个规则名")
-                    colL, colR = st.columns([1,1])
-                    with colL:
-                        only_topk = st.checkbox("仅限当日 Top-K 范围", value=True)
-                    with colR:
-                        run_filter = st.button("筛选当日命中标的", use_container_width=True)
+                    with st.form("detail_rule_filter"):
+                        st.caption("说明：基于当日 details JSON，筛出‘命中该规则’的股票；按 Score 降序（得分相同则按代码升序）。")
+
+                        rule_names = [r.get("name") for r in (data.get("rules") or []) if r.get("name")]
+                        options = sorted(set(rule_names)) if rule_names else []
+                        # 让选择在 rerun 后也能保持
+                        default_idx = (options.index(st.session_state.get("detail_rule_name"))
+                                    if st.session_state.get("detail_rule_name") in options
+                                    else (0 if options else None))
+                        chosen_rule_name = st.selectbox(
+                            "选择规则（指标）",
+                            options=options,
+                            index=default_idx,
+                            placeholder="请选择一个规则名",
+                            key="detail_rule_name",
+                        )
+
+                        colL, colR = st.columns([1, 1])
+                        with colL:
+                            limit_n = st.number_input(
+                                "最多显示/导出 N 条",
+                                min_value=10, max_value=5000, value=200, step=10,
+                                key="detail_rulehits_limit_n",
+                            )
+                        with colR:
+                            run_filter = st.form_submit_button("筛选当日命中标的", use_container_width=True)
 
                     if run_filter:
+                        # st.session_state["scroll_after_rerun"] = "detail_rule_anchor"
+                        st.session_state["scroll_after_rerun"] = "detail_rule_anchor_detail"
                         if not ref_real:
                             st.error("未能确定参考日。")
                         elif not chosen_rule_name:
@@ -886,11 +910,6 @@ if _in_streamlit():
                             try:
                                 # 可选：用 All 文件限制 universe（Top-K）
                                 allow_set = None
-                                if only_topk:
-                                    df_allx = _read_df(_path_all(ref_real), dtype={"ts_code": str}, encoding="utf-8-sig")
-                                    if not df_allx.empty:
-                                        # 若有 rank 列，默认 All 即全市场；若你希望严格 Top-K，可在这里进一步 head(K)
-                                        allow_set = set(df_allx["ts_code"].astype(str))
                                 if ddir.exists():
                                     for p in ddir.glob("*.json"):
                                         try:
@@ -918,12 +937,21 @@ if _in_streamlit():
                                 else:
                                     # 排序：score 降序；分数相同按代码升序（作为最终 tiebreak）
                                     df_hit = df_hit.sort_values(["score", "ts_code"], ascending=[False, True]).reset_index(drop=True)
-                                    st.dataframe(df_hit, use_container_width=True, height=420)
-                                    # 导出 & 复制
-                                    codes = df_hit["ts_code"].astype(str).tolist()
-                                    txt = _codes_to_txt(codes, st.session_state["export_pref"]["style"], st.session_state["export_pref"]["with_suffix"])
-                                    copy_txt_button(txt, label="📋 复制筛选结果（按当前预览）", key=f"copy_rulehits_{ref_real}_{chosen_rule_name}")
-                                    _download_txt("导出筛选结果 TXT", txt, f"rulehits_{normalize_ts(chosen_rule_name)}_{ref_real}.txt", key="dl_rule_hits")
+
+                                    # 按 N 截断用于展示/导出
+                                    n = int(limit_n) if "limit_n" in locals() else 200
+                                    df_show = df_hit.head(n)
+
+                                    st.caption(f"命中 {len(df_hit)} 只；显示前 {len(df_show)} 只")
+                                    st.dataframe(df_show, use_container_width=True, height=420)
+
+                                    # 导出 & 复制（基于“当前预览”的前 N 只）
+                                    codes = df_show["ts_code"].astype(str).tolist()
+                                    txt = _codes_to_txt(
+                                        codes,
+                                        st.session_state["export_pref"]["style"],
+                                        st.session_state["export_pref"]["with_suffix"]
+                                    )
                             except Exception as e:
                                 st.error(f"筛选失败：{e}")
 
@@ -1005,8 +1033,10 @@ if _in_streamlit():
                 # st.session_state["tester_rule_json"] = json.dumps(empty_rule, ensure_ascii=False, indent=2)
                 st.session_state["tester_rule_json"] = ""
             st.button("🧹 一键清空", use_container_width=True, on_click=_clear_tester_rule)
-            ref_in = st.text_input("参考日（留空=自动最新）", value="")
-            ts_in = st.text_input("个股代码", value="")
+            # ref_in = st.text_input("参考日（留空=自动最新）", value="")
+            # ts_in = st.text_input("个股代码", value="")
+            ref_in = st.text_input("参考日（留空=自动最新）", value="", key="tester_ref_input")
+            ts_in = st.text_input("个股代码", value="", key="tester_ts_input")
             uni_choice = st.selectbox("名单", ["全市场","仅白名单","仅黑名单"], index=0, key="tester_uni")
             _uni_map = {"全市场":"all", "仅白名单":"white", "仅黑名单":"black", "仅特别关注榜":"attention"}
 
@@ -1897,15 +1927,24 @@ if _in_streamlit():
                     first_trade = str(pd.to_datetime(tr["date"].astype(str), errors="coerce").dt.strftime("%Y%m%d").min())
                     # 起点 = 首笔成交日前一个“交易日”
                     date_start_use = _prev_trade_date(first_trade, 1)
+                # else:
+                #     # 没有成交记录就从观察日开始（避免从远古起算）
+                #     date_start_use = str(obs) if 'obs' in locals() else str(ref)
+                # nav = pm.reprice_and_nav(cur_pid,
+                #                         date_start=str(date_start_use),
+                #                         date_end=str(ref),
+                #                         price_mode=price_mode,
+                #                         asset=asset)
                 else:
                     # 没有成交记录就从观察日开始（避免从远古起算）
-                    date_start_use = str(obs) if 'obs' in locals() else str(ref)
-                nav = pm.reprice_and_nav(cur_pid,
-                                        date_start=str(date_start_use),
-                                        date_end=str(ref),
-                                        price_mode=price_mode,
-                                        asset=asset)
+                    date_start_use = str(obs)
 
+                pm.reprice_and_nav(
+                    cur_pid,
+                    date_start=str(date_start_use),
+                    date_end=str(obs),
+                    benchmarks=(),
+                )
                 nav_df = pm.read_nav(cur_pid)
                 pos_df = pm.read_positions(cur_pid)
             except Exception as e:
@@ -2254,3 +2293,45 @@ if _in_streamlit():
         with col2:
             st.markdown("**score_ui.log（尾部 400 行）**")
             st.code(_tail(LOG_DIR / "score_ui.log", 400), language="bash")
+
+    # _anchor = st.session_state.pop("scroll_after_rerun", None)
+    # if _anchor:
+    #     components.html(
+    #         f"<script>document.getElementById('{_anchor}')?.scrollIntoView({{behavior:'instant', block:'start'}});</script>",
+    #         height=0,
+    #     )
+
+    # _anchor = st.session_state.pop("scroll_after_rerun", None)
+    # if _anchor:
+    #     components.html(
+    #         f"<script>parent.document.getElementById('{_anchor}')?.scrollIntoView({{behavior:'instant', block:'start'}});</script>",
+    #         height=0,
+    #     )
+
+    _anchor = st.session_state.pop("scroll_after_rerun", None)
+    if _anchor:
+        components.html(f"""
+        <script>
+        (function() {{
+        const id = {_anchor!r};
+        function go() {{
+            const doc = parent.document || document;
+            // 1) 激活“个股详情”页签（按钮 role="tab"，文本以“个股详情”开头）
+            const tabs = doc.querySelectorAll('button[role="tab"]');
+            for (const btn of tabs) {{
+            if ((btn.innerText || '').trim().startsWith('个股详情')) {{ btn.click(); break; }}
+            }}
+            // 2) 滚动到锚点
+            const el = doc.getElementById(id);
+            if (el) {{
+            el.scrollIntoView({{behavior:'instant', block:'start'}});
+            }} else {{
+            // 兜底：把 hash 设置为锚点
+            parent.location.hash = id;
+            }}
+        }}
+        // 多次尝试，等外层 DOM 稳定
+        setTimeout(go, 0); setTimeout(go, 200); setTimeout(go, 600);
+        }})();
+        </script>
+        """, height=0)

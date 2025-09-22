@@ -4,34 +4,15 @@
 
 ## 1) 环境配置（优先）
 
-### 1.1 Python 版本与虚拟环境
-- 推荐 **Python 3.10 ~ 3.12**。  
-- 强烈建议使用虚拟环境：
-
-```bash
-# 任一平台（venv）
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-
-# macOS/Linux
-source .venv/bin/activate
-```
+### 1.1 Python 版本
+- 推荐 **Python 3.10+**。  
 
 ### 1.2 安装依赖
 **基础依赖（必须）**：
 ```bash
 pip install -U pip
-pip install pandas numpy pyarrow duckdb tushare tqdm streamlit
+pip install pandas numpy pyarrow duckdb tushare tqdm streamlit plotly matplotlib xlsxwriter tabulate openpyxl
 ```
-- `pyarrow`：Parquet 读写；`duckdb`：大规模扫描/合并；`tushare`：数据源；`streamlit`：可视化 UI。
-
-**可选 / 扩展**（绘图、导出）：
-```bash
-pip install plotly matplotlib xlsxwriter tabulate openpyxl
-```
-
 ### 1.3 Windows 一键脚本（可选）
 - `setup_win.bat` 会一次性安装常用包（若缺 `duckdb/tushare/streamlit`，请再手动执行上面的基础依赖安装）。  
 - `app_score.bat` 一键启动评分界面（等同 `streamlit run score_ui.py`）。
@@ -44,13 +25,19 @@ pip install plotly matplotlib xlsxwriter tabulate openpyxl
 
 ### 2.1 如何获取 Token
 1. 访问 [Tushare 官网](https://tushare.pro)，注册并登录 **Tushare Pro**；  
+
 2. 进入“个人中心 / 账号 / Token”，复制你的 **个人 Token**。
+
+3. 本程序使用了付费数据，请通过官网付费通道购买200元积分；
+
+   或使用免费不复权数据，需要修改download接口调用和限频器参数
 
 > 建议把 Token 视为**私密凭证**，不要提交到公开仓库。
 
 ### 2.2 在本项目里配置 Token 的两种方式
 
-**方式 A：环境变量（推荐）**  
+**方式 A：环境变量  
+
 - Windows PowerShell：
   ```powershell
   $env:TUSHARE_TOKEN="你的token"
@@ -64,7 +51,8 @@ pip install plotly matplotlib xlsxwriter tabulate openpyxl
   export TUSHARE_TOKEN="你的token"
   ```
 
-**方式 B：写入 `config.py`**  
+**方式 B：写入 `config.py`**  (简单)
+
 - 打开项目根目录 `config.py`，设置：
   ```python
   TOKEN = "你的token"
@@ -227,5 +215,3 @@ REGISTRY["my_ind"] = IndMeta(
 - 读取不到数据 → 确认 `PARQUET_BASE` 与 `DATA_ROOT` 对齐；复权口径与是否带指标一致。  
 - Windows 中文路径/盘符问题 → 尽量使用英文路径（例如 `D:\stock_data`）。  
 - 代理/网络 → 默认不走代理；若必须代理，请在启动前设置系统级代理环境变量。
-
-—— 祝玩得开心！
