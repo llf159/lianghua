@@ -412,6 +412,11 @@ VAR_MAP = {
     "AMOUNT": "df['amount']",
     "REFDATE": "REF_DATE",
     "J": "df['j']",
+    "j": "df['j']",  # 添加小写版本
+    "K": "df['k']",
+    "k": "df['k']",  # 添加小写版本
+    "D": "df['d']",
+    "d": "df['d']",  # 添加小写版本
     "VR": "df['vr']",
     "Z_SLOPE": "df['z_slope']",
     "BBI": "df['bbi']",
@@ -583,6 +588,13 @@ def evaluate(script, df, extra_context=None):
     }
     if extra_context:
         ctx.update(extra_context) 
+    
+    # 添加 DataFrame 列的动态访问支持
+    # 这样 VAR_MAP 中的 "J": "df['j']" 就能正确工作
+    for col in df.columns:
+        if isinstance(col, str) and col.isidentifier():
+            ctx[f"df['{col}']"] = df[col]
+    
     results = {}
     last_value = None
     for name, expr in program:

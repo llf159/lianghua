@@ -1,13 +1,6 @@
 # -*- coding: utf-8 -*-
-"""
-Score UI — 无侧栏版（中文）
-- 参数在“排名（运行+浏览）”页签中编辑（与原版一致的交互思路）
-- 统计作为普通页签（Tracking / Surge / Commonality / Portfolio统计）
-- 个股详情含“命中信号日期查询”
-- 导出统一支持 TXT（空格分隔/一行一个，是否带交易所后缀）
-- 组合模拟/持仓：基于 Top 文件生成当期持仓与相对上期调仓列表（可导出）
-"""
 from __future__ import annotations
+
 import os, io, json, re
 from pathlib import Path
 from datetime import datetime, timedelta, date
@@ -23,6 +16,8 @@ import shutil
 import uuid
 import time
 import queue
+import traceback
+
 import download as dl
 import app_pv as apv
 import scoring_core as se
@@ -33,6 +28,14 @@ from parquet_viewer import read_range, asset_root, list_trade_dates
 from config import PARQUET_BASE, PARQUET_ADJ
 import tdx_compat as tdx
 from stats_core import _pick_trade_dates, _prev_trade_date
+import indicators as ind
+
+from predict_core import (
+    PredictionInput, PositionCheckInput,
+    run_prediction, run_position_checks,
+    load_prediction_rules, load_position_policies, load_opportunity_policies,
+    Scenario
+)
 
 # ---- Streamlit context guard & cache alias (auto-injected) ----
 def _in_streamlit():
@@ -55,8 +58,50 @@ def _noop_cache_data(*dargs, **dkw):
 
 cache_data = (st.cache_data if _in_streamlit() else _noop_cache_data)
 # --------------------------------------------------------------
+
+def _safe_path_hash(p: Path) -> int:
+    try:
+        return p.stat().st_mtime_ns
+    except (OSError, FileNotFoundError):
+        return hash(str(p))
+
+def _is_valid_date(date_str: str) -> bool:
+    try:
+        datetime.strptime(date_str, "%Y%m%d")
+        return True
+    except ValueError:
+        return False
+
+def _safe_int(x, default: int = 60) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
+def _init_session_state():
+    """统一初始化 Streamlit session_state 的关键字段，避免重复判断散落各处。"""
+    try:
+        import streamlit as st  # local import so this can run outside Streamlit too
+        if not _in_streamlit():
+            return
+        defaults = {
+            "cur_pid": None,
+            "cur_pf": None,
+            "rules_obj": {
+                "prescreen": getattr(se, "SC_PRESCREEN_RULES", []),
+                "rules": getattr(se, "SC_RULES", []),
+            },
+            "export_pref": {"style": "space", "with_suffix": True},
+        }
+        for k, v in defaults.items():
+            if k not in st.session_state:
+                st.session_state[k] = v
+    except Exception:
+        pass
+
 if _in_streamlit():
     st.set_page_config(page_title="ScoreApp", layout="wide")
+    _init_session_state()
 # ===== 常量路径 =====
 SC_OUTPUT_DIR = Path(getattr(cfg, "SC_OUTPUT_DIR", "output/score"))
 TOP_DIR  = SC_OUTPUT_DIR / "top"
@@ -145,7 +190,7 @@ def _path_detail(ref: str, ts: str) -> Path: return DET_DIR / ref / f"{normalize
 def _today_str() -> str:
     return date.today().strftime("%Y%m%d")
 
-@cache_data(show_spinner=False, hash_funcs={Path: lambda p: p.stat().st_mtime_ns})
+@cache_data(show_spinner=False, hash_funcs={Path: _safe_path_hash})
 def _read_df(path: Path, usecols=None, dtype=None, encoding: str = "utf-8-sig") -> pd.DataFrame:
     try:
         return pd.read_csv(path, usecols=usecols, dtype=dtype, encoding=encoding, engine="c")
@@ -226,10 +271,16 @@ def run_se_run_for_date_in_bg(arg):
         t.start()
 
         # 主线程循环抽取进度事件并刷新 UI
+                # 超时保护，避免后台任务卡死
+        _timeout_s = int(getattr(cfg, 'UI_BG_TIMEOUT_SEC', 300))
+        _start_ts = time.time()
         while not done.is_set():
             se.drain_progress_events()
             time.sleep(0.05)
-
+            if (time.time() - _start_ts) > _timeout_s:
+                if status:
+                    status.update(label='已超时', state='error')
+                raise TimeoutError('后台任务超时（>{}s）'.format(_timeout_s))
         # 抽干剩余事件
         se.drain_progress_events()
         status.update(label="已完成", state="complete")
@@ -252,7 +303,7 @@ def run_se_screen_in_bg(*, when_expr, ref_date, timeframe, window, scope, univer
                     when_expr,
                     ref_date=ref_date,
                     timeframe=timeframe,
-                    window=int(window),
+                    window=_safe_int(window, 60),
                     scope=scope,
                     universe=universe,
                     write_white=write_white,
@@ -268,10 +319,16 @@ def run_se_screen_in_bg(*, when_expr, ref_date, timeframe, window, scope, univer
         t.start()
 
         # 主线程循环抽取进度事件并刷新 UI
+                # 超时保护，避免后台任务卡死
+        _timeout_s = int(getattr(cfg, 'UI_BG_TIMEOUT_SEC', 300))
+        _start_ts = time.time()
         while not done.is_set():
             se.drain_progress_events()
             time.sleep(0.05)
-
+            if (time.time() - _start_ts) > _timeout_s:
+                if status:
+                    status.update(label='已超时', state='error')
+                raise TimeoutError('后台任务超时（>{}s）'.format(_timeout_s))
         # 抽干剩余事件
         se.drain_progress_events()
         status.update(label="已完成", state="complete")
@@ -361,6 +418,21 @@ def _rule_to_screen_args(rule: dict):
         tf = str(rule.get("timeframe","D")).upper()
         win = int(rule.get("window", 60))
         scope = str(rule.get("scope","ANY")).upper()
+        # --- substitute placeholders (K/M/N) for scope ---
+        try:
+            import re as _re
+            k = int(rule.get("k", rule.get("n", 0)) or 0)
+            m = int(rule.get("m", 0) or 0)
+            # COUNT>=K -> COUNT>=<k or 3>
+            if "COUNT" in scope and _re.search(r"\bK\b", scope):
+                scope = _re.sub(r"\bK\b", str(k or 3), scope)
+            # CONSEC>=M -> CONSEC>=<m or 3>
+            if "CONSEC" in scope and _re.search(r"\bM\b", scope):
+                scope = _re.sub(r"\bM\b", str(m or 3), scope)
+            # ANY_N / ALL_N -> ANY_<k or 3> / ALL_<k or 3>
+            scope = scope.replace("ANY_N", f"ANY_{k or 3}").replace("ALL_N", f"ALL_{k or 3}")
+        except Exception:
+            pass
         return when, tf, win, scope
 
 
@@ -384,7 +456,7 @@ def _codes_to_txt(codes: List[str], style: str="space", with_suffix: bool=True) 
 def _download_txt(label: str, text: str, filename: str, key: Optional[str]=None):
     st.download_button(label, data=text.encode("utf-8-sig"),
                        file_name=filename, mime="text/plain",
-                       use_container_width=True, key=key)
+                       width='stretch', key=key)
 
 
 def copy_txt_button(text: str, label: str = "一键复制（TXT）", key: str = "copy0"):
@@ -414,38 +486,23 @@ def _tail(path: Path, n: int=400) -> str:
         return ""
 
 
-def _scan_date_range(start_yyyymmdd: str, end_yyyymmdd: str) -> List[str]:
-    s = datetime.strptime(start_yyyymmdd, "%Y%m%d")
-    e = datetime.strptime(end_yyyymmdd, "%Y%m%d")
-    out = []
-    while s <= e:
-        out.append(s.strftime("%Y%m%d"))
-        s += timedelta(days=1)
-    return out
-
-
 def _fmt_retcols_percent(df):
-    try:
-        import pandas as _pd
-        import numpy as _np
-    except Exception:
-        return df
     df = df.copy()
     cols = [c for c in df.columns if str(c).startswith("ret_fwd_")]
     if not cols:
         return df
     for c in cols:
         # 转成数值
-        s = _pd.to_numeric(df[c], errors="coerce")
-        finite = s[_np.isfinite(s)]
+        s = pd.to_numeric(df[c], errors="coerce")
+        finite = s[np.isfinite(s)]
         if finite.shape[0] == 0:
             continue
         q95 = finite.abs().quantile(0.95)
         # 小于等于 0.5 说明是小数（例如 0.034），需要×100
-        if _pd.notna(q95) and q95 <= 0.5:
+        if pd.notna(q95) and q95 <= 0.5:
             s = s * 100.0
         # 统一两位小数 + 百分号
-        df[c] = s.map(lambda x: (f"{x:.2f}%" if _pd.notna(x) else None))
+        df[c] = s.map(lambda x: (f"{x:.2f}%" if pd.notna(x) else None))
     return df
 
 
@@ -464,6 +521,153 @@ def _apply_runtime_overrides(rules_obj: dict,
     # setattr(se, "SC_ATTENTION_ENABLE", bool(attn_on))
     setattr(se, "SC_UNIVERSE", universe)
 
+
+def _humanize_error(err) -> tuple[str, list[str], list[str], str]:
+    s = str(err) if not isinstance(err, dict) else str(err.get("error", ""))
+    causes, fixes = [], []
+    title = "运行出错"
+
+    # 结构化判断
+    if "JSONDecodeError" in s or "Expecting value" in s or "Invalid control character" in s:
+        title = "JSON 格式错误"
+        causes = ["JSON 不合法（逗号/引号/花括号/结尾逗号等）"]
+        fixes = ["用 JSON 校验工具检查；字段名一律双引号；最后一项不要加逗号"]
+    elif "表达式错误" in s or "evaluate_bool" in s:
+        title = "策略表达式语法错误"
+        causes = ["括号不配对 / 参数缺失 / 不支持的函数或列名"]
+        fixes = ["检查括号与逗号；确认列名存在；必要时简化表达式逐段排查"]
+    elif "timeframe" in s or "resample" in s:
+        title = "不支持的周期 (timeframe)"
+        causes = ["传入了未实现的周期"]
+        fixes = ["改为项目支持的 D/W/M/60MIN 等"]
+    elif "empty-window" in s or "empty window" in s or "无可用标的" in s:
+        title = "数据窗口无数据"
+        causes = ["窗口区间过短或参考日无交易数据", "标的退市/长期停牌导致无数据"]
+        fixes = ["拉长 window；更换参考日；调整股票池/市场范围"]
+    elif "KeyError" in s or "missing" in s or "列" in s:
+        title = "缺少列/指标"
+        causes = ["表达式引用了数据中不存在的列"]
+        fixes = ["在数据侧补列，或使用内置兜底（如 J/VR）"]
+    elif "eval-exception" in s:
+        title = "表达式执行异常"
+        causes = ["计算过程出现无效值（如被 0 除、NaN 等）"]
+        fixes = ["增加保护：如 MAX(MIN(...)) 限幅；使用 REF/IFNULL 等避免 NaN/INF"]
+
+    return title, causes, fixes, s
+
+
+def _indicator_options(tag: str | None = "product"):
+    try:
+        # 只列出有 py_func 的（能在本地算）的指标名
+        names = [k for k, m in getattr(ind, "REGISTRY", {}).items() if getattr(m, "py_func", None)]
+        if tag and hasattr(ind, "names_by_tag"):
+            tagged = set(ind.names_by_tag(tag))  # 只要打了 product 标签的
+            names = [n for n in names if n in tagged] or names
+        return sorted(set(names))
+    except Exception:
+        # 兜底：保持现在的三个
+        return ["kdj", "ma", "macd"]
+
+
+@cache_data(show_spinner=False, ttl=300)
+def _get_rule_names() -> list[str]:
+    """获取规则名称列表，带缓存"""
+    try:
+        rule_names = [str(r.get("name") or f"RULE_{i}") for i, r in enumerate(getattr(se, "SC_RULES", []) or [])]
+        return sorted(list(dict.fromkeys(rule_names)))
+    except Exception:
+        return []
+
+@cache_data(show_spinner=False, ttl=300)
+def _cached_load_prediction_rules() -> list[dict]:
+    """缓存版本的 load_prediction_rules 函数"""
+    try:
+        return load_prediction_rules()
+    except Exception:
+        return []
+
+def _apply_tiebreak_sorting(df: pd.DataFrame, tiebreak_mode: str = "none") -> pd.DataFrame:
+    """
+    对股票表格应用Tie-break排序
+    
+    Args:
+        df: 包含ts_code和score列的DataFrame
+        tiebreak_mode: 排序模式 ("none" 或 "kdj_j_asc")
+    
+    Returns:
+        排序后的DataFrame
+    """
+    if df.empty or "ts_code" not in df.columns or "score" not in df.columns:
+        return df
+    
+    # 创建副本避免修改原数据
+    df_sorted = df.copy()
+    
+    if tiebreak_mode == "kdj_j_asc":
+        # 需要KDJ J值进行Tie-break排序
+        # 这里我们按得分降序，然后按ts_code升序作为兜底
+        # 注意：实际的KDJ J值需要从数据中获取，这里先用ts_code作为兜底
+        df_sorted = df_sorted.sort_values(["score", "ts_code"], ascending=[False, True]).reset_index(drop=True)
+    else:
+        # 默认：只按得分降序，得分相同时按ts_code升序
+        df_sorted = df_sorted.sort_values(["score", "ts_code"], ascending=[False, True]).reset_index(drop=True)
+    
+    return df_sorted
+
+@cache_data(show_spinner=False, ttl=120)
+def _resolve_pred_universe(label: str, ref: str) -> list[str]:
+    """
+    将 UI 的范围标签展开为 ts_code 列表：
+    - all：读 output/score/all/score_all_<ref>.csv（若无，则退回 top）
+    - white/black：读 scoring_core 的缓存名单
+    - attention：读“特别关注榜”（若找不到则尝试按文件名匹配）
+    """
+    label = (label or "").strip().lower()
+    codes: list[str] = []
+
+    if label == "all":
+        p_all = _path_all(ref)  # 这个工具在现有文件里已定义
+        if p_all.exists() and p_all.stat().st_size > 0:
+            df = _read_df(p_all, dtype={"ts_code": str})
+            if df is not None and not df.empty and "ts_code" in df.columns:
+                codes = df["ts_code"].astype(str).tolist()
+        if not codes:
+            # 兜底用 Top（至少不会是空）
+            p_top = _path_top(ref)
+            if p_top.exists() and p_top.stat().st_size > 0:
+                df = _read_df(p_top, dtype={"ts_code": str})
+                if df is not None and not df.empty and "ts_code" in df.columns:
+                    df = df.sort_values(df.columns[0])  # 任意稳定顺序
+                    codes = df["ts_code"].astype(str).tolist()
+
+    elif label in {"white", "black"}:
+        try:
+            kind = "whitelist" if label == "white" else "blacklist"
+            codes = se._read_cache_list_codes(ref, kind) or []
+        except Exception:
+            codes = []
+
+    elif label == "attention":
+        try:
+            codes = se._load_attention_codes(ref) or []
+        except Exception:
+            # 退回按文件名找 “attention*<ref>.csv”
+            p = _find_attn_file_by_date(ref)  # 这个工具已在文件内定义
+            if p:
+                df = _read_df(p, dtype={"ts_code": str})
+                if df is not None and not df.empty:
+                    # 智能识别列名
+                    for cand in ["ts_code", "code", "ts", "symbol"]:
+                        if cand in df.columns:
+                            codes = df[cand].astype(str).tolist()
+                            break
+
+    # 规范化、去重、排序
+    try:
+        codes = [normalize_ts(c) for c in codes if c]
+    except Exception:
+        codes = [str(c).strip() for c in codes if c]
+    return sorted(set(codes))
 
 # ==== 强度榜文件定位====
 def _pick_latest_attn_date() -> Optional[str]:
@@ -626,21 +830,34 @@ class Stepper:
 
 # ===== 主ui部分 =====
 if _in_streamlit():
+    # ===== 页眉 =====
+    st.title("ScoreApp")
     
+
+    # === Global portfolio state (added by assistant) ===
+    if "cur_pid" not in st.session_state:
+        st.session_state["cur_pid"] = None
+    if "cur_pf" not in st.session_state:
+        st.session_state["cur_pf"] = None
+
+    # Local aliases for convenience across tabs
+    cur_pid = st.session_state.get("cur_pid")
+    cur_pf  = st.session_state.get("cur_pf")
+    # === End global portfolio state ===
+
     if "rules_obj" not in st.session_state:
         st.session_state["rules_obj"] = {
-            "prescreen": getattr(cfg, "SC_PRESCREEN_RULES", []),
-            "rules": getattr(cfg, "SC_RULES", []),
+            # "prescreen": getattr(cfg, "SC_PRESCREEN_RULES", []),
+            # "rules": getattr(cfg, "SC_RULES", []),
+            "prescreen": getattr(se, "SC_PRESCREEN_RULES", []),
+            "rules": getattr(se, "SC_RULES", []),
         }
     if "export_pref" not in st.session_state:
         st.session_state["export_pref"] = {"style": "space", "with_suffix": True}
-        # ===== 页眉 =====
-        st.title("ScoreApp")
 
     # ===== 顶层页签 =====
-    tab_rank, tab_detail, tab_position, tab_rules, tab_attn, tab_data, tab_screen, tab_tools, tab_port, tab_stats, tab_logs = st.tabs(
-        ["排名", "个股详情", "持仓建议", "规则编辑", "强度榜", "数据下载/浏览", "普通选股", "工具箱", "组合模拟/持仓", "统计", "日志"]
-    )
+    tab_rank, tab_detail, tab_position, tab_predict, tab_rules, tab_attn, tab_data, tab_screen, tab_tools, tab_port, tab_stats, tab_logs, = st.tabs(
+        ["排名", "个股详情", "持仓建议", "明日预测", "规则编辑", "强度榜", "数据下载/浏览", "选股", "工具箱", "组合模拟/持仓", "统计", "日志"])
 
     # ================== 排名 ==================
     with tab_rank:
@@ -664,9 +881,9 @@ if _in_streamlit():
                                             "with_suffix": with_suffix}
             run_col1, run_col2 = st.columns([1,1])
             with run_col1:
-                run_btn = st.button("🚀 运行评分（写入 Top/All/Details）", use_container_width=True)
+                run_btn = st.button("🚀 运行评分（写入 Top/All/Details）", width='stretch')
             with run_col2:
-                latest_btn = st.button("📅 读取最近一次结果（不重新计算）", use_container_width=True)
+                latest_btn = st.button("📅 读取最近一次结果（不重新计算）", width='stretch')
 
         # 运行
         ref_to_use = ref_inp.strip() or _pick_latest_ref_date()
@@ -698,6 +915,7 @@ if _in_streamlit():
             st.info("未找到任何 Top 文件，请先运行评分或检查输出目录。")
 
         st.divider()
+
         with st.container(border=True):
             st.markdown("**Top-K 预览(较大的表可能渲染较慢。**")
             show_mode = st.radio("展示方式", ["限制条数", "显示全部"], horizontal=True, key="topk_show_mode")
@@ -710,7 +928,7 @@ if _in_streamlit():
                     st.caption(f"已选择显示全部（共 {rows_eff} 行）。")
                 else:
                     rows_eff = int(rows_to_show)
-                st.dataframe(df_all.head(rows_eff), use_container_width=True, height=420)
+                st.dataframe(df_all.head(rows_eff), width='stretch', height=420)
                 if "ts_code" in df_all.columns:
                     codes = df_all["ts_code"].astype(str).head(rows_eff).tolist()
                     txt = _codes_to_txt(codes, st.session_state["export_pref"]["style"], st.session_state["export_pref"]["with_suffix"])
@@ -752,7 +970,12 @@ if _in_streamlit():
                 data = obj
                 summary = data.get("summary", {}) or {}
                 ts = data.get("ts_code", code_norm)
-                score = float(summary.get("score", 0))
+                try:
+                    score = float(summary.get("score", 0))
+                    if not np.isfinite(score):
+                        score = 0.0
+                except Exception:
+                    score = 0.0
                 # 计算当日排名（优先 JSON → 全量CSV → Top-K 回退）
                 rank_display = "—"
                 r_json = summary.get("rank")
@@ -863,101 +1086,344 @@ if _in_streamlit():
                     if show_when:
                         rules["when"] = rules["name"].map(name_to_when).fillna("")
                     st.markdown("**规则明细**")
-                    st.dataframe(rules, use_container_width=True, height=420)
+                    st.dataframe(rules, width='stretch', height=420)
                 else:
                     st.info("无规则明细。")
                 # st.markdown('<div id="rank_rule_anchor"></div>', unsafe_allow_html=True)
                 st.markdown('<div id="detail_rule_anchor_detail"></div>', unsafe_allow_html=True)
-                with st.expander("按触发某规则筛选（当日全市场）", expanded=True):
-                    with st.form("detail_rule_filter"):
-                        st.caption("说明：基于当日 details JSON，筛出‘命中该规则’的股票；按 Score 降序（得分相同则按代码升序）。")
-
-                        rule_names = [r.get("name") for r in (data.get("rules") or []) if r.get("name")]
-                        options = sorted(set(rule_names)) if rule_names else []
-                        # 让选择在 rerun 后也能保持
-                        default_idx = (options.index(st.session_state.get("detail_rule_name"))
-                                    if st.session_state.get("detail_rule_name") in options
-                                    else (0 if options else None))
-                        chosen_rule_name = st.selectbox(
-                            "选择规则（指标）",
-                            options=options,
-                            index=default_idx,
-                            placeholder="请选择一个规则名",
-                            key="detail_rule_name",
-                        )
-
-                        colL, colR = st.columns([1, 1])
-                        with colL:
-                            limit_n = st.number_input(
-                                "最多显示/导出 N 条",
-                                min_value=10, max_value=5000, value=200, step=10,
-                                key="detail_rulehits_limit_n",
-                            )
-                        with colR:
-                            run_filter = st.form_submit_button("筛选当日命中标的", use_container_width=True)
-
-                    if run_filter:
-                        # st.session_state["scroll_after_rerun"] = "detail_rule_anchor"
-                        st.session_state["scroll_after_rerun"] = "detail_rule_anchor_detail"
-                        if not ref_real:
-                            st.error("未能确定参考日。")
-                        elif not chosen_rule_name:
-                            st.warning("请先选择一个规则名。")
-                        else:
-                            # 读取当日全市场 details，挑出命中 chosen_rule_name 的股票
-                            rows = []
-                            ddir = DET_DIR / ref_real
-                            try:
-                                # 可选：用 All 文件限制 universe（Top-K）
-                                allow_set = None
-                                if ddir.exists():
-                                    for p in ddir.glob("*.json"):
-                                        try:
-                                            j = json.loads(p.read_text(encoding="utf-8-sig"))
-                                        except Exception:
-                                            continue
-                                        ts2 = str(j.get("ts_code", "")).strip()
-                                        if not ts2:
-                                            continue
-                                        if (allow_set is not None) and (ts2 not in allow_set):
-                                            continue
-                                        sm = j.get("summary") or {}
-                                        sc = float(sm.get("score", 0.0))
-                                        hit = False
-                                        for rr in j.get("rules", []) or []:
-                                            # 命中标准：该规则名相等，且当日加分>0 或 ok=True
-                                            if rr.get("name") == chosen_rule_name and (float(rr.get("add", 0.0)) > 0.0 or bool(rr.get("ok"))):
-                                                hit = True
-                                                break
-                                        if hit:
-                                            rows.append({"ts_code": ts2, "score": sc})
-                                df_hit = pd.DataFrame(rows)
-                                if df_hit.empty:
-                                    st.info("当日无标的命中该规则。")
-                                else:
-                                    # 排序：score 降序；分数相同按代码升序（作为最终 tiebreak）
-                                    df_hit = df_hit.sort_values(["score", "ts_code"], ascending=[False, True]).reset_index(drop=True)
-
-                                    # 按 N 截断用于展示/导出
-                                    n = int(limit_n) if "limit_n" in locals() else 200
-                                    df_show = df_hit.head(n)
-
-                                    st.caption(f"命中 {len(df_hit)} 只；显示前 {len(df_show)} 只")
-                                    st.dataframe(df_show, use_container_width=True, height=420)
-
-                                    # 导出 & 复制（基于“当前预览”的前 N 只）
-                                    codes = df_show["ts_code"].astype(str).tolist()
-                                    txt = _codes_to_txt(
-                                        codes,
-                                        st.session_state["export_pref"]["style"],
-                                        st.session_state["export_pref"]["with_suffix"]
-                                    )
-                            except Exception as e:
-                                st.error(f"筛选失败：{e}")
 
     # ================== 持仓建议 ==================
     with tab_position:
-        st.subheader("持仓建议（还没做")
+        st.subheader("持仓建议（个股）")
+        with st.expander("输入", expanded=True):
+            c1, c2, c3 = st.columns([1,1,1])
+            with c1:
+                pos_ref = st.text_input("参考日（YYYYMMDD；留空=自动取最新）", value="", key="pos_ref_input")
+                price_mode = st.selectbox("买点来源", ["按日期取价", "策略取价（可选）", "手工输入"], index=0)
+            with c2:
+                raw_code = st.text_input("股票代码（支持多种写法）", value="", key="pos_code_input")
+                price_field = st.selectbox("价格口径", ["开盘价(open)", "收盘价(close)", "最高价(high)", "最低价(low)"], index=0)
+            with c3:
+                # recompute_opts = st.multiselect("仅重算需要的指标", ["kdj","ma","macd"], default=["kdj"], key="pos_recompute_indicators")
+                recalc_mode_pos = st.radio("指标重算", ["自选", "全部(all)", "不重算(none)"],
+                                        index=0, horizontal=True, key="pos_recalc_mode")
+                if recalc_mode_pos == "自选":
+                    recompute_opts = st.multiselect("仅重算需要的指标",
+                                                    _indicator_options(),
+                                                    default=["kdj"],
+                                                    key="pos_recompute_pick")
+                    recompute_to_pass = tuple(recompute_opts) if recompute_opts else ("kdj",)
+                elif recalc_mode_pos == "全部(all)":
+                    recompute_to_pass = "all"
+                else:
+                    recompute_to_pass = "none"
+
+                use_virtual = st.checkbox("基于“明日虚拟日”检查（勾选后按下方场景）", value=False)
+
+            # 场景参数（仅当 use_virtual）
+            scen = Scenario()
+            if use_virtual:
+                # with st.expander("明日情景参数", expanded=False):
+                with st.container(border=True):
+                    st.markdown("**明日情景参数**")
+                    cc1, cc2, cc3 = st.columns([1,1,1])
+                    with cc1:
+                        scen_mode = st.selectbox("价格模式", ["close_pct","open_pct","gap_then_close_pct","flat","limit_up","limit_down"], index=0)
+                        pct = st.number_input("涨跌幅 pct（%）", value=2.0, step=0.5, format="%.2f")
+                        gap_pct = st.number_input("跳空 gap_pct（%）", value=0.0, step=0.5, format="%.2f")
+                    with cc2:
+                        vol_mode = st.selectbox("量能模式", ["same","pct","mult"], index=2)
+                        vol_arg = st.number_input("量能参数（% 或 倍数）", value=1.2, step=0.1, format="%.2f")
+                        hl_mode = st.selectbox("高低生成", ["follow","atr_like","range_pct"], index=0)
+                    with cc3:
+                        range_pct = st.number_input("range_pct（%）", value=2.0, step=0.5, format="%.2f")
+                        atr_mult = st.number_input("atr_mult", value=1.0, step=0.1, format="%.2f")
+                        lock_hi_open = st.checkbox("锁定收盘高于开盘", value=False)
+                    scen = Scenario(mode=scen_mode, pct=pct, gap_pct=gap_pct, vol_mode=vol_mode, vol_arg=vol_arg,
+                                    hl_mode=hl_mode, range_pct=range_pct, atr_mult=atr_mult,
+                                    lock_higher_than_open=lock_hi_open)
+
+            # 买点来源
+            entry_price = None
+            # 统一参考日
+            try:
+                root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
+                trade_dates = list_trade_dates(root)
+                latest_ref = trade_dates[-1] if trade_dates else ""
+            except Exception:
+                latest_ref = ""
+            ref_use = pos_ref.strip() or latest_ref
+
+            code_norm = normalize_ts(raw_code.strip()) if raw_code.strip() else ""
+            if price_mode == "按日期取价":
+                sel_date = st.text_input("买点日期（YYYYMMDD）", value=ref_use, key="pos_entry_date")
+                if st.button("取价", width='stretch'):
+                    if code_norm and sel_date:
+                        try:
+                            # 读取该日的价格
+                            df = read_range(PARQUET_BASE, PARQUET_ADJ, "stock", [code_norm], sel_date, sel_date)
+                            if not df.empty:
+                                row = df.sort_values("trade_date").iloc[-1]
+                                fld = {"开盘价(open)":"open","收盘价(close)":"close","最高价(high)":"high","最低价(low)":"low"}[price_field]
+                                entry_price = float(row[fld])
+                                st.success(f"买点={entry_price:.4f}")
+                            else:
+                                st.warning("该日无数据")
+                        except Exception as e:
+                            st.error(f"取价失败：{e}")
+            elif price_mode == "手工输入":
+                entry_price = st.number_input("手工输入买点", value=0.0, step=0.01, format="%.4f")
+            else:
+                # 策略取价（可选）
+                opps = load_opportunity_policies()
+                names = [r.get("name","") for r in opps]
+                if not names:
+                    st.info("暂无“买点策略（个股）”可用，请在 strategies_repo.py 填写 OPPORTUNITY_POLICIES。")
+                opp_name = st.selectbox("选择买点策略", names, index=0 if names else None)
+                lookback_days = st.number_input("回看天数", min_value=30, max_value=1000, value=180)
+                if st.button("按策略取最近一次触发日并定价", width='stretch', disabled=not (code_norm and names)):
+                    try:
+                        start = (datetime.strptime(ref_use, "%Y%m%d") - timedelta(days=int(lookback_days))).strftime("%Y%m%d")
+                        df = read_range(PARQUET_BASE, PARQUET_ADJ, "stock", [code_norm], start, ref_use)
+                        df = df.sort_values("trade_date")
+                        if df.empty:
+                            st.warning("无数据")
+                        else:
+                            # 表达式运行
+                            expr = next((r.get("when") or r.get("check") or "" for r in opps if r.get("name")==opp_name), "")
+                            if not expr:
+                                st.warning("策略没有 when/check 表达式")
+                            else:
+                                ctx = {
+                                    "OPEN": df["open"].astype(float).values,
+                                    "HIGH": df["high"].astype(float).values,
+                                    "LOW": df["low"].astype(float).values,
+                                    "CLOSE": df["close"].astype(float).values,
+                                    "V": df["vol"].astype(float).values,
+                                }
+                                sig = tdx.evaluate_bool(expr, pd.DataFrame(ctx))
+                                idx = [i for i, v in enumerate(sig) if bool(v)]
+                                if not idx:
+                                    st.info("回看期内无触发")
+                                else:
+                                    last_i = idx[-1]
+                                    row = df.iloc[last_i]
+                                    fld = {"开盘价(open)":"open","收盘价(close)":"close","最高价(high)":"high","最低价(low)":"low"}[price_field]
+                                    entry_price = float(row[fld])
+                                    st.success(f"触发日 {row['trade_date']}，买点={entry_price:.4f}")
+                    except Exception as e:
+                        st.error(f"策略取价失败：{e}")
+
+        # 选择“持仓检查策略（个股）”
+        pos_rules = load_position_policies()
+        pos_names = [r.get("name","") for r in pos_rules]
+        selected = st.multiselect("选择要检查的策略", pos_names, default=pos_names)
+        selected_rules = [r for r in pos_rules if r.get("name") in set(selected)]
+
+        if st.button("执行检查", width='stretch', disabled=not (code_norm and ref_use and selected_rules)):
+            try:
+                # 决定 entry_price
+                ep = float(entry_price) if entry_price else None
+                if ep is None:
+                    st.warning("请先设置买点（上面的【取价】或手工输入）。")
+                else:
+                    pci = PositionCheckInput(
+                        ref_date=ref_use,
+                        ts_code=code_norm,
+                        rules=selected_rules,
+                        entry_price=ep,
+                        use_scenario=bool(use_virtual),
+                        scenario=scen if use_virtual else None,
+                        # recompute_indicators=tuple(recompute_opts) if recompute_opts else ("kdj",),
+                        recompute_indicators=recompute_to_pass,
+                        extra_vars=None
+                    )
+                    tbl = run_position_checks(pci)
+                    st.dataframe(tbl, width='stretch')
+                    # 导出
+                    csv = tbl.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button("导出 CSV", data=csv, file_name=f"position_checks_{code_norm}_{ref_use}.csv", mime="text/csv", width='stretch')
+            except Exception as e:
+                st.error(f"执行失败：{e}")
+
+    # ================== 明日预测 ==================
+    with tab_predict:
+        st.subheader("明日预测")
+        
+        # 使用 st.form 防止参数变化时立即刷新UI
+        with st.form("prediction_form"):
+            with st.expander("输入参数", expanded=True):
+                c1, c2 = st.columns([1,1])
+                with c1:
+                    pred_ref = st.text_input("参考日（YYYYMMDD；留空=自动取最新）", value="", key="pred_ref_input")
+                    use_rule_scen = st.checkbox("使用规则内置场景（若规则提供）", value=False)
+                    expr_text = st.text_input("临时检查表达式（可留空）", value="")
+                    # recompute_opts = st.multiselect("仅重算需要的指标", ["kdj","ma","macd"], default=["kdj"], key="pred_recompute_indicators")
+                    recalc_mode_pred = st.radio("指标重算", ["自选", "全部(all)", "不重算(none)"],
+                                                index=0, horizontal=True, key="pred_recalc_mode")
+                    if recalc_mode_pred == "自选":
+                        recompute_opts = st.multiselect("仅重算需要的指标",
+                                                        _indicator_options(),
+                                                        default=["kdj"],
+                                                        key="pred_recompute_pick")
+                        recompute_to_pass = tuple(recompute_opts) if recompute_opts else ("kdj",)
+                    elif recalc_mode_pred == "全部(all)":
+                        recompute_to_pass = "all"
+                    else:
+                        recompute_to_pass = "none"
+                with c2:
+
+                    uni_choice_pred = st.selectbox(
+                        "选股范围",
+                        ["自定义（下方文本）","全市场","仅白名单","仅黑名单","仅特别关注榜"],
+                        index=0, key="pred_uni_choice")
+                    # 文本框仅在"自定义"时使用
+                    pasted = st.text_area("选股范围（支持多种分隔符：空格、换行、逗号、分号、竖线等；可混合 ts_code / 简写）", height=120, placeholder="例：\n000001.SZ 600000.SH 000001\n或：\n000001.SZ,600000.SH;000001|300001", disabled=(not uni_choice_pred.startswith("自定义")) )
+                # with st.expander("全局场景（若未使用规则内置场景则生效）", expanded=False):
+                with st.container(border=True):
+                    st.markdown("**全局场景（若未使用规则内置场景则生效）**")
+                    cc1, cc2, cc3 = st.columns([1,1,1])
+                    with cc1:
+                        scen_mode = st.selectbox("价格模式", ["close_pct","open_pct","gap_then_close_pct","flat","limit_up","limit_down"], index=0)
+                        pct = st.number_input("涨跌幅 pct（%）", value=2.0, step=0.5, format="%.2f")
+                        gap_pct = st.number_input("跳空 gap_pct（%）", value=0.0, step=0.5, format="%.2f")
+                    with cc2:
+                        vol_mode = st.selectbox("量能模式", ["same","pct","mult"], index=2)
+                        vol_arg = st.number_input("量能参数（% 或 倍数）", value=1.2, step=0.1, format="%.2f")
+                        hl_mode = st.selectbox("高低生成", ["follow","atr_like","range_pct"], index=0)
+                    with cc3:
+                        range_pct = st.number_input("range_pct（%）", value=2.0, step=0.5, format="%.2f")
+                        atr_mult = st.number_input("atr_mult", value=1.0, step=0.1, format="%.2f")
+                        lock_hi_open = st.checkbox("锁定收盘高于开盘", value=False)
+            # 规则选择（使用缓存）
+            rules = _cached_load_prediction_rules()
+            names = [r.get("name","") for r in rules]
+            chosen = st.multiselect("选择预测策略（可留空）", names, default=[])
+            chosen_rules = [r for r in rules if r.get("name") in set(chosen)]
+            
+            # Tie-break排序选择
+            tiebreak_pred = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=0, key="pred_tiebreak")
+
+            # 提交按钮
+            submitted = st.form_submit_button("运行明日预测", width='stretch')
+        
+        # 只有在表单提交时才执行计算
+        if submitted:
+            # 参考日与代码集
+            try:
+                root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
+                trade_dates = list_trade_dates(root)
+                latest_ref = trade_dates[-1] if trade_dates else ""
+            except Exception:
+                latest_ref = ""
+            ref_use = pred_ref.strip() or latest_ref
+
+            # 解析粘贴的文本范围 - 支持空格和各种分隔符的兼容版本
+            def _parse_codes(txt: str):
+                out = []
+                if not txt:
+                    return out
+                
+                # 支持多种分隔符：换行、空格、制表符、逗号、分号、竖线
+                import re
+                # 使用正则表达式分割，支持多种分隔符
+                separators = r'[\s\n\r\t,;|]+'
+                codes = re.split(separators, txt)
+                
+                for code in codes:
+                    s = code.strip()
+                    if not s:
+                        continue
+                    try:
+                        out.append(normalize_ts(s))
+                    except Exception:
+                        continue
+                # 去重
+                return sorted(set([x for x in out if x]))
+            uni = _parse_codes(pasted)
+
+            scen = Scenario(mode=scen_mode, pct=pct, gap_pct=gap_pct, vol_mode=vol_mode, vol_arg=vol_arg,
+                            hl_mode=hl_mode, range_pct=range_pct, atr_mult=atr_mult,
+                            lock_higher_than_open=lock_hi_open)
+
+            _uni_map = {"全市场": "all", "仅白名单": "white", "仅黑名单": "black", "仅特别关注榜": "attention"}
+            use_codes = uni_choice_pred.startswith("自定义")
+            if use_codes:
+                uni_arg = uni  # 粘贴的自定义列表，前面已 normalize 去重
+            else:
+                uni_label = _uni_map.get(uni_choice_pred, "all")
+                uni_arg = _resolve_pred_universe(uni_label, ref_use)
+
+            # 只有当 ref 有效且范围"非空"时才允许运行
+            can_run = bool(ref_use) and bool(uni_arg)
+
+            # 可选：为空时给个提示
+            if not use_codes and not uni_arg:
+                st.info(f"【{uni_choice_pred}】在 {ref_use} 无可用代码源，请先在\"排名\"页签生成当日 all/top 文件或检查名单缓存。")
+            
+            # 自定义名单模式下的调试信息
+            if use_codes:
+                if uni_arg:
+                    st.success(f"✅ 自定义名单解析成功：共 {len(uni_arg)} 只股票")
+                    # 显示前几只股票作为预览
+                    preview_codes = uni_arg[:5]
+                    st.caption(f"预览：{', '.join(preview_codes)}{'...' if len(uni_arg) > 5 else ''}")
+                else:
+                    st.warning("⚠️ 自定义名单为空，请检查输入的股票代码格式")
+                    st.caption("支持的格式：000001、000001.SZ、SZ000001、600000.SH 等；支持分隔符：空格、换行、逗号、分号、竖线")
+
+            if can_run:
+                try:
+                    inp = PredictionInput(
+                        ref_date=ref_use,
+                        universe=uni_arg,
+                        scenario=scen,
+                        rules=chosen_rules if chosen_rules else None,
+                        expr=(expr_text or None),
+                        use_rule_scenario=bool(use_rule_scen),
+                        # recompute_indicators=tuple(recompute_opts) if recompute_opts else ("kdj",),
+                        recompute_indicators=recompute_to_pass,
+                        cache_dir="cache/sim_pred"
+                    )
+                    df = run_prediction(inp)
+                    # 应用Tie-break排序
+                    df_sorted = _apply_tiebreak_sorting(df, tiebreak_pred)
+                    st.dataframe(df_sorted, width='stretch')
+                    # 下载
+                    csv = df_sorted.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button("导出 CSV", data=csv, file_name=f"prediction_hits_{ref_use}.csv", mime="text/csv", width='stretch')
+                    # 仅导出代码 TXT
+                    if not df_sorted.empty:
+                        codes_txt = "\n".join(df_sorted["ts_code"].astype(str).tolist())
+                        st.download_button("导出代码TXT（仅命中集）", data=codes_txt, file_name=f"prediction_hits_{ref_use}.txt", mime="text/plain", width='stretch')
+                except Exception as e:
+                    st.error(f"运行失败：{e}")
+                    # 添加详细的调试信息
+                    with st.expander("调试信息", expanded=False):
+                        st.write(f"""
+**错误详情：**
+- 参考日：{ref_use}
+- 股票数量：{len(uni_arg) if uni_arg else 0}
+- 股票列表：{uni_arg[:10] if uni_arg else '无'}
+- 场景模式：{scen_mode}
+- 规则数量：{len(chosen_rules) if chosen_rules else 0}
+- 表达式：{expr_text or '无'}
+
+**可能的原因：**
+1. 股票代码格式不正确
+2. 参考日无交易数据
+3. 股票在参考日停牌或退市
+4. 规则表达式有语法错误
+5. 数据文件缺失或损坏
+
+**建议：**
+1. 检查股票代码格式（如：000001.SZ）
+2. 尝试使用其他参考日
+3. 检查规则表达式语法
+4. 确认数据文件完整性
+                        """)
+            else:
+                st.warning("请检查参数设置，确保参考日和选股范围都有效")
 
     # ================== 规则编辑 ==================
     with tab_rules:
@@ -965,7 +1431,7 @@ if _in_streamlit():
         colL, colR = st.columns([2,1])
         default_text = json.dumps(st.session_state["rules_obj"], ensure_ascii=False, indent=2)
         with colL:
-            text = st.text_area("规则 JSON（含 prescreen / rules）", value=default_text, height=300)
+            text = st.text_area("规则 JSON（含 prescreen / rules / PREDICTION_RULES / POSITION_POLICIES / OPPORTUNITY_POLICIES）", value=default_text, height=300)
         with colR:
             up = st.file_uploader("从文件载入 JSON", type=["json"])
             if up:
@@ -974,21 +1440,21 @@ if _in_streamlit():
                     st.success("已载入至编辑器（未应用）。")
                 except Exception as e:
                     st.error(f"载入失败：{e}")
-            if st.button("✅ 校验并应用（仅当前进程）", use_container_width=True):
+            if st.button("✅ 校验并应用（仅当前进程）", width='stretch'):
                 try:
                     st.session_state["rules_obj"] = json.loads(text)
                     st.success("校验通过，已应用。运行评分时将使用该临时规则。")
                 except Exception as e:
                     st.error(f"JSON 解析失败：{e}")
             RULES_JSON = Path("./rules.json")
-            if st.button("💾 导出到 rules.json", use_container_width=True):
+            if st.button("💾 导出到 rules.json", width='stretch'):
                 try:
                     RULES_JSON.write_text(text, encoding="utf-8-sig")
                     st.success(f"已写入 {RULES_JSON}")
                 except Exception as e:
                     st.error(f"写入失败：{e}")
 
-            if st.button("📥 从 rules.json 载入", use_container_width=True):
+            if st.button("📥 从 rules.json 载入", width='stretch'):
                 try:
                     t = RULES_JSON.read_text(encoding="utf-8-sig")
                     st.session_state["rules_obj"] = json.loads(t)
@@ -996,12 +1462,14 @@ if _in_streamlit():
                 except Exception as e:
                     st.error(f"读取失败：{e}")
 
-            if st.button("↩️ 还原为 config 默认", use_container_width=True):
+            if st.button("↩️ 还原为 config 默认", width='stretch'):
                 st.session_state["rules_obj"] = {
-                    "prescreen": getattr(cfg, "SC_PRESCREEN_RULES", []),
-                    "rules": getattr(cfg, "SC_RULES", []),
+                    # "prescreen": getattr(cfg, "SC_PRESCREEN_RULES", []),
+                    # "rules": getattr(cfg, "SC_RULES", []),
+                    "prescreen": getattr(se, "SC_PRESCREEN_RULES", []),
+                    "rules": getattr(se, "SC_RULES", []),
                 }
-                st.experimental_rerun()
+                st.rerun()
         st.divider()
         with st.container(border=True):
             st.markdown("### 🧪 策略测试器（单条规则）")
@@ -1032,7 +1500,7 @@ if _in_streamlit():
                 # empty_rule = None
                 # st.session_state["tester_rule_json"] = json.dumps(empty_rule, ensure_ascii=False, indent=2)
                 st.session_state["tester_rule_json"] = ""
-            st.button("🧹 一键清空", use_container_width=True, on_click=_clear_tester_rule)
+            st.button("🧹 一键清空", width='stretch', on_click=_clear_tester_rule)
             # ref_in = st.text_input("参考日（留空=自动最新）", value="")
             # ts_in = st.text_input("个股代码", value="")
             ref_in = st.text_input("参考日（留空=自动最新）", value="", key="tester_ref_input")
@@ -1046,9 +1514,9 @@ if _in_streamlit():
 
         colD, colE = st.columns([1,1])
         with colD:
-            run_btn = st.button("在个股中运行", use_container_width=True)
+            run_btn = st.button("在个股中运行", width='stretch')
         with colE:
-            run_all_btn = st.button("在名单中运行", use_container_width=True, key="tester_run_all")
+            run_all_btn = st.button("在名单中运行", width='stretch', key="tester_run_all")
 
         refD_all = ref_in.strip() or _pick_latest_ref_date() or ""
         if run_all_btn:
@@ -1078,10 +1546,10 @@ if _in_streamlit():
                 if not df_sel.empty:
                     df_sel["board"] = df_sel["ts_code"].map(market_label)
                     st.success(f"命中 {len(df_sel)} 只；参考日：{df_sel['ref_date'].iloc[0] if 'ref_date' in df_sel.columns and len(df_sel)>0 else (refD_all or '自动')}")
-                    st.dataframe(df_sel, use_container_width=True, height=480)
+                    st.dataframe(df_sel, width='stretch', height=480)
                     # 导出
                     csv_bytes = df_sel.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button("导出结果 CSV", data=csv_bytes, file_name="tester_screen_all.csv", mime="text/csv", use_container_width=True)
+                    st.download_button("导出结果 CSV", data=csv_bytes, file_name="tester_screen_all.csv", mime="text/csv", width='stretch')
                 else:
                     st.info("未命中。")
 
@@ -1100,7 +1568,7 @@ if _in_streamlit():
                     name_key = str(rule.get("name","")).strip()
                     if name_key:
                         df_detail = df_detail[df_detail["name"] == name_key]
-                    st.dataframe(df_detail, use_container_width=True)
+                    st.dataframe(df_detail, width='stretch')
             except Exception as e:
                 st.error(f"运行失败：{e}")
 
@@ -1198,7 +1666,6 @@ if _in_streamlit():
                             pass
                     if need_vr and ("vr" not in df.columns) and ("vol" in df.columns):
                         try:
-                            import pandas as pd
                             v = pd.to_numeric(df["vol"], errors="coerce")
                             n = 26
                             df = df.copy()
@@ -1230,7 +1697,6 @@ if _in_streamlit():
                     st.info("未产生任何命中/细节。")
                     st.stop()
 
-                import pandas as pd, numpy as np
                 df_rules = pd.DataFrame(rows).copy()
 
                 # —— “最后命中距今天数” 与详情页一致的口径：优先用 lag，其次 hit_date，再退 hit_dates 最末 —— 
@@ -1258,7 +1724,7 @@ if _in_streamlit():
                 ] if c in df_rules.columns]
 
                 st.markdown(f"**测试代码：{ts_code} · 参考日：{ref_use}**")
-                st.dataframe(df_rules[show_cols], use_container_width=True, height=420)
+                st.dataframe(df_rules[show_cols], width='stretch', height=420)
 
             except Exception as e:
                 st.error(f"测试失败：{e}")
@@ -1283,7 +1749,7 @@ if _in_streamlit():
         with c4:
             # date_end = st.text_input("结束日（YYYYMMDD；留空=自动最新）", value="")
             date_end = st.text_input("结束日（YYYYMMDD；留空=自动最新）", value="", key="attn_end_date")
-            gen_btn = st.button("生成并预览", use_container_width=True)
+            gen_btn = st.button("生成并预览", width='stretch')
 
         if gen_btn:
             try:
@@ -1312,7 +1778,7 @@ if _in_streamlit():
                 )
                 st.success(f"强度榜已生成：{csv_path}")
                 df_a = pd.read_csv(csv_path)
-                st.dataframe(df_a, use_container_width=True, height=480)
+                st.dataframe(df_a, width='stretch', height=480)
                 try:
                     if df_a is not None and not df_a.empty:
                         # 识别代码列（优先 ts_code）
@@ -1418,7 +1884,7 @@ if _in_streamlit():
         with st.container(border=True):
             rows_eff = int(topn_attn)
             st.markdown("**强度榜 Top-N 预览**")
-            st.dataframe(df_attn.head(rows_eff), use_container_width=True, height=420)
+            st.dataframe(df_attn.head(rows_eff), width='stretch', height=420)
 
             # TXT 复制（按你的导出偏好）
             if "ts_code" in df_attn.columns:
@@ -1430,12 +1896,200 @@ if _in_streamlit():
                 )
                 copy_txt_button(txt, label="复制以上", key=f"copy_attn_{ref_attn}")
 
+        # --- 轻量：前几日 Top-K 扫描（只看 Top，不算强度） ---
+        with st.expander("前几日 Top-K 扫描（轻量）", expanded=True):
+            # —— 参数区 ——
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                end_use = st.text_input("观察日（YYYYMMDD）", value=_pick_latest_ref_date() or "", key="lite_end")
+            with c2:
+                lookback_days = st.number_input("回看天数 D（不含今天）", min_value=1, max_value=60, value=3, key="lite_D")
+            with c3:
+                k_min = st.number_input("K 最小（含）", min_value=1, max_value=10000, value=1, key="lite_kmin")
+            with c4:
+                k_max = st.number_input("K 最大（含）", min_value=1, max_value=10000, value=cfg_int("SC_TOP_K", 50), key="lite_kmax")
+
+            c5, c6, c7 = st.columns(3)
+            with c5:
+                hit_mode = st.selectbox(
+                    "命中口径",
+                    ["与今天Top交集", "累计上榜次数≥N", "连续上榜天数≥N"],
+                    index=0, key="lite_mode"
+                )
+            with c6:
+                n_th = st.number_input("N（阈值）", min_value=1, max_value=60, value=2, key="lite_N",
+                                    disabled=(hit_mode == "与今天Top交集"))
+            with c7:
+                today_topk = st.number_input("今天对比 Top-K", min_value=1, max_value=5000,
+                                            value=cfg_int("SC_TOP_K", 50), key="lite_todayK",
+                                            disabled=(hit_mode != "与今天Top交集"))
+
+            limit = st.number_input("输出条数上限", min_value=5, max_value=2000, value=200, key="lite_limit")
+
+            go = st.button("计算（轻量 Top-K）", width='stretch', key="btn_lite_calc")
+
+            if go:
+                try:
+                    days = _cached_trade_dates(PARQUET_BASE, PARQUET_ADJ) or []
+                    if not days:
+                        st.warning("无法获取交易日历。"); st.stop()
+                    # 观察日处理：若手填不在交易日里，取最近一个交易日
+                    if not end_use or end_use not in days:
+                        end_idx = len(days) - 1
+                        end = days[end_idx]
+                        if end_use and end_use not in days:
+                            st.caption(f"观察日不在交易日历内，已改用最近交易日：{end}")
+                    else:
+                        end_idx = days.index(end_use)
+                        end = end_use
+                    if end_idx <= 0:
+                        st.info("观察日前没有更早交易日可统计。"); st.stop()
+
+                    # 回看窗口（不含今天 end）
+                    D = int(lookback_days)
+                    start_idx = max(0, end_idx - D)
+                    win_days = days[start_idx:end_idx]  # t-D ~ t-1
+
+                    # K 范围校正
+                    k1, k2 = int(min(k_min, k_max)), int(max(k_min, k_max))
+
+                    # —— 汇总前 D 日 Top-K（K∈[k1,k2]）——
+                    occ = {}             # 累计命中次数
+                    best_rank = {}       # 窗口内最好名次（越小越好）
+                    last_seen = {}       # 最近出现日
+                    day_index = {d:i for i,d in enumerate(win_days)}   # 便于算连续
+                    appear_idx = {}      # ts_code -> 出现的日序号列表
+
+                    for d in win_days:
+                        p = _path_top(d)
+                        if not p.exists() or p.stat().st_size == 0:
+                            continue
+                        df = _read_df(p, dtype={"ts_code": str})
+                        if df is None or df.empty:
+                            continue
+                        if "rank" not in df.columns:
+                            df = df.reset_index(drop=True)
+                            df["rank"] = np.arange(1, len(df) + 1)
+                        # 只取 K 范围
+                        df = df[(df["rank"] >= k1) & (df["rank"] <= k2)]
+                        for ts, rk in zip(df["ts_code"].astype(str), df["rank"].astype(int)):
+                            occ[ts] = occ.get(ts, 0) + 1
+                            best_rank[ts] = min(best_rank.get(ts, 10**9), rk)
+                            last_seen[ts] = d if (ts not in last_seen or d > last_seen[ts]) else last_seen[ts]
+                            appear_idx.setdefault(ts, []).append(day_index[d])
+
+                    # 连续天数（窗口内的最大连续段）
+                    max_streak = {}
+                    for ts, idxs in appear_idx.items():
+                        idxs = sorted(set(idxs))
+                        if not idxs:
+                            max_streak[ts] = 0
+                            continue
+                        best = cur = 1
+                        for a, b in zip(idxs, idxs[1:]):
+                            if b == a + 1:
+                                cur += 1
+                                best = max(best, cur)
+                            else:
+                                cur = 1
+                        max_streak[ts] = best
+
+                    # 汇总 DataFrame（只含在窗口内出现过的）
+                    rows = []
+                    for ts in sorted(occ.keys()):
+                        rows.append({
+                            "ts_code": ts,
+                            "prev_hits": int(occ.get(ts, 0)),
+                            "max_streak": int(max_streak.get(ts, 0)),
+                            "best_rank_prev": int(best_rank.get(ts, 10**9)),
+                            "last": last_seen.get(ts, None),
+                        })
+                    df_prev = pd.DataFrame(rows).sort_values(
+                        ["prev_hits","best_rank_prev","ts_code"], ascending=[False, True, True]
+                    ).reset_index(drop=True)
+
+                    # —— 命中计算 —— 
+                    if hit_mode == "与今天Top交集":
+                        p_today = _path_top(end)
+                        if not p_today.exists() or p_today.stat().st_size == 0:
+                            st.info(f"{end} 的 Top 文件不存在或为空。"); st.stop()
+                        df_today = _read_df(p_today, dtype={"ts_code": str})
+                        if df_today is None or df_today.empty:
+                            st.info(f"{end} 的 Top 文件读取为空。"); st.stop()
+                        if "rank" not in df_today.columns:
+                            df_today = df_today.reset_index(drop=True)
+                            df_today["rank"] = np.arange(1, len(df_today) + 1)
+                        df_today = df_today.sort_values("rank").head(int(today_topk))
+                        today_set = set(df_today["ts_code"].astype(str))
+                        hit = df_prev[df_prev["ts_code"].astype(str).isin(today_set)].copy()
+                        hit = hit.merge(
+                            df_today[["ts_code","rank"]].rename(columns={"rank":"today_rank"}),
+                            on="ts_code", how="left"
+                        ).sort_values(
+                            ["prev_hits","today_rank","best_rank_prev","ts_code"],
+                            ascending=[False, True, True, True]
+                        ).head(int(limit))
+                        st.markdown(
+                            f"**窗口：{win_days[0] if win_days else '—'} ~ {win_days[-1] if win_days else '—'}（不含今天 {end}）｜K∈[{k1},{k2}]，今天对比 Top-K={int(today_topk)}**"
+                        )
+                        st.markdown("**命中：与今天 Top 交集（延续/再上榜）**")
+                        if hit.empty:
+                            st.caption("无命中。")
+                        else:
+                            st.dataframe(hit, width='stretch', height=360)
+                            # 复制代码
+                            codes = hit["ts_code"].astype(str).tolist()
+                            txt = _codes_to_txt(codes, st.session_state["export_pref"]["style"],
+                                                st.session_state["export_pref"]["with_suffix"])
+                            copy_txt_button(txt, label="📋 复制命中代码", key=f"copy_lite_inter_{end}")
+
+                    elif hit_mode == "累计上榜次数≥N":
+                        hit = df_prev[df_prev["prev_hits"] >= int(n_th)].copy()
+                        hit = hit.sort_values(
+                            ["prev_hits","best_rank_prev","ts_code"],
+                            ascending=[False, True, True]
+                        ).head(int(limit))
+                        st.markdown(
+                            f"**窗口：{win_days[0] if win_days else '—'} ~ {win_days[-1] if win_days else '—'}（不含今天 {end}）｜K∈[{k1},{k2}]**"
+                        )
+                        st.markdown(f"**命中：累计上榜次数 ≥ {int(n_th)}**")
+                        if hit.empty:
+                            st.caption("无命中。")
+                        else:
+                            st.dataframe(hit, width='stretch', height=360)
+                            codes = hit["ts_code"].astype(str).tolist()
+                            txt = _codes_to_txt(codes, st.session_state["export_pref"]["style"],
+                                                st.session_state["export_pref"]["with_suffix"])
+                            copy_txt_button(txt, label="📋 复制命中代码", key=f"copy_lite_cnt_{end}")
+
+                    else:  # 连续上榜天数≥N
+                        hit = df_prev[df_prev["max_streak"] >= int(n_th)].copy()
+                        hit = hit.sort_values(
+                            ["max_streak","best_rank_prev","ts_code"],
+                            ascending=[False, True, True]
+                        ).head(int(limit))
+                        st.markdown(
+                            f"**窗口：{win_days[0] if win_days else '—'} ~ {win_days[-1] if win_days else '—'}（不含今天 {end}）｜K∈[{k1},{k2}]**"
+                        )
+                        st.markdown(f"**命中：连续上榜天数 ≥ {int(n_th)}**")
+                        if hit.empty:
+                            st.caption("无命中。")
+                        else:
+                            st.dataframe(hit, width='stretch', height=360)
+                            codes = hit["ts_code"].astype(str).tolist()
+                            txt = _codes_to_txt(codes, st.session_state["export_pref"]["style"],
+                                                st.session_state["export_pref"]["with_suffix"])
+                            copy_txt_button(txt, label="📋 复制命中代码", key=f"copy_lite_streak_{end}")
+
+                except Exception as e:
+                    st.error(f"计算失败：{e}")
+
             # # CSV 下载（Top-N）
             # st.download_button(
             #     "⬇️ 导出 Top-N（CSV）",
             #     data=df_attn.head(rows_eff).to_csv(index=False).encode("utf-8-sig"),
             #     file_name=f"attention_top{rows_eff}_{ref_attn}.csv",
-            #     use_container_width=True,
+            #     width='stretch',
             #     key=f"dl_attn_{ref_attn}"
             # )
 
@@ -1488,7 +2142,7 @@ if _in_streamlit():
             # 一键
             c1, c2 = st.columns(2)
             with c1:
-                run_all = st.button("🚀 一键运行", use_container_width=True, type="primary")
+                run_all = st.button("🚀 一键运行", width='stretch', type="primary")
             with c2:
                 dry = st.checkbox("仅打印日志（不执行）", value=False, help="仅用于预览参数")
 
@@ -1620,7 +2274,7 @@ if _in_streamlit():
             with c1:
                 try:
                     df = apv.overview_table(base, api_adj)
-                    st.dataframe(df, use_container_width=True, height=360)
+                    st.dataframe(df, width='stretch', height=360)
                 except Exception as e:
                     st.error(f"概览失败：{e}")
             with c2:
@@ -1635,50 +2289,151 @@ if _in_streamlit():
             st.markdown("---")
             st.caption("数据浏览由 parquet_viewer 支持，可在其他页或命令行使用更丰富的功能。")
 
-    # ================== 普通选股（TDX表达式） ==================
+    # ================== 选股 ==================
     with tab_screen:
-        st.subheader("普通选股（类TDX 表达式）")
-        # exp = st.text_input("表达式（示例：CLOSE>MA(CLOSE,20) AND VOL>MA(VOL,5)）", value="")
-        exp = st.text_input("表达式（示例：CLOSE>MA(CLOSE,20) AND VOL>MA(VOL,5)）", value="", key="screen_expr")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            level = st.selectbox("时间级别", ["D","W","M"], index=0)
-        with c2:
-            window = st.number_input("窗口长度", min_value=1, max_value=500, value=60)
-        with c3:
-            scope_logic = st.selectbox("命中范围(scope)", ["LAST","ANY","ALL","COUNT>=k","CONSEC>=m"], index=0)
-        with c4:
-            refD = st.text_input("参考日（可选，YYYYMMDD）", value="")
-        uni_choice = st.selectbox("选股范围", ["全市场","仅白名单","仅黑名单"], index=0)
+        st.subheader("选股")
+
+        # === 统一参考日 & 范围 ===
+        c_top1, c_top2 = st.columns([1,1])
+        with c_top1:
+            refD_unified = st.text_input("参考日（YYYYMMDD，留空=自动最新）", value=st.session_state.get("screen_refD",""), key="screen_refD")
+        with c_top2:
+            uni_choice = st.selectbox("选股范围", ["全市场","仅白名单","仅黑名单","仅特别关注榜"], index=0, key="screen_uni_choice")
         _uni_map = {"全市场":"all", "仅白名单":"white", "仅黑名单":"black", "仅特别关注榜":"attention"}
-        run_screen = st.button("运行筛选并预览", use_container_width=True)
 
-        if run_screen:
+        # ========== 1) 表达式筛选 ==========
+        with st.form("expression_screening_form"):
+            st.markdown("### 表达式筛选")
+            exp = st.text_input("表达式（示例：CLOSE>MA(CLOSE,20) AND VOL>MA(VOL,5)）", value=st.session_state.get("screen_expr",""), key="screen_expr")
+            c1, c2, c3, c4, c5, c6 = st.columns([1,1,1,1,1,1])
+            with c1:
+                level = st.selectbox("时间级别", ["D","W","M"], index=0, key="screen_level")
+            with c2:
+                window = st.number_input("窗口长度", min_value=1, max_value=500, value=60, key="screen_window")
+            with c3:
+                scope_logic = st.selectbox("命中范围(scope)", ["LAST","ANY","ALL","COUNT>=k","CONSEC>=m","ANY_n","ALL_n"], index=0, key="screen_scope_logic")
+            with c4:
+                n_k_m = st.number_input("k/m/n(特定选择才生效)", min_value=1, max_value=500, value=3, key="screen_nkm")
+            with c5:
+                tiebreak_expr = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=0, key="screen_tiebreak_expr")
+            with c6:
+                run_btn = st.form_submit_button("运行筛选", width='stretch')
+
+        if run_btn:
             try:
-                if hasattr(se, "tdx_screen"):
-                    df_sel = run_se_screen_in_bg(
-                    when_expr=exp,
-                    ref_date=refD.strip() or None,
-                    timeframe=level,
-                    window=int(window),
-                    scope=scope_logic,
-                    universe=_uni_map.get(uni_choice, "all"),
-                    write_white=False,
-                    write_black_rest=False,
-                    return_df=True
-                )
-
-                    st.dataframe(df_sel, use_container_width=True, height=480)
-                    st.caption(f"共 {len(df_sel)} 只股票")
-                    if not df_sel.empty and "ts_code" in df_sel.columns:
-                        txt = _codes_to_txt(df_sel["ts_code"].astype(str).tolist(),
-                                            st.session_state["export_pref"]["style"],
-                                            st.session_state["export_pref"]["with_suffix"])
-                        _download_txt("导出命中代码 TXT", txt, "select.txt", key="dl_select")
+                if not exp.strip():
+                    st.warning("请先输入表达式。")
                 else:
-                    st.warning("未检测到 tdx_screen，实现后此页自动可用。")
+                    # 组装 scope
+                    scope = scope_logic
+                    if scope_logic.startswith("COUNT"):
+                        scope = f"COUNT>={int(n_k_m)}"
+                    elif scope_logic.startswith("CONSEC"):
+                        scope = f"CONSEC>={int(n_k_m)}"
+                    elif scope_logic == "ANY_n":
+                        scope = f"ANY_{int(n_k_m)}"
+                    elif scope_logic == "ALL_n":
+                        scope = f"ALL_{int(n_k_m)}"
+
+                    df_sel = run_se_screen_in_bg(
+                        when_expr=exp.strip(),
+                        ref_date=(refD_unified.strip() or None),
+                        timeframe=level,
+                        window=_safe_int(window, 60),
+                        scope=scope,
+                        universe=_uni_map.get(uni_choice,"all"),
+                        write_white=False,
+                        write_black_rest=False,
+                        return_df=True,
+                    )
+                    if df_sel is None or df_sel.empty:
+                        st.info("无命中。")
+                    else:
+                        # 应用Tie-break排序
+                        df_sel_sorted = _apply_tiebreak_sorting(df_sel, tiebreak_expr)
+                        st.caption(f"命中 {len(df_sel_sorted)} 只；参考日：{(df_sel_sorted['ref_date'].iloc[0] if 'ref_date' in df_sel_sorted.columns and len(df_sel_sorted)>0 else (refD_unified or '自动'))}")
+                        st.dataframe(df_sel_sorted, width='stretch', height=480)
+                        # 导出 TXT（代码）
+                        if "ts_code" in df_sel.columns:
+                            txt = _codes_to_txt(df_sel["ts_code"].astype(str).tolist(),
+                                                st.session_state["export_pref"]["style"],
+                                                st.session_state["export_pref"]["with_suffix"])
+                            copy_txt_button(txt, label="📋 复制以上（按当前预览）", key=f"copy_screen_expr_{refD_unified or 'auto'}")
             except Exception as e:
                 st.error(f"筛选失败：{e}")
+
+        st.divider()
+
+        # ========== 2) 按触发规则筛选（当日全市场，多选） ==========
+        with st.form("rule_screening_form"):
+            st.markdown("### 按触发规则筛选（当日全市场，多选）")
+            st.caption("说明：读取当日 details JSON；按所选规则名判断：当日 add>0 或 ok=True 视为命中；支持\"任一/全部\"聚合。")
+            # 规则名来自 se.SC_RULES（使用缓存）
+            rule_names = _get_rule_names()
+            picked = st.multiselect("规则名（可多选）", options=rule_names, default=[], key="detail_multi_rules")
+            agg_mode = st.radio("命中逻辑", ["任一命中（OR）","全部命中（AND）"], index=0, horizontal=True, key="detail_hit_mode")
+            cA, cB, cC = st.columns([1,1,1])
+            with cA:
+                limit_n = st.number_input("最多显示/导出 N 条", min_value=10, max_value=5000, value=200, step=10, key="detail_limit_n")
+            with cB:
+                tiebreak_rule = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=0, key="screen_tiebreak_rule")
+            with cC:
+                run_detail = st.form_submit_button("筛选当日命中标的", width='stretch')
+
+        if run_detail:
+            ref_real = refD_unified.strip() or _pick_latest_ref_date() or ""
+            if not ref_real:
+                st.error("未能确定参考日。")
+            elif not picked:
+                st.warning("请先选择至少一个规则名。")
+            else:
+                ddir = DET_DIR / str(ref_real)
+                rows = []
+                try:
+                    allow_set = None
+                    if ddir.exists():
+                        for p in ddir.glob("*.json"):
+                            try:
+                                j = json.loads(p.read_text(encoding="utf-8-sig"))
+                            except Exception:
+                                continue
+                            ts2 = str(j.get("ts_code","")).strip()
+                            if not ts2:
+                                continue
+                            if (allow_set is not None) and (ts2 not in allow_set):
+                                continue
+                            sm = j.get("summary") or {}
+                            sc = float(sm.get("score", 0.0))
+                            names_today = set()
+                            for rr in (j.get("rules") or []):
+                                if float(rr.get("add", 0.0)) > 0.0 or bool(rr.get("ok")):
+                                    n = rr.get("name")
+                                    if n: names_today.add(str(n))
+                            if names_today:
+                                if agg_mode.startswith("任一"):
+                                    hit = any((n in names_today) for n in picked)
+                                else:
+                                    hit = all((n in names_today) for n in picked)
+                                if hit:
+                                    rows.append({"ts_code": ts2, "score": sc})
+                    df_hit = pd.DataFrame(rows)
+                    if df_hit.empty:
+                        st.info("未筛到命中标的。")
+                    else:
+                        # 应用Tie-break排序
+                        df_hit_sorted = _apply_tiebreak_sorting(df_hit, tiebreak_rule)
+                        n = int(limit_n)
+                        df_show = df_hit_sorted.head(n)
+                        st.caption(f"命中 {len(df_hit_sorted)} 只；显示前 {len(df_show)} 只；参考日：{ref_real}")
+                        st.dataframe(df_show, width='stretch', height=420)
+                        # 导出 TXT
+                        if "ts_code" in df_show.columns:
+                            txt = _codes_to_txt(df_show["ts_code"].astype(str).tolist(),
+                                                st.session_state["export_pref"]["style"],
+                                                st.session_state["export_pref"]["with_suffix"])
+                            copy_txt_button(txt, label="📋 复制以上（按当前预览）", key=f"copy_screen_rule_{ref_real}")
+                except Exception as e:
+                    st.error(f"读取明细失败：{e}")
 
     # ================== 工具箱 ==================
     with tab_tools:
@@ -1693,7 +2448,7 @@ if _in_streamlit():
             do_force = st.checkbox("强制重建（覆盖已有）", value=False,
                                 help="若之前失败留下了 0 字节文件或想重算，勾选此项。")
 
-            go_fill = st.button("执行自动补算", use_container_width=True)
+            go_fill = st.button("执行自动补算", width='stretch')
             if go_fill:
                 try:
                     if hasattr(se, "backfill_prev_n_days"):
@@ -1710,7 +2465,7 @@ if _in_streamlit():
             start = st.text_input("起始日 YYYYMMDD", value="", key="tools_fix_start")
             end = st.text_input("结束日 YYYYMMDD", value="", key="tools_fix_end")
             do_force_fix = st.checkbox("强制重建（覆盖已有）", value=False)
-            go_fix = st.button("补齐缺失", use_container_width=True)
+            go_fix = st.button("补齐缺失", width='stretch')
             if go_fix and start and end:
                 try:
                     if hasattr(se, "backfill_missing_ranks"):                   
@@ -1726,7 +2481,7 @@ if _in_streamlit():
                 st.session_state["scan_inventory_loaded"] = False
             col0, col1 = st.columns([1,3])
             with col0:
-                do_scan = st.button("加载/刷新列表", key="btn_scan_inventory", use_container_width=True)
+                do_scan = st.button("加载/刷新列表", key="btn_scan_inventory", width='stretch')
                 if do_scan:
                     st.session_state["scan_inventory_loaded"] = True
             if not st.session_state["scan_inventory_loaded"]:
@@ -1789,13 +2544,13 @@ if _in_streamlit():
                             if kind == "All 排名":
                                 p = _path_all(sel_date)
                                 if p.exists() and p.stat().st_size > 0:
-                                    st.dataframe(_read_df(p).head(200), use_container_width=True, height=360)
+                                    st.dataframe(_read_df(p).head(200), width='stretch', height=360)
                                 else:
                                     st.info("该日 All 文件不存在或为空。")
                             elif kind == "Top 排名":
                                 p = _path_top(sel_date)
                                 if p.exists() and p.stat().st_size > 0:
-                                    st.dataframe(_read_df(p).head(200), use_container_width=True, height=360)
+                                    st.dataframe(_read_df(p).head(200), width='stretch', height=360)
                                 else:
                                     st.info("该日 Top 文件不存在或为空。")
                             else:
@@ -1839,7 +2594,7 @@ if _in_streamlit():
         with col1:
             st.markdown("**新建组合**")
             new_name = st.text_input("名称", value=st.session_state.get("pf_ledger","default"))
-            if st.button("创建组合", use_container_width=True):
+            if st.button("创建组合", width='stretch'):
                 pid = pm.create_portfolio(
                     name=new_name,
                     init_cash=float(st.session_state["pf_init_cash"]),
@@ -1854,14 +2609,22 @@ if _in_streamlit():
         with col2:
             st.markdown("**当前组合**")
             ports = pm.list_portfolios()
-            if not ports:
-                st.info("暂无组合，请先创建。")
-                st.stop()
+                # st.stop()
             # 以 name 排序
-            ports_items = sorted(list(ports.items()), key=lambda kv: kv[1].name)
-            names = [f"{p.name} ({pid[:6]})" for pid, p in ports_items]
-            sel = st.selectbox("选择组合", options=list(range(len(ports_items))), format_func=lambda i: names[i], index=0)
-            cur_pid, cur_pf = ports_items[int(sel)][0], ports_items[int(sel)][1]
+            ports_items = sorted(list(ports.items()), key=lambda kv: kv[1].name) if ports else []
+            if not ports_items:
+                st.info("暂无组合，请先创建。")
+                cur_pid, cur_pf = None, None
+                st.session_state['cur_pid'] = None
+                st.session_state['cur_pf'] = None
+                st.session_state['cur_pid'] = cur_pid
+                st.session_state['cur_pf'] = cur_pf
+            else:
+                names = [f"{p.name} ({pid[:6]})" for pid, p in ports_items]
+                sel = st.selectbox("选择组合", options=list(range(len(ports_items))), format_func=lambda i: names[i], index=0)
+                cur_pid, cur_pf = ports_items[sel]
+                st.session_state['cur_pid'] = cur_pid
+                st.session_state['cur_pf'] = cur_pf
 
         st.divider()
 
@@ -1879,7 +2642,7 @@ if _in_streamlit():
         try:
             ts_norm = normalize_ts(ts) if ts else ""
             if ts_norm and d_exec:
-                df_one = read_range(PARQUET_BASE, "stock", PARQUET_ADJ, ts_norm, d_exec, d_exec, columns=["open","high","low","close"])
+                df_one = read_range(PARQUET_BASE, PARQUET_ADJ, "stock", [ts_norm], d_exec, d_exec, columns=["open","high","low","close"])
                 if df_one is not None and not df_one.empty:
                     row = df_one.iloc[-1]
                     px_open = float(row.get("open", float("nan")))
@@ -1901,7 +2664,7 @@ if _in_streamlit():
             else:
                 price = None
 
-        if st.button("记录成交", use_container_width=True, key="btn_rec_trade"):
+        if cur_pf and st.button("记录成交", width='stretch', key="btn_rec_trade"):
             try:
                 pm.record_trade(pid=cur_pid, date=str(d_exec), ts_code=str(ts_norm), side=str(side), qty=int(qty),
                                 price_mode=(None if price is not None else cur_pf.trade_price_mode),
@@ -1915,7 +2678,7 @@ if _in_streamlit():
         # —— 观察日估值 / 净值 ——
         st.markdown("**观察日收益与持仓估值**")
         obs = st.text_input("观察日（YYYYMMDD；默认=最新交易日）", value=_pick_latest_ref_date() or "")
-        if obs:
+        if obs and cur_pf:
             # 回放估值（从组合创建日至观察日）
             # 我们用 read_nav() 读取结果
             try:
@@ -1927,14 +2690,6 @@ if _in_streamlit():
                     first_trade = str(pd.to_datetime(tr["date"].astype(str), errors="coerce").dt.strftime("%Y%m%d").min())
                     # 起点 = 首笔成交日前一个“交易日”
                     date_start_use = _prev_trade_date(first_trade, 1)
-                # else:
-                #     # 没有成交记录就从观察日开始（避免从远古起算）
-                #     date_start_use = str(obs) if 'obs' in locals() else str(ref)
-                # nav = pm.reprice_and_nav(cur_pid,
-                #                         date_start=str(date_start_use),
-                #                         date_end=str(ref),
-                #                         price_mode=price_mode,
-                #                         asset=asset)
                 else:
                     # 没有成交记录就从观察日开始（避免从远古起算）
                     date_start_use = str(obs)
@@ -1958,13 +2713,13 @@ if _in_streamlit():
                         st.markdown("**当前持仓**")
                         show_cols = [c for c in ["ts_code","qty","cost","mkt_price","mkt_value","unreal_pnl"] if c in cur_pos.columns]
                         cur_pos = cur_pos[show_cols].sort_values("mkt_value", ascending=False)
-                        st.dataframe(cur_pos, use_container_width=True, height=300)
+                        st.dataframe(cur_pos, width='stretch', height=300)
                     else:
                         st.caption("观察日无持仓记录。")
                 st.metric("组合市值", f"{(row.get('nav',1.0) * float(cur_pf.init_cash)):.0f}")
                 st.metric("区间收益率", f"{(row.get('nav',1.0) - 1.0):.2%}")
                 cols = [c for c in ["date","cash","position_mv","nav","ret_d","max_dd"] if c in nav_df.columns]
-                st.dataframe(nav_df[cols].tail(5), use_container_width=True)
+                st.dataframe(nav_df[cols].tail(5), width='stretch')
                 st.markdown("**净值曲线（NAV）**")
                 try:
                     st.line_chart(nav_df.set_index("date")["nav"])
@@ -2006,7 +2761,7 @@ if _in_streamlit():
                 track_max_json = st.number_input("最多读取明细JSON（按当日排名排序）", min_value=50, max_value=5000, value=300, step=50, key="track_max_json")
 
 
-            if st.button("生成跟踪表（含前日排行/名单/指标勾选/后续涨幅）", key="btn_run_tracking", use_container_width=True):
+            if st.button("生成跟踪表（含前日排行/名单/指标勾选/后续涨幅）", key="btn_run_tracking", width='stretch'):
                 try:
                     from stats_core import run_tracking
                     import scoring_core as se
@@ -2080,7 +2835,7 @@ if _in_streamlit():
                     ] if c in detail.columns]
                     detail_fmt2 = _fmt_retcols_percent(detail)
                     st.dataframe(detail_fmt2[show_cols].sort_values(["rank"]).reset_index(drop=True),
-                                use_container_width=True, height=460)
+                                width='stretch', height=460)
                     st.caption("ret_fwd_N = 未来 N 日涨幅（Tracking 已计算）；名单列来自 cache/attention；hit:<规则名> 为所选排名规则在参考日是否触发。")
                 except Exception as e:
                     st.error(f"生成失败：{e}")
@@ -2106,7 +2861,7 @@ if _in_streamlit():
                 surge_rule_names = st.multiselect("指标（可多选）", options=rule_names, default=[] if rule_names else [], key="surge_rule_names")
                 surge_max_json = st.number_input("最多读取明细JSON（仅对样本内股票）", min_value=50, max_value=5000, value=100, step=50, key="surge_max_json")
 
-            if st.button("运行 Surge", key="btn_run_surge", use_container_width=True):
+            if st.button("运行 Surge", key="btn_run_surge", width='stretch'):
                 with st.spinner("生成 Surge 榜单中…"):
                     try:
                         from stats_core import run_surge
@@ -2154,7 +2909,7 @@ if _in_streamlit():
                         st.error(f"Surge 失败：{e}")
                     else:
                         table_fmt = _fmt_retcols_percent(table)
-                        st.dataframe(table_fmt, use_container_width=True, height=420)
+                        st.dataframe(table_fmt, width='stretch', height=420)
                         st.caption("各分组文件已写入 output/surge_lists/<ref>/ 。")
 
         
@@ -2172,7 +2927,7 @@ if _in_streamlit():
             w_en = st.checkbox("对大涨样本加权（用于“同组全体/两者对比”口径）", value=False)
             w_pos = st.slider("样本权重", min_value=1.0, max_value=5.0, value=2.0, step=0.5, help="仅在“同组全体/两者对比”下生效")
 
-            if st.button("运行 Commonality", use_container_width=True):
+            if st.button("运行 Commonality", width='stretch'):
                 try:
                     from stats_core import run_commonality
                     rlist = [int(x) for x in retrosC.split(",") if x.strip().isdigit()]
@@ -2192,7 +2947,6 @@ if _in_streamlit():
                     )
 
                     if countStrat:
-                        import pandas as pd
                         trig = None
                         if isinstance(cr.reports, dict):
                             trig = cr.reports.get("strategy_triggers")
@@ -2211,7 +2965,7 @@ if _in_streamlit():
                             order_cols = [c for c in ["obs_date","scope","trigger_weighted","trigger_count","name"] if c in trig.columns]
                             if order_cols:
                                 trig = trig.sort_values(order_cols, ascending=[True, True, False, False, True][:len(order_cols)])
-                            st.dataframe(trig, use_container_width=True, height=420)
+                            st.dataframe(trig, width='stretch', height=420)
 
                             # —— 对比视图 ——
                             show_pivot = st.checkbox("按组/口径对比（透视表）", value=True)
@@ -2252,12 +3006,11 @@ if _in_streamlit():
                                     dfp = dfp[dfp["scope"]==scope_pick]
                                 if "group" in dfp.columns:
                                     pv = dfp.pivot_table(index="name", columns="group", values=pick_metric, aggfunc="max")
-                                    st.dataframe(pv, use_container_width=True, height=420)
+                                    st.dataframe(pv, width='stretch', height=420)
 
                         # —— 每票命中条数分布 ——
                         ks_hist_single = [k for k in (cr.reports.keys() if isinstance(cr.reports, dict) else []) if str(k).startswith("hits_histogram_single__")]
                         ks_hist_each   = [k for k in (cr.reports.keys() if isinstance(cr.reports, dict) else []) if str(k).startswith("hits_histogram_each__")]
-                        import pandas as pd
                         if ks_hist_single:
                             st.markdown("**单次型（ANY/LAST 等）命中条数分布**")
                             hist_single = pd.concat([cr.reports[k] for k in ks_hist_single], ignore_index=True, sort=False)
@@ -2266,7 +3019,7 @@ if _in_streamlit():
                             show = hist_single[hist_single["scope"]==scope_show] if scopes_hist else hist_single
                             if not show.empty:
                                 pv2 = show.pivot_table(index="n_single_rules_hit", columns="group", values="ratio", aggfunc="max")
-                                st.dataframe(pv2, use_container_width=True, height=280)
+                                st.dataframe(pv2, width='stretch', height=280)
                         if ks_hist_each:
                             st.markdown("**多次型（EACH）命中条数分布**")
                             hist_each = pd.concat([cr.reports[k] for k in ks_hist_each], ignore_index=True, sort=False)
@@ -2275,7 +3028,7 @@ if _in_streamlit():
                             show2 = hist_each[hist_each["scope"]==scope_show2] if scopes_hist2 else hist_each
                             if not show2.empty:
                                 pv3 = show2.pivot_table(index="n_each_rules_hit", columns="group", values="ratio", aggfunc="max")
-                                st.dataframe(pv3, use_container_width=True, height=280)
+                                st.dataframe(pv3, width='stretch', height=280)
 
 
                     st.caption("分析集/报告已写入 output/commonality/<ref>/ （包括 strategy_triggers__*.parquet, hits_by_stock__*.parquet, hits_histogram__*.parquet）。")
@@ -2293,20 +3046,6 @@ if _in_streamlit():
         with col2:
             st.markdown("**score_ui.log（尾部 400 行）**")
             st.code(_tail(LOG_DIR / "score_ui.log", 400), language="bash")
-
-    # _anchor = st.session_state.pop("scroll_after_rerun", None)
-    # if _anchor:
-    #     components.html(
-    #         f"<script>document.getElementById('{_anchor}')?.scrollIntoView({{behavior:'instant', block:'start'}});</script>",
-    #         height=0,
-    #     )
-
-    # _anchor = st.session_state.pop("scroll_after_rerun", None)
-    # if _anchor:
-    #     components.html(
-    #         f"<script>parent.document.getElementById('{_anchor}')?.scrollIntoView({{behavior:'instant', block:'start'}});</script>",
-    #         height=0,
-    #     )
 
     _anchor = st.session_state.pop("scroll_after_rerun", None)
     if _anchor:

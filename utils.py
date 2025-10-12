@@ -103,3 +103,107 @@ def market_label(ts_code: str) -> str:
     )):
         return "北交所"
     return "其他"
+
+# 策略文件读取工具
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+from pathlib import Path as _PathForStrategy
+import importlib.util as _importlib_util, types as _types_for_strategy
+
+@dataclass
+class StrategySet:
+    title: str
+    category: str   # "ranking" | "filter" | "prediction"
+    rules: List[Dict[str, Any]]
+    path: str
+
+
+def _import_module_from_path(_path: str, name: str = "strategy_repo_dyn") -> _types_for_strategy.ModuleType:
+    spec = _importlib_util.spec_from_file_location(name, _path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载策略模块：{_path}")
+    mod = _importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore
+    return mod
+
+
+def _candidate_repo_paths() -> List[_PathForStrategy]:
+    here = _PathForStrategy(__file__).parent
+    return [
+        here / "strategies_repo.py",
+        here.parent / "strategies_repo.py",
+        _PathForStrategy("./strategies_repo.py"),
+        _PathForStrategy("./strategies/strategies_repo.py"),
+    ]
+
+
+def _load_from_repo(py_path: Optional[str]) -> Optional[List[StrategySet]]:
+    target = None
+    if py_path:
+        p = _PathForStrategy(py_path)
+        if p.exists():
+            target = p
+    else:
+        for c in _candidate_repo_paths():
+            if c.exists():
+                target = c
+                break
+    if not target:
+        return None
+    mod = _import_module_from_path(str(target), name=f"strategy_repo_{target.name}")
+    sets: List[StrategySet] = []
+    if hasattr(mod, "RANKING_RULES"):
+        sets.append(StrategySet(title=str(getattr(mod, "RANKING_TITLE", "ranking")), category="ranking", rules=list(getattr(mod, "RANKING_RULES", [])), path=str(target)))
+    if hasattr(mod, "FILTER_RULES"):
+        sets.append(StrategySet(title=str(getattr(mod, "FILTER_TITLE", "filter")), category="filter", rules=list(getattr(mod, "FILTER_RULES", [])), path=str(target)))
+    if hasattr(mod, "PREDICTION_RULES"):
+        sets.append(StrategySet(title=str(getattr(mod, "PREDICTION_TITLE", "prediction")), category="prediction", rules=list(getattr(mod, "PREDICTION_RULES", [])), path=str(target)))
+    return sets
+
+
+def _split_config_rules_by_hard_penalty(rules: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    rank, filt = [], []
+    for r in rules:
+        if isinstance(r, dict) and r.get("hard_penalty", False):
+            filt.append(r)
+        else:
+            rank.append(r)
+    return {"ranking": rank, "filter": filt}
+
+
+def load_strategy_sets_py(py_path: Optional[str] = None) -> List[StrategySet]:
+    sets = _load_from_repo(py_path)
+    if sets is not None:
+        return sets
+    cfg_mod = _import_module_from_path(str(_PathForStrategy(__file__).parent / "config.py"), name="config_for_strategy_fallback")
+    sc_rules = list(getattr(cfg_mod, "SC_RULES", []))
+    spl = _split_config_rules_by_hard_penalty(sc_rules)
+    return [
+        StrategySet(title="ranking@config", category="ranking", rules=spl["ranking"], path=str(cfg_mod.__file__)),
+        StrategySet(title="filter@config(hard_penalty=True)", category="filter", rules=spl["filter"], path=str(cfg_mod.__file__)),
+        StrategySet(title="prediction@empty", category="prediction", rules=[], path=str(cfg_mod.__file__)),
+    ]
+
+
+def load_rank_rules_py(py_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for s in load_strategy_sets_py(py_path):
+        if s.category == "ranking":
+            out.extend(s.rules)
+    return out
+
+
+def load_filter_rules_py(py_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for s in load_strategy_sets_py(py_path):
+        if s.category == "filter":
+            out.extend(s.rules)
+    return out
+
+
+def load_pred_rules_py(py_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for s in load_strategy_sets_py(py_path):
+        if s.category == "prediction":
+            out.extend(s.rules)
+    return out

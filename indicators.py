@@ -13,7 +13,7 @@ class IndMeta:
     py_func: Optional[Callable] = None  # 可选：Python 兜底函数
     kwargs: Dict = field(default_factory=dict)
     tags: List[str] = field(default_factory=list)  # 使用场景标签，如 ["product","prelaunch"]
-
+    warmup: Optional[int] = None        # 该指标建议的预热天数
 REGISTRY: Dict[str, IndMeta] = {
     "kdj": IndMeta(
         name="kdj",
@@ -26,7 +26,8 @@ REGISTRY: Dict[str, IndMeta] = {
         """,
         py_func=lambda df, **kw: kdj(df, **kw),  # 复用你已有的 kdj(df) 实现
         kwargs={}, 
-        tags=["product","prelaunch"]
+        tags=["product","prelaunch"],
+        warmup=10,
     ),
     "volume_ratio": IndMeta(
         name="volume_ratio",
@@ -34,14 +35,16 @@ REGISTRY: Dict[str, IndMeta] = {
         tdx="VR := SAFE_DIV(V, MA(V, 20));",
         py_func=lambda df, **kw: volume_ratio(df, **kw),
         kwargs={"n": 20},
-        tags=["product","prelaunch"]
+        tags=["product","prelaunch"],
+        warmup=20,
     ),
     "bbi": IndMeta(
         name="bbi",
         out={"bbi": 2},
         tdx="BBI := (MA(C,3) + MA(C,6) + MA(C,12) + MA(C,24)) / 4;",
         py_func=lambda df, **kw: bbi(df),
-        tags=["product","prelaunch"]
+        tags=["product","prelaunch"],
+        warmup=24,
     ),
     "rsi": IndMeta(
         name="rsi",
@@ -53,7 +56,8 @@ REGISTRY: Dict[str, IndMeta] = {
         """,
         py_func=lambda df, **kw: rsi(df['close'], **kw),
         kwargs={"period": 14},  # Python 兜底参数
-        tags=["product","prelaunch"]
+        tags=["product","prelaunch"],
+        warmup=14,
     ),
     "DIFF": IndMeta(
         name="DIFF",
@@ -63,7 +67,8 @@ REGISTRY: Dict[str, IndMeta] = {
         """,
         py_func=lambda df, **kw: macd_diff(df['close'], **kw),
         kwargs={"fast": 12, "slow": 26},
-        tags=["product","prelaunch"]
+        tags=["product","prelaunch"],
+        warmup=26,
     ),
 }
 
@@ -130,6 +135,90 @@ def names_by_tag(tag: str) -> List[str]:
     return [n for n,m in REGISTRY.items() if tag in m.tags]
 
 
+def names_in_expr(expr: str) -> list[str]:
+    import re
+    tokens = list(re.findall(r'[A-Z_][A-Z0-9_]*', str(expr).upper()))
+    # 内置函数/符号黑名单（去掉 DIFF，避免误杀）
+    blacklist = {
+        'OPEN','HIGH','LOW','CLOSE','V','VOL','AMOUNT','O','H','L','C',
+        'MA','EMA','SMA','LLV','HHV','REF','CROSS','COUNT','IF','MIN','MAX',
+        'ABS','STD','STDV','STDDEV','SUM','ZIG','FILTER','BACKSET','BARSLAST',
+        'AND','OR','NOT','TRUE','FALSE','N','M','K','D','RSV','WMA','VAR','EXP',
+        'SAFE_DIV','EPS','SLOPE','SIGN','ROUND','FLOOR','CEIL','SQRT',
+        'MACD','DEA','DI','ADX','ADXR','HHVBARS','LLVBARS','CONST','BETWEEN'
+    }
+    toks = [t for t in tokens if t not in blacklist]
+
+    # 自动：由 REGISTRY 的 out 反推映射（输出列 -> 指标名）
+    mapping = {}
+    for key, meta in REGISTRY.items():
+        for out_col in (meta.out or {}):
+            mapping[out_col.upper()] = key
+
+    # 手工特例（别名）
+    mapping.update({
+        'J': 'kdj',
+        'KDJ_J': 'kdj',
+        'VR': 'volume_ratio',
+    })
+
+    seen, out = set(), []
+    for t in toks:
+        key = mapping.get(t)
+        if key and key in REGISTRY and key not in seen:
+            out.append(key)
+            seen.add(key)
+    return out
+
+
+def warmup_for(names: Optional[Union[str, List[str]]]) -> int:
+    """
+    给一组指标名，返回需要的 warm-up 天数（取最大）。
+    names 可以是 "all"、None、单个字符串或列表。
+    """
+    if names is None:
+        return 0
+    if isinstance(names, str):
+        if names.lower().strip() == 'all':
+            sel = list(REGISTRY.keys())
+        else:
+            sel = [n.strip() for n in names.split(',') if n.strip()]
+    else:
+        sel = list(names)
+    w = 0
+    for n in sel:
+        meta = REGISTRY.get(n)
+        if not meta:
+            continue
+        try:
+            w = max(w, int(meta.warmup or 0))
+        except Exception:
+            pass
+    return int(w)
+
+
+def estimate_warmup(exprs: Optional[List[str]], recompute_indicators: Union[str, List[str], tuple]) -> int:
+    """
+    综合“将要重算哪些指标” + “表达式内涉及哪些指标”，估算需要的 warm-up 天数。
+    - recompute_indicators: "none" | "all" | [name, ...]
+    - exprs: 规则/临时表达式列表；可为 None/空
+    返回：所需 warm-up 天数（至少 0）
+    """
+    # 不重算指标 → 不需要 warm-up
+    if isinstance(recompute_indicators, str) and recompute_indicators.lower().strip() == 'none':
+        return 0
+    # 将要重算的指标集合
+    if isinstance(recompute_indicators, str) and recompute_indicators.lower().strip() == 'all':
+        need = set(REGISTRY.keys())
+    else:
+        need = {str(x).strip() for x in (list(recompute_indicators) if isinstance(recompute_indicators, (list, tuple)) else []) if str(x).strip()}
+    # 从表达式里补齐隐式依赖
+    for e in (exprs or []):
+        for n in names_in_expr(e):
+            need.add(n)
+    # 返回最大 warm-up
+    return warmup_for(sorted(need))
+
 # =================== python兼容层 ==========================
 def moving_average(series, window):
     return series.rolling(window).mean()
@@ -183,4 +272,3 @@ def bbi(df):
     ma24 = df['close'].rolling(24).mean()
 
     return (ma3 + ma6 + ma12 + ma24) / 4
-

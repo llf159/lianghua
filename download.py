@@ -36,7 +36,7 @@ _TLS = threading.local()
 from utils import normalize_trade_date, normalize_ts
 
 _pro = None  # 真正的客户端放这里
-
+WARM = int(globals().get("WARM", ind.warmup_for(list(ind.REGISTRY.keys())) or 0))
 
 def _require_pro():
     """只有在确实需要 Pro 接口时才初始化；否则不触发任何 token 读取。
@@ -315,16 +315,21 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prew
             df2 = normalize_trade_date(df2).sort_values("trade_date")
             start_dt = df2["trade_date"].min()
 
-            # 选一段旧成品(或旧 plain)作 warm-up；用配置里的天数
-            WARM = max(120, SYMBOL_PRODUCT_WARMUP_DAYS)  # 建议 ≥150 更稳
+            # 选一段旧成品(或旧 plain)作 warm-up：按指标元数据 + 配置兜底
+            try:
+                from indicators import warmup_for as _ind_warmup_for
+                warm_ind = int(_ind_warmup_for(names))
+            except Exception:
+                warm_ind = 0
+            need_tail = max(int(WARM), int(warm_ind))
             tail_old = None
             if isinstance(old_ind, pd.DataFrame) and not old_ind.empty:
                 old_ind = normalize_trade_date(old_ind)
-                tail_old = old_ind[old_ind["trade_date"] < start_dt].tail(WARM)
+                tail_old = old_ind[old_ind["trade_date"] < start_dt].tail(need_tail)
             # 若没有旧 ind，就用 old_plain 的尾巴（如你前面已读到 old_plain）
             if (tail_old is None or tail_old.empty) and isinstance(old_plain, pd.DataFrame) and not old_plain.empty:
                 old_plain = normalize_trade_date(old_plain)
-                tail_old = old_plain[old_plain["trade_date"] < start_dt].tail(WARM)
+                tail_old = old_plain[old_plain["trade_date"] < start_dt].tail(need_tail)
 
             # 参与计算的输入：旧尾巴 + 新增窗口
             if tail_old is not None and not tail_old.empty:
@@ -359,7 +364,13 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prew
                 if isinstance(old_ind, pd.DataFrame) and not old_ind.empty:
                     old_td = pd.to_datetime(old_ind["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
                     last   = old_td.max()
-                    warmup_start = (last - pd.Timedelta(days=SYMBOL_PRODUCT_WARMUP_DAYS))
+                    warmup_start = (last - pd.Timedelta(days=WARM))
+                    try:
+                        warm_ind = int(ind.warmup_for(names))
+                    except Exception:
+                        warm_ind = 0
+                    warm_days = max(int(WARM), warm_ind)
+                    warmup_start = (last - pd.Timedelta(days=warm_days))
                     keep_old = old_ind.loc[old_td < warmup_start].copy()
                     keep_old = normalize_trade_date(keep_old)
                     new_part = df2.loc[pd.to_datetime(df2["trade_date"].astype(str), format="%Y%m%d", errors="coerce") >= warmup_start].copy()
@@ -805,40 +816,43 @@ def _recalc_increment_inmem(ts_list, last_duck_str: str, end: str, threads: int 
         glob_dst = os.path.join(dst_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
         cutoff_back = int(INC_INMEM_CUTOFF_BACK_DAYS or 365)
         _base = pd.to_datetime(str(last_duck_str), format="%Y%m%d", errors="coerce")
-        if pd.isna(_base):  # 指标分区尚未建成，或拿到'00000000'
+        if pd.isna(_base):
             _base = pd.Timestamp("2005-01-01")
         cutoff_start = (_base - pd.Timedelta(days=cutoff_back)).strftime("%Y%m%d")
-        # 统一成整数，避免 DuckDB 的 BIGINT vs VARCHAR 比较
         _cutoff_i = int(cutoff_start)
-        _end_i    = int(end)
-
-        # （可选防呆）
+        _end_i = int(end)
         if _cutoff_i > _end_i:
             _cutoff_i = _end_i
-        try:
-            # —— df_cut 的 SQL：改为整数比较 ——  （原来用 d.trade_date >= '{cutoff_start}'）
-            df_cut = con.sql(f"""
-                SELECT d.ts_code, max(d.trade_date) AS last_date
-                FROM parquet_scan('{glob_dst}', hive_partitioning=1) AS d
-                JOIN ts_list t ON d.ts_code = t.ts_code
-                WHERE CAST(d.trade_date AS BIGINT) >= {_cutoff_i}
-                GROUP BY d.ts_code
-            """).df()
-            
-        except duckdb.Error:
-            df_cut = pd.DataFrame(columns=["ts_code","last_date"])
+
+        # 从指标分区回看近 N 天取每股的 last_date
+        df_cut = con.sql(f"""
+            SELECT d.ts_code, max(d.trade_date) AS last_date
+            FROM parquet_scan('{glob_dst}', hive_partitioning=1) AS d
+            JOIN ts_list t ON d.ts_code = t.ts_code
+            WHERE CAST(d.trade_date AS BIGINT) >= {_cutoff_i}
+            GROUP BY d.ts_code
+        """).df()
 
         cutoff = pd.DataFrame({"ts_code": ts_list})
         mp = dict(zip(df_cut["ts_code"], df_cut["last_date"]))
         cutoff["last_date"] = cutoff["ts_code"].map(mp).fillna(0).astype(int)
 
-        # 每股 warm-up 下界（last_date - SYMBOL_PRODUCT_WARMUP_DAYS - PAD）
+        # 并入“指标最大 warm-up”
+        try:
+            cfg_names = (SYMBOL_PRODUCT_INDICATORS or "all")
+            names = list(ind.REGISTRY.keys()) if str(cfg_names).lower()=="all" else [x.strip() for x in str(cfg_names).split(",") if x.strip()]
+            warm_i = int(ind.warmup_for(names))
+        except Exception:
+            warm_i = 0
         pad = int(INC_INMEM_PADDING_DAYS or 5)
+        need_warm = max(int(WARM), warm_i)
+
+        # 注意把 warm_lower 存成整数，便于 DuckDB 无歧义比较
         cutoff["warm_lower"] = (
-            pd.to_datetime(cutoff["last_date"].astype(str).str.zfill(8), errors="coerce")
-            .fillna(pd.Timestamp("2005-01-01"))
-            - pd.Timedelta(days=SYMBOL_PRODUCT_WARMUP_DAYS + pad)
+            pd.to_datetime(cutoff["last_date"].astype(str).str.zfill(8), errors="coerce").fillna(pd.Timestamp("2005-01-01"))
+            - pd.Timedelta(days=need_warm + pad)
         ).dt.strftime("%Y%m%d").astype(int)
+
         con.register("cutoff_df", cutoff)
 
         # ② 只读本次涉及股票 + 各自窗口的基础列（DuckDB 一把拉进内存）
@@ -1064,7 +1078,59 @@ def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
 
             df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
             write_partition(df)
+            # return ts_code, "ok"
+            # ==== NEW: 边下载边算指标 ====
+            if INC_STREAM_COMPUTE_INDICATORS and WRITE_SYMBOL_INDICATORS:
+                try:
+                    # 1) 统一数值化 & 排序，作为 prewarmed 的新增窗口
+                    df_new = df.sort_values("trade_date")
+                    for c in ["open","high","low","close","vol","amount"]:
+                        if c in df_new.columns:
+                            df_new[c] = pd.to_numeric(df_new[c], errors="coerce")
+
+                    # 2) 计算哪个复权视角下写成品
+                    _adj_for_ind = _decide_symbol_adj_for_fast_init()   # 'raw' | 'qfq' | 'hfq'
+
+                    # 2.1 若目标是 raw，直接用刚下载的 df_new 计算
+                    if _adj_for_ind == "raw":
+                        _with_api_adj("raw", _WRITE_SYMBOL_INDICATORS, ts_code, df_new, end, prewarmed=True)
+                        if INC_STREAM_UPDATE_FAST_CACHE:
+                            _update_fast_init_cache(ts_code, df_new, "raw")
+
+                    # 2.2 若目标是 qfq/hfq，则再拉同区间的复权数据来算指标（避免用 raw 误算）
+                    else:
+                        def call_bar_adj():
+                            return ts.pro_bar(
+                                ts_code=ts_code,
+                                start_date=actual_start,
+                                end_date=end,
+                                adj=_adj_for_ind,
+                                freq='D',
+                                asset='E'
+                            )
+                        df_adj = _retry(lambda: call_bar_adj(), f"stock_pro_bar_{_adj_for_ind}_{ts_code}")
+                        if df_adj is not None and not df_adj.empty:
+                            df_adj = df_adj.sort_values("trade_date").drop(
+                                columns=[c for c in ("pre_close","change","pct_chg") if c in df_adj.columns],
+                                errors="ignore"
+                            )
+                            _with_api_adj(_adj_for_ind, _WRITE_SYMBOL_INDICATORS, ts_code, df_adj, end, prewarmed=True)
+                            if INC_STREAM_UPDATE_FAST_CACHE:
+                                _update_fast_init_cache(ts_code, df_adj, _adj_for_ind)
+                        # 也可选择顺手把 raw 版本回灌 fast_cache，加速后续合并
+                        if INC_STREAM_UPDATE_FAST_CACHE:
+                            _update_fast_init_cache(ts_code, df_new, "raw")
+
+                    # 3) （可选）把这只股票的指标合并到 daily_*_indicators 分区
+                    if INC_STREAM_MERGE_IND_SUBSET:
+                        _with_api_adj(_adj_for_ind, duckdb_merge_symbol_products_to_daily_subset, [ts_code])
+
+                except Exception as e_calc:
+                    # 保守起见：指标失败不影响主流程的“下载+落盘”
+                    logging.warning("[INC_STREAM][%s] 边下载边算失败：%s", ts_code, e_calc)
+            # ==== NEW END ====
             return ts_code, "ok"
+
         except Exception as e:
             return ts_code, f"err:{e}"
 

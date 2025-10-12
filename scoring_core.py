@@ -37,19 +37,36 @@ from config import (
     SC_REF_DATE, SC_LOOKBACK_D, SC_PRESCREEN_LOOKBACK_D, SC_BASE_SCORE, SC_MIN_SCORE,
     SC_TOP_K, SC_TIE_BREAK, SC_MAX_WORKERS, SC_READ_TAIL_DAYS,
     SC_OUTPUT_DIR, SC_CACHE_DIR,
-    SC_RULES, SC_PRESCREEN_RULES,
+    SC_DO_TRACKING, SC_DO_SURGE,
     SC_WRITE_WHITELIST, SC_WRITE_BLACKLIST, SC_ATTENTION_SOURCE,
     SC_ATTENTION_WINDOW_D, SC_ATTENTION_MIN_HITS, SC_ATTENTION_TOP_K,
     SC_BENCH_CODES, SC_BENCH_WINDOW, SC_BENCH_FILL, SC_BENCH_FEATURES,
     SC_UNIVERSE, 
 )
+try:
+    from config import SC_PRESCREEN_RULES
+except Exception:
+    SC_PRESCREEN_RULES = []
     
 from parquet_viewer import asset_root, list_trade_dates, read_range
 from indicators import kdj  # 用于兜底计算 J（若数据不含 j 列）
 from utils import normalize_ts, normalize_trade_date
 import tdx_compat as tdx
 from tdx_compat import evaluate_bool
-from stats_core import run_tracking, post_scoring, run_surge
+from stats_core import post_scoring
+
+# --- 策略来源切换：优先从 strategies_repo.py 读取 ---
+try:
+    from utils import load_rank_rules_py, load_filter_rules_py
+    _loaded_rank = load_rank_rules_py()
+    _loaded_filter = load_filter_rules_py()
+    if _loaded_rank:
+        SC_RULES = _loaded_rank
+    if _loaded_filter:
+        SC_PRESCREEN_RULES = _loaded_filter
+except Exception as _e:
+    # 保持与原 config 一致（静默回退）
+    pass
 
 OUTPUT_DIR = Path(SC_OUTPUT_DIR)
 DETAIL_DIR = OUTPUT_DIR / "details"
@@ -1119,12 +1136,12 @@ def _scope_hit(s_bool: pd.Series, scope: str) -> bool:
     if ss == "ALL":
         return bool(s.all())
 
-    m1 = re.match(r"COUNT>?\s*=\s*(\d+)", ss)
+    m1 = re.match(r"COUNT\s*(?:>=|=|≥|＝)\s*(\d+)\b", ss)
     if m1:
         k = int(m1.group(1))
         return int(s.sum()) >= k
 
-    m2 = re.match(r"CONSEC>?\s*=\s*(\d+)", ss)
+    m2 = re.match(r"CONSEC\s*(?:>=|=|≥|＝)\s*(\d+)\b", ss)
     if m2:
         m = int(m2.group(1))
         # 最长 True 连续段
@@ -1139,7 +1156,7 @@ def _scope_hit(s_bool: pd.Series, scope: str) -> bool:
         return best >= m
 
     # ---- 新增：ANY_n / ALL_n ----
-    m3 = re.match(r"ANY[_\-]?(\d+)$", ss)
+    m3 = re.match(r"ANY(?:[_\-\s]?)(\d+)$", ss)
     if m3:
         n = int(m3.group(1))
         if len(s) < n:
@@ -1150,7 +1167,7 @@ def _scope_hit(s_bool: pd.Series, scope: str) -> bool:
             LOGGER.debug(f"[SCOPE] ANY_{n}: len={len(s)} max_in_subwin={int(roll.max())} -> {hit}")
         return hit
 
-    m4 = re.match(r"ALL[_\-]?(\d+)$", ss)
+    m4 = re.match(r"ALL(?:[_\-\s]?)(\d+)$", ss)
     if m4:
         n = int(m4.group(1))
         if len(s) < n:
@@ -1162,6 +1179,10 @@ def _scope_hit(s_bool: pd.Series, scope: str) -> bool:
         return hit
 
     # 默认当作 ANY
+    try:
+        LOGGER.warning("[SCOPE] 未识别的 scope='%s'，按 ANY 处理", scope)
+    except Exception:
+        pass
     return bool(s.any())
 
 
@@ -1371,6 +1392,124 @@ def _inject_benchmark_features(dfD: pd.DataFrame, start: str, end: str) -> pd.Da
     return base
 
 
+def _eval_rule_add_on_df(dfD: pd.DataFrame, rule: dict, ref_date: str) -> dict:
+    tf   = str(rule.get("timeframe","D")).upper()
+    win  = int(rule.get("window", SC_LOOKBACK_D))
+    pts  = float(rule.get("points", 0))
+    dfTF = dfD if tf=="D" else _resample(dfD, tf)
+    win_df = _window_slice(dfTF, ref_date, win)
+    res = {"add": 0.0, "cnt": None, "lag": None, "hit_date": None, "gate_ok": True, "error": None}
+    try:
+        scope = str(rule.get("scope","ANY")).upper().strip()
+        if scope in {"EACH","PERBAR","EACH_TRUE"}:
+            cnt, err = _count_hits_perbar(dfD, rule, ref_date)
+            if err: res["error"] = err
+            gate_ok, _, _ = _eval_gate(dfD, rule, ref_date)
+            res["gate_ok"] = gate_ok
+            if cnt and pts and gate_ok:
+                res["cnt"] = int(cnt); res["add"] = float(pts * int(cnt))
+            # 命中日
+            cand_when = None
+            if "clauses" in rule and rule["clauses"]:
+                for c in rule["clauses"]:
+                    if c.get("when"): cand_when = c["when"]; break
+            else:
+                cand_when = rule.get("when")
+            if cand_when and not win_df.empty:
+                _d, _ = _last_true_date(win_df, cand_when); res["hit_date"] = _d
+            return res
+
+        if scope in {"RECENT","DIST","NEAR"}:
+            add, lag, err = _recent_points(dfD, rule, ref_date)
+            if err: res["error"] = err
+            gate_ok, _, _ = _eval_gate(dfD, rule, ref_date)
+            res["gate_ok"] = gate_ok
+            res["lag"] = (None if lag is None else int(lag))
+            if gate_ok and add:
+                res["add"] = float(add)
+            if res["lag"] is not None and not win_df.empty:
+                idx = win_df.index if isinstance(win_df.index, pd.DatetimeIndex) else pd.to_datetime(win_df["trade_date"].astype(str))
+                i = res["lag"]; 
+                if 0 <= i < len(idx): res["hit_date"] = idx[-1 - i].strftime("%Y%m%d")
+            return res
+
+        # 常规布尔
+        ok, err = _eval_rule(dfD, rule, ref_date)
+        if err: res["error"] = err
+        gate_ok, _, _ = _eval_gate(dfD, rule, ref_date)
+        res["gate_ok"] = gate_ok
+        if ok and gate_ok and pts:
+            res["add"] = float(pts)
+        # 命中日/全集命中
+        w = (rule.get("when") or "").strip()
+        if w and not win_df.empty:
+            _d, _ = _last_true_date(win_df, w); res["hit_date"] = _d
+        return res
+    except Exception as e:
+        res["error"] = f"eval-exception: {e}"
+        return res
+
+
+def apply_rule_across_universe(rule: dict, ref_date: str | None = None, universe: str | list[str] | None = "all", return_df: bool = True):
+    ref = ref_date or _pick_ref_date()
+    tf  = str(rule.get("timeframe","D")).upper()
+    win = int(rule.get("window", SC_LOOKBACK_D))
+    st  = _start_for_tf_window(ref, tf, win)
+    codes0 = _list_codes_for_day(ref)
+    codes, src = _apply_universe_filter(list(codes0), ref, universe)
+    if not codes: 
+        return pd.DataFrame() if return_df else None
+
+    # 需要列：基础 + J/VR
+    need = ["trade_date","open","high","low","close","vol","amount"]
+    def scan(expr: str):
+        if _expr_mentions(expr, "J"):  need.append("j")
+        if _expr_mentions(expr, "VR"): need.append("vr")
+    if "clauses" in (rule or {}) and rule["clauses"]:
+        for c in rule["clauses"] or []: scan((c.get("when") or ""))
+    else:
+        scan((rule.get("when") or ""))
+
+    rows = []
+    max_workers = (SC_MAX_WORKERS or max(os.cpu_count()-1, 1))
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futs = []
+        for c in codes:
+            futs.append(ex.submit(_apply_one_stock_for_rule, c, st, ref, rule, need))
+        _progress("screen_start", total=len(futs), current=0, message=f"workers={max_workers}")
+        done = 0
+        for f in as_completed(futs):
+            done += 1
+            _progress("screen_progress", total=len(futs), current=done)
+            rows.append(f.result())
+    _progress("screen_done", total=len(rows), current=done, message=f"rows={len(rows)}")
+
+    if return_df:
+        return pd.DataFrame(rows)
+    return None
+
+
+def _apply_one_stock_for_rule(ts_code: str, st: str, ref: str, rule: dict, need_cols: list[str]) -> dict:
+    try:
+        dfD = _read_stock_df(ts_code, st, ref, columns=need_cols)
+        if dfD is None or dfD.empty:
+            return {"ts_code": ts_code, "ref_date": ref, "add": 0.0, "error": "empty-window"}
+        # 兜底 J/VR
+        if "j" in need_cols and "j" not in dfD.columns:
+            try: dfD = dfD.copy(); dfD["j"] = kdj(dfD)
+            except Exception: pass
+        if "vr" in need_cols and "vr" not in dfD.columns and "vol" in dfD.columns:
+            v = pd.to_numeric(dfD["vol"], errors="coerce")
+            dfD = dfD.copy(); dfD["vr"] = (v / v.rolling(26).mean()).values
+
+        tdx.EXTRA_CONTEXT.update(get_eval_env(ts_code, ref))
+        _inject_config_tags(dfD, ref)  # 允许表达式里用 ANY_TAG 等
+        out = _eval_rule_add_on_df(dfD, rule, ref)
+        out.update({"ts_code": ts_code, "ref_date": ref})
+        return out
+    except Exception as e:
+        return {"ts_code": ts_code, "ref_date": ref, "add": 0.0, "error": str(e)}
+
 # ------------------------- 初选（预筛） -------------------------
 @dataclass
 class PrescreenResult:
@@ -1397,7 +1536,8 @@ def _prescreen(dfD: pd.DataFrame, ref_date: str) -> PrescreenResult:
     reason：命中规则的 reason 文案（若未提供，用 name）。
     """
     for rule in (SC_PRESCREEN_RULES or []):
-        hard = bool(rule.get("hard_penalty", False))
+        hard = bool(rule.get("hard_penalty", True))
+        # hard = bool(rule.get("hard_penalty", False))
         if not hard:
             continue
         if "clauses" in rule and rule["clauses"]:
@@ -2188,7 +2328,7 @@ def tdx_screen(
         return pd.DataFrame() if return_df else None
 
     cols = _scan_cols_from_expr(when)
-    ("[screen] 参考日=%s tf=%s window=%d scope=%s 宇宙=%d", ref, tf, win, scope, len(codes))
+    LOGGER.debug("[screen] 参考日=%s tf=%s window=%d scope=%s 宇宙=%d", ref, tf, win, scope, len(codes))
     LOGGER.debug("[screen] 读取列=%s 起始=%s", cols, st)
 
     hits: list[str] = []
@@ -2249,11 +2389,13 @@ def _has_streamlit_ctx() -> bool:
     except Exception:
         return False
 
+
 def _on_main_thread() -> bool:
     try:
         return threading.current_thread() is threading.main_thread()
     except Exception:
         return threading.current_thread().name == "MainThread"
+
 
 def drain_progress_events(consumer=None, max_batch: int = 256):
     """
@@ -2302,6 +2444,7 @@ def set_progress_handler(fn):
     PROGRESS_HANDLER = _enqueue_only
     return True
 
+
 def _progress(phase: str, *, current: int | None = None, total: int | None = None,
               message: str | None = None, **extra):
     """
@@ -2325,3 +2468,44 @@ def _progress(phase: str, *, current: int | None = None, total: int | None = Non
             _logging.getLogger(__name__).debug(f"[progress-cb-error] {e}")
         except Exception:
             pass
+
+
+def diagnose_expr(when: str, ref_date: str | None = None, timeframe: str = "D", window: int = 60) -> dict:
+    when = (when or "").strip()
+    if not when:
+        return {"ok": False, "error": "when 不能为空", "need_cols": [], "missing": []}
+
+    ref = ref_date or _pick_ref_date()
+    tf  = (timeframe or "D").upper()
+    win = int(window)
+    st  = _start_for_tf_window(ref, tf, win)
+
+    # 选一只探针标的 & 读取数据
+    codes = _list_codes_for_day(ref)
+    ts0 = (codes[0] if codes else None)
+    if not ts0:
+        return {"ok": False, "error": "无可用标的供诊断", "need_cols": [], "missing": []}
+
+    need = _scan_cols_from_expr(when)      # 基础 + J/VR
+    dfD  = _read_stock_df(ts0, st, ref, columns=need)
+    have = set(map(str.lower, dfD.columns))
+
+    # J/VR 自动兜底
+    auto_filled = []
+    if _expr_mentions(when, "J") and ("j" not in have):
+        try:
+            dfD = dfD.copy(); dfD["j"] = kdj(dfD); auto_filled.append("j")
+        except Exception: pass
+    if _expr_mentions(when, "VR") and ("vr" not in have) and ("vol" in have):
+        v = pd.to_numeric(dfD["vol"], errors="coerce")
+        dfD = dfD.copy(); dfD["vr"] = (v / v.rolling(26).mean()).values; auto_filled.append("vr")
+
+    # 做一次窗口求值来抓语法问题
+    dfTF   = dfD if tf == "D" else _resample(dfD, tf)
+    win_df = _window_slice(dfTF, ref, win)
+    try:
+        with _ctx_df(win_df):
+            _ = evaluate_bool(when, win_df)
+        return {"ok": True, "error": None, "need_cols": need, "missing": list(set(map(str.lower, need)) - set(have)), "auto_filled": auto_filled, "probe": ts0, "ref_date": ref}
+    except Exception as e:
+        return {"ok": False, "error": f"表达式错误: {e}", "need_cols": need, "missing": list(set(map(str.lower, need)) - set(have)), "auto_filled": auto_filled, "probe": ts0, "ref_date": ref}

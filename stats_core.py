@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8-sig -*-
 from __future__ import annotations
 
 import logging
@@ -16,6 +16,7 @@ import math
 import json
 import numpy as np
 import pandas as pd
+import re
 import importlib
 from config import PARQUET_BASE, PARQUET_ADJ
 from parquet_viewer import asset_root, read_range, list_trade_dates
