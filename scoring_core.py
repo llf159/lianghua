@@ -42,6 +42,7 @@ from config import (
     SC_ATTENTION_WINDOW_D, SC_ATTENTION_MIN_HITS, SC_ATTENTION_TOP_K,
     SC_BENCH_CODES, SC_BENCH_WINDOW, SC_BENCH_FILL, SC_BENCH_FEATURES,
     SC_UNIVERSE, 
+    SC_DETAIL_STORAGE, SC_USE_DB_STORAGE, SC_DB_FALLBACK_TO_JSON,
 )
 try:
     from config import SC_PRESCREEN_RULES
@@ -660,22 +661,48 @@ def _select_columns_for_rules() -> List[str]:
 
 
 def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: list[dict]):
-    try:
-        base = os.path.join(SC_OUTPUT_DIR, "details", str(ref_date))
-        os.makedirs(base, exist_ok=True)
-        out_path = os.path.join(base, f"{ts_code}_{ref_date}.json")
-        payload = {
-            "ts_code": ts_code,
-            "ref_date": ref_date,
-            "summary": summary,      # {"score": float, "tiebreak": float|None, "highlights": [...], "drawbacks":[...]}
-            "rules": per_rules       # 每条规则的细粒度命中情况（见下）
-        }
-        with open(out_path, "w", encoding="utf-8") as f:
-            import json
-            json.dump(_json_sanitize(payload), f, ensure_ascii=False, indent=2, allow_nan=False)
-        LOGGER.debug("[detail] %s -> %s", ts_code, out_path)
-    except Exception as e:
-        LOGGER.warning("[detail] 写明细失败 %s: %s", ts_code, e)
+    """
+    写入个股详情，优先使用数据库存储，失败时回退到JSON文件
+    """
+    success = True
+    db_success = False
+    
+    # 1. 优先尝试数据库存储
+    if SC_DETAIL_STORAGE in ["database", "both"] and SC_USE_DB_STORAGE:
+        try:
+            from detail_db import get_detail_db
+            db = get_detail_db()
+            if db.save_detail(ts_code, ref_date, summary, per_rules):
+                LOGGER.debug("[detail] DB %s -> %s", ts_code, ref_date)
+                db_success = True
+            else:
+                LOGGER.warning("[detail] DB写明细失败 %s", ts_code)
+        except Exception as e:
+            LOGGER.warning("[detail] DB写明细失败 %s: %s", ts_code, e)
+    
+    # 2. 如果数据库失败且配置了回退，或者配置了JSON存储，则使用JSON文件
+    if (not db_success and SC_DB_FALLBACK_TO_JSON) or SC_DETAIL_STORAGE in ["json", "both"]:
+        try:
+            base = os.path.join(SC_OUTPUT_DIR, "details", str(ref_date))
+            os.makedirs(base, exist_ok=True)
+            out_path = os.path.join(base, f"{ts_code}_{ref_date}.json")
+            payload = {
+                "ts_code": ts_code,
+                "ref_date": ref_date,
+                "summary": summary,      # {"score": float, "tiebreak": float|None, "highlights": [...], "drawbacks":[...]}
+                "rules": per_rules       # 每条规则的细粒度命中情况（见下）
+            }
+            with open(out_path, "w", encoding="utf-8") as f:
+                import json
+                json.dump(_json_sanitize(payload), f, ensure_ascii=False, indent=2, allow_nan=False)
+            LOGGER.debug("[detail] JSON %s -> %s", ts_code, out_path)
+            success = True
+        except Exception as e:
+            LOGGER.warning("[detail] JSON写明细失败 %s: %s", ts_code, e)
+            success = False
+    
+    if not success:
+        LOGGER.warning("[detail] 写明细失败 %s", ts_code)
 
 
 def _list_true_dates(df: pd.DataFrame, expr: str, *, ref_date: str, window: int, timeframe: str) -> list[str]:
@@ -919,8 +946,8 @@ def _build_score_all_from_details(ref_date: str) -> Path | None:
     if not rows:
         return None
     df = pd.DataFrame(rows).dropna(subset=["ts_code", "score"])
-    # 排序：总分降序、tiebreak 降序、代码升序
-    df = df.sort_values(["score", "tiebreak_j", "ts_code"], ascending=[False, False, True])
+    # 排序：按得分降序，同分时按J值升序，再同分时按代码升序（兜底）
+    df = df.sort_values(["score", "tiebreak_j", "ts_code"], ascending=[False, True, True])
     df["rank"] = np.arange(1, len(df) + 1)
     df["trade_date"] = str(ref_date)
     # 写全量排名文件
@@ -2187,9 +2214,9 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     _progress("write_cache_lists", message=f"white={len(whitelist_items)} black={len(blacklist_items)}")
     _write_cache_lists(ref_date, whitelist_items, blacklist_items)
 
-    # 排序：总分降序；Tie-break（KDJ J）升序；ts_code 升序兜底
+    # 排序：按得分降序，同分时按J值升序，再同分时按代码升序（兜底）
     def key_fn(x: ScoreDetail):
-        tb = x.tiebreak if x.tiebreak is not None else math.inf  # J 越小越优
+        tb = x.tiebreak if x.tiebreak is not None else float('inf')  # J值越小越好
         return (-x.score, tb, x.ts_code)
 
     scored_sorted = sorted(scored, key=key_fn)
@@ -2238,23 +2265,44 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     except Exception as _e:
         LOGGER.warning("[UI] 写入 ui_hints.json 失败：%s", _e)
         LOGGER.info(f"[名单] 白名单 {len(whitelist_items)}，黑名单 {len(blacklist_items)}")
-    # —— 回写 rank 到各自的明细 JSON（可选，但推荐启用） ——
+    # —— 回写 rank 到各自的明细（优先数据库，失败时回退到JSON） ——
     try:
-        import json as _json
-        details_dir = os.path.join(SC_OUTPUT_DIR, "details", str(ref_date))
         totalN = len(scored_sorted)
-        for i, s in enumerate(scored_sorted):
-            fp = os.path.join(details_dir, f"{s.ts_code}_{ref_date}.json")
-            if not os.path.isfile(fp):
-                continue
-            with open(fp, "r", encoding="utf-8-sig") as f:
-                obj = _json.load(f)
-            summ = obj.get("summary") or {}
-            summ["rank"] = int(i + 1)          # 绝对名次（1 开始）
-            summ["total"] = int(totalN)        # 当日样本总数
-            obj["summary"] = summ
-            with open(fp, "w", encoding="utf-8") as f:
-                _json.dump(_json_sanitize(obj), f, ensure_ascii=False, indent=2, allow_nan=False)
+        db_success = False
+        
+        # 1. 优先尝试数据库批量更新排名
+        if SC_DETAIL_STORAGE in ["database", "both"] and SC_USE_DB_STORAGE:
+            try:
+                from detail_db import get_detail_db
+                db = get_detail_db()
+                if db.batch_update_ranks(ref_date, scored_sorted):
+                    LOGGER.debug("[detail] 数据库批量更新排名成功")
+                    db_success = True
+                else:
+                    LOGGER.warning("[detail] 数据库批量更新排名失败")
+            except Exception as e:
+                LOGGER.warning("[detail] 数据库批量更新排名异常：%s", e)
+        
+        # 2. 如果数据库失败且配置了回退，或者配置了JSON存储，则使用JSON文件
+        if (not db_success and SC_DB_FALLBACK_TO_JSON) or SC_DETAIL_STORAGE in ["json", "both"]:
+            import json as _json
+            details_dir = os.path.join(SC_OUTPUT_DIR, "details", str(ref_date))
+            for i, s in enumerate(scored_sorted):
+                fp = os.path.join(details_dir, f"{s.ts_code}_{ref_date}.json")
+                if not os.path.isfile(fp):
+                    continue
+                try:
+                    with open(fp, "r", encoding="utf-8-sig") as f:
+                        obj = _json.load(f)
+                    summ = obj.get("summary") or {}
+                    summ["rank"] = int(i + 1)          # 绝对名次（1 开始）
+                    summ["total"] = int(totalN)        # 当日样本总数
+                    obj["summary"] = summ
+                    with open(fp, "w", encoding="utf-8") as f:
+                        _json.dump(_json_sanitize(obj), f, ensure_ascii=False, indent=2, allow_nan=False)
+                except Exception as e:
+                    LOGGER.warning("[detail] JSON回写排名失败 %s: %s", s.ts_code, e)
+        
     except Exception as e:
         LOGGER.warning("[detail] 回写 rank 失败：%s", e)
 
@@ -2370,6 +2418,29 @@ def tdx_screen(
         out = pd.DataFrame({"ts_code": sorted(hits)})
         out["ref_date"] = ref
         out["rule"] = f"{tf}{win}:{scope}::{when}"
+        
+        # 读取当日得分数据并合并，然后按得分排序
+        try:
+            score_path = ALL_DIR / f"score_all_{ref}.csv"
+            if score_path.exists() and score_path.stat().st_size > 0:
+                df_score = pd.read_csv(score_path, dtype={"ts_code": str})
+                # 合并得分数据
+                out = out.merge(df_score[["ts_code", "score", "tiebreak_j"]], on="ts_code", how="left")
+                
+                # 按得分降序排序，同分时按J值升序，再同分时按代码升序
+                out = out.sort_values(["score", "tiebreak_j", "ts_code"], 
+                                    ascending=[False, True, True], 
+                                    na_position="last").reset_index(drop=True)
+                
+                # 添加排名列
+                out["rank"] = range(1, len(out) + 1)
+                
+                LOGGER.info(f"[screen] 已按得分排序，共{len(out)}只股票")
+            else:
+                LOGGER.warning(f"[screen] 未找到得分文件 {score_path}，保持原排序")
+        except Exception as e:
+            LOGGER.warning(f"[screen] 读取得分数据失败: {e}，保持原排序")
+        
         return out
     return None
 

@@ -60,6 +60,7 @@ class CacheBackend:
     def set(self, key: str, df: pd.DataFrame) -> None:
         raise NotImplementedError
 
+
 class FileCache(CacheBackend):
     """把结果存到 cache_dir 下的 parquet/csv（默认 parquet）。"""
     def __init__(self, cache_dir: str = "cache/sim", fmt: Literal["parquet","csv"]="parquet") -> None:
@@ -115,11 +116,13 @@ def _hash_scenario(scen: "Scenario") -> str:
     import hashlib as _hashlib  # local import to avoid clashes
     return _hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
 
+
 def _hash_universe(codes: List[str]) -> str:
     arr = sorted(str(c) for c in (codes or []))
     raw = "|".join(arr)
     import hashlib as _hashlib
     return _hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+
 
 def _make_cache_key(ref_date: str, sim_date: str, scene_hash: str, uni_hash: str, ind_flag: str) -> str:
     return f"{ref_date}_{sim_date}_{scene_hash}_{uni_hash}_{ind_flag}"
@@ -176,6 +179,7 @@ def _infer_next_date_str(ref_date: str) -> str:
     d = dt.datetime.strptime(ref_date, "%Y%m%d") + dt.timedelta(days=1)
     return d.strftime("%Y%m%d")
 
+
 def _load_hist_window(
     base: str,
     adj: str,
@@ -209,6 +213,7 @@ def _load_hist_window(
     # 每只按日期排序
     return df.sort_values(["ts_code","trade_date"]).reset_index(drop=True)
 
+
 def _gen_hl_from_mode(latest: pd.Series, scen: Scenario) -> Tuple[float,float]:
     O, C, H, L = latest["open"], latest["close"], latest["high"], latest["low"]
     if scen.hl_mode == "follow":
@@ -226,6 +231,7 @@ def _gen_hl_from_mode(latest: pd.Series, scen: Scenario) -> Tuple[float,float]:
         span = float(max(C, O)) * (abs(float(scen.range_pct)) / 100.0)
         mid = (float(C) + float(O)) / 2.0
         return float(mid + span/2.0), float(mid - span/2.0)
+
 
 def _apply_scenario_row(latest: pd.Series, scen: Scenario) -> Dict[str, Any]:
     """基于上一日 latest 行（Series），生成“模拟日”一行"""
@@ -322,6 +328,10 @@ def simulate_next_day(
             pass
 
     # 1) 载入历史
+    _emit("pred_select_ref_date", message=f"选择参考日: {ref_date}")
+    _emit("pred_build_universe_done", message=f"构建模拟清单: {len(universe_codes)} 只股票")
+    _emit("pred_start", message="开始模拟明日数据")
+    
     df_hist = _load_hist_window(base, adj, asset, universe_codes, ref_date, scenario.warmup_days)
     if df_hist.empty:
         empty = pd.DataFrame(columns=["ts_code","trade_date","open","high","low","close","vol"])
@@ -329,8 +339,10 @@ def simulate_next_day(
 
     # 2) 逐只生成模拟行
     last_rows = df_hist.groupby("ts_code").tail(1).reset_index(drop=True)
+    total_stocks = len(last_rows)
     recs: List[Dict[str, Any]] = []
-    for _, row in last_rows.iterrows():
+    
+    for i, (_, row) in enumerate(last_rows.iterrows()):
         ts = str(row["ts_code"])
         scen = per_stock.for_ts(ts, scenario)
         vals = _apply_scenario_row(row, scen)
@@ -339,6 +351,11 @@ def simulate_next_day(
             "trade_date": sim_date,
             **vals
         })
+        
+        # 发送进度事件
+        _emit("pred_progress", current=i+1, total=total_stocks, 
+              message=f"生成模拟数据: {ts} ({i+1}/{total_stocks})")
+    
     df_sim = pd.DataFrame.from_records(recs, columns=["ts_code","trade_date","open","high","low","close","vol"])
 
     # 3) 拼接（历史 + 模拟）
@@ -353,25 +370,36 @@ def simulate_next_day(
             names = [k for k,v in getattr(ind, "REGISTRY", {}).items() if getattr(v, "py_func", None)]
         else:
             names = [n for n in recompute_indicators if n in getattr(ind, "REGISTRY", {}) and getattr(ind.REGISTRY[n], "py_func", None)]
-        parts: List[pd.DataFrame] = []
-        for ts, sub in df_all.groupby("ts_code"):
-            sub = sub.copy()
-            for name in names:
-                meta = ind.REGISTRY[name]
-                try:
-                    res = meta.py_func(sub, **(getattr(meta, "kwargs", {}) or {}))
-                    if isinstance(res, pd.Series):
-                        sub[name] = res
-                    elif isinstance(res, pd.DataFrame):
-                        for c in res.columns:
-                            sub[str(c)] = res[c]
-                    elif isinstance(res, dict):
-                        for c, s in res.items():
-                            sub[str(c)] = s
-                except Exception:
-                    pass
-            parts.append(sub)
-        df_all = pd.concat(parts, ignore_index=True).sort_values(["ts_code","trade_date"]).reset_index(drop=True)
+        
+        if names:
+            _emit("pred_progress", message=f"开始重算指标: {', '.join(names)}")
+            parts: List[pd.DataFrame] = []
+            stock_groups = list(df_all.groupby("ts_code"))
+            total_stocks = len(stock_groups)
+            
+            for i, (ts, sub) in enumerate(stock_groups):
+                sub = sub.copy()
+                for name in names:
+                    meta = ind.REGISTRY[name]
+                    try:
+                        res = meta.py_func(sub, **(getattr(meta, "kwargs", {}) or {}))
+                        if isinstance(res, pd.Series):
+                            sub[name] = res
+                        elif isinstance(res, pd.DataFrame):
+                            for c in res.columns:
+                                sub[str(c)] = res[c]
+                        elif isinstance(res, dict):
+                            for c, s in res.items():
+                                sub[str(c)] = s
+                    except Exception:
+                        pass
+                parts.append(sub)
+                
+                # 发送进度事件
+                _emit("pred_progress", current=i+1, total=total_stocks, 
+                      message=f"重算指标: {ts} ({i+1}/{total_stocks})")
+            
+            df_all = pd.concat(parts, ignore_index=True).sort_values(["ts_code","trade_date"]).reset_index(drop=True)
 
     # 5) 落盘（可选，默认不落盘；与缓存独立）
     if out_dir:
@@ -389,6 +417,9 @@ def simulate_next_day(
             cache.set(cache_key, df_all)
         except Exception:
             pass
+
+    # 发送完成事件
+    _emit("pred_done", message=f"模拟完成: {sim_date}")
 
     return SimResult(ref_date=ref_date, sim_date=sim_date, df_sim=df_sim, df_concat=df_all)
 
@@ -525,6 +556,7 @@ def _fallback_kdj(df: pd.DataFrame) -> pd.DataFrame:
     j = 3*k - 2*d
     return pd.DataFrame({"k": k, "d": d, "j": j})
 
+
 def _extract_last_j_for_each(df_concat: pd.DataFrame, sim_date: str) -> pd.Series:
     """从 df_concat 中抽取各票在 sim_date 的 J 值。优先用现成列（j/J/kdj_j），否则回退计算。"""
     out: Dict[str, float] = {}
@@ -542,7 +574,7 @@ def _extract_last_j_for_each(df_concat: pd.DataFrame, sim_date: str) -> pd.Serie
         out[str(ts)] = float(kdj["j"].iloc[-1])
     return pd.Series(out, name="J")
 
-# ---------------- 主入口：明日预测 ----------------
+# ---------------- 主入口：明日模拟 ----------------
 @dataclass
 class PredictionInput:
     ref_date: str
@@ -554,11 +586,13 @@ class PredictionInput:
     recompute_indicators: Iterable[str] | Literal["all","none"] = ("kdj",)   # 只重算所需
     cache_dir: Optional[str] = None          # 可传 "cache/sim_pred"
 
+
 def run_prediction(inp: PredictionInput) -> pd.DataFrame:
     """
     返回列：
-      ts_code, rule_name, J, ref_date, sim_date, scenario_id
-    - 当 rules/expr 都为空：返回全体的 J 表（命中等于“全部”）
+      ts_code, rule_name, J, ref_date, sim_date, scenario_id, score, tiebreak_j, rank
+    - 当 rules/expr 都为空：返回全体的 J 表（命中等于"全部"）
+    - 新增：自动读取当日得分数据并合并到结果中
     """
     results = []
     # A) 有规则：逐规则跑
@@ -642,13 +676,39 @@ def run_prediction(inp: PredictionInput) -> pd.DataFrame:
         results.append(out[["ts_code","rule_name","J","ref_date","sim_date","scenario_id"]])
 
     if not results:
-        return pd.DataFrame(columns=["ts_code","rule_name","J","ref_date","sim_date","scenario_id"])
+        return pd.DataFrame(columns=["ts_code","rule_name","J","ref_date","sim_date","scenario_id","score","tiebreak_j","rank"])
+    
     df = pd.concat(results, ignore_index=True)
     # 统一列
     if "rule_name" not in df.columns:
         df["rule_name"] = ""
         df = df[["ts_code","rule_name","J","ref_date","sim_date","scenario_id"]]
-    return df.sort_values(["rule_name","ts_code"]).reset_index(drop=True)
+    
+    # 新增：读取当日得分数据并合并
+    try:
+        # 尝试读取得分文件
+        score_path = Path("output/score/all") / f"score_all_{inp.ref_date}.csv"
+        if score_path.exists() and score_path.stat().st_size > 0:
+            df_score = pd.read_csv(score_path, dtype={"ts_code": str})
+            # 合并得分数据
+            df = df.merge(df_score[["ts_code", "score", "tiebreak_j", "rank"]], on="ts_code", how="left")
+            # 按得分降序排序，同分时按J值升序，再同分时按代码升序
+            df = df.sort_values(["score", "tiebreak_j", "ts_code"], 
+                              ascending=[False, True, True], 
+                              na_position="last").reset_index(drop=True)
+        else:
+            # 如果没有得分文件，添加空的得分列
+            df["score"] = None
+            df["tiebreak_j"] = None
+            df["rank"] = None
+    except Exception as e:
+        # 如果读取得分文件失败，添加空的得分列
+        print(f"警告：读取得分文件失败: {e}")
+        df["score"] = None
+        df["tiebreak_j"] = None
+        df["rank"] = None
+    
+    return df
 
 # ---------------- 主入口：个股持仓检查 ----------------
 @dataclass
@@ -734,7 +794,7 @@ def run_position_checks(inp: PositionCheckInput) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
-# ---------------- 内部：批量判定（明日预测用） ----------------
+# ---------------- 内部：批量判定（明日模拟用） ----------------
 def _eval_exprs(df_concat: pd.DataFrame, sim_date: str, exprs: Dict[str,str], ts_codes: List[str]) -> pd.DataFrame:
     codes = [str(x) for x in (ts_codes or [])]
     rows = []
@@ -797,6 +857,7 @@ def _find_repo_path(py_path: Optional[str] = None) -> Optional[Path]:
             return p
     return None
 
+
 def _load_repo(py_path: Optional[str] = None):
     """尝试动态 import strategies_repo.py，找不到则返回 None。"""
     path = _find_repo_path(py_path)
@@ -825,6 +886,7 @@ def load_prediction_rules(py_path: Optional[str] = None) -> List[Dict[str, Any]]
             return val
     return []
 
+
 def load_position_policies(py_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     从 strategies_repo 读取 POSITION_POLICIES；结构：
@@ -836,6 +898,7 @@ def load_position_policies(py_path: Optional[str] = None) -> List[Dict[str, Any]
         if isinstance(val, list):
             return val
     return []
+
 
 def load_opportunity_policies(py_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """
@@ -869,3 +932,19 @@ __all__ = [
     "CacheBackend",
     "scenario_hash",
 ]
+
+# ---------------- 进度回调（供 UI 显示） ----------------
+_progress_handler = None
+def set_progress_handler(fn):  # fn(phase, current=None, total=None, message=None, **kw)
+    global _progress_handler
+    _progress_handler = fn
+
+
+def _emit(phase, current=None, total=None, message=None, **kw):
+    if callable(_progress_handler):
+        _progress_handler(phase, current=current, total=total, message=message, **kw)
+
+
+def drain_progress_events():
+    # 若内部用队列异步产生日志，这里消费队列；若直接回调，可留空与scoring_core保持接口一致
+    pass

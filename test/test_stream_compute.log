@@ -1,0 +1,3 @@
+2025-10-14 18:51:40,674 WARNING [root] 丢弃无法解析的 trade_date 行（1 条）
+2025-10-14 18:52:12,275 WARNING [root] 丢弃无法解析的 trade_date 行（1 条）
+2025-10-14 18:52:12,329 INFO [root] [stock][FAST] 日线已最新 (last=20251014)

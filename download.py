@@ -32,11 +32,15 @@ from tdx_compat import evaluate as tdx_eval
 import indicators as ind
 
 import threading
+# fcntl 在Windows上不可用，使用其他方式实现文件锁
+try:
+    import fcntl  # 用于文件锁
+except ImportError:
+    fcntl = None  # Windows系统
 _TLS = threading.local()
 from utils import normalize_trade_date, normalize_ts
 
 _pro = None  # 真正的客户端放这里
-WARM = int(globals().get("WARM", ind.warmup_for(list(ind.REGISTRY.keys())) or 0))
 
 def _require_pro():
     """只有在确实需要 Pro 接口时才初始化；否则不触发任何 token 读取。
@@ -78,7 +82,7 @@ except ImportError:
     sys.stderr.write("未安装 tushare: pip install tushare\n")
     sys.exit(1)
 
-ts.set_token(TOKEN)
+# Token 设置已移至 _require_pro() 函数中，避免重复设置
 
 os.makedirs(DATA_ROOT, exist_ok=True)
 
@@ -321,7 +325,7 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prew
                 warm_ind = int(_ind_warmup_for(names))
             except Exception:
                 warm_ind = 0
-            need_tail = max(int(WARM), int(warm_ind))
+            need_tail = max(int(SYMBOL_PRODUCT_WARMUP_DAYS), int(warm_ind))
             tail_old = None
             if isinstance(old_ind, pd.DataFrame) and not old_ind.empty:
                 old_ind = normalize_trade_date(old_ind)
@@ -364,12 +368,12 @@ def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prew
                 if isinstance(old_ind, pd.DataFrame) and not old_ind.empty:
                     old_td = pd.to_datetime(old_ind["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
                     last   = old_td.max()
-                    warmup_start = (last - pd.Timedelta(days=WARM))
+                    warmup_start = (last - pd.Timedelta(days=SYMBOL_PRODUCT_WARMUP_DAYS))
                     try:
                         warm_ind = int(ind.warmup_for(names))
                     except Exception:
                         warm_ind = 0
-                    warm_days = max(int(WARM), warm_ind)
+                    warm_days = max(int(SYMBOL_PRODUCT_WARMUP_DAYS), warm_ind)
                     warmup_start = (last - pd.Timedelta(days=warm_days))
                     keep_old = old_ind.loc[old_td < warmup_start].copy()
                     keep_old = normalize_trade_date(keep_old)
@@ -402,14 +406,22 @@ def _rate_limit():
     now = time.time()
     while True:
         with _CALL_TS_LOCK:
-            # 清理过期
+            # 清理过期记录
             while _CALL_TS and now - _CALL_TS[0] > 60:
                 _CALL_TS.pop(0)
+            
+            # 检查是否还有调用额度
             if len(_CALL_TS) < CALLS_PER_MIN:
                 logging.debug('[BRANCH] def _rate_limit | IF len(_CALL_TS) < CALLS_PER_MIN -> taken')
                 _CALL_TS.append(now)
                 return
-            sleep_for = 60 - (now - _CALL_TS[0]) + 0.01
+            
+            # 计算等待时间，添加安全检查
+            if _CALL_TS:
+                sleep_for = 60 - (now - _CALL_TS[0]) + 0.01
+            else:
+                sleep_for = 1.0  # 如果列表为空，等待1秒
+                
         time.sleep(sleep_for)
         now = time.time()
 
@@ -428,8 +440,14 @@ def _retry(fn: Callable[[], pd.DataFrame], desc: str, retries: int = RETRY_TIMES
         try:
             _rate_limit()          # 如果你后面换了 _rate_control_point()，这里对应改
             return fn()
+        except (ConnectionError, TimeoutError, OSError) as e:
+            last_msg = f"网络错误: {str(e)}"
+            logging.warning("%s 失败 (%s) 尝试 %d/%d", desc, last_msg, attempt, retries)
+            if attempt == retries:
+                logging.debug('[BRANCH] def _retry | IF attempt == retries -> taken')
+                break  # 出循环抛错
         except Exception as e:
-            last_msg = str(e)
+            last_msg = f"未知错误: {str(e)}"
             logging.warning("%s 失败 (%s) 尝试 %d/%d", desc, last_msg, attempt, retries)
             if attempt == retries:
                 logging.debug('[BRANCH] def _retry | IF attempt == retries -> taken')
@@ -489,7 +507,140 @@ def _save_partition(df: pd.DataFrame, root: str):
         pdir = os.path.join(root, f"trade_date={dt}")
         os.makedirs(pdir, exist_ok=True)
         fname = os.path.join(pdir, f"data_{int(time.time()*1e6)}.parquet")
-        sub.to_parquet(fname, index=False, engine=PARQUET_ENGINE)
+        _safe_write_parquet(sub, fname)
+
+def _clean_and_validate_dataframe(df: pd.DataFrame, ts_code: str = None) -> pd.DataFrame:
+    """清理和验证DataFrame，剔除异常行并告警"""
+    if df is None or df.empty:
+        logging.warning("数据为空: %s", ts_code or "未知")
+        return df
+    
+    # 检查必需列
+    required_cols = ["trade_date", "open", "high", "low", "close", "vol"]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        logging.warning("缺少必需列 %s: %s", missing_cols, ts_code or "未知")
+        return df
+    
+    original_count = len(df)
+    df_clean = df.copy()
+    
+    try:
+        # 1. 清理价格数据：剔除NaN和<=0的行
+        price_cols = ["open", "high", "low", "close"]
+        for col in price_cols:
+            if col in df_clean.columns:
+                # 记录异常行
+                nan_mask = df_clean[col].isna()
+                zero_mask = df_clean[col] <= 0
+                invalid_mask = nan_mask | zero_mask
+                
+                if invalid_mask.any():
+                    invalid_count = invalid_mask.sum()
+                    invalid_dates = df_clean.loc[invalid_mask, "trade_date"].tolist() if "trade_date" in df_clean.columns else []
+                    logging.warning("剔除价格异常行 %s: %d行 (日期: %s)", 
+                                 f"{ts_code or '未知'}.{col}", invalid_count, invalid_dates[:5])
+                    df_clean = df_clean[~invalid_mask]
+        
+        # 2. 清理成交量：剔除<0的行
+        if "vol" in df_clean.columns:
+            vol_mask = df_clean["vol"] < 0
+            if vol_mask.any():
+                invalid_count = vol_mask.sum()
+                invalid_dates = df_clean.loc[vol_mask, "trade_date"].tolist() if "trade_date" in df_clean.columns else []
+                logging.warning("剔除成交量异常行 %s: %d行 (日期: %s)", 
+                             ts_code or "未知", invalid_count, invalid_dates[:5])
+                df_clean = df_clean[~vol_mask]
+        
+        # 3. 清理高低价关系异常的行
+        if all(col in df_clean.columns for col in ["high", "low", "open", "close"]):
+            # 最高价 < 最低价
+            hl_mask = df_clean["high"] < df_clean["low"]
+            # 最高价 < 开盘价或收盘价
+            ho_mask = df_clean["high"] < df_clean["open"]
+            hc_mask = df_clean["high"] < df_clean["close"]
+            # 最低价 > 开盘价或收盘价
+            lo_mask = df_clean["low"] > df_clean["open"]
+            lc_mask = df_clean["low"] > df_clean["close"]
+            
+            invalid_mask = hl_mask | ho_mask | hc_mask | lo_mask | lc_mask
+            
+            if invalid_mask.any():
+                invalid_count = invalid_mask.sum()
+                invalid_dates = df_clean.loc[invalid_mask, "trade_date"].tolist() if "trade_date" in df_clean.columns else []
+                logging.warning("剔除价格关系异常行 %s: %d行 (日期: %s)", 
+                             ts_code or "未知", invalid_count, invalid_dates[:5])
+                df_clean = df_clean[~invalid_mask]
+        
+        # 4. 清理日期格式异常的行
+        if "trade_date" in df_clean.columns:
+            try:
+                # 尝试解析日期，无法解析的会被标记为NaT
+                parsed_dates = pd.to_datetime(df_clean["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+                date_mask = parsed_dates.isna()
+                
+                if date_mask.any():
+                    invalid_count = date_mask.sum()
+                    invalid_dates = df_clean.loc[date_mask, "trade_date"].tolist()
+                    logging.warning("剔除日期格式异常行 %s: %d行 (日期: %s)", 
+                                 ts_code or "未知", invalid_count, invalid_dates[:5])
+                    df_clean = df_clean[~date_mask]
+            except Exception as e:
+                logging.warning("日期解析异常 %s: %s", ts_code or "未知", e)
+        
+        # 5. 统计清理结果
+        cleaned_count = len(df_clean)
+        removed_count = original_count - cleaned_count
+        
+        if removed_count > 0:
+            logging.info("数据清理完成 %s: 原始%d行 -> 清理后%d行 (剔除%d行)", 
+                       ts_code or "未知", original_count, cleaned_count, removed_count)
+        
+        # 6. 如果清理后数据为空，记录警告但不返回空DataFrame
+        if df_clean.empty:
+            logging.warning("清理后数据为空: %s", ts_code or "未知")
+            return df_clean
+            
+    except Exception as e:
+        logging.warning("数据清理异常: %s - %s", ts_code or "未知", e)
+        return df
+    
+    return df_clean
+
+def _safe_write_parquet(df: pd.DataFrame, filepath: str, ts_code: str = None):
+    """安全写入Parquet文件，避免并发冲突"""
+    import tempfile
+    import shutil
+    
+    # 数据清理和验证
+    df_clean = _clean_and_validate_dataframe(df, ts_code)
+    
+    # 如果清理后数据为空，仍然写入空文件（保持一致性）
+    if df_clean.empty:
+        logging.warning("清理后数据为空，写入空文件: %s", filepath)
+    
+    # 使用临时文件避免并发写入冲突
+    temp_dir = os.path.dirname(filepath)
+    temp_fd, temp_path = tempfile.mkstemp(suffix='.parquet', dir=temp_dir)
+    
+    try:
+        # 写入临时文件
+        df_clean.to_parquet(temp_path, index=False, engine=PARQUET_ENGINE)
+        # 原子性移动到目标位置
+        shutil.move(temp_path, filepath)
+    except Exception as e:
+        logging.error("写入文件失败 %s: %s", filepath, e)
+        # 清理临时文件
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+        raise
+    finally:
+        try:
+            os.close(temp_fd)
+        except:
+            pass
 
 
 def _tqdm_iter(seq, desc: str, unit="日"):
@@ -845,7 +996,7 @@ def _recalc_increment_inmem(ts_list, last_duck_str: str, end: str, threads: int 
         except Exception:
             warm_i = 0
         pad = int(INC_INMEM_PADDING_DAYS or 5)
-        need_warm = max(int(WARM), warm_i)
+        need_warm = max(int(SYMBOL_PRODUCT_WARMUP_DAYS), warm_i)
 
         # 注意把 warm_lower 存成整数，便于 DuckDB 无歧义比较
         cutoff["warm_lower"] = (
@@ -1177,8 +1328,8 @@ def fast_init_download(end_date: str):
     failed = []   # 初次失败列表 (含异常信息)
 
     def task(ts_code: str):
-        # 根据复权类型切换子目录
-        adj_folder = API_ADJ  
+        # 根据复权类型切换子目录，使用统一的映射关系
+        adj_folder = {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}.get(API_ADJ, "raw")
         sub_dir = os.path.join(FAST_INIT_STOCK_DIR, adj_folder)
         os.makedirs(sub_dir, exist_ok=True)
         fpath = os.path.join(sub_dir, f"{ts_code}.parquet")
@@ -1209,6 +1360,12 @@ def fast_init_download(end_date: str):
                         logging.debug('[BRANCH] def fast_init_download > def task | IF max_d < lag_threshold -> taken')
                         need_redownload = True
 
+            except (FileNotFoundError, PermissionError) as e:
+                need_redownload = True
+                logging.warning("文件访问错误 %s -> 强制重下 (%s)", ts_code, e)
+            except (pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+                need_redownload = True
+                logging.warning("数据解析错误 %s -> 强制重下 (%s)", ts_code, e)
             except Exception as e:
                 need_redownload = True
                 logging.warning("Skip 检查读取失败 %s -> 强制重下 (%s)", ts_code, e)
@@ -1238,9 +1395,10 @@ def fast_init_download(end_date: str):
             if df is None or df.empty:
                 logging.debug('[BRANCH] def fast_init_download > def task | IF df is None or df.empty -> taken')
                 return (ts_code, 'empty', None)
+            
             df = df.sort_values("trade_date")
             df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
-            df.to_parquet(fpath, index=False)
+            _safe_write_parquet(df, fpath, ts_code)
 
             if API_ADJ != "raw":
                 logging.debug('[BRANCH] def fast_init_download > def task | IF API_ADJ != "raw" -> taken')
@@ -1290,8 +1448,9 @@ def fast_init_download(end_date: str):
         time.sleep(FAILED_RETRY_WAIT)
 
         def retry_task(ts_code: str):
-            # fpath = os.path.join(FAST_INIT_STOCK_DIR, f"{ts_code}.parquet")
-            fpath = os.path.join(FAST_INIT_STOCK_DIR, API_ADJ, f"{ts_code}.parquet")
+            # 使用统一的路径映射关系
+            adj_folder = {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}.get(API_ADJ, "raw")
+            fpath = os.path.join(FAST_INIT_STOCK_DIR, adj_folder, f"{ts_code}.parquet")
             if os.path.exists(fpath):
                 logging.debug('[BRANCH] def fast_init_download > def retry_task | IF os.path.exists(fpath) -> taken')
                 return (ts_code, 'exists')
@@ -1309,9 +1468,10 @@ def fast_init_download(end_date: str):
                 if df is None or df.empty:
                     logging.debug('[BRANCH] def fast_init_download > def retry_task | IF df is None or df.empty -> taken')
                     return (ts_code, 'empty')
+                
                 df = df.sort_values("trade_date")
                 df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
-                df.to_parquet(fpath, index=False)
+                _safe_write_parquet(df, fpath, ts_code)
 
                 if API_ADJ != "raw":
                     logging.debug('[BRANCH] def fast_init_download > def retry_task | IF API_ADJ != "raw" -> taken')
@@ -1341,8 +1501,9 @@ def fast_init_download(end_date: str):
         if err2 > 0:
             logging.debug('[BRANCH] def fast_init_download | IF err2 > 0 -> taken')
             final_failed = []
+            adj_folder = {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}.get(API_ADJ, "raw")
             for c in failed_codes:
-                fpath = os.path.join(FAST_INIT_STOCK_DIR, API_ADJ, f"{c}.parquet")
+                fpath = os.path.join(FAST_INIT_STOCK_DIR, adj_folder, f"{c}.parquet")
                 if not os.path.exists(fpath):
                     logging.debug('[BRANCH] def fast_init_download | IF not os.path.exists(fpath) -> taken')
                     final_failed.append(c)

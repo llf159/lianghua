@@ -512,7 +512,12 @@ def evaluate_bool(script: str, df, prefer_keys=("sig", "last_expr", "SIG", "LAST
 def _replace_variables(expr):
     keys = sorted(VAR_MAP.keys(), key=len, reverse=True)
     for k in keys:
-        expr = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(k)}(?![A-Za-z0-9_])', VAR_MAP[k], expr)
+        # 只替换独立的变量名，不替换已经在 df['...'] 中的内容
+        # 检查是否已经包含该变量的替换结果
+        replacement = VAR_MAP[k]
+        if replacement in expr:
+            continue  # 如果已经替换过，跳过
+        expr = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(k)}(?![A-Za-z0-9_])', replacement, expr)
     return expr
 
 

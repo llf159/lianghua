@@ -1,218 +1,416 @@
-# 上手手册
+# 量化交易系统
 
----
+一个功能完整的量化交易系统，集成了数据下载、技术指标计算、股票评分、策略回测、组合管理、预测模拟等核心功能。
 
-## 1) 环境配置（优先）
+## 🚀 核心功能
 
-### 1.1 Python 版本
-- 推荐 **Python 3.10+**。  
-- 注意不要使用 **Python 3.14**。
+### 📊 数据管理
+- **Tushare数据下载**：支持股票、指数历史数据全量/增量下载
+- **多格式存储**：Parquet + CSV双格式存储，支持DuckDB加速查询
+- **数据完整性**：自动检查数据缺口，支持断点续传
+- **指标计算**：内置KDJ、RSI、BBI、量比等20+技术指标
 
-### 1.2 安装依赖
-**基础依赖（必须）**：
+### 🎯 智能评分系统
+- **多维度评分**：基于技术指标、趋势分析、量价关系等综合评分
+- **规则引擎**：支持通达信风格表达式，灵活配置评分规则
+- **实时排名**：全市场股票实时评分排名，支持Top-K筛选
+- **黑白名单**：自动生成初选白名单和淘汰黑名单
+
+### 📈 策略回测
+- **多策略支持**：排名策略、筛选策略、预测策略、持仓检查策略
+- **回测引擎**：支持多种买卖模式，可配置手续费和滑点
+- **性能分析**：详细的回测报告，包含收益率、最大回撤、夏普比率等
+- **组合管理**：支持多组合并行管理，实时持仓跟踪
+
+### 🔮 预测模拟
+- **明日模拟**：基于历史数据模拟次日开盘表现
+- **场景分析**：支持多种市场场景的预测分析
+- **缓存机制**：智能缓存预测结果，提高计算效率
+- **风险评估**：预测结果包含置信度和风险提示
+
+### 💾 数据存储
+- **数据库支持**：SQLite/DuckDB双数据库支持
+- **JSON存储**：结构化JSON存储个股详情
+- **自动回退**：数据库失败时自动回退到JSON存储
+- **数据迁移**：支持历史数据迁移和格式转换
+
+### 🖥️ 用户界面
+- **Web界面**：基于Streamlit的现代化Web界面
+- **多标签页**：排名、详情、持仓、预测、规则编辑等
+- **实时更新**：支持实时数据更新和进度显示
+- **数据可视化**：丰富的图表和统计展示
+
+## 📋 系统要求
+
+### 环境配置
+- **Python版本**：推荐 Python 3.10+（避免使用 Python 3.14）
+- **操作系统**：Windows 10/11、macOS、Linux
+- **内存**：建议 8GB+（大数据量处理需要更多内存）
+- **存储**：建议 50GB+ 可用空间
+
+### 依赖包
 ```bash
+# 基础依赖
+pip install pandas numpy pyarrow duckdb tushare tqdm streamlit plotly matplotlib xlsxwriter tabulate openpyxl
+
+# 可选依赖（用于特定功能）
+pip install gradio  # 用于Parquet浏览界面
+```
+
+## ⚙️ 快速开始
+
+### 1. 环境配置
+
+#### 1.1 安装依赖
+```bash
+# 克隆项目
+git clone <repository-url>
+cd 量化
+
+# 创建虚拟环境
+python -m venv .venv
+.venv\Scripts\activate  # Windows
+# source .venv/bin/activate  # macOS/Linux
+
+# 安装依赖
 pip install -U pip
 pip install pandas numpy pyarrow duckdb tushare tqdm streamlit plotly matplotlib xlsxwriter tabulate openpyxl
 ```
-### 1.3 Windows 一键脚本（可选）
-- `setup_win.bat` 会一次性安装常用包（若缺 `duckdb/tushare/streamlit`，请再手动执行上面的基础依赖安装）。  
-- `app_score.bat` 一键启动评分界面（等同 `streamlit run score_ui.py`）。
 
-> 提示：双击 `.bat` 之前，**先**在当前目录打开 `cmd` 或 PowerShell 并激活虚拟环境（见 1.1）。
+#### 1.2 Windows一键脚本（可选）
+- `setup_win.bat`：一键安装常用包
+- `app_score.bat`：一键启动评分界面
 
----
+### 2. 配置Tushare Token
 
-## 2) 获取并配置 Tushare Token（重点）
+#### 2.1 获取Token
+1. 访问 [Tushare官网](https://tushare.pro) 注册并登录
+2. 进入"个人中心 / 账号 / Token"复制个人Token
+3. 购买200元积分（推荐）或使用免费数据
 
-### 2.1 如何获取 Token
-1. 访问 [Tushare 官网](https://tushare.pro)，注册并登录 **Tushare Pro**；  
+#### 2.2 配置Token
+**方式A：环境变量**
+```bash
+# Windows PowerShell
+$env:TUSHARE_TOKEN="你的token"
 
-2. 进入“个人中心 / 账号 / Token”，复制你的 **个人 Token**。
+# Windows CMD
+set TUSHARE_TOKEN=你的token
 
-3. 本程序使用了付费数据，请通过官网付费通道购买200元积分；
+# macOS/Linux
+export TUSHARE_TOKEN="你的token"
+```
 
-   或使用免费不复权数据，需要修改download接口调用和限频器参数
+**方式B：配置文件（推荐）**
+编辑 `config.py`：
+```python
+TOKEN = "你的token"
+```
 
-> 建议把 Token 视为**私密凭证**，不要提交到公开仓库。
+### 3. 数据下载
 
-### 2.2 在本项目里配置 Token 的两种方式
-
-**方式 A：环境变量  
-
-- Windows PowerShell：
-  ```powershell
-  $env:TUSHARE_TOKEN="你的token"
-  ```
-- Windows CMD：
-  ```cmd
-  set TUSHARE_TOKEN=你的token
-  ```
-- macOS / Linux（bash/zsh）：
-  ```bash
-  export TUSHARE_TOKEN="你的token"
-  ```
-
-**方式 B：写入 `config.py`**  (简单)
-
-- 打开项目根目录 `config.py`，设置：
-  ```python
-  TOKEN = "你的token"
-  ```
-
-> 运行时，程序**优先读取 `config.TOKEN`**，若为空则回退到环境变量 `TUSHARE_TOKEN`。
-
----
-
-## 3) 数据目录与对齐关系（很重要）
-
-- 下载任务使用 `download.py` 的根目录：`DATA_ROOT`  
-- 评分/可视化使用 `config.py` 的：
-  - `PARQUET_BASE`（**需与 `DATA_ROOT` 对齐**）
-  - `PARQUET_ADJ`：`"daily" | "raw" | "qfq" | "hfq"`
-  - `PARQUET_USE_INDICATORS`：`True` 使用 `*_indicators` 分区
-
-> 简言之：**哪里下载，哪里可视化**。把 `PARQUET_BASE` 指到 `DATA_ROOT` 所在目录即可。
-
----
-
-## 4) 首次全量 & 日常增量
-
-### 4.1 首次全量（第一次执行，历史全拉）
+#### 3.1 首次全量下载
 ```bash
 python download.py
 # 按提示选择：是否第一次下载？→ y
 ```
-**会完成：**  
-- 股票/指数全历史拉取（按 `trade_date=YYYYMMDD` 分区到 Parquet）；  
-- 生成/更新 **单股成品**（可选带指标列）；  
-- 生成元信息、必要的索引/合并。
 
-**关键参数（在 `download.py` 或其配置段中）：**
-- `ASSETS=["stock","index"]`（可先只拉 `"stock"`）
-- `API_ADJ="qfq"`（初次全量的复权口径）
-- 并发：`FAST_INIT_THREADS`、`STOCK_INC_THREADS`
-- DuckDB 资源：`DUCKDB_THREADS`、`DUCKDB_MEMORY_LIMIT`、`DUCKDB_ENABLE_COMPACT_AFTER`
-
-### 4.2 日常增量（每天或按需补最新交易日）
+#### 3.2 日常增量更新
 ```bash
 python download.py
 # 按提示选择：是否第一次下载？→ n
 ```
-**会完成：**  
-- 拉取新增交易日；  
-- 识别受影响股票，**只对增量区间**重算单股成品（含指标）；  
-- 必要时做分区合并/压实。
 
-> 常见问题：若提示 “Tushare Pro 未配置”，请检查 2.2 的 Token 设置；若读取 Parquet 报错，确保已安装 `pyarrow`。
+### 4. 启动系统
 
----
+#### 4.1 启动评分界面
+```bash
+# 方式1：直接启动
+streamlit run score_ui.py
 
-## 5) 查看数据（Parquet 浏览/读取）
-
-### 5.1 图形界面（*Parquet 浏览 App*）
-仓库若包含 app_pv.py，可直接双击运行：
-
-**界面能力（典型）：**选择股票、时间区间、是否使用带指标分区、显示 Schema/样例行、导出片段等。
-
-### 5.2 编程方式（`parquet_viewer.py`）
-```python
-from parquet_viewer import read_by_symbol, read_range, asset_root, allowed_stock_adjs
-
-BASE = r"E:/stock_data"  # 与 DATA_ROOT / PARQUET_BASE 一致
-
-# 单股成品（带指标）
-df1 = read_by_symbol(BASE, adj="qfq", ts_code="600519.SH", with_indicators=True)
-
-# 按区间读取（日线分区，优先 duckdb，回退 pandas/pyarrow）
-df2 = read_range(BASE, asset="stock", adj="qfq",
-                 ts_code="600519.SH", start="20240101", end="20240630",
-                 columns=["ts_code","trade_date","open","high","low","close","vol"])
+# 方式2：Windows一键启动
+app_score.bat
 ```
 
-**常用函数速览**
-- `allowed_stock_adjs(base)`：列出已有复权口径/分区（如 `daily_qfq_indicators`）  
-- `normalize_stock_adj(base, adj_kind, with_indicators)`：从 `qfq/raw/hfq/daily` + 是否带指标 → 实际目录名  
-- `list_symbols(root)` / `list_trade_dates(root)`：扫描已有股票与日期分区  
-- `scan_with_duckdb(...)` / `scan_with_pandas(...)`：两种后端（自动择优）
+#### 4.2 启动Parquet浏览界面
+```bash
+streamlit run app_pv.py
+```
 
----
+## 📁 项目结构
 
-## 6) 指标系统（`indicators.py`）——介绍与配置（加量）
+```
+量化/
+├── 核心模块/
+│   ├── config.py              # 配置文件
+│   ├── download.py            # 数据下载模块
+│   ├── scoring_core.py        # 评分核心引擎
+│   ├── predict_core.py        # 预测模拟模块
+│   ├── stats_core.py          # 统计分析模块
+│   ├── detail_db.py           # 数据库存储模块
+│   └── indicators.py          # 技术指标模块
+├── 界面模块/
+│   ├── score_ui.py            # 主评分界面
+│   ├── app_pv.py              # Parquet浏览界面
+│   └── parquet_viewer.py      # 数据查看工具
+├── 策略模块/
+│   ├── strategies_repo.py     # 策略仓库
+│   ├── tdx_compat.py          # 通达信兼容层
+│   └── backtest_core.py       # 回测核心
+├── 工具模块/
+│   ├── utils.py               # 工具函数
+│   ├── tools/                 # 工具脚本目录
+│   └── 手册/                  # 使用手册
+├── 数据目录/
+│   ├── cache/                 # 缓存目录
+│   ├── output/                # 输出目录
+│   └── log/                   # 日志目录
+└── 配置文件/
+    ├── setup_win.bat          # Windows安装脚本
+    └── app_score.bat          # Windows启动脚本
+```
 
-### 6.1 已内置指标（节选）
-| 名称 | 输出列（小数位） | 说明 / 等价表达 |
-|---|---|---|
-| `kdj` | `j`(2) | 经典 KDJ 的 J 值（`RSV→K→D→J`） |
-| `volume_ratio` | `vr`(4) | 量比，`V / MA(V, 20)` |
-| `bbi` | `bbi`(2) | 多均线均值：MA(3,6,12,24) 平均 |
-| `rsi` | `rsi`(2) | 相对强弱指标，默认 `N=14` |
+## 🔧 配置说明
 
-> 每个指标在 `REGISTRY` 中以 `IndMeta` 描述：输出列、小数位、TDX 脚本与 Python 兜底函数等。TDX 失败时自动回退 Python。
-
-### 6.2 选择要计算的指标
-在增量/全量产品化过程中，可通过配置控制：
-- `SYMBOL_PRODUCT_INDICATORS = "all"`（默认）→ 计算全部已注册指标；  
-- 或设为**逗号分隔**列表：`"kdj,rsi,bbi,duokong_short,duokong_long"`；  
-- `SYMBOL_PRODUCT_WARMUP_DAYS = 120~200`：增量重算时为保证指标稳定所需的 **warm‑up** 天数。
-
-### 6.3 添加自定义指标（进阶）
-在 `indicators.py` 中向 `REGISTRY` 添加：
+### 数据配置
 ```python
-REGISTRY["my_ind"] = IndMeta(
-    name="my_ind",
+# config.py 关键配置
+PARQUET_BASE = r"E:\stock_data"        # 数据存储根目录
+PARQUET_ADJ = "qfq"                    # 复权方式：qfq/hfq/raw/daily
+PARQUET_USE_INDICATORS = True          # 是否使用带指标的分区
+```
+
+### 评分配置
+```python
+# 评分系统配置
+SC_REF_DATE = "today"                  # 参考日期
+SC_LOOKBACK_D = 60                     # 评分窗口（天）
+SC_TOP_K = 100                         # Top-K数量
+SC_BASE_SCORE = 50                     # 基础分数
+SC_MIN_SCORE = 0                       # 最低分数
+```
+
+### 数据库配置
+```python
+# 数据库存储配置
+SC_DETAIL_STORAGE = "database"         # 存储方式：database/json/both
+SC_DETAIL_DB_TYPE = "sqlite"           # 数据库类型：sqlite/duckdb
+SC_USE_DB_STORAGE = True               # 是否启用数据库存储
+SC_DB_FALLBACK_TO_JSON = True          # 数据库失败时回退到JSON
+```
+
+## 📊 使用指南
+
+### 1. 数据管理
+
+#### 查看数据
+```python
+from parquet_viewer import read_by_symbol, read_range
+
+# 读取单股数据
+df = read_by_symbol("E:/stock_data", adj="qfq", ts_code="600519.SH", with_indicators=True)
+
+# 读取时间区间数据
+df = read_range("E:/stock_data", asset="stock", adj="qfq", 
+                ts_code="600519.SH", start="20240101", end="20240630")
+```
+
+#### 数据完整性检查
+```bash
+# 启动Parquet浏览界面
+streamlit run app_pv.py
+```
+
+### 2. 评分系统
+
+#### 运行评分
+```python
+from scoring_core import run_for_date
+
+# 运行当日评分
+result_path = run_for_date()
+
+# 运行指定日期评分
+result_path = run_for_date("20250115")
+```
+
+#### 自定义评分规则
+编辑 `strategies_repo.py` 或通过Web界面添加规则：
+```python
+{
+    'name': '自定义规则',
+    'timeframe': 'D',
+    'window': 20,
+    'when': 'C > MA(C, 20)',
+    'scope': 'LAST',
+    'points': 5,
+    'explain': '收盘价高于20日均线'
+}
+```
+
+### 3. 预测模拟
+
+#### 运行预测
+```python
+from predict_core import run_prediction, PredictionInput
+
+# 创建预测输入
+inp = PredictionInput(
+    ref_date="20250115",
+    codes=["600519.SH", "000001.SZ"],
+    scenarios=["bull", "bear", "neutral"]
+)
+
+# 运行预测
+result = run_prediction(inp)
+```
+
+### 4. 组合管理
+
+#### 创建组合
+通过Web界面的"组合模拟/持仓"标签页创建和管理投资组合。
+
+#### 持仓跟踪
+系统自动跟踪组合表现，提供详细的持仓分析和风险提示。
+
+## 🛠️ 高级功能
+
+### 1. 自定义指标
+
+在 `indicators.py` 中添加自定义指标：
+```python
+REGISTRY["my_indicator"] = IndMeta(
+    name="my_indicator",
     out={"my_col": 3},
-    tdx="MY_COL := EMA(CLOSE, 10) - EMA(CLOSE, 30);",  # 可选
-    py_func=lambda df, **kw: my_ind(df, **kw),         # 可选
+    tdx="MY_COL := EMA(CLOSE, 10) - EMA(CLOSE, 30);",
+    py_func=lambda df, **kw: my_indicator_func(df, **kw),
     kwargs={"fast": 10, "slow": 30},
     tags=["product"]
 )
 ```
-- **最少**需要：`name` 与 `out`（输出列名与小数位）。  
-- 二选一或都写：`tdx`（脚本）/`py_func`（Python 实现）。  
-- 新增后，确保 `SYMBOL_PRODUCT_INDICATORS` 包含它（或置为 `"all"`）。
+
+### 2. 策略回测
+
+#### 配置回测参数
+```python
+# config.py
+STRATEGY_START_DATE = "20220601"
+STRATEGY_END_DATE = "20250801"
+HOLD_DAYS = 2
+BUY_MODE = "open"  # open/close/signal_open
+SELL_MODE = "other"  # open/close/strategy/other
+```
+
+#### 运行回测
+```python
+from backtest_core import run_backtest
+result = run_backtest()
+```
+
+### 3. 数据迁移
+
+#### 迁移到数据库
+```bash
+python tools/migrate_details_to_db.py
+```
+
+#### 格式转换
+```bash
+python tools/parquet_to_csv.py
+```
+
+## 📈 性能优化
+
+### 1. 内存优化
+- 调整 `DUCKDB_MEMORY_LIMIT` 控制DuckDB内存使用
+- 使用 `SC_READ_TAIL_DAYS` 限制读取数据量
+- 启用 `INC_STREAM_COMPUTE_INDICATORS` 流式计算指标
+
+### 2. 并发优化
+- 调整 `SC_MAX_WORKERS` 控制并行度
+- 使用 `FAST_INIT_THREADS` 优化初始下载
+- 启用 `STREAM_FLUSH_*` 配置流式处理
+
+### 3. 存储优化
+- 使用Parquet格式提高压缩率
+- 启用 `DUCKDB_ENABLE_COMPACT_AFTER` 自动压实
+- 定期清理缓存目录
+
+## 🔍 故障排查
+
+### 常见问题
+
+#### 1. Tushare Pro未配置
+```
+错误：Tushare Pro 未配置
+解决：检查 config.TOKEN 或环境变量 TUSHARE_TOKEN
+```
+
+#### 2. 内存不足
+```
+错误：DuckDB内存不足
+解决：降低 DUCKDB_MEMORY_LIMIT 或 DUCKDB_THREADS
+```
+
+#### 3. 数据读取失败
+```
+错误：读取不到数据
+解决：检查 PARQUET_BASE 与 DATA_ROOT 是否对齐
+```
+
+#### 4. 依赖包缺失
+```bash
+# 安装缺失的包
+pip install pyarrow duckdb tushare streamlit
+```
+
+### 日志查看
+- 评分日志：`log/score.log`
+- 下载日志：`log/fast_init.log`
+- 系统日志：控制台输出
+
+### 调试模式
+```python
+# 启用详细日志
+import logging
+logging.basicConfig(level=logging.DEBUG)
+```
+
+## 📚 开发指南
+
+### 1. 添加新功能
+- 在对应模块中添加功能函数
+- 更新 `config.py` 添加配置项
+- 在Web界面中添加对应标签页
+
+### 2. 自定义策略
+- 在 `strategies_repo.py` 中添加策略规则
+- 使用通达信风格表达式编写条件
+- 通过Web界面测试和调试
+
+### 3. 扩展指标
+- 在 `indicators.py` 中注册新指标
+- 提供TDX脚本和Python实现
+- 设置合适的预热天数
+
+## 🤝 贡献指南
+
+1. Fork 项目
+2. 创建功能分支
+3. 提交更改
+4. 发起 Pull Request
+
+## 📄 许可证
+
+本项目采用 MIT 许可证，详见 LICENSE 文件。
+
+## 📞 支持
+
+如有问题或建议，请：
+1. 查看本文档的故障排查部分
+2. 检查项目的 Issues 页面
+3. 提交新的 Issue 描述问题
 
 ---
 
-## 7) 评分界面（`score_ui.py`）与一键脚本（Windows）
-
-### 7.1 快速启动（Windows）
-- 双击 `app_score.bat`（内容：`streamlit run score_ui.py`）。
-- 首次使用前，如果缺包：先双击 `setup_win.bat` 安装通用依赖，随后**务必**补装：
-  ```bash
-  pip install duckdb tushare streamlit pyarrow
-  ```
-
-### 7.2 常见设置（在 `config.py`）
-- `USE_PARQUET=True`；`PARQUET_BASE` 指向数据目录；`PARQUET_ADJ`/`PARQUET_USE_INDICATORS` 与你下载的口径一致；  
-- 回测窗口：`STRATEGY_START_DATE/STRATEGY_END_DATE`；  
-- 其它评分选项按页面表单为准。
-
-> 规则编写与表达式口径，请参考《策略测试器_字段与表达式参考.md》。
-
----
-
-## 8) 使用方法（把脚本放进流程里）
-
-**Windows 新人 10 分钟上手：**
-1. 安装 Python 3.10+，在项目目录执行：  
-   ```bash
-   python -m venv .venv
-   .venv\Scripts\activate
-   ```
-2. 双击 `setup_win.bat`（或手动执行 §1.2 的 `pip install ...`）。  
-3. 配置 Token（§2.2），并把 `PARQUET_BASE` 指到一个**可写**目录（如 `D:\stock_data`）。  
-4. **首次全量**：`python download.py` → 回答 `y`。  
-5. **启动评分 UI**：双击 `app_score.bat`（或 `streamlit run score_ui.py`）。  
-6. **Parquet 浏览 App**（如仓库包含）：`streamlit run parquet_viewer_app.py`。  
-7. **日常增量**：`python download.py` → 回答 `n`。
-
----
-
-## 9) 故障排查（FAQ）
-
-- “Tushare Pro 未配置” → 检查 `config.TOKEN` 或 `TUSHARE_TOKEN`。  
-- “需要 pyarrow/duckdb” → `pip install pyarrow duckdb`。  
-- DuckDB 内存不足 → 调低 `DUCKDB_THREADS`，或设 `DUCKDB_MEMORY_LIMIT="4GB"`。  
-- 读取不到数据 → 确认 `PARQUET_BASE` 与 `DATA_ROOT` 对齐；复权口径与是否带指标一致。  
-- Windows 中文路径/盘符问题 → 尽量使用英文路径（例如 `D:\stock_data`）。  
-- 代理/网络 → 默认不走代理；若必须代理，请在启动前设置系统级代理环境变量。
+**注意**：本系统仅供学习和研究使用，不构成投资建议。投资有风险，入市需谨慎。

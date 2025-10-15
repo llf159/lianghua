@@ -25,11 +25,11 @@ import config as cfg
 import stats_core as stats
 from utils import normalize_ts, ensure_datetime_index, normalize_trade_date, market_label
 from parquet_viewer import read_range, asset_root, list_trade_dates
-from config import PARQUET_BASE, PARQUET_ADJ
+from config import PARQUET_BASE, PARQUET_ADJ, SC_DETAIL_STORAGE, SC_USE_DB_STORAGE, SC_DB_FALLBACK_TO_JSON
 import tdx_compat as tdx
 from stats_core import _pick_trade_dates, _prev_trade_date
 import indicators as ind
-
+import predict_core as pr
 from predict_core import (
     PredictionInput, PositionCheckInput,
     run_prediction, run_position_checks,
@@ -190,7 +190,7 @@ def _path_detail(ref: str, ts: str) -> Path: return DET_DIR / ref / f"{normalize
 def _today_str() -> str:
     return date.today().strftime("%Y%m%d")
 
-@cache_data(show_spinner=False, hash_funcs={Path: _safe_path_hash})
+@cache_data(show_spinner=False, hash_funcs={Path: _safe_path_hash}, ttl=60)
 def _read_df(path: Path, usecols=None, dtype=None, encoding: str = "utf-8-sig") -> pd.DataFrame:
     try:
         return pd.read_csv(path, usecols=usecols, dtype=dtype, encoding=encoding, engine="c")
@@ -437,12 +437,33 @@ def _rule_to_screen_args(rule: dict):
 
 
 def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
-    p = _path_detail(ref, ts)
-    if not p.exists(): return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return None
+    """
+    加载个股详情，优先从数据库读取，失败时回退到JSON文件
+    """
+    # 1. 优先从数据库读取
+    if SC_USE_DB_STORAGE and SC_DETAIL_STORAGE in ["database", "both"]:
+        try:
+            from detail_db import get_detail_db
+            db = get_detail_db()
+            result = db.load_detail(ts, ref)
+            if result:
+                return result
+        except Exception as e:
+            # LOGGER.warning(f"数据库读取失败 {ts}_{ref}: {e}")
+            pass
+    
+    # 2. 如果数据库失败且配置了回退，或者配置了JSON存储，则使用JSON文件
+    if (SC_DB_FALLBACK_TO_JSON) or SC_DETAIL_STORAGE in ["json", "both"]:
+        p = _path_detail(ref, ts)
+        if not p.exists(): 
+            return None
+        try:
+            return json.loads(p.read_text(encoding="utf-8-sig"))
+        except Exception as e:
+            # LOGGER.warning(f"JSON文件读取失败 {ts}_{ref}: {e}")
+            return None
+    
+    return None
 
 
 def _codes_to_txt(codes: List[str], style: str="space", with_suffix: bool=True) -> str:
@@ -588,11 +609,11 @@ def _cached_load_prediction_rules() -> list[dict]:
 
 def _apply_tiebreak_sorting(df: pd.DataFrame, tiebreak_mode: str = "none") -> pd.DataFrame:
     """
-    对股票表格应用Tie-break排序
+    对股票表格应用排序
     
     Args:
         df: 包含ts_code和score列的DataFrame
-        tiebreak_mode: 排序模式 ("none" 或 "kdj_j_asc")
+        tiebreak_mode: 排序模式 ("none", "kdj_j_asc")
     
     Returns:
         排序后的DataFrame
@@ -603,13 +624,11 @@ def _apply_tiebreak_sorting(df: pd.DataFrame, tiebreak_mode: str = "none") -> pd
     # 创建副本避免修改原数据
     df_sorted = df.copy()
     
-    if tiebreak_mode == "kdj_j_asc":
-        # 需要KDJ J值进行Tie-break排序
-        # 这里我们按得分降序，然后按ts_code升序作为兜底
-        # 注意：实际的KDJ J值需要从数据中获取，这里先用ts_code作为兜底
-        df_sorted = df_sorted.sort_values(["score", "ts_code"], ascending=[False, True]).reset_index(drop=True)
+    if tiebreak_mode == "kdj_j_asc" and "tiebreak_j" in df_sorted.columns:
+        # 按得分降序，同分时按J值升序，再同分时按代码升序（兜底）
+        df_sorted = df_sorted.sort_values(["score", "tiebreak_j", "ts_code"], ascending=[False, True, True]).reset_index(drop=True)
     else:
-        # 默认：只按得分降序，得分相同时按ts_code升序
+        # 默认：只按得分降序排序，同分时按代码升序（兜底）
         df_sorted = df_sorted.sort_values(["score", "ts_code"], ascending=[False, True]).reset_index(drop=True)
     
     return df_sorted
@@ -828,6 +847,113 @@ class Stepper:
                 state="error",
             )
 
+
+@contextmanager
+def pred_progress_to_streamlit():
+    if not _in_streamlit():
+        # 非 Streamlit/测试环境：挂空回调
+        def _noop(*a, **k): pass
+        pr.set_progress_handler(_noop)
+        try:
+            yield None, None, None
+        finally:
+            pr.set_progress_handler(None)
+        return
+
+    status = st.status("准备中…", expanded=True)
+    bar = st.progress(0, text="就绪")
+    info = st.empty()
+
+    import queue as _q
+    _evq = _q.Queue()
+
+    # 后台线程只入队，不直接碰 st.*
+    def _enqueue_handler(phase, current=None, total=None, message=None, **kw):
+        try:
+            _evq.put_nowait((phase, current, total, message))
+        except Exception:
+            pass
+
+    def _render_event(phase, current=None, total=None, message=None):
+        txt = {
+            "pred_select_ref_date": "选择参考日",
+            "pred_build_universe_done": "构建模拟清单",
+            "pred_start": "模拟开始",
+            "pred_progress": "模拟进行中",
+            "pred_done": "模拟完成",
+        }.get(phase, phase)
+        
+        # 使用message作为主要显示内容，如果没有则使用txt
+        display_text = message if message else txt
+        
+        if total and current is not None:
+            pct = int(current * 100 / max(total, 1))
+            bar.progress(pct, text=f"{display_text} ({current}/{total})")
+        else:
+            bar.progress(0, text=display_text)
+
+    # 主线程消费：供 run_prediction_in_bg 循环调用
+    def _drain():
+        try:
+            while True:
+                ev = _evq.get_nowait()
+                _render_event(*ev)
+        except _q.Empty:
+            pass
+
+    # 安装回调 & monkeypatch drain
+    pr.set_progress_handler(_enqueue_handler)
+    _orig_drain = getattr(pr, "drain_progress_events", None)
+    pr.drain_progress_events = _drain  # 关键：把“抽干”替换成主线程渲染
+
+    try:
+        yield status, bar, info
+    finally:
+        pr.set_progress_handler(None)
+        # 还原 drain（保持模块整洁）
+        if callable(_orig_drain):
+            pr.drain_progress_events = _orig_drain
+        else:
+            pr.drain_progress_events = lambda: None
+
+
+def run_prediction_in_bg(inp):
+    with pred_progress_to_streamlit() as (status, bar, info):
+        done = threading.Event()
+        result = {"df": None, "err": None}
+        def _worker():
+            try:
+                result["df"] = run_prediction(inp)  # 仍用已有函数
+            except Exception as e:
+                result["err"] = e
+            finally:
+                done.set()
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+        _timeout_s = int(getattr(cfg, 'UI_BG_TIMEOUT_SEC', 300))
+        _start_ts = time.time()
+        while not done.is_set():
+            # 消费 predict_core 的进度事件（如果内部使用事件队列的话）
+            try:
+                pr.drain_progress_events()
+            except Exception:
+                pass
+            time.sleep(0.05)
+            if (time.time() - _start_ts) > _timeout_s:
+                if status:
+                    status.update(label='已超时', state='error')
+                raise TimeoutError('后台任务超时（>{}s）'.format(_timeout_s))
+        # 抽干剩余事件
+        try:
+            pr.drain_progress_events()
+        except Exception:
+            pass
+        status.update(label="已完成", state="complete")
+        if result["err"]:
+            raise result["err"]
+        return result["df"]
+
 # ===== 主ui部分 =====
 if _in_streamlit():
     # ===== 页眉 =====
@@ -857,7 +983,7 @@ if _in_streamlit():
 
     # ===== 顶层页签 =====
     tab_rank, tab_detail, tab_position, tab_predict, tab_rules, tab_attn, tab_data, tab_screen, tab_tools, tab_port, tab_stats, tab_logs, = st.tabs(
-        ["排名", "个股详情", "持仓建议", "明日预测", "规则编辑", "强度榜", "数据下载/浏览", "选股", "工具箱", "组合模拟/持仓", "统计", "日志"])
+        ["排名", "个股详情", "持仓建议", "明日模拟", "规则编辑", "强度榜", "数据下载/浏览", "选股", "工具箱", "组合模拟/持仓", "统计", "日志"])
 
     # ================== 排名 ==================
     with tab_rank:
@@ -947,25 +1073,52 @@ if _in_streamlit():
         ref_real = (ref_d or "").strip() or _pick_latest_ref_date() or ""
         # 读取该参考日 Top 文件以便下拉选择
         try:
-            df_top_ref = _read_df(_path_top(ref_real)) if ref_real else pd.DataFrame()
+            # 强制刷新缓存，避免缓存问题
+            if ref_real:
+                top_path = _path_top(ref_real)
+                if top_path.exists():
+                    # 清除可能的缓存
+                    if hasattr(_read_df, 'clear'):
+                        _read_df.clear()
+                    df_top_ref = _read_df(top_path)
+                else:
+                    df_top_ref = pd.DataFrame()
+            else:
+                df_top_ref = pd.DataFrame()
+                
             options_codes = df_top_ref["ts_code"].astype(str).tolist() if ("ts_code" in df_top_ref.columns and not df_top_ref.empty) else []
-        except Exception:
+            # 调试信息
+            st.caption(f"调试: 参考日={ref_real}, TopK文件行数={len(df_top_ref)}, 可选股票数={len(options_codes)}")
+        except Exception as e:
             options_codes = []
+            st.caption(f"调试: 读取TopK文件失败: {e}")
         with c1:
-            # code_from_list = st.selectbox("从 Top-K 选择（可选）", options=options_codes or [], index=0 if options_codes else None, placeholder="也可手动输入 ↓")
-            code_from_list = st.selectbox("从 Top-K 选择（可选）", options=options_codes or [],
-                                        index=0 if options_codes else None,
-                                        placeholder="也可手动输入 ↓", key="detail_code_from_top")
+            # 确保options_codes不为空，且index有效
+            if options_codes:
+                code_from_list = st.selectbox("从 Top-K 选择（可选）", options=options_codes,
+                                            index=0, placeholder="也可手动输入 ↓", key="detail_code_from_top")
+            else:
+                # 当没有TopK数据时，提供一个默认选项但不禁用
+                code_from_list = st.selectbox("从 Top-K 选择（可选）", options=[""],
+                                            index=0, placeholder="暂无Top-K数据，请手动输入 ↓", 
+                                            key="detail_code_from_top")
 
+        # 使用session_state来管理代码输入，确保从selectbox选择后能正确更新
+        if 'detail_code_input' not in st.session_state:
+            st.session_state.detail_code_input = ""
+        
+        # 如果从selectbox选择了代码，更新输入框的值
+        if code_from_list and code_from_list != "":
+            st.session_state.detail_code_input = code_from_list
                     
-        code_typed = st.text_input("或手动输入股票代码", value=(code_from_list or ""), key="detail_code_input")
+        code_typed = st.text_input("或手动输入股票代码", key="detail_code_input")
         code_norm = normalize_ts(code_typed) if code_typed else ""
 
         # —— 渲染详情（含 old 版功能） ——
         if code_norm and ref_real:
             obj = _load_detail_json(ref_real, code_norm)
             if not obj:
-                st.warning("未找到该票的详情 JSON（可能当日未在样本内或未产出 Details）。")
+                st.warning("未找到该票的详情数据（可能当日未在样本内或未产出 Details）。")
             else:
                 data = obj
                 summary = data.get("summary", {}) or {}
@@ -1246,9 +1399,9 @@ if _in_streamlit():
             except Exception as e:
                 st.error(f"执行失败：{e}")
 
-    # ================== 明日预测 ==================
+    # ================== 明日模拟 ==================
     with tab_predict:
-        st.subheader("明日预测")
+        st.subheader("明日模拟")
         
         # 使用 st.form 防止参数变化时立即刷新UI
         with st.form("prediction_form"):
@@ -1298,14 +1451,14 @@ if _in_streamlit():
             # 规则选择（使用缓存）
             rules = _cached_load_prediction_rules()
             names = [r.get("name","") for r in rules]
-            chosen = st.multiselect("选择预测策略（可留空）", names, default=[])
+            chosen = st.multiselect("选择模拟策略（可留空）", names, default=[])
             chosen_rules = [r for r in rules if r.get("name") in set(chosen)]
             
             # Tie-break排序选择
-            tiebreak_pred = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=0, key="pred_tiebreak")
+            tiebreak_pred = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=1, key="pred_tiebreak")
 
             # 提交按钮
-            submitted = st.form_submit_button("运行明日预测", width='stretch')
+            submitted = st.form_submit_button("运行明日模拟", width='stretch')
         
         # 只有在表单提交时才执行计算
         if submitted:
@@ -1385,10 +1538,28 @@ if _in_streamlit():
                         recompute_indicators=recompute_to_pass,
                         cache_dir="cache/sim_pred"
                     )
-                    df = run_prediction(inp)
+                    # df = run_prediction(inp)
+                    df = run_prediction_in_bg(inp)
                     # 应用Tie-break排序
                     df_sorted = _apply_tiebreak_sorting(df, tiebreak_pred)
+                    
+                    # 显示结果信息
+                    if not df_sorted.empty:
+                        st.caption(f"命中 {len(df_sorted)} 只；参考日：{ref_use}")
+                        if 'score' in df_sorted.columns and df_sorted['score'].notna().any():
+                            st.caption("已按得分排序（降序），同分时按J值升序")
+                        else:
+                            st.caption("未找到得分数据，按默认排序")
+                    
                     st.dataframe(df_sorted, width='stretch')
+                    
+                    # 复制代码功能（与选股页面保持一致）
+                    if not df_sorted.empty and "ts_code" in df_sorted.columns:
+                        codes = df_sorted["ts_code"].astype(str).tolist()
+                        txt = _codes_to_txt(codes, st.session_state["export_pref"]["style"], 
+                                          st.session_state["export_pref"]["with_suffix"])
+                        copy_txt_button(txt, label="📋 复制命中代码", key=f"copy_prediction_{ref_use}")
+                    
                     # 下载
                     csv = df_sorted.to_csv(index=False).encode("utf-8-sig")
                     st.download_button("导出 CSV", data=csv, file_name=f"prediction_hits_{ref_use}.csv", mime="text/csv", width='stretch')
@@ -1425,313 +1596,927 @@ if _in_streamlit():
             else:
                 st.warning("请检查参数设置，确保参考日和选股范围都有效")
 
-    # ================== 规则编辑 ==================
+    # ================== 规则编辑辅助模块 ==================
     with tab_rules:
-        st.subheader("规则编辑（仅当前进程临时生效，保存不会改 config.py）")
-        colL, colR = st.columns([2,1])
-        default_text = json.dumps(st.session_state["rules_obj"], ensure_ascii=False, indent=2)
-        with colL:
-            text = st.text_area("规则 JSON（含 prescreen / rules / PREDICTION_RULES / POSITION_POLICIES / OPPORTUNITY_POLICIES）", value=default_text, height=300)
-        with colR:
-            up = st.file_uploader("从文件载入 JSON", type=["json"])
-            if up:
-                try:
-                    st.session_state["rules_obj"] = json.loads(up.read().decode("utf-8-sig"))
-                    st.success("已载入至编辑器（未应用）。")
-                except Exception as e:
-                    st.error(f"载入失败：{e}")
-            if st.button("✅ 校验并应用（仅当前进程）", width='stretch'):
-                try:
-                    st.session_state["rules_obj"] = json.loads(text)
-                    st.success("校验通过，已应用。运行评分时将使用该临时规则。")
-                except Exception as e:
-                    st.error(f"JSON 解析失败：{e}")
-            RULES_JSON = Path("./rules.json")
-            if st.button("💾 导出到 rules.json", width='stretch'):
-                try:
-                    RULES_JSON.write_text(text, encoding="utf-8-sig")
-                    st.success(f"已写入 {RULES_JSON}")
-                except Exception as e:
-                    st.error(f"写入失败：{e}")
-
-            if st.button("📥 从 rules.json 载入", width='stretch'):
-                try:
-                    t = RULES_JSON.read_text(encoding="utf-8-sig")
-                    st.session_state["rules_obj"] = json.loads(t)
-                    st.success("已加载到编辑器（别忘了再点“校验并应用”）")
-                except Exception as e:
-                    st.error(f"读取失败：{e}")
-
-            if st.button("↩️ 还原为 config 默认", width='stretch'):
-                st.session_state["rules_obj"] = {
-                    # "prescreen": getattr(cfg, "SC_PRESCREEN_RULES", []),
-                    # "rules": getattr(cfg, "SC_RULES", []),
-                    "prescreen": getattr(se, "SC_PRESCREEN_RULES", []),
-                    "rules": getattr(se, "SC_RULES", []),
-                }
+        st.subheader("规则编辑辅助工具")
+        st.info("通过可视化界面配置策略规则，自动生成规则配置")
+        
+        # 规则类型选择
+        rule_type = st.selectbox(
+            "选择规则类型",
+            ["排名策略 (ranking)", "筛选策略 (filter)", "模拟策略 (prediction)", "持仓策略 (position)", "买点策略 (opportunity)"],
+            help="选择要创建的规则类型，不同类型有不同的必填字段"
+        )
+        
+        # 策略类型说明
+        with st.expander("策略类型说明", expanded=False):
+            st.markdown("""
+            **策略类型详解：**
+            
+            - **排名策略 (ranking)**: 用于股票评分排名，使用 `when` 表达式判断条件，通过 `points` 字段加分
+              - 配置项：name, timeframe, window, scope, points, explain, show_reason, as, gate, clauses, dist_points
+              
+            - **筛选策略 (filter)**: 用于股票筛选过滤，使用 `when` 表达式判断条件，可设置 `hard_penalty` 硬性惩罚
+              - 配置项：name, timeframe, window, scope, reason, hard_penalty, gate, clauses
+              
+            - **模拟策略 (prediction)**: 用于市场场景模拟，使用 `check` 表达式判断条件，需要 `scenario` 场景名称
+              - 配置项：name, scenario
+              
+            - **持仓策略 (position)**: 用于持仓股票检查，使用 `when` 表达式判断买卖时机
+              - 配置项：name, explain
+              
+            - **买点策略 (opportunity)**: 用于寻找买入机会，使用 `when` 表达式判断买入条件
+              - 配置项：name, explain
+            """)
+        
+        # 预设模板选择
+        col_template1, col_template2 = st.columns([3, 1])
+        with col_template1:
+            template_option = st.selectbox(
+                "选择预设模板（可选）",
+                ["自定义", "均线突破", "成交量放大", "价格回调", "趋势确认", "技术指标"],
+                help="选择预设模板可以快速填充常用配置"
+            )
+        with col_template2:
+            if st.button("🔄 清除模板", help="清除当前模板设置，恢复默认值"):
+                # 清除所有模板相关的session_state
+                for key in ['template_name', 'template_timeframe', 'template_window', 
+                           'template_scope', 'template_points', 'template_explain', 'template_when',
+                           'template_check', 'template_scenario']:
+                    if key in st.session_state:
+                        del st.session_state[key]
                 st.rerun()
-        st.divider()
-        with st.container(border=True):
-            st.markdown("### 🧪 策略测试器（单条规则）")
-            with st.expander("使用方法 / 字段说明", expanded=False):
-                md_path_candidates = ["./手册/规则编辑方法.md"]
-                for _p in md_path_candidates:
-                    md_text = _read_md_file(_p)
-                    if not md_text.startswith("⚠️ 未找到帮助文档"):
-                        break
-                st.markdown(md_text)
-
-        # 1) 首次进入时给一个默认模板
-        if "tester_rule_json" not in st.session_state:
-            st.session_state["tester_rule_json"] = json.dumps({
-                "name": "测试：近3日放量并站上MA20",
-                "timeframe": "D",
-                "window": 60,
-                "scope": "RECENT",
-                "when": "VOL>MA(VOL,5) AND CLOSE>MA(CLOSE,20)",
-                "points": 3,
-                "dist_points": [{"min":0,"max":0,"points":3},{"min":1,"max":2,"points":2},{"min":3,"max":5,"points":1}],
-                "explain": "近N日放量且站上MA20"
-            }, ensure_ascii=False, indent=2)
-
-        colleft, colright = st.columns([2,1])
-        with colright:
-            def _clear_tester_rule():
-                # empty_rule = None
-                # st.session_state["tester_rule_json"] = json.dumps(empty_rule, ensure_ascii=False, indent=2)
-                st.session_state["tester_rule_json"] = ""
-            st.button("🧹 一键清空", width='stretch', on_click=_clear_tester_rule)
-            # ref_in = st.text_input("参考日（留空=自动最新）", value="")
-            # ts_in = st.text_input("个股代码", value="")
-            ref_in = st.text_input("参考日（留空=自动最新）", value="", key="tester_ref_input")
-            ts_in = st.text_input("个股代码", value="", key="tester_ts_input")
-            uni_choice = st.selectbox("名单", ["全市场","仅白名单","仅黑名单"], index=0, key="tester_uni")
-            _uni_map = {"全市场":"all", "仅白名单":"white", "仅黑名单":"black", "仅特别关注榜":"attention"}
-
-        with colleft:
-            # 2) 不要再传 value=……，只保留 key
-            rule_raw = st.text_area("临时规则（JSON）", height=260, key="tester_rule_json")
-
-        colD, colE = st.columns([1,1])
-        with colD:
-            run_btn = st.button("在个股中运行", width='stretch')
-        with colE:
-            run_all_btn = st.button("在名单中运行", width='stretch', key="tester_run_all")
-
-        refD_all = ref_in.strip() or _pick_latest_ref_date() or ""
-        if run_all_btn:
-            try:
-                raw = st.session_state.get("tester_rule_json", "")
-                if raw.strip():
-                    rule = json.loads(raw)
-                else:
-                    rule = None   # 用户当前没填
-
-                rule = json.loads(rule_raw)
-                when_expr, tf, win, scope = _rule_to_screen_args(rule)
-
-                # 2) 调 tdx_screen，注意不写黑白名单，仅预览
-                df_sel = se.tdx_screen(
-                    when_expr,
-                    ref_date=refD_all.strip() or None,
-                    timeframe=tf,
-                    window=int(win),
-                    scope=scope,                              # 支持 LAST/ANY/ALL/COUNT>=k/CONSEC>=m/ANY_n/ALL_n:contentReference[oaicite:7]{index=7}
-                    universe=_uni_map.get(uni_choice,"all"),  # all/white/black/attention
-                    write_white=False,
-                    write_black_rest=False,
-                    return_df=True
+        
+        # 根据模板预设值
+        if template_option != "自定义":
+            if template_option == "均线突破":
+                st.session_state.template_name = "均线突破"
+                st.session_state.template_timeframe = "D"
+                st.session_state.template_window = 20
+                st.session_state.template_scope = "EACH"
+                st.session_state.template_points = 2
+                st.session_state.template_explain = "价格突破均线，确认上涨趋势"
+                st.session_state.template_when = "C > MA(C, 20)"
+            elif template_option == "成交量放大":
+                st.session_state.template_name = "成交量放大"
+                st.session_state.template_timeframe = "D"
+                st.session_state.template_window = 20
+                st.session_state.template_scope = "EACH"
+                st.session_state.template_points = 1
+                st.session_state.template_explain = "成交量显著放大，显示资金关注"
+                st.session_state.template_when = "V > MA(V, 20) * 1.5"
+            elif template_option == "价格回调":
+                st.session_state.template_name = "价格回调"
+                st.session_state.template_timeframe = "D"
+                st.session_state.template_window = 10
+                st.session_state.template_scope = "LAST"
+                st.session_state.template_points = -5
+                st.session_state.template_explain = "短期价格回调，风险提示"
+                st.session_state.template_when = "C < MA(C, 5)"
+            elif template_option == "趋势确认":
+                st.session_state.template_name = "趋势确认"
+                st.session_state.template_timeframe = "D"
+                st.session_state.template_window = 20
+                st.session_state.template_scope = "EACH"
+                st.session_state.template_points = 3
+                st.session_state.template_explain = "多重条件确认趋势"
+                st.session_state.template_when = "C > MA(C, 20) AND MA(C, 5) > MA(C, 20) AND V > MA(V, 20)"
+            elif template_option == "技术指标":
+                st.session_state.template_name = "技术指标"
+                st.session_state.template_timeframe = "D"
+                st.session_state.template_window = 14
+                st.session_state.template_scope = "EACH"
+                st.session_state.template_points = 2
+                st.session_state.template_explain = "基于技术指标的信号"
+                st.session_state.template_when = "RSI < 30 AND C > MA(C, 10)"
+            
+            # 为模拟策略添加特殊模板
+            if rule_category == "prediction":
+                if template_option == "均线突破":
+                    st.session_state.template_check = "C > MA(C, 20)"
+                    st.session_state.template_scenario = "均线突破场景"
+                elif template_option == "成交量放大":
+                    st.session_state.template_check = "V > MA(V, 20) * 1.5"
+                    st.session_state.template_scenario = "成交量放大场景"
+                elif template_option == "价格回调":
+                    st.session_state.template_check = "C < MA(C, 5)"
+                    st.session_state.template_scenario = "价格回调场景"
+                elif template_option == "趋势确认":
+                    st.session_state.template_check = "C > MA(C, 20) AND MA(C, 5) > MA(C, 20) AND V > MA(V, 20)"
+                    st.session_state.template_scenario = "趋势确认场景"
+                elif template_option == "技术指标":
+                    st.session_state.template_check = "RSI < 30 AND C > MA(C, 10)"
+                    st.session_state.template_scenario = "技术指标场景"
+        
+        # 提取规则类型
+        rule_category = rule_type.split(" ")[1].strip("()")
+        
+        # 初始化变量
+        use_clauses = False
+        when_expr = ""
+        check_expr = ""
+        scenario = ""
+        scenario_config = None
+        explain = ""
+        rule_name = ""
+        timeframe = "D"
+        window = 60
+        scope = "ANY"
+        points = 0
+        show_reason = True
+        rule_as = "auto"
+        gate = ""
+        dist_points = 0
+        hard_penalty = False
+        reason = ""
+        
+        # 场景配置变量
+        use_scenario = False
+        price_mode = "close_pct"
+        pct = 0.0
+        gap_pct = 0.0
+        hl_mode = "follow"
+        range_pct = 1.5
+        atr_mult = 1.0
+        vol_mode = "same"
+        vol_arg = 0.0
+        lock_higher_than_open = False
+        lock_inside_day = False
+        warmup_days = 60
+        
+        # 根据策略类型显示不同的配置项
+        if rule_category == "ranking":
+            # 排名策略配置
+            col_left, col_right = st.columns([1, 1])
+            
+            with col_left:
+                st.markdown("#### 基础配置")
+                
+                # 规则名称
+                rule_name = st.text_input(
+                    "规则名称 (name)",
+                    value=st.session_state.get('template_name', ''),
+                    placeholder="例如：短期上涨趋势",
+                    help="规则的显示名称，用于识别和说明"
                 )
-                # 3) 友好列
-                if not df_sel.empty:
-                    df_sel["board"] = df_sel["ts_code"].map(market_label)
-                    st.success(f"命中 {len(df_sel)} 只；参考日：{df_sel['ref_date'].iloc[0] if 'ref_date' in df_sel.columns and len(df_sel)>0 else (refD_all or '自动')}")
-                    st.dataframe(df_sel, width='stretch', height=480)
-                    # 导出
-                    csv_bytes = df_sel.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button("导出结果 CSV", data=csv_bytes, file_name="tester_screen_all.csv", mime="text/csv", width='stretch')
+                
+                # 时间周期
+                timeframe_options = ["D", "W", "M", "60MIN"]
+                timeframe_index = timeframe_options.index(st.session_state.get('template_timeframe', 'D'))
+                timeframe = st.selectbox(
+                    "时间周期 (timeframe)",
+                    timeframe_options,
+                    index=timeframe_index,
+                    help="数据的时间周期：D(日线)、W(周线)、M(月线)、60MIN(60分钟)"
+                )
+                
+                # 回看窗口
+                window = st.number_input(
+                    "回看窗口 (window)",
+                    min_value=1,
+                    max_value=500,
+                    value=st.session_state.get('template_window', 60),
+                    help="回看的历史数据条数，通常设置为5-100"
+                )
+                
+                # 命中口径
+                scope_options = ["ANY", "LAST", "ALL", "EACH", "RECENT", "DIST", "NEAR", "CONSEC", "COUNT"]
+                scope_index = scope_options.index(st.session_state.get('template_scope', 'ANY'))
+                scope = st.selectbox(
+                    "命中口径 (scope)",
+                    scope_options,
+                    index=scope_index,
+                    help="规则命中的判断方式：ANY(任意)、LAST(最近)、ALL(全部)、EACH(每个)等"
+                )
+                
+                # 分数
+                points = st.number_input(
+                    "分数 (points)",
+                    value=st.session_state.get('template_points', 0),
+                    step=1,
+                    help="规则命中时的加分或减分，正数为加分，负数为减分"
+                )
+            
+            with col_right:
+                st.markdown("#### 高级配置")
+                
+                # 说明文字
+                explain = st.text_area(
+                    "说明文字 (explain)",
+                    value=st.session_state.get('template_explain', ''),
+                    placeholder="例如：短期上涨趋势，价格突破短期均线",
+                    help="规则的详细说明，用于解释规则的作用"
+                )
+                
+                # 是否显示理由
+                show_reason = st.checkbox(
+                    "显示理由 (show_reason)",
+                    value=True,
+                    help="是否在结果中显示此规则的命中理由"
+                )
+                
+                # 分类标签
+                rule_as = st.selectbox(
+                    "分类标签 (as)",
+                    ["auto", "opportunity", "highlight", "drawback"],
+                    index=0,
+                    help="规则分类：auto(自动)、opportunity(机会)、highlight(高亮)、drawback(缺点)"
+                )
+                
+                # 前置门槛
+                gate = st.text_input(
+                    "前置门槛 (gate)",
+                    placeholder="例如：C > MA(C, 5)",
+                    help="规则生效的前置条件，必须满足才能执行此规则"
+                )
+                
+                # 多子句组合
+                use_clauses = st.checkbox(
+                    "使用多子句组合 (clauses)",
+                    help="使用clauses替代when字段，支持更复杂的逻辑组合"
+                )
+                
+                # 分布分数
+                dist_points = st.number_input(
+                    "分布分数 (dist_points)",
+                    value=0,
+                    step=1,
+                    help="用于分布计算的分数，通常与points配合使用"
+                )
+        
+        elif rule_category == "filter":
+            # 筛选策略配置
+            col_left, col_right = st.columns([1, 1])
+            
+            with col_left:
+                st.markdown("#### 基础配置")
+                
+                # 规则名称
+                rule_name = st.text_input(
+                    "规则名称 (name)",
+                    value=st.session_state.get('template_name', ''),
+                    placeholder="例如：基本面筛选",
+                    help="规则的显示名称，用于识别和说明"
+                )
+                
+                # 时间周期
+                timeframe_options = ["D", "W", "M", "60MIN"]
+                timeframe_index = timeframe_options.index(st.session_state.get('template_timeframe', 'D'))
+                timeframe = st.selectbox(
+                    "时间周期 (timeframe)",
+                    timeframe_options,
+                    index=timeframe_index,
+                    help="数据的时间周期：D(日线)、W(周线)、M(月线)、60MIN(60分钟)"
+                )
+                
+                # 回看窗口
+                window = st.number_input(
+                    "回看窗口 (window)",
+                    min_value=1,
+                    max_value=500,
+                    value=st.session_state.get('template_window', 60),
+                    help="回看的历史数据条数，通常设置为5-100"
+                )
+                
+                # 命中口径
+                scope_options = ["ANY", "LAST", "ALL", "EACH", "RECENT", "DIST", "NEAR", "CONSEC", "COUNT"]
+                scope_index = scope_options.index(st.session_state.get('template_scope', 'ANY'))
+                scope = st.selectbox(
+                    "命中口径 (scope)",
+                    scope_options,
+                    index=scope_index,
+                    help="规则命中的判断方式：ANY(任意)、LAST(最近)、ALL(全部)、EACH(每个)等"
+                )
+            
+            with col_right:
+                st.markdown("#### 筛选配置")
+                
+                # 硬性惩罚
+                hard_penalty = st.checkbox(
+                    "硬性惩罚 (hard_penalty)",
+                    help="是否启用硬性惩罚，启用后不符合条件的股票将被直接排除"
+                )
+                
+                # 筛选原因
+                reason = st.text_input(
+                    "筛选原因 (reason)",
+                    value=st.session_state.get('template_reason', ''),
+                    placeholder="例如：不符合基本面要求",
+                    help="筛选策略的拒绝原因说明"
+                )
+                
+                # 前置门槛
+                gate = st.text_input(
+                    "前置门槛 (gate)",
+                    placeholder="例如：C > MA(C, 5)",
+                    help="规则生效的前置条件，必须满足才能执行此规则"
+                )
+                
+                # 多子句组合
+                use_clauses = st.checkbox(
+                    "使用多子句组合 (clauses)",
+                    help="使用clauses替代when字段，支持更复杂的逻辑组合"
+                )
+        
+        elif rule_category == "prediction":
+            # 模拟策略配置
+            st.markdown("#### 基础配置")
+            
+            # 规则名称
+            rule_name = st.text_input(
+                "规则名称 (name)",
+                value=st.session_state.get('template_name', ''),
+                placeholder="例如：上涨场景模拟",
+                help="规则的显示名称，用于识别和说明"
+            )
+            
+            st.markdown("#### 场景配置")
+            
+            # 场景配置开关
+            use_scenario = st.checkbox(
+                "使用场景配置 (scenario)",
+                help="是否使用内置场景配置，否则使用默认场景"
+            )
+            
+            if use_scenario:
+                col_scenario1, col_scenario2 = st.columns([1, 1])
+                
+                with col_scenario1:
+                    st.markdown("##### 价格假设")
+                    
+                    # 价格模式
+                    price_mode = st.selectbox(
+                        "价格模式 (mode)",
+                        ["close_pct", "open_pct", "gap_then_close_pct", "limit_up", "limit_down", "flat"],
+                        index=0,
+                        help="价格变化模式：close_pct(收盘涨跌)、open_pct(开盘涨跌)、gap_then_close_pct(跳空后收盘涨跌)、limit_up(涨停)、limit_down(跌停)、flat(平盘)"
+                    )
+                    
+                    # 涨跌幅
+                    if price_mode in ["close_pct", "open_pct", "gap_then_close_pct"]:
+                        pct = st.number_input(
+                            "涨跌幅 (pct)",
+                            value=0.0,
+                            step=0.1,
+                            format="%.1f",
+                            help="涨跌幅百分比，正数为上涨，负数为下跌"
+                        )
+                    
+                    # 跳空幅度
+                    if price_mode == "gap_then_close_pct":
+                        gap_pct = st.number_input(
+                            "跳空幅度 (gap_pct)",
+                            value=0.0,
+                            step=0.1,
+                            format="%.1f",
+                            help="跳空幅度百分比，开盘=昨收*(1+gap_pct)"
+                        )
+                    
+                    st.markdown("##### 高低点生成")
+                    
+                    # 高低点模式
+                    hl_mode = st.selectbox(
+                        "高低点模式 (hl_mode)",
+                        ["follow", "atr_like", "range_pct"],
+                        index=0,
+                        help="高低点生成模式：follow(跟随)、atr_like(类ATR)、range_pct(固定振幅)"
+                    )
+                    
+                    if hl_mode == "range_pct":
+                        range_pct = st.number_input(
+                            "当日振幅 (range_pct)",
+                            value=1.5,
+                            step=0.1,
+                            format="%.1f",
+                            help="当日高低振幅百分比"
+                        )
+                    elif hl_mode == "atr_like":
+                        atr_mult = st.number_input(
+                            "ATR倍数 (atr_mult)",
+                            value=1.0,
+                            step=0.1,
+                            format="%.1f",
+                            help="ATR倍数，从近N日高低均值估算"
+                        )
+                
+                with col_scenario2:
+                    st.markdown("##### 成交量配置")
+                    
+                    # 成交量模式
+                    vol_mode = st.selectbox(
+                        "成交量模式 (vol_mode)",
+                        ["same", "pct", "mult"],
+                        index=0,
+                        help="成交量模式：same(相同)、pct(百分比变化)、mult(倍数变化)"
+                    )
+                    
+                    if vol_mode == "pct":
+                        vol_arg = st.number_input(
+                            "成交量变化 (vol_arg)",
+                            value=0.0,
+                            step=1.0,
+                            format="%.1f",
+                            help="成交量变化百分比，+10表示+10%"
+                        )
+                    elif vol_mode == "mult":
+                        vol_arg = st.number_input(
+                            "成交量倍数 (vol_arg)",
+                            value=1.0,
+                            step=0.1,
+                            format="%.1f",
+                            help="成交量倍数，1.2表示放大20%"
+                        )
+                    
+                    st.markdown("##### 约束条件")
+                    
+                    # 约束条件
+                    lock_higher_than_open = st.checkbox(
+                        "收盘高于开盘 (lock_higher_than_open)",
+                        help="强制收盘价≥开盘价"
+                    )
+                    
+                    lock_inside_day = st.checkbox(
+                        "高低点覆盖开收盘 (lock_inside_day)",
+                        help="强制H/L覆盖O/C"
+                    )
+                    
+                    # 指标重算窗口
+                    warmup_days = st.number_input(
+                        "指标重算窗口 (warmup_days)",
+                        min_value=10,
+                        max_value=200,
+                        value=60,
+                        help="需要拼接多少历史天作warm-up，越大指标越准但越慢"
+                    )
+                
+                # 构建场景配置
+                scenario_config = {
+                    "mode": price_mode,
+                    "pct": pct if price_mode in ["close_pct", "open_pct", "gap_then_close_pct"] else 0.0,
+                    "gap_pct": gap_pct if price_mode == "gap_then_close_pct" else 0.0,
+                    "hl_mode": hl_mode,
+                    "range_pct": range_pct if hl_mode == "range_pct" else 1.5,
+                    "atr_mult": atr_mult if hl_mode == "atr_like" else 1.0,
+                    "vol_mode": vol_mode,
+                    "vol_arg": vol_arg if vol_mode in ["pct", "mult"] else 0.0,
+                    "lock_higher_than_open": lock_higher_than_open,
+                    "lock_inside_day": lock_inside_day,
+                    "warmup_days": warmup_days
+                }
+                
+                # 显示生成的场景配置
+                with st.expander("场景配置预览", expanded=False):
+                    st.code(json.dumps(scenario_config, ensure_ascii=False, indent=2), language="json")
+            else:
+                scenario_config = None
+        
+        elif rule_category == "position":
+            # 持仓策略配置
+            col_left, col_right = st.columns([1, 1])
+            
+            with col_left:
+                st.markdown("#### 基础配置")
+                
+                # 规则名称
+                rule_name = st.text_input(
+                    "规则名称 (name)",
+                    value=st.session_state.get('template_name', ''),
+                    placeholder="例如：止损策略",
+                    help="规则的显示名称，用于识别和说明"
+                )
+            
+            with col_right:
+                st.markdown("#### 策略配置")
+                
+                # 说明文字
+                explain = st.text_area(
+                    "说明文字 (explain)",
+                    value=st.session_state.get('template_explain', ''),
+                    placeholder="例如：当价格跌破支撑位时止损",
+                    help="规则的详细说明，用于解释策略的作用"
+                )
+        
+        elif rule_category == "opportunity":
+            # 买点策略配置
+            col_left, col_right = st.columns([1, 1])
+            
+            with col_left:
+                st.markdown("#### 基础配置")
+                
+                # 规则名称
+                rule_name = st.text_input(
+                    "规则名称 (name)",
+                    value=st.session_state.get('template_name', ''),
+                    placeholder="例如：突破买点",
+                    help="规则的显示名称，用于识别和说明"
+                )
+            
+            with col_right:
+                st.markdown("#### 策略配置")
+                
+                # 说明文字
+                explain = st.text_area(
+                    "说明文字 (explain)",
+                    value=st.session_state.get('template_explain', ''),
+                    placeholder="例如：价格突破阻力位时的买入机会",
+                    help="规则的详细说明，用于解释策略的作用"
+                )
+            
+            if use_clauses:
+                clauses_config = st.text_area(
+                    "子句配置 (clauses)",
+                    placeholder='[{"when": "C > MA(C, 20)", "points": 2}, {"when": "V > MA(V, 20)", "points": 1}]',
+                    help="JSON格式的多子句配置，每个子句包含when表达式和points分数"
+                )
+                
+                # 子句配置提示
+                with st.expander("多子句配置说明", expanded=False):
+                    st.markdown("""
+                    **多子句配置格式：**
+                    ```json
+                    [
+                        {
+                            "when": "C > MA(C, 20)",
+                            "points": 2,
+                            "explain": "价格突破20日均线"
+                        },
+                        {
+                            "when": "V > MA(V, 20)",
+                            "points": 1,
+                            "explain": "成交量放大"
+                        }
+                    ]
+                    ```
+                    
+                    **字段说明：**
+                    - `when`: 条件表达式（必填）
+                    - `points`: 分数（可选，默认0）
+                    - `explain`: 说明文字（可选）
+                    """)
+        
+        # 条件表达式配置 - 根据策略类型显示不同字段
+        if rule_category == "prediction":
+            st.markdown("#### 模拟策略表达式")
+            check_expr = st.text_area(
+                "检查表达式 (check) *",
+                value=st.session_state.get('template_check', ''),
+                placeholder="例如：C > MA(C, 20)",
+                help="模拟策略的检查条件，用于判断是否满足特定场景"
+            )
+            scenario = st.text_input(
+                "场景名称 (scenario)",
+                value=st.session_state.get('template_scenario', ''),
+                placeholder="例如：上涨场景",
+                help="模拟策略的场景名称，用于标识不同的市场情况（可选）"
+            )
+        else:
+            st.markdown("#### 条件表达式")
+            
+            if not use_clauses:
+                # 单条件表达式
+                when_expr = st.text_area(
+                    "条件表达式 (when) *",
+                    value=st.session_state.get('template_when', ''),
+                    placeholder="例如：C > MA(C, 20) AND V > MA(V, 20)",
+                    help=f"TDX风格的布尔表达式，用于{rule_category}策略的条件判断"
+                )
+            else:
+                st.info("使用多子句组合时，条件表达式在clauses字段中配置")
+        
+        # 表达式语法提示
+        with st.expander("表达式语法提示", expanded=False):
+            md_path_candidates = ["./手册/规则编辑方法.md"]
+            for _p in md_path_candidates:
+                md_text = _read_md_file(_p)
+                if not md_text.startswith("⚠️ 未找到帮助文档"):
+                    break
+            st.markdown(md_text)
+        
+        # 生成规则配置
+        st.markdown("#### 规则预览")
+        
+        col_generate1, col_generate2 = st.columns([1, 1])
+        with col_generate1:
+            generate_btn = st.button("🔧 生成规则配置", type="primary")
+        with col_generate2:
+            validate_btn = st.button("✅ 验证规则", help="验证规则配置是否正确")
+        
+        if generate_btn or validate_btn:
+            # 构建规则配置
+            rule_config = {}
+            
+            # 根据策略类型处理字段
+            if rule_category == "ranking":
+                # 排名策略字段
+                if rule_name:
+                    rule_config["name"] = rule_name
+                if timeframe != "D":
+                    rule_config["timeframe"] = timeframe
+                if window != 60:
+                    rule_config["window"] = window
+                if scope != "ANY":
+                    rule_config["scope"] = scope
+                if points != 0:
+                    rule_config["points"] = points
+                if explain:
+                    rule_config["explain"] = explain
+                if not show_reason:
+                    rule_config["show_reason"] = show_reason
+                if rule_as != "auto":
+                    rule_config["as"] = rule_as
+                if gate:
+                    rule_config["gate"] = gate
+                if dist_points != 0:
+                    rule_config["dist_points"] = dist_points
+                    
+            elif rule_category == "filter":
+                # 筛选策略字段
+                if rule_name:
+                    rule_config["name"] = rule_name
+                if timeframe != "D":
+                    rule_config["timeframe"] = timeframe
+                if window != 60:
+                    rule_config["window"] = window
+                if scope != "ANY":
+                    rule_config["scope"] = scope
+                if hard_penalty:
+                    rule_config["hard_penalty"] = hard_penalty
+                if reason:
+                    rule_config["reason"] = reason
+                if gate:
+                    rule_config["gate"] = gate
+                    
+            elif rule_category == "prediction":
+                # 模拟策略字段
+                if rule_name:
+                    rule_config["name"] = rule_name
+                if scenario_config:
+                    rule_config["scenario"] = scenario_config
+                    
+            elif rule_category == "position":
+                # 持仓策略字段
+                if rule_name:
+                    rule_config["name"] = rule_name
+                if explain:
+                    rule_config["explain"] = explain
+                    
+            elif rule_category == "opportunity":
+                # 买点策略字段
+                if rule_name:
+                    rule_config["name"] = rule_name
+                if explain:
+                    rule_config["explain"] = explain
+            
+            # 条件表达式 - 根据策略类型处理
+            if rule_category == "prediction":
+                # 模拟策略使用check字段
+                if check_expr:
+                    rule_config["check"] = check_expr
+                if scenario:
+                    rule_config["scenario"] = scenario
+                
+                # 验证必填字段
+                if not check_expr:
+                    st.error("❌ 缺少必填字段：检查表达式 (check)")
                 else:
-                    st.info("未命中。")
-
-                # 4) （可选）点名看“单票明细” —— 和上面明细页同口径
-                st.markdown("###### 查看某只股票的明细（与单票测试相同口径）")
-                ts_pick_ori = st.text_input("输入 ts_code 查看（如 000001.SZ）", value="")
-                ts_pick = normalize_ts((ts_pick_ori or "").strip())
-                if ts_pick:
-                    # 根据规则窗口估算最小读取区间，然后读单票数据
-                    ref = (df_sel["ref_date"].iloc[0] if (not df_sel.empty and "ref_date" in df_sel.columns) else (refD_all or None)) or se._pick_ref_date()
-                    start = se._compute_read_start(ref)  # 保证窗口足够:contentReference[oaicite:9]{index=9}:contentReference[oaicite:10]{index=10}
-                    dfD = se._read_stock_df(ts_pick.strip(), start, ref, columns=["trade_date","open","high","low","close","vol","amount"])
-                    per_rows = se._build_per_rule_detail(dfD, ref)  # 返回含 ok/add/cnt/lag/hit_date/hit_dates 等字段:contentReference[oaicite:11]{index=11}
-                    df_detail = pd.DataFrame(per_rows)
-                    # 只显示当前这条规则（按 name 或 when 关键字都可以）
-                    name_key = str(rule.get("name","")).strip()
-                    if name_key:
-                        df_detail = df_detail[df_detail["name"] == name_key]
-                    st.dataframe(df_detail, width='stretch')
-            except Exception as e:
-                st.error(f"运行失败：{e}")
-
-        if run_btn:
-            try:
-                raw = st.session_state.get("tester_rule_json", "")
-                if raw.strip():
-                    rule = json.loads(raw)
+                    # 显示生成的配置
+                    st.success("✅ 规则配置生成成功！")
+                    
+                    # 显示JSON格式
+                    st.markdown("**生成的规则配置：**")
+                    st.code(json.dumps(rule_config, ensure_ascii=False, indent=2), language="json")
+                    
+                    # 提供复制功能
+                    if st.button("📋 复制配置"):
+                        st.code(json.dumps(rule_config, ensure_ascii=False, indent=2))
+                        st.success("配置已复制到剪贴板（请手动复制）")
+            else:
+                # 其他策略类型使用when字段
+                if not use_clauses and when_expr:
+                    rule_config["when"] = when_expr
+                elif use_clauses:
+                    st.warning("请在上方clauses字段中配置多子句组合")
                 else:
-                    rule = None   # 用户当前没填
-                rule = json.loads(rule_raw or "{}")
-            except Exception as e:
-                st.error(f"规则 JSON 解析失败：{e}")
-                st.stop()
+                    # 验证必填字段
+                    if not when_expr:
+                        st.error("❌ 缺少必填字段：条件表达式 (when)")
+                    else:
+                        # 显示生成的配置
+                        st.success("✅ 规则配置生成成功！")
+                        
+                        # 显示JSON格式
+                        st.markdown("**生成的规则配置：**")
+                        st.code(json.dumps(rule_config, ensure_ascii=False, indent=2), language="json")
+                        
+                        # 提供复制功能
+                        if st.button("📋 复制配置"):
+                            st.code(json.dumps(rule_config, ensure_ascii=False, indent=2))
+                            st.success("配置已复制到剪贴板（请手动复制）")
+            
+            # 验证规则
+            if validate_btn:
+                st.markdown("#### 规则验证结果")
+                
+                # 基础验证
+                validation_errors = []
+                validation_warnings = []
+                
+                # 检查必填字段
+                if rule_category == "prediction":
+                    if not check_expr:
+                        validation_errors.append("缺少必填字段：检查表达式 (check)")
+                    elif not check_expr.strip():
+                        validation_errors.append("检查表达式不能为空")
+                    elif len(check_expr) < 3:
+                        validation_warnings.append("检查表达式可能过于简单")
+                elif rule_category in ["ranking", "filter"]:
+                    if not when_expr and not use_clauses:
+                        validation_errors.append("缺少必填字段：条件表达式 (when)")
+                    elif when_expr and not use_clauses:
+                        if not when_expr.strip():
+                            validation_errors.append("条件表达式不能为空")
+                        elif len(when_expr) < 3:
+                            validation_warnings.append("条件表达式可能过于简单")
+                elif rule_category in ["position", "opportunity"]:
+                    if not when_expr:
+                        validation_errors.append("缺少必填字段：条件表达式 (when)")
+                    elif not when_expr.strip():
+                        validation_errors.append("条件表达式不能为空")
+                    elif len(when_expr) < 3:
+                        validation_warnings.append("条件表达式可能过于简单")
+                
+                # 检查数值范围
+                if rule_category in ["ranking", "filter"]:
+                    if window < 1 or window > 500:
+                        validation_warnings.append(f"回看窗口值 {window} 可能不合理，建议在1-100之间")
+                
+                if rule_category == "ranking":
+                    if abs(points) > 100:
+                        validation_warnings.append(f"分数值 {points} 可能过大，建议在-50到50之间")
+                
+                # 显示验证结果
+                if validation_errors:
+                    st.error("❌ 验证失败")
+                    for error in validation_errors:
+                        st.error(f"• {error}")
+                else:
+                    st.success("✅ 规则验证通过")
+                
+                if validation_warnings:
+                    st.warning("⚠️ 验证警告")
+                    for warning in validation_warnings:
+                        st.warning(f"• {warning}")
+                
+                # 显示配置预览
+                if not validation_errors:
+                    st.markdown("**配置预览：**")
+                    st.code(json.dumps(rule_config, ensure_ascii=False, indent=2), language="json")
+        
+        st.markdown("---")
+        
+        # ================== 策略语法检查 ==================
+        st.subheader("策略语法检查器")
+        st.info("自动检查本地策略文件的语法错误、必填字段、表达式有效性等")
+        
+        with st.expander("使用方法 / 字段说明", expanded=False):
+            st.markdown("""
+            **策略语法检查器功能：**
+            
+            1. **自动文件定位** - 自动扫描并定位策略文件
+            2. **语法验证** - 验证策略规则的语法和字段有效性
+            3. **表达式检查** - 检查TDX表达式的正确性
+            4. **字段验证** - 检查必填字段和字段类型
+            5. **指标检查** - 验证指标依赖关系
+            
+            **支持的策略类型：**
+            - 排名策略 (ranking)
+            - 筛选策略 (filter)  
+            - 模拟策略 (prediction)
+            - 持仓策略 (position)
+            - 买点策略 (opportunity)
+            
+            **检查内容：**
+            - ✅ Python文件语法正确性
+            - ✅ 策略列表结构正确性
+            - ✅ 每个规则的字段和表达式
+            - ✅ 必填字段完整性
+            - ✅ 字段类型正确性
+            - ✅ 表达式语法正确性
+            - ✅ 支持的函数和变量
+            - ✅ 缺失的数据列和指标
+            """)
 
-            ts_code = normalize_ts((ts_in or "").strip())
-            if not ts_code:
-                st.error("请填写测试代码")
-                st.stop()
-
-            # 暂存并临时替换全局规则集，只跑这一条
-            bak_rules = getattr(se, "SC_RULES", None)
-            setattr(se, "SC_RULES", [rule])
-            bak_pres  = getattr(se, "SC_PRESCREEN_RULES", None)
-            try:
-                setattr(se, "SC_RULES", [rule])
-                setattr(se, "SC_PRESCREEN_RULES", [])
-
-                # 参考日 & 读取窗口 / 列裁剪
-                ref_use = (ref_in or "").strip() or (_pick_latest_ref_date() or "")
-                if not ref_use:
-                    st.error("未找到参考日：请先在“排名”页签跑一次或手填。")
-                    st.stop()
-
-                # 估算读取起点（按本条规则的 timeframe+window）
-                start = se._start_for_tf_window(ref_use, str(rule.get("timeframe", "D")), int(rule.get("window", getattr(se, "SC_LOOKBACK_D", 60))))
-
-                # 1) 当前测试规则所需的起始日与列
-                tf_curr = str(rule.get("timeframe","D"))
-                win_curr = int(rule.get("window", getattr(se, "SC_LOOKBACK_D", 60)))
-                start_curr = se._start_for_tf_window(ref_use, tf_curr, win_curr)
-                cols_curr = set(se._select_columns_for_rules())
-
-                # 2) 扫整份 config（尤其是 as=... 的标签规则）所需的“最早起始日 + 列”
-                cfg_cols = set()
-                cfg_start = start_curr
-                if bak_rules:
-                    se.SC_RULES = bak_rules
-                    try:
-                        cfg_cols = set(se._select_columns_for_rules())
-                        # 仅考虑带 as 的规则（机会/亮点/瑕疵标签），估算它们各自所需的起始日，取最早
-                        cfg_starts = []
-                        for r in (bak_rules or []):
-                            if str(r.get("as") or "").strip():
-                                tf_r = str(r.get("timeframe","D"))
-                                win_r = int(r.get("window", getattr(se, "SC_LOOKBACK_D", 60)))
-                                cfg_starts.append(se._start_for_tf_window(ref_use, tf_r, win_r))
-                        if cfg_starts:
-                            cfg_start = min([start_curr] + cfg_starts)
-                    finally:
-                        # 复位回单条测试
-                        se.SC_RULES = [rule]
-                        se.SC_PRESCREEN_RULES = []
-
-                # 并集合并：读更早的起始日 + 更全的列
-                start = cfg_start
-                columns = sorted(cols_curr | cfg_cols)
-
-                # 读取单票数据
-                df = se._read_stock_df(ts_code, start, ref_use, columns)
-                if df is None or df.empty:
-                    st.warning("数据为空或读取失败。")
-                    st.stop()
-
-                # 保持与正式评分一致的表达式上下文
-                # 3) 兜底补齐标签规则常用指标（如 j/vr），以免注入失败
-                try:
-                    need_j = False
-                    need_vr = False
-                    if bak_rules:
-                        for r in bak_rules:
-                            if not str(r.get("as") or "").strip():
-                                continue
-                            texts = [str(r.get("when") or "")]
-                            texts += [str(c.get("when") or "") for c in r.get("clauses",[])]
-                            s = " ".join(texts).lower()
-                            need_j = need_j or (" j" in f" {s}")  # 粗略包含判断
-                            need_vr = need_vr or (" vr" in f" {s}")
-                    if need_j and ("j" not in df.columns):
+        # 导入验证器
+        try:
+            from strategy_validator import validate_strategy_file
+            validation_available = True
+        except ImportError:
+            st.error("策略验证器模块未找到，请确保 strategy_validator.py 文件存在")
+            validation_available = False
+        
+        if validation_available:
+            # 自动定位策略文件
+            strategy_files = []
+            import glob
+            import os
+            
+            # 按优先级搜索策略文件
+            search_paths = [
+                "strategies_repo.py",  # 当前目录
+                "strategies/strategies_repo.py",  # strategies目录
+                "**/strategies_repo.py",  # 递归搜索
+            ]
+            
+            for pattern in search_paths:
+                files = glob.glob(pattern, recursive=True)
+                for file in files:
+                    if os.path.isfile(file):
+                        # 转换为绝对路径避免重复
+                        abs_path = os.path.abspath(file)
+                        if abs_path not in strategy_files:
+                            strategy_files.append(abs_path)
+            
+            # 去重并排序
+            strategy_files = sorted(strategy_files)
+            
+            if strategy_files:
+                # 自动选择第一个文件（通常是主要的策略文件）
+                default_file = strategy_files[0]
+                
+                if len(strategy_files) > 1:
+                    selected_file = st.selectbox(
+                        "选择策略文件",
+                        strategy_files,
+                        index=0,
+                        help=f"自动定位到 {len(strategy_files)} 个策略文件，默认选择: {default_file}"
+                    )
+                else:
+                    selected_file = default_file
+                    st.info(f"自动定位到策略文件: {selected_file}")
+                
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    check_btn = st.button("🔍 检查语法", width='stretch')
+                with col2:
+                    if st.button("📄 查看文件内容", width='stretch'):
                         try:
-                            from indicators import kdj
-                            df = df.copy()
-                            df["j"] = kdj(df)
-                        except Exception:
-                            pass
-                    if need_vr and ("vr" not in df.columns) and ("vol" in df.columns):
+                            with open(selected_file, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                            st.code(content, language='python')
+                        except Exception as e:
+                            st.error(f"读取文件失败: {e}")
+                
+                if check_btn:
+                    with st.spinner("正在检查策略文件..."):
                         try:
-                            v = pd.to_numeric(df["vol"], errors="coerce")
-                            n = 26
-                            df = df.copy()
-                            df["vr"] = (v / v.rolling(n).mean()).values
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                # 4) 明确注入 config 标签到 CUSTOM_TAGS（与正式链路对齐）
-                try:
-                    if tdx is not None:
-                        # tdx.EXTRA_CONTEXT.clear()
-                        tdx.EXTRA_CONTEXT.update(se.get_eval_env(ts_code, ref_use))
-                        if bak_rules:
-                            se.SC_RULES = bak_rules
-                            try:
-                                se._inject_config_tags(df, ref_use)  # 这里用日线 df 注入标签
-                            finally:
-                                se.SC_RULES = [rule]
-                        else:
-                            se._inject_config_tags(df, ref_use)
-                except Exception:
-                    pass
-
-                # 直接用与“详情页”一致的构造函数得到逐规则明细
-                rows = se._build_per_rule_detail(df, ref_use)
-                if not rows:
-                    st.info("未产生任何命中/细节。")
-                    st.stop()
-
-                df_rules = pd.DataFrame(rows).copy()
-
-                # —— “最后命中距今天数” 与详情页一致的口径：优先用 lag，其次 hit_date，再退 hit_dates 最末 —— 
-                ref_dt = pd.to_datetime(ref_use)
-                def _last_days(row: dict):
-                    lag = row.get("lag")
-                    if isinstance(lag, (int, float)) and not pd.isna(lag):
-                        return int(lag)
-                    hd = row.get("hit_date")
-                    if isinstance(hd, str) and hd:
-                        try: return int((ref_dt - pd.to_datetime(hd)).days)
-                        except Exception: return None
-                    hds = row.get("hit_dates") or []
-                    if isinstance(hds, list) and hds:
-                        try: return int((ref_dt - pd.to_datetime(hds[-1])).days)
-                        except Exception: return None
-                    return None
-
-                df_rules["last_hit_days"] = [ _last_days(r) for r in df_rules.to_dict("records") ]
-
-                # 展示列（存在才展示）
-                show_cols = [c for c in [
-                    "name","scope","timeframe","window","period","ok","points","add","cnt","lag",
-                    "hit_date","hit_count","hit_dates","last_hit_days","gate_ok","gate_when","explain"
-                ] if c in df_rules.columns]
-
-                st.markdown(f"**测试代码：{ts_code} · 参考日：{ref_use}**")
-                st.dataframe(df_rules[show_cols], width='stretch', height=420)
-
-            except Exception as e:
-                st.error(f"测试失败：{e}")
-            finally:
-                # 还原全局
-                if bak_rules is not None: setattr(se, "SC_RULES", bak_rules)
-                if bak_pres  is not None: setattr(se, "SC_PRESCREEN_RULES", bak_pres)
+                            result = validate_strategy_file(selected_file)
+                            
+                            # 显示验证结果
+                            if result.is_valid:
+                                st.success("✅ 策略文件验证通过！")
+                            else:
+                                st.error("❌ 策略文件验证失败")
+                            
+                            # 显示错误
+                            if result.errors:
+                                st.markdown("#### 🚨 错误")
+                                for error in result.errors:
+                                    field_info = f" (字段: {error['field']})" if error.get('field') else ""
+                                    st.error(f"• {error['message']}{field_info}")
+                            
+                            # 显示警告
+                            if result.warnings:
+                                st.markdown("#### ⚠️ 警告")
+                                for warning in result.warnings:
+                                    field_info = f" (字段: {warning['field']})" if warning.get('field') else ""
+                                    st.warning(f"• {warning['message']}{field_info}")
+                            
+                            # 显示建议
+                            if result.suggestions:
+                                st.markdown("#### 💡 建议")
+                                for suggestion in result.suggestions:
+                                    field_info = f" (字段: {suggestion['field']})" if suggestion.get('field') else ""
+                                    st.info(f"• {suggestion['message']}{field_info}")
+                            
+                            # 显示缺失的列和指标
+                            if result.missing_columns:
+                                st.markdown("#### 📊 缺失的数据列")
+                                st.warning(f"以下列在数据中不存在: {', '.join(result.missing_columns)}")
+                            
+                            if result.missing_indicators:
+                                st.markdown("#### 🔧 缺失的指标")
+                                st.warning(f"以下指标未注册: {', '.join(result.missing_indicators)}")
+                            
+                            # 显示语法问题
+                            if result.syntax_issues:
+                                st.markdown("#### 🔍 语法问题")
+                                for issue in result.syntax_issues:
+                                    st.warning(f"• {issue}")
+                            
+                        except Exception as e:
+                            st.error(f"文件验证出错: {e}")
+            else:
+                st.warning("未找到策略文件，请确保 strategies_repo.py 文件存在")
 
     # ================== 强度榜 ==================
     with tab_attn:
@@ -1854,47 +2639,55 @@ if _in_streamlit():
         ref_attn = (ref_inp_attn.strip() or _pick_latest_attn_date())
         if not ref_attn:
             st.info("未在 attention 目录发现任何 CSV，请先产出强度榜或检查输出路径。")
+        else:
+            attn_path = _find_attn_file_by_date(ref_attn)
+            st.caption(f"参考日：{ref_attn}")
+            if not attn_path or (not attn_path.exists()):
+                st.warning("未找到该日的强度榜文件。")
+            else:
+                # 读取强度榜
+                df_attn = _read_df(attn_path)
+                if df_attn is None or df_attn.empty:
+                    st.warning("强度榜文件为空或无法读取。")
 
-        attn_path = _find_attn_file_by_date(ref_attn)
-        st.caption(f"参考日：{ref_attn}")
-        if not attn_path or (not attn_path.exists()):
-            st.warning("未找到该日的强度榜文件（请确认 attention 目录与命名）。")
+        # 只有在有有效数据时才进行排序和显示
+        if 'df_attn' in locals() and df_attn is not None and not df_attn.empty:
+            # 统一/容错排序：默认优先按 score 降序，同分时按J值升序；没有 score 则按 rank 升序；否则保持原顺序
+            def _auto_sort(df: pd.DataFrame) -> pd.DataFrame:
+                if "score" in df.columns:
+                    if "tiebreak_j" in df.columns:
+                        return df.sort_values(["score", "tiebreak_j"], ascending=[False, True])
+                    else:
+                        return df.sort_values(["score"], ascending=[False])
+                if "rank" in df.columns:
+                    return df.sort_values(["rank"], ascending=[True])
+                return df
 
-        # 读取强度榜
-        df_attn = _read_df(attn_path)
-        if df_attn is None or df_attn.empty:
-            st.warning("强度榜文件为空或无法读取。")
+            if sort_key == "score ↓" and "score" in df_attn.columns:
+                if "tiebreak_j" in df_attn.columns:
+                    df_attn = df_attn.sort_values(["score", "tiebreak_j"], ascending=[False, True])
+                else:
+                    df_attn = df_attn.sort_values(["score"], ascending=[False])
+            elif sort_key == "rank ↑" and "rank" in df_attn.columns:
+                df_attn = df_attn.sort_values(["rank"], ascending=[True])
+            # "保持原文件顺序" 就不动
 
-        # 统一/容错排序：默认优先按 score 降序；没有 score 则按 rank 升序；否则保持原顺序
-        def _auto_sort(df: pd.DataFrame) -> pd.DataFrame:
-            if "score" in df.columns:
-                return df.sort_values(["score", "ts_code"], ascending=[False, True])
-            if "rank" in df.columns:
-                return df.sort_values(["rank", "ts_code"], ascending=[True, True])
-            return df
+            # 预览 + 导出/复制，行为与"排名"页尽量一致
+            st.divider()
+            with st.container(border=True):
+                rows_eff = int(topn_attn)
+                st.markdown("**强度榜 Top-N 预览**")
+                st.dataframe(df_attn.head(rows_eff), width='stretch', height=420)
 
-        if sort_key == "score ↓" and "score" in df_attn.columns:
-            df_attn = df_attn.sort_values(["score", "ts_code"], ascending=[False, True])
-        elif sort_key == "rank ↑" and "rank" in df_attn.columns:
-            df_attn = df_attn.sort_values(["rank", "ts_code"], ascending=[True, True])
-        # “保持原文件顺序” 就不动
-
-        # 预览 + 导出/复制，行为与“排名”页尽量一致
-        st.divider()
-        with st.container(border=True):
-            rows_eff = int(topn_attn)
-            st.markdown("**强度榜 Top-N 预览**")
-            st.dataframe(df_attn.head(rows_eff), width='stretch', height=420)
-
-            # TXT 复制（按你的导出偏好）
-            if "ts_code" in df_attn.columns:
-                codes = df_attn["ts_code"].astype(str).head(rows_eff).tolist()
-                txt = _codes_to_txt(
-                    codes,
-                    st.session_state["export_pref"]["style"],
-                    st.session_state["export_pref"]["with_suffix"]
-                )
-                copy_txt_button(txt, label="复制以上", key=f"copy_attn_{ref_attn}")
+                # TXT 复制（按你的导出偏好）
+                if "ts_code" in df_attn.columns:
+                    codes = df_attn["ts_code"].astype(str).head(rows_eff).tolist()
+                    txt = _codes_to_txt(
+                        codes,
+                        st.session_state["export_pref"]["style"],
+                        st.session_state["export_pref"]["with_suffix"]
+                    )
+                    copy_txt_button(txt, label="复制以上", key=f"copy_attn_{ref_attn}")
 
         # --- 轻量：前几日 Top-K 扫描（只看 Top，不算强度） ---
         with st.expander("前几日 Top-K 扫描（轻量）", expanded=True):
@@ -2315,7 +3108,7 @@ if _in_streamlit():
             with c4:
                 n_k_m = st.number_input("k/m/n(特定选择才生效)", min_value=1, max_value=500, value=3, key="screen_nkm")
             with c5:
-                tiebreak_expr = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=0, key="screen_tiebreak_expr")
+                tiebreak_expr = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=1, key="screen_tiebreak_expr")
             with c6:
                 run_btn = st.form_submit_button("运行筛选", width='stretch')
 
@@ -2349,10 +3142,11 @@ if _in_streamlit():
                     if df_sel is None or df_sel.empty:
                         st.info("无命中。")
                     else:
-                        # 应用Tie-break排序
-                        df_sel_sorted = _apply_tiebreak_sorting(df_sel, tiebreak_expr)
-                        st.caption(f"命中 {len(df_sel_sorted)} 只；参考日：{(df_sel_sorted['ref_date'].iloc[0] if 'ref_date' in df_sel_sorted.columns and len(df_sel_sorted)>0 else (refD_unified or '自动'))}")
-                        st.dataframe(df_sel_sorted, width='stretch', height=480)
+                        # 结果已经按得分排序，直接显示
+                        st.caption(f"命中 {len(df_sel)} 只；参考日：{(df_sel['ref_date'].iloc[0] if 'ref_date' in df_sel.columns and len(df_sel)>0 else (refD_unified or '自动'))}")
+                        if 'score' in df_sel.columns:
+                            st.caption("已按得分排序（降序），同分时按J值升序")
+                        st.dataframe(df_sel, width='stretch', height=480)
                         # 导出 TXT（代码）
                         if "ts_code" in df_sel.columns:
                             txt = _codes_to_txt(df_sel["ts_code"].astype(str).tolist(),
@@ -2367,7 +3161,7 @@ if _in_streamlit():
         # ========== 2) 按触发规则筛选（当日全市场，多选） ==========
         with st.form("rule_screening_form"):
             st.markdown("### 按触发规则筛选（当日全市场，多选）")
-            st.caption("说明：读取当日 details JSON；按所选规则名判断：当日 add>0 或 ok=True 视为命中；支持\"任一/全部\"聚合。")
+            st.caption("说明：读取当日 details 数据；按所选规则名判断：当日 add>0 或 ok=True 视为命中；支持\"任一/全部\"聚合。")
             # 规则名来自 se.SC_RULES（使用缓存）
             rule_names = _get_rule_names()
             picked = st.multiselect("规则名（可多选）", options=rule_names, default=[], key="detail_multi_rules")
@@ -2376,7 +3170,7 @@ if _in_streamlit():
             with cA:
                 limit_n = st.number_input("最多显示/导出 N 条", min_value=10, max_value=5000, value=200, step=10, key="detail_limit_n")
             with cB:
-                tiebreak_rule = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=0, key="screen_tiebreak_rule")
+                tiebreak_rule = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=1, key="screen_tiebreak_rule")
             with cC:
                 run_detail = st.form_submit_button("筛选当日命中标的", width='stretch')
 
@@ -2387,35 +3181,72 @@ if _in_streamlit():
             elif not picked:
                 st.warning("请先选择至少一个规则名。")
             else:
-                ddir = DET_DIR / str(ref_real)
                 rows = []
                 try:
-                    allow_set = None
-                    if ddir.exists():
-                        for p in ddir.glob("*.json"):
-                            try:
-                                j = json.loads(p.read_text(encoding="utf-8-sig"))
-                            except Exception:
-                                continue
-                            ts2 = str(j.get("ts_code","")).strip()
-                            if not ts2:
-                                continue
-                            if (allow_set is not None) and (ts2 not in allow_set):
-                                continue
-                            sm = j.get("summary") or {}
-                            sc = float(sm.get("score", 0.0))
-                            names_today = set()
-                            for rr in (j.get("rules") or []):
-                                if float(rr.get("add", 0.0)) > 0.0 or bool(rr.get("ok")):
-                                    n = rr.get("name")
-                                    if n: names_today.add(str(n))
-                            if names_today:
-                                if agg_mode.startswith("任一"):
-                                    hit = any((n in names_today) for n in picked)
-                                else:
-                                    hit = all((n in names_today) for n in picked)
-                                if hit:
-                                    rows.append({"ts_code": ts2, "score": sc})
+                    # 优先使用数据库查询
+                    if SC_USE_DB_STORAGE and SC_DETAIL_STORAGE in ["database", "both"]:
+                        from detail_db import get_detail_db
+                        db = get_detail_db()
+                        df_all = db.query_by_date(ref_real)
+                        
+                        if not df_all.empty:
+                            for _, row in df_all.iterrows():
+                                ts2 = str(row.get("ts_code", "")).strip()
+                                if not ts2:
+                                    continue
+                                sc = float(row.get("score", 0.0))
+                                
+                                # 解析rules JSON
+                                rules_json = row.get("rules", "[]")
+                                try:
+                                    rules = json.loads(rules_json) if isinstance(rules_json, str) else rules_json
+                                except:
+                                    rules = []
+                                
+                                names_today = set()
+                                for rr in rules:
+                                    if float(rr.get("add", 0.0)) > 0.0 or bool(rr.get("ok")):
+                                        n = rr.get("name")
+                                        if n: names_today.add(str(n))
+                                
+                                if names_today:
+                                    if agg_mode.startswith("任一"):
+                                        hit = any((n in names_today) for n in picked)
+                                    else:
+                                        hit = all((n in names_today) for n in picked)
+                                    if hit:
+                                        rows.append({"ts_code": ts2, "score": sc})
+                    
+                    # 回退到JSON文件查询
+                    else:
+                        ddir = DET_DIR / str(ref_real)
+                        allow_set = None
+                        if ddir.exists():
+                            for p in ddir.glob("*.json"):
+                                try:
+                                    j = json.loads(p.read_text(encoding="utf-8-sig"))
+                                except Exception:
+                                    continue
+                                ts2 = str(j.get("ts_code","")).strip()
+                                if not ts2:
+                                    continue
+                                if (allow_set is not None) and (ts2 not in allow_set):
+                                    continue
+                                sm = j.get("summary") or {}
+                                sc = float(sm.get("score", 0.0))
+                                names_today = set()
+                                for rr in (j.get("rules") or []):
+                                    if float(rr.get("add", 0.0)) > 0.0 or bool(rr.get("ok")):
+                                        n = rr.get("name")
+                                        if n: names_today.add(str(n))
+                                if names_today:
+                                    if agg_mode.startswith("任一"):
+                                        hit = any((n in names_today) for n in picked)
+                                    else:
+                                        hit = all((n in names_today) for n in picked)
+                                    if hit:
+                                        rows.append({"ts_code": ts2, "score": sc})
+                    
                     df_hit = pd.DataFrame(rows)
                     if df_hit.empty:
                         st.info("未筛到命中标的。")
@@ -2556,7 +3387,7 @@ if _in_streamlit():
                             else:
                                 pdir = DET_DIR / sel_date
                                 if pdir.exists():
-                                    st.info(f"{sel_date} 共有 {len(list(pdir.glob('*.json')))} 个详情 JSON。")
+                                    st.info(f"{sel_date} 共有 {len(list(pdir.glob('*.json')))} 个详情文件。")
                                 else:
                                     st.info("该日没有 Details 目录。")
 

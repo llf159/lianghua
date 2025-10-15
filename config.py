@@ -113,6 +113,11 @@ INC_INMEM_CHUNK_TS = 800                 # （可选）非常多股票时的分�
 INC_SKIP_OLD_READ = True                 # _WRITE_SYMBOL_INDICATORS 跳过旧文件 warm-read（由上游预热）
 INC_RECALC_WORKERS = 32                  # None=自动(≈2×CPU)，也可设定具体整数
 
+# ===================== 增量流式处理 =====================
+INC_STREAM_COMPUTE_INDICATORS = True     # 边下载边计算指标
+INC_STREAM_UPDATE_FAST_CACHE = True      # 边下载边更新 fast_init 缓存
+INC_STREAM_MERGE_IND_SUBSET = True       # 边下载边合并指标到 daily 分区
+
 # ===================== Scoring 系统 =====================
 SC_DO_TRACKING = False
 SC_DO_SURGE = False
@@ -133,6 +138,18 @@ SC_READ_TAIL_DAYS = None       # 若不为 None，则强制只读最近 N 天数
 # 输出目录与缓存目录
 SC_OUTPUT_DIR = os.path.join(BASE_DIR, "output", "score")
 SC_CACHE_DIR  = os.path.join(BASE_DIR, "cache", "scorelists")
+
+# ===================== 个股详情存储配置 =====================
+# 存储方式：'json' | 'database' | 'both'
+SC_DETAIL_STORAGE = "database"     # 优先使用数据库存储，失败时回退到JSON
+# 数据库类型：'sqlite' | 'duckdb'
+SC_DETAIL_DB_TYPE = "sqlite"
+# 数据库文件路径（相对于SC_OUTPUT_DIR）
+SC_DETAIL_DB_PATH = "details.db"
+# 是否启用数据库存储
+SC_USE_DB_STORAGE = True
+# 数据库失败时是否回退到JSON文件
+SC_DB_FALLBACK_TO_JSON = True
 # —— 名单开关（可选写入）——
 SC_WRITE_WHITELIST = True   # 写白名单 cache/…/whitelist.csv
 SC_WRITE_BLACKLIST = True   # 写黑名单 cache/…/blacklist.csv

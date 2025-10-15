@@ -5,7 +5,7 @@ strategies_repo.py — Python 版策略仓库
 """
 RANKING_TITLE = "排名策略（由 config.SC_RULES 抽取）"
 FILTER_TITLE = "筛选策略（hard_penalty=True）"
-PREDICTION_TITLE = "预测策略（预留，当前为空）"
+PREDICTION_TITLE = "模拟策略（预留，当前为空）"
 POSITION_TITLE = "持仓检查策略（个股）"
 OPPORTUNITY_TITLE = "买点策略（个股）"
 
@@ -17,7 +17,7 @@ RANKING_RULES = [
 FILTER_RULES = [
 ]
 
-# 预测策略
+# 模拟策略
 PREDICTION_RULES = [
 ]
 
