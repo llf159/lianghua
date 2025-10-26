@@ -1,10 +1,10 @@
 
 # -*- coding: utf-8 -*-
 """
-注意：
-- 本应用基于你提供的 parquet_viewer.py 封装，因此请把 parquet_viewer_app.py 和 parquet_viewer.py 放在同一目录下。
-- DuckDB 可选但强烈推荐（更快）。未安装时自动退回 pandas+pyarrow。
-- 本版增强了“概览/完整性检查”，一键看到起止日期、缺口、最新分区行数、与指标目录对齐情况等。
+数据查看器应用
+- 基于parquet_viewer.py封装
+- 支持DuckDB和pandas+pyarrow两种数据访问方式
+- 提供数据概览和完整性检查功能
 """
 
 from __future__ import annotations
@@ -20,8 +20,12 @@ from pathlib import Path
 import json
 import datetime as dt
 import re
+from log_system import get_logger
 
-# —— 强制本地不走代理 ——
+# 初始化日志记录器
+logger = get_logger("app_pv")
+
+# 网络配置
 os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
 os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 
@@ -29,8 +33,134 @@ ROOT = Path(__file__).resolve().parent  # 当前脚本所在的根目录
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import parquet_viewer as pv
 from utils import normalize_ts
+from database_manager import get_database_manager
+
+# ========== 数据库适配器 ==========
+class DatabaseAdapter:
+    """数据库适配器，提供与 parquet_viewer.py 兼容的接口"""
+    
+    def __init__(self):
+        # 使用统一的数据库管理器
+        self.db_manager = get_database_manager()
+        # 添加数据库路径用于直接查询
+        from config import DATA_ROOT, UNIFIED_DB_PATH
+        self.db_path = os.path.abspath(os.path.join(DATA_ROOT, UNIFIED_DB_PATH))
+    
+    def list_trade_dates(self, root: str) -> List[str]:
+        """获取交易日期列表（兼容 parquet_viewer.list_trade_dates）"""
+        try:
+            # 使用数据库管理器获取交易日期
+            return self.db_manager.get_trade_dates(self.db_path)
+        except Exception as e:
+            logger.error(f"获取交易日期失败: {e}")
+            return []
+    
+    def _extract_adj_type_from_path(self, root: str) -> str:
+        """从路径中提取复权类型"""
+        if "raw" in root:
+            return "raw"
+        elif "qfq" in root:
+            return "qfq"
+        elif "hfq" in root:
+            return "hfq"
+        elif "ind" in root:
+            return "ind"
+        else:
+            return "qfq"  # 默认使用qfq
+    
+    def get_connection(self):
+        """获取数据库连接的上下文管理器 - 使用统一的数据库管理器"""
+        return self.db_manager.get_connection(self.db_path)
+    
+    def _apply_precision_and_limit(self, df: pd.DataFrame, limit: Optional[int] = None) -> pd.DataFrame:
+        """应用精度控制和限制"""
+        if df.empty:
+            return df
+        
+        # 应用精度控制
+        price_cols = ["open", "high", "low", "close", "vol", "amount"]
+        for col in price_cols:
+            if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].astype(float).round(2)
+        
+        # 对指标列应用精度控制
+        indicator_cols = ["kdj_k", "kdj_d", "kdj_j", "rsi", "bbi", "ma5", "ma10", "ma20", "ma60"]
+        for col in indicator_cols:
+            if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].astype(float).round(2)
+        
+        # 应用限制
+        if limit is not None:
+            if limit < 0:
+                df = df.tail(-limit)
+            else:
+                df = df.head(limit)
+        
+        return df
+    
+    def read_day(self, base: str, asset: str, adj: str, day: str, limit: Optional[int] = None) -> pd.DataFrame:
+        """读取某一天的数据（兼容 parquet_viewer.read_day）"""
+        try:
+            # 转换复权类型
+            adj_type = adj if adj != "daily" else "raw"
+            
+            # 使用数据库管理器查询单日数据
+            df = self.db_manager.query_stock_data(
+                db_path=self.db_path,
+                start_date=day,
+                end_date=day,
+                adj_type=adj_type
+            )
+            
+            return self._apply_precision_and_limit(df, limit)
+        except Exception as e:
+            logger.error(f"查询单日数据失败: {e}")
+            return pd.DataFrame()
+    
+    def read_range(self, base: str, asset: str, adj: str, ts_code: str, start: str, end: str,
+                   columns: Optional[List[str]] = None, limit: Optional[int] = None) -> pd.DataFrame:
+        """读取日期范围的数据（兼容 parquet_viewer.read_range）"""
+        try:
+            # 转换复权类型
+            adj_type = adj if adj != "daily" else "raw"
+            
+            # 使用数据库管理器查询范围数据
+            df = self.db_manager.query_stock_data(
+                db_path=self.db_path,
+                ts_code=ts_code,
+                start_date=start,
+                end_date=end,
+                columns=columns,
+                adj_type=adj_type
+            )
+            
+            # 应用精度控制和限制
+            df = self._apply_precision_and_limit(df, limit)
+            
+            return df
+        except Exception as e:
+            logger.error(f"查询范围数据失败: {e}")
+            return pd.DataFrame()
+    
+    def get_database_stats(self) -> Dict[str, Any]:
+        """获取数据库统计信息"""
+        try:
+            # 使用数据库管理器获取数据库信息
+            return self.db_manager.get_database_info(self.db_path)
+        except Exception as e:
+            logger.error(f"获取数据库统计信息失败: {e}")
+            return {}
+
+# 全局数据库适配器实例
+_db_adapter = None
+
+def get_db_adapter() -> DatabaseAdapter:
+    """获取数据库适配器实例（单例模式）"""
+    global _db_adapter
+    if _db_adapter is None:
+        _db_adapter = DatabaseAdapter()
+    return _db_adapter
 
 # 配置文件路径：放在当前用户目录下
 CONFIG_PATH = Path.home() / ".parquet_viewer_app.json"
@@ -64,7 +194,13 @@ def save_base(base: str):
 
 
 def _date_list(root: str) -> List[str]:
-    return pv.list_trade_dates(root)
+    # 使用数据库适配器
+    try:
+        db_adapter = get_db_adapter()
+        return db_adapter.list_trade_dates(root)
+    except Exception as e:
+        logger.error(f"获取交易日期失败: {e}")
+        return []
 
 
 def _date_gaps(dates: List[str]) -> List[str]:
@@ -88,33 +224,33 @@ def _distinct_count_latest_k(root: str, k: int = 3) -> Dict[str, int]:
     统计最近 k 个有分区的 trade_date 的行数（或去重 ts_code 数）。
     返回 {trade_date: rows}
     """
-    dates = pv.list_trade_dates(root)
-    if not dates:
-        return {}
-    pick = dates[-k:]
-    out: Dict[str, int] = {}
-    # 选择 duckdb 优先
-    if pv.HAS_DUCKDB:
-        import duckdb
-        for d in pick:
-            pattern = os.path.join(root, f"trade_date={d}", "*.parquet").replace("\\", "/")
+    try:
+        # 使用数据库适配器
+        db_adapter = get_db_adapter()
+        dates = db_adapter.list_trade_dates(root)
+        if not dates:
+            return {}
+        
+        pick = dates[-k:]
+        out: Dict[str, int] = {}
+        
+        # 使用数据库管理器查询每天的行数
+        for date in pick:
             try:
-                cnt = duckdb.sql(f"SELECT COUNT(*) FROM parquet_scan('{pattern}')").fetchone()[0] or 0
-            except Exception:
-                cnt = 0
-            out[d] = int(cnt)
+                df = db_adapter.db_manager.query_stock_data(
+                    db_path=db_adapter.db_path,
+                    start_date=date,
+                    end_date=date
+                )
+                out[date] = len(df)
+            except Exception as e:
+                logger.warning(f"查询日期 {date} 数据失败: {e}")
+                out[date] = 0
+        
         return out
-    # 退回 pandas 遍历
-    for d in pick:
-        part_files = glob.glob(os.path.join(root, f"trade_date={d}", "*.parquet"))
-        total = 0
-        for f in part_files:
-            try:
-                total += len(pd.read_parquet(f))
-            except Exception:
-                pass
-        out[d] = total
-    return out
+    except Exception as e:
+        logger.error(f"数据库查询行数失败: {e}")
+        return {}
 
 
 def _stock_universe_size(base: str) -> Optional[int]:
@@ -132,46 +268,41 @@ def _stock_universe_size(base: str) -> Optional[int]:
 def _indicators_alignment(base: str) -> List[Dict[str, Any]]:
     """比较 daily_{adj} 与 daily_{adj}_indicators 的覆盖对齐情况。"""
     rows: List[Dict[str, Any]] = []
-    for kind in ["raw", "qfq", "hfq"]:
-        try:
-            root_base = pv.asset_root(base, "stock", kind)
-            # 从目录名抽出 normalized 名（pv.asset_root 已做 normalize_stock_adj）
-            # 指标目录尝试在 normalized 名追加 _indicators
-            base_dir = root_base
-            if base_dir.endswith("_indicators"):
-                # 已经是指标目录（根据 PARQUET_USE_INDICATORS 配置）则跳过
-                continue
-            # 构造指标目录
-            if base_dir.endswith("daily"):
-                ind_dir = base_dir + "_indicators"
-            else:
-                ind_dir = base_dir + "_indicators"
-
-            def _last_date(dirpath: str) -> Optional[str]:
-                ds = pv.list_trade_dates(dirpath)
-                return ds[-1] if ds else None
-
-            if not os.path.isdir(base_dir):
-                rows.append(dict(adj=kind, base_exists=False, ind_exists=os.path.isdir(ind_dir),
-                                 base_last=None, ind_last=None, lag=None))
-                continue
-            if not os.path.isdir(ind_dir):
-                rows.append(dict(adj=kind, base_exists=True, ind_exists=False,
-                                 base_last=_last_date(base_dir), ind_last=None, lag=None))
-                continue
-            b_last = _last_date(base_dir)
-            i_last = _last_date(ind_dir)
-            lag = None
-            if b_last and i_last:
-                try:
-                    lag = int(i_last) - int(b_last)  # 若 <0 表示指标落后
-                except Exception:
+    try:
+        # 使用数据库适配器获取统计信息
+        db_adapter = get_db_adapter()
+        stats = db_adapter.get_database_stats()
+        
+        for kind in ["raw", "qfq", "hfq"]:
+            try:
+                # 从数据库统计信息中获取数据
+                if kind in stats and isinstance(stats[kind], dict):
+                    base_last = stats[kind].get('latest_date')
+                    base_exists = stats[kind].get('count', 0) > 0
+                    
+                    # 对于数据库版本，基础数据和指标数据都在同一个表中
+                    # 所以基础数据和指标数据是同步的
+                    ind_exists = base_exists
+                    ind_last = base_last
+                    lag = 0  # 数据库版本中基础数据和指标数据是同步的
+                else:
+                    base_exists = False
+                    ind_exists = False
+                    base_last = None
+                    ind_last = None
                     lag = None
-            rows.append(dict(adj=kind, base_exists=True, ind_exists=True,
-                             base_last=b_last, ind_last=i_last, lag=lag))
-        except Exception:
-            # 某个 kind 不存在时安静跳过
-            continue
+                
+                rows.append(dict(adj=kind, base_exists=base_exists, ind_exists=ind_exists,
+                                 base_last=base_last, ind_last=ind_last, lag=lag))
+            except Exception:
+                # 某个 kind 不存在时安静跳过
+                continue
+    except Exception:
+        # 如果数据库查询失败，返回空结果
+        logger.warning("数据库查询失败，无法获取指标对齐信息")
+        for kind in ["raw", "qfq", "hfq"]:
+            rows.append(dict(adj=kind, base_exists=False, ind_exists=False,
+                             base_last=None, ind_last=None, lag=None))
     return rows
 
 
@@ -206,71 +337,85 @@ def _adj_dir_name(adj_kind: str) -> str:
 def overview_df(base: str, adj_kind: str='qfq') -> pd.DataFrame:
     base = base or "DEFAULT_BASE"
     adj_dir = _adj_dir_name(adj_kind)
-    entries = [
-        ("index/daily", os.path.join(base, "index", "daily")),
-        (f"stock/{adj_dir}", os.path.join(base, "stock", "daily", adj_dir)),
-        (f"stock/{adj_dir}_indicators", os.path.join(base, "stock", "daily", adj_dir + "_indicators")),
-    ]
-    stock_base = _stock_universe_size(base)
-    rows: List[Dict[str, Any]] = []
-
-    # 指标对齐情况（按 adj 汇总）
-    ind_align = {r["adj"]: r for r in _indicators_alignment(base)}
-
-    for name, root in entries:
-        item: Dict[str, Any] = dict(name=name, path=root)
-        dates = _date_list(root)
-        if not dates:
-            item.update(first=None, last=None, days=0, gap_cnt=None, gap_samples=None,
-                        latest_date=None, latest_rows=None, expected_rows=(None if name.startswith("index/") else stock_base),
-                        files_latest=None, status="EMPTY", reason="无分区")
+    
+    # 使用数据库适配器获取数据
+    try:
+        db_adapter = get_db_adapter()
+        dates = db_adapter.list_trade_dates(base)
+        db_info = db_adapter.get_database_stats()
+        
+        # 构建概览信息
+        rows: List[Dict[str, Any]] = []
+        
+        if dates:
+            # 数据库有数据
+            gaps = _date_gaps(dates)
+            latest_counts = _distinct_count_latest_k(base, k=1)
+            latest_date = list(latest_counts.keys())[-1] if latest_counts else dates[-1]
+            latest_rows = list(latest_counts.values())[-1] if latest_counts else 0
+            
+            # 获取股票基数
+            stock_base = _stock_universe_size(base)
+            
+            # 创建概览条目
+            item = {
+                "name": f"stock/{adj_dir}",
+                "path": base,
+                "first": dates[0],
+                "last": dates[-1],
+                "days": len(dates),
+                "gap_cnt": len(gaps),
+                "gap_samples": "; ".join(gaps[:3]) if gaps else "",
+                "latest_date": latest_date,
+                "latest_rows": latest_rows,
+                "expected_rows": stock_base,
+                "files_latest": 0,  # 数据库模式不统计文件数
+                "ind_lag": 0,  # 数据库模式中基础数据和指标数据是同步的
+            }
+            
+            status, reason = _health_score(item)
+            item.update(status=status, reason=reason)
             rows.append(item)
-            continue
-
-        gaps = _date_gaps(dates)
-        latest_counts = _distinct_count_latest_k(root, k=1)
-        latest_date = list(latest_counts.keys())[-1] if latest_counts else dates[-1]
-        latest_rows = list(latest_counts.values())[-1] if latest_counts else 0
-        # 统计该日 part 文件数
-        files_latest = len(glob.glob(os.path.join(root, f"trade_date={latest_date}", "*.parquet")))
-
-        # 指标对齐：仅 stock 目录才有
-        ind_lag = None
-        if name.startswith("stock/") and not name.endswith("_indicators"):
-            # 对当前 adj 进行对齐比较
-            r = None
-            try:
-                # 构造基础与指标目录，不强制存在
-                base_dir = os.path.join(base, "stock", "daily", adj_dir)
-                ind_dir = base_dir + "_indicators"
-                def _last_date(dirpath: str):
-                    ds = pv.list_trade_dates(dirpath)
-                    return ds[-1] if ds else None
-                b_last = _last_date(base_dir) if os.path.isdir(base_dir) else None
-                i_last = _last_date(ind_dir) if os.path.isdir(ind_dir) else None
-                if b_last and i_last:
-                    try:
-                        ind_lag = int(i_last) - int(b_last)
-                    except Exception:
-                        ind_lag = None
-            except Exception:
-                ind_lag = None
-
-        item.update(
-            first=dates[0],
-            last=dates[-1],
-            days=len(dates),
-            gap_cnt=len(gaps),
-            gap_samples="; ".join(gaps[:3]) if gaps else "",
-            latest_date=latest_date,
-            latest_rows=latest_rows,
-            expected_rows=(None if name.startswith("index/") else stock_base),
-            files_latest=files_latest,
-            ind_lag=ind_lag,
-        )
-        status, reason = _health_score(item)
-        item.update(status=status, reason=reason)
-        rows.append(item)
+        else:
+            # 数据库无数据
+            item = {
+                "name": f"stock/{adj_dir}",
+                "path": base,
+                "first": None,
+                "last": None,
+                "days": 0,
+                "gap_cnt": None,
+                "gap_samples": None,
+                "latest_date": None,
+                "latest_rows": None,
+                "expected_rows": None,
+                "files_latest": None,
+                "ind_lag": None,
+                "status": "EMPTY",
+                "reason": "无数据"
+            }
+            rows.append(item)
+            
+    except Exception as e:
+        logger.error(f"生成概览失败: {e}")
+        # 返回错误信息
+        item = {
+            "name": f"stock/{adj_dir}",
+            "path": base,
+            "first": None,
+            "last": None,
+            "days": 0,
+            "gap_cnt": None,
+            "gap_samples": None,
+            "latest_date": None,
+            "latest_rows": None,
+            "expected_rows": None,
+            "files_latest": None,
+            "ind_lag": None,
+            "status": "ERROR",
+            "reason": f"数据库错误: {e}"
+        }
+        rows = [item]
 
     df = pd.DataFrame(rows, columns=[
         "name","status","reason","first","last","days","gap_cnt","gap_samples",
@@ -280,11 +425,22 @@ def overview_df(base: str, adj_kind: str='qfq') -> pd.DataFrame:
 
 
 def get_info(base: str, adj_kind: str='qfq') -> str:
-    """保留一个精简文本版（方便复制），详细请看“概览表格”与“诊断建议”。"""
+    """保留一个精简文本版（方便复制），详细请看"概览表格"与"诊断建议"。"""
     base = base or "DEFAULT_BASE"
     lines = []
     lines.append(f"数据目录：{os.path.abspath(base)}")
-    lines.append(f"DuckDB：{'可用' if pv.HAS_DUCKDB else '不可用（建议 pip install duckdb）'}")
+    
+    # 检查数据库状态
+    try:
+        db_adapter = get_db_adapter()
+        db_info = db_adapter.get_database_stats()
+        if db_info.get('exists', False):
+            lines.append(f"数据库：可用 (大小: {db_info.get('size', 0)} 字节)")
+        else:
+            lines.append("数据库：不可用")
+    except Exception as e:
+        lines.append(f"数据库状态检查失败: {e}")
+    
     try:
         df = overview_df(base, adj_kind)
         for _, r in df.iterrows():
@@ -332,18 +488,38 @@ def overview_advice(base: str, adj_kind: str='qfq') -> str:
 
 # -------------------- 业务包装函数（保留原有功能） --------------------
 def get_dates(base: str, asset: str, adj: str) -> str:
-    root = pv.asset_root(base, asset, adj if asset == "stock" else "daily")
-    dates = pv.list_trade_dates(root)
+    # 根据资产类型和复权类型确定实际使用的复权类型
+    if asset == "index":
+        actual_adj = "ind"  # 指数使用ind复权类型
+    else:
+        actual_adj = adj  # 股票使用选择的复权类型
+    
+    # 使用数据库适配器
+    try:
+        db_adapter = get_db_adapter()
+        dates = db_adapter.list_trade_dates(base)
+    except Exception as e:
+        logger.error(f"获取交易日期失败: {e}")
+        return f"获取交易日期失败: {e}"
+    
     if not dates:
         return "（无分区）"
-    return f"{asset} / {('daily' if asset=='index' else adj)}: {len(dates)} 天\n" + ", ".join(dates)
+    return f"{asset} / {actual_adj}: {len(dates)} 天\n" + ", ".join(dates)
 
 
 def run_day(base: str, asset: str, adj: str, date: str, limit: Optional[int]) -> pd.DataFrame:
     limit_clean = (limit or "").strip()
     is_int = limit_clean.lstrip("-").isdigit()
     limit = int(limit_clean) if is_int else None
-    df = pv.read_day(base, asset, adj, date, limit)
+    
+    # 使用数据库适配器
+    try:
+        db_adapter = get_db_adapter()
+        df = db_adapter.read_day(base, asset, adj, date, limit)
+    except Exception as e:
+        logger.error(f"查询单日数据失败: {e}")
+        return pd.DataFrame()
+    
     return df
 
 
@@ -351,11 +527,22 @@ def run_show(base: str, asset: str, adj: str, ts: str, start: str, end: str,
              columns: Optional[str], limit: Optional[int]) -> Tuple[pd.DataFrame, Optional[plt.Figure]]:
     ts_norm = normalize_ts(ts, asset)
     cols = [c.strip() for c in re.split(r"[，,;；\s]+", columns) if c.strip()] if columns else None
-    adj2 = adj if asset == "stock" else "daily"
+    # 根据资产类型确定复权类型
+    if asset == "index":
+        adj2 = "ind"  # 指数使用ind复权类型
+    else:
+        adj2 = adj  # 股票使用选择的复权类型
     limit_clean = (limit or "").strip()
     is_int = limit_clean.lstrip("-").isdigit()
     limit = int(limit_clean) if is_int else None
-    df = pv.read_range(base, asset, adj2, ts_norm, start, end, cols, limit)
+    
+    # 使用数据库适配器
+    try:
+        db_adapter = get_db_adapter()
+        df = db_adapter.read_range(base, asset, adj2, ts_norm, start, end, cols, limit)
+    except Exception as e:
+        logger.error(f"查询范围数据失败: {e}")
+        df = pd.DataFrame()
 
     fig = None
     # 如果包含 trade_date 和 close，则画一张简单的收盘价曲线
@@ -384,7 +571,8 @@ def run_schema(file_path: str = "", file_obj=None) -> str:
         else:
             return f"文件不存在：{file_path}"
     try:
-        if pv.HAS_PYARROW:
+        # 尝试使用pyarrow读取parquet文件
+        try:
             import pyarrow.parquet as pq  # type: ignore
             pf = pq.ParquetFile(file_path)
             md = pf.metadata
@@ -395,7 +583,8 @@ def run_schema(file_path: str = "", file_obj=None) -> str:
                 col = md.schema.column(i)
                 lines.append(f"  - {col.name}: {col.physical_type}")
             return "\n".join(lines)
-        else:
+        except ImportError:
+            # 回退到pandas
             df = pd.read_parquet(file_path)
             return f"File: {file_path}\nRows: {len(df)}, Columns: {len(df.columns)}\nColumns: {', '.join(df.columns)}"
     except Exception as e:
@@ -406,8 +595,20 @@ def run_export(base: str, asset: str, adj: str, ts: str, start: str, end: str,
                columns: Optional[str], out_dir: str) -> Tuple[str, Optional[str]]:
     ts_norm = normalize_ts(ts, asset)
     cols = [c.strip() for c in columns.split(",")] if columns else None
-    adj2 = adj if asset == "stock" else "daily"
-    df = pv.read_range(base, asset, adj2, ts_norm, start, end, cols, None)
+    # 根据资产类型确定复权类型
+    if asset == "index":
+        adj2 = "ind"  # 指数使用ind复权类型
+    else:
+        adj2 = adj  # 股票使用选择的复权类型
+    
+    # 使用数据库适配器
+    try:
+        db_adapter = get_db_adapter()
+        df = db_adapter.read_range(base, asset, adj2, ts_norm, start, end, cols, None)
+    except Exception as e:
+        logger.error(f"查询导出数据失败: {e}")
+        return f"查询数据失败: {e}", None
+    
     if df is None or df.empty:
         return "（空结果，未生成 CSV）", None
     os.makedirs(out_dir, exist_ok=True)
@@ -472,7 +673,7 @@ def build_ui(base_default: str = DEFAULT_BASE):
         with gr.Tab("分区日期 dates"):
             base_dates = gr.Textbox(label="数据根目录 base", value=base_default)
             asset_dates = gr.Radio(choices=["index", "stock"], value="index", label="资产 asset")
-            adj_dates = gr.Dropdown(choices=["raw", "qfq", "hfq"], value="qfq", label="复权 adj（index 固定为 daily）")
+            adj_dates = gr.Dropdown(choices=["raw", "qfq", "hfq", "ind"], value="qfq", label="复权 adj（index 使用 ind）")
             btn_dates = gr.Button("列出日期")
             out_dates = gr.Textbox(label="分区日期", lines=10)
             btn_dates.click(get_dates, inputs=[base_dates, asset_dates, adj_dates], outputs=[out_dates])
@@ -480,7 +681,7 @@ def build_ui(base_default: str = DEFAULT_BASE):
         with gr.Tab("某天 day"):
             base_day = gr.Textbox(label="数据根目录 base", value=base_default)
             asset_day = gr.Radio(choices=["index", "stock"], value="index", label="资产 asset")
-            adj_day = gr.Dropdown(choices=["raw", "qfq", "hfq"], value="qfq", label="复权 adj（index 固定为 daily）")
+            adj_day = gr.Dropdown(choices=["raw", "qfq", "hfq", "ind"], value="qfq", label="复权 adj（index 使用 ind）")
             date_day = gr.Textbox(label="交易日 YYYYMMDD")
             limit_day = gr.Textbox(label="最多显示行数", placeholder="可空，默认为全部，负数为倒数")
             btn_day = gr.Button("查询")
@@ -490,7 +691,7 @@ def build_ui(base_default: str = DEFAULT_BASE):
         with gr.Tab("区间/代码 show"):
             base_show = gr.Textbox(label="数据根目录 base", value=base_default)
             asset_show = gr.Radio(choices=["index", "stock"], value="index", label="资产 asset")
-            adj_show = gr.Dropdown(choices=["raw", "qfq", "hfq"], value="qfq", label="复权 adj（index 固定为 daily）")
+            adj_show = gr.Dropdown(choices=["raw", "qfq", "hfq", "ind"], value="qfq", label="复权 adj（index 使用 ind）")
             ts_show = gr.Textbox(label="ts_code（如 000001）")
             start_show = gr.Textbox(label="起始日期 YYYYMMDD")
             end_show = gr.Textbox(label="结束日期 YYYYMMDD")
@@ -513,7 +714,7 @@ def build_ui(base_default: str = DEFAULT_BASE):
         with gr.Tab("导出 CSV"):
             base_exp = gr.Textbox(label="数据根目录 base", value=base_default)
             asset_exp = gr.Radio(choices=["index", "stock"], value="index", label="资产 asset")
-            adj_exp = gr.Dropdown(choices=["raw", "qfq", "hfq"], value="qfq", label="复权 adj（index 固定为 daily）")
+            adj_exp = gr.Dropdown(choices=["raw", "qfq", "hfq", "ind"], value="qfq", label="复权 adj（index 使用 ind）")
             ts_exp = gr.Textbox(label="ts_code（如 000001）")
             start_exp = gr.Textbox(label="起始日期 YYYYMMDD")
             end_exp = gr.Textbox(label="结束日期 YYYYMMDD")

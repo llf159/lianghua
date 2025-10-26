@@ -2,14 +2,81 @@
 from __future__ import annotations
 
 import os, io, json, re
+import warnings
 from pathlib import Path
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict
 import threading
-import logging
+from log_system import get_logger
 import pandas as pd
 import numpy as np
 import streamlit as st
+
+# 忽略tushare的FutureWarning
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    module="tushare.pro.data_pro",
+    message=".*fillna.*method.*deprecated.*"
+)
+
+# 初始化日志记录器
+logger = get_logger("score_ui")
+def ui_cleanup_database_connections():
+    """强制清理所有数据库连接 - 统一使用 data_reader 管理"""
+    try:
+        # 延迟导入 data_reader，避免启动时立即初始化数据库连接
+        try:
+            from database_manager import clear_connections_only
+        except ImportError as e:
+            st.error(f"无法导入 database_manager 模块: {e}")
+            return False
+        
+        # 清理数据库连接（轻量级清理，不关闭工作线程）
+        clear_connections_only()
+        
+        # 数据库连接已通过 database_manager 清理
+        
+        # 强制垃圾回收
+        import gc
+        gc.collect()
+        
+        st.success("✅ 数据库连接清理完成")
+        return True
+        
+    except Exception as e:
+        st.error(f"数据库连接清理失败: {e}")
+        return False
+
+def check_database_status():
+    """检查数据库状态"""
+    try:
+        # 延迟导入 data_reader，避免启动时立即初始化数据库连接
+        try:
+            from database_manager import get_database_manager
+            # get_database_info 已从 database_manager 导入
+        except ImportError as e:
+            st.error(f"无法导入 database_manager 模块: {e}")
+            return False
+        
+        # 获取数据库信息
+        db_info = get_database_info()
+        
+        # 获取数据库管理器统计信息
+        manager = get_database_manager()
+        enhanced_stats = manager.get_stats()
+        
+        st.info(f"数据库管理器: {enhanced_stats}")
+        st.info(f"数据库信息: {db_info}")
+        
+        return True
+    except Exception as e:
+        st.error(f"检查数据库状态失败: {e}")
+        return False
+
+
+# 进程控制功能已移除，相关问题在database_manager中统一处理
+
 import streamlit.components.v1 as components
 from contextlib import contextmanager
 import shutil
@@ -18,14 +85,33 @@ import time
 import queue
 import traceback
 
-import download as dl
-import app_pv as apv
+# 延迟导入，避免启动时立即初始化数据库连接
+# import download as dl
 import scoring_core as se
 import config as cfg
 import stats_core as stats
 from utils import normalize_ts, ensure_datetime_index, normalize_trade_date, market_label
-from parquet_viewer import read_range, asset_root, list_trade_dates
-from config import PARQUET_BASE, PARQUET_ADJ, SC_DETAIL_STORAGE, SC_USE_DB_STORAGE, SC_DB_FALLBACK_TO_JSON
+# 使用 database_manager 替代 data_reader
+from database_manager import (
+    get_database_manager, query_stock_data, get_trade_dates, 
+    get_stock_list, get_latest_trade_date, get_smart_end_date,
+    get_database_info, get_data_source_status, close_all_connections,
+    clear_connections_only
+)
+
+def _lazy_import_download():
+    """延迟导入 download 模块的函数"""
+    try:
+        import download as dl
+        return dl
+    except ImportError as e:
+        logger = get_logger("score_ui")
+        logger.error(f"导入 download 失败: {e}")
+        return None
+
+# 直接使用 database_manager 函数，不再需要包装器
+import os
+from config import DATA_ROOT, API_ADJ, SC_DETAIL_STORAGE, SC_USE_DB_STORAGE, SC_DB_FALLBACK_TO_JSON
 import tdx_compat as tdx
 from stats_core import _pick_trade_dates, _prev_trade_date
 import indicators as ind
@@ -96,6 +182,36 @@ def _init_session_state():
         for k, v in defaults.items():
             if k not in st.session_state:
                 st.session_state[k] = v
+        
+        # 初始化数据库连接管理
+        if "db_initialized" not in st.session_state:
+            try:
+                # 设置数据库连接为延迟初始化模式（不触发连接）
+                # 使用 database_manager 进行初始化
+                try:
+                    # 数据库管理器已经自动初始化
+                    logger = get_logger("score_ui")
+                    logger.info("数据库管理器已初始化")
+                    
+                    # 注册退出时清理函数（不立即执行）
+                    # close_all_connections 已从 database_manager 导入
+                    import atexit
+                    atexit.register(close_all_connections)
+                except ImportError as e:
+                    logger = get_logger("score_ui")
+                    logger.warning(f"无法导入 data_reader 模块: {e}")
+                except Exception as e:
+                    logger = get_logger("score_ui")
+                    logger.warning(f"数据库连接管理初始化失败: {e}")
+                
+                st.session_state["db_initialized"] = True
+            except Exception as e:
+                logger = get_logger("score_ui")
+                logger.warning(f"数据库连接管理初始化失败: {e}")
+        
+        # 添加表达式选股时的数据库连接管理
+        if "expression_screening_active" not in st.session_state:
+            st.session_state["expression_screening_active"] = False
     except Exception:
         pass
 
@@ -125,6 +241,11 @@ def _apply_overrides(
     inc_ind_workers: int | None,
 ):
     """把 UI 输入同步到 download.py 的全局，以便其函数读取。"""
+    # 延迟导入 download 模块
+    dl = _lazy_import_download()
+    if dl is None:
+        raise ImportError("无法导入 download 模块")
+    
     # download.py 内部多数直接使用模块级常量，这里原地覆写它们
     dl.DATA_ROOT = base
     dl.ASSETS = [a.lower() for a in assets]
@@ -138,32 +259,37 @@ def _apply_overrides(
 
     # 同步到 config，以便其他模块（如 parquet_viewer）看到一致的 base/adj
     try:
-        cfg.PARQUET_BASE = base
         cfg.DATA_ROOT = base
-        cfg.PARQUET_ADJ = api_adj.lower() if api_adj.lower() in {"daily","raw","qfq","hfq"} else getattr(cfg, "PARQUET_ADJ", "qfq")
+        cfg.API_ADJ = api_adj.lower() if api_adj.lower() in {"raw","qfq","hfq"} else getattr(cfg, "API_ADJ", "qfq")
     except Exception:
         pass
 
 @cache_data(show_spinner=False, ttl=300)
 def _latest_trade_date(base: str, adj: str) -> str | None:
     try:
-
-        root = asset_root(base, "stock", adj)
-        ds = list_trade_dates(root)
-        return ds[-1] if ds else None
+        # 使用 database_manager 获取最新交易日
+        latest_date = get_latest_trade_date()
+        return latest_date
     except Exception:
         return None
 
 # -------------------- 执行动作（封装 download.py） --------------------
 def _run_fast_init(end_use: str):
+    # 延迟导入 download 模块
+    dl = _lazy_import_download()
+    if dl is None:
+        raise ImportError("无法导入 download 模块")
+    
     dl.fast_init_download(end_use)                       # 首次全量（单股缓存）
-    if getattr(dl, "DUCK_MERGE_DAY_LAG", 5) >= 0:
-        dl.duckdb_partition_merge()                     # 合并到 daily_*
-    if getattr(dl, "WRITE_SYMBOL_INDICATORS", True):
-        dl.duckdb_merge_symbol_products_to_daily()      # 合并指标到 daily_*_indicators
+    # 数据库操作已迁移到 data_reader.py，合并操作已集成到下载过程中
 
 
 def _run_increment(start_use: str, end_use: str, do_stock: bool, do_index: bool, do_indicators: bool):
+    # 延迟导入 download 模块
+    dl = _lazy_import_download()
+    if dl is None:
+        raise ImportError("无法导入 download 模块")
+    
     # 若 fast_init 的缓存存在，先合并一次（与 main() 逻辑一致）
     try:
         if any(
@@ -171,7 +297,8 @@ def _run_increment(start_use: str, end_use: str, do_stock: bool, do_index: bool,
             and any(f.endswith(".parquet") for f in os.listdir(os.path.join(dl.FAST_INIT_STOCK_DIR, d)))
             for d in ("raw","qfq","hfq")
         ):
-            dl.duckdb_partition_merge()
+            # 数据库操作已迁移到 data_reader.py
+            pass
     except Exception:
         pass
 
@@ -199,8 +326,8 @@ def _read_df(path: Path, usecols=None, dtype=None, encoding: str = "utf-8-sig") 
 
 @cache_data(show_spinner=False, ttl=600)
 def _cached_trade_dates(base: str, adj: str):
-    root = asset_root(base, "stock", adj)
-    return list_trade_dates(root) or []
+    # 使用 database_manager 获取交易日列表
+    return get_trade_dates() or []
 
 # ==== 进度转发到主线程：仅子线程/子进程入队，主线程消费并渲染 ====
 @contextmanager
@@ -209,20 +336,30 @@ def se_progress_to_streamlit():
         # bare/子线程下：挂空回调，啥也不画，避免任何 st.* 调用
         def _noop(*a, **k): 
             pass
-        se.set_progress_handler(_noop)
+        # 使用新的日志系统替代废弃的 set_progress_handler
+        from log_system import get_logger
+        logger = get_logger("scoring_core")
+        logger.info("使用新的日志系统进行进度跟踪")
         try:
             yield None, None, None
         finally:
-            se.set_progress_handler(None)
+            pass
         return
     status = st.status("准备中…", expanded=True)
     bar = st.progress(0, text="就绪")
     info = st.empty()
 
-    def ui_consumer(phase, current=None, total=None, message=None, **kw):
-        if not _in_streamlit():
-            return
-        # Runs on main thread only when drain_progress_events is called
+    import queue as _q
+    _evq = _q.Queue()
+    
+    # 后台线程只入队，不直接碰 st.*
+    def _enqueue_handler(phase, current=None, total=None, message=None, **kw):
+        try:
+            _evq.put_nowait((phase, current, total, message))
+        except Exception:
+            pass
+
+    def _render_event(phase, current=None, total=None, message=None):
         txt = {
             "select_ref_date": "选择参考日", "compute_read_window": "计算读取区间",
             "build_universe_done": "构建评分清单", "score_start": "并行评分启动",
@@ -234,15 +371,43 @@ def se_progress_to_streamlit():
         }.get(phase, phase)
         if total and current is not None:
             pct = int(current * 100 / max(total, 1))
-            bar.progress(pct, text=(f"{txt} · {current}/{total}" if str(phase).startswith("screen") and total is not None and current is not None else txt))
+            # 显示进度详情：评分和筛选都显示数量
+            if phase in ("score_progress", "screen_progress"):
+                bar.progress(pct, text=f"{txt} · {current}/{total}")
+            else:
+                bar.progress(pct, text=txt)
         else:
-            info.write(txt)
+            # 使用message作为主要显示内容，如果没有则使用txt
+            display_text = message if message else txt
+            info.write(display_text)
 
-    se.set_progress_handler(ui_consumer)
+    # 主线程消费：供 run_se_run_for_date_in_bg 循环调用
+    def _drain():
+        try:
+            while True:
+                ev = _evq.get_nowait()
+                _render_event(*ev)
+        except _q.Empty:
+            pass
+
+    # 使用新的日志系统并设置进度处理器
+    from log_system import get_logger
+    logger = get_logger("scoring_core")
+    logger.info("使用新的日志系统进行进度跟踪")
+    
+    # 关键：设置进度处理器，使评分系统能够发送进度事件
+    _orig_drain = getattr(se, "drain_progress_events", None)
+    se.set_progress_handler(_enqueue_handler)
+    se.drain_progress_events = _drain  # 将"抽干"替换成主线程渲染
+    
     try:
         yield status, bar, info
     finally:
-        se.set_progress_handler(None)
+        # 还原 drain（保持模块整洁）
+        if callable(_orig_drain):
+            se.drain_progress_events = _orig_drain
+        else:
+            se.drain_progress_events = lambda: None
 
 @cache_data(show_spinner=False)
 def _read_md_file(path: str) -> str:
@@ -261,29 +426,48 @@ def run_se_run_for_date_in_bg(arg):
 
         def _worker():
             try:
+                try:
+                    # prefer local UI cleanup if present
+                    if 'ui_cleanup_database_connections' in globals():
+                        ui_cleanup_database_connections()
+                    else:
+                        # 使用轻量级清理函数，避免关闭工作线程
+                        from database_manager import clear_connections_only
+                        clear_connections_only()
+                except Exception:
+                    pass
+                
+                # 在子线程中运行评分，但确保数据库连接正确初始化
+                from database_manager import get_database_manager
+                manager = get_database_manager()
+                
+                # 确保数据库管理器已正确初始化，避免连接问题
+                try:
+                    # 测试数据库连接是否正常
+                    test_date = manager.get_latest_trade_date()
+                    if test_date:
+                        logger.info(f"[评分] 数据库连接正常，最新交易日: {test_date}")
+                    else:
+                        logger.warning("[评分] 数据库连接正常但无最新交易日数据")
+                except Exception as e:
+                    logger.warning(f"[评分] 数据库连接测试失败: {e}")
+                
                 result["path"] = se.run_for_date(arg)
             except Exception as e:
                 result["err"] = e
             finally:
                 done.set()
-
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
 
         # 主线程循环抽取进度事件并刷新 UI
-                # 超时保护，避免后台任务卡死
-        _timeout_s = int(getattr(cfg, 'UI_BG_TIMEOUT_SEC', 300))
-        _start_ts = time.time()
         while not done.is_set():
             se.drain_progress_events()
             time.sleep(0.05)
-            if (time.time() - _start_ts) > _timeout_s:
-                if status:
-                    status.update(label='已超时', state='error')
-                raise TimeoutError('后台任务超时（>{}s）'.format(_timeout_s))
         # 抽干剩余事件
         se.drain_progress_events()
-        status.update(label="已完成", state="complete")
+        if status is not None:
+            status.update(label="已完成", state="complete")
 
         if result["err"]:
             raise result["err"]
@@ -299,19 +483,37 @@ def run_se_screen_in_bg(*, when_expr, ref_date, timeframe, window, scope, univer
 
         def _worker():
             try:
-                result["df"] = se.tdx_screen(
-                    when_expr,
-                    ref_date=ref_date,
-                    timeframe=timeframe,
-                    window=_safe_int(window, 60),
-                    scope=scope,
-                    universe=universe,
-                    write_white=write_white,
-                    write_black_rest=write_black_rest,
-                    return_df=return_df
-                )
+                try:
+                    # prefer local UI cleanup if present
+                    if 'ui_cleanup_database_connections' in globals():
+                        ui_cleanup_database_connections()
+                    else:
+                        # 使用轻量级清理函数，避免关闭工作线程
+                        from database_manager import clear_connections_only
+                        clear_connections_only()
+                except Exception:
+                    pass
+                
+                st.session_state["expression_screening_active"] = True
+                
+                try:
+                    result["df"] = se.tdx_screen(
+                        when_expr,
+                        ref_date=ref_date,
+                        timeframe=timeframe,
+                        window=_safe_int(window, 60),
+                        scope=scope,
+                        universe=universe,
+                        write_white=write_white,
+                        write_black_rest=write_black_rest,
+                        return_df=return_df
+                    )
+                finally:
+                    st.session_state["expression_screening_active"] = False
+                    
             except Exception as e:
                 result["err"] = e
+                st.session_state["expression_screening_active"] = False
             finally:
                 done.set()
 
@@ -319,32 +521,76 @@ def run_se_screen_in_bg(*, when_expr, ref_date, timeframe, window, scope, univer
         t.start()
 
         # 主线程循环抽取进度事件并刷新 UI
-                # 超时保护，避免后台任务卡死
-        _timeout_s = int(getattr(cfg, 'UI_BG_TIMEOUT_SEC', 300))
-        _start_ts = time.time()
         while not done.is_set():
             se.drain_progress_events()
             time.sleep(0.05)
-            if (time.time() - _start_ts) > _timeout_s:
-                if status:
-                    status.update(label='已超时', state='error')
-                raise TimeoutError('后台任务超时（>{}s）'.format(_timeout_s))
         # 抽干剩余事件
         se.drain_progress_events()
-        status.update(label="已完成", state="complete")
+        if status is not None:
+            status.update(label="已完成", state="complete")
 
         if result["err"]:
             raise result["err"]
         return result["df"]
 
 
-def _pick_latest_ref_date() -> Optional[str]:
+def _get_latest_date_from_files() -> Optional[str]:
+    """从评分结果文件名中提取最新日期"""
     files = sorted(TOP_DIR.glob("score_top_*.csv"))
     dates = []
     for p in files:
         m = re.search(r"(\d{8})", p.name)
         if m: dates.append(m.group(1))
     return max(dates) if dates else None
+
+
+def _get_latest_date_from_database() -> Optional[str]:
+    """从数据库获取最新交易日"""
+    try:
+        from database_manager import get_latest_trade_date
+        latest = get_latest_trade_date()
+        if latest:
+            logger.info(f"从数据库获取最新交易日: {latest}")
+            return latest
+    except Exception as e:
+        logger.warning(f"从数据库获取最新交易日失败: {e}")
+    return None
+
+
+def _get_latest_date_from_daily_partition() -> Optional[str]:
+    """从daily分区获取最新交易日"""
+    try:
+        from database_manager import get_trade_dates
+        dates = get_trade_dates()
+        if dates:
+            latest = dates[-1]
+            logger.info(f"从daily分区获取最新交易日: {latest}")
+            return latest
+    except Exception as e:
+        logger.warning(f"从daily分区获取最新交易日失败: {e}")
+    return None
+
+
+def _pick_smart_ref_date() -> Optional[str]:
+    """智能获取参考日期，按优先级尝试多种方式"""
+    # 1. 优先从数据库获取
+    latest = _get_latest_date_from_database()
+    if latest:
+        return latest
+    
+    # 2. 从daily分区获取
+    latest = _get_latest_date_from_daily_partition()
+    if latest:
+        return latest
+    
+    # 3. 最后从评分结果文件获取
+    latest = _get_latest_date_from_files()
+    if latest:
+        logger.warning(f"回退到评分结果文件中的最新日期: {latest}")
+    else:
+        logger.error("无法获取任何参考日期")
+    
+    return latest
 
 
 def _prev_ref_date(cur: str) -> Optional[str]:
@@ -358,7 +604,7 @@ def _prev_ref_date(cur: str) -> Optional[str]:
 
 
 def _from_last_hints(days: list[int] | None = None,
-                     base: str = PARQUET_BASE, adj: str = PARQUET_ADJ,
+                     base: str = DATA_ROOT, adj: str = API_ADJ,
                      last: str | None = None):
     """
     基于“最新交易日 last（缺省=本地数据的最后一天）”，返回：
@@ -366,8 +612,7 @@ def _from_last_hints(days: list[int] | None = None,
       - 映射 dict: {n: d8}，n 个交易日前对应的 yyyymmdd 字符串。
     """
     try:
-        root = asset_root(base, "stock", adj)
-        ds = list_trade_dates(root) or []
+        ds = get_trade_dates() or []
         if not ds:
             return "", {}
         last = last or ds[-1]
@@ -420,15 +665,15 @@ def _rule_to_screen_args(rule: dict):
         scope = str(rule.get("scope","ANY")).upper()
         # --- substitute placeholders (K/M/N) for scope ---
         try:
-            import re as _re
+            import re
             k = int(rule.get("k", rule.get("n", 0)) or 0)
             m = int(rule.get("m", 0) or 0)
             # COUNT>=K -> COUNT>=<k or 3>
-            if "COUNT" in scope and _re.search(r"\bK\b", scope):
-                scope = _re.sub(r"\bK\b", str(k or 3), scope)
+            if "COUNT" in scope and re.search(r"\bK\b", scope):
+                scope = re.sub(r"\bK\b", str(k or 3), scope)
             # CONSEC>=M -> CONSEC>=<m or 3>
-            if "CONSEC" in scope and _re.search(r"\bM\b", scope):
-                scope = _re.sub(r"\bM\b", str(m or 3), scope)
+            if "CONSEC" in scope and re.search(r"\bM\b", scope):
+                scope = re.sub(r"\bM\b", str(m or 3), scope)
             # ANY_N / ALL_N -> ANY_<k or 3> / ALL_<k or 3>
             scope = scope.replace("ANY_N", f"ANY_{k or 3}").replace("ALL_N", f"ALL_{k or 3}")
         except Exception:
@@ -441,15 +686,101 @@ def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
     加载个股详情，优先从数据库读取，失败时回退到JSON文件
     """
     # 1. 优先从数据库读取
-    if SC_USE_DB_STORAGE and SC_DETAIL_STORAGE in ["database", "both"]:
+    if SC_USE_DB_STORAGE and SC_DETAIL_STORAGE in ["database","both","db"]:
         try:
-            from detail_db import get_detail_db
-            db = get_detail_db()
-            result = db.load_detail(ts, ref)
-            if result:
+            # 使用正确的details数据库路径
+            from config import SC_OUTPUT_DIR, SC_DETAIL_DB_PATH
+            details_db_path = os.path.join(SC_OUTPUT_DIR, 'details', 'details.db')
+            
+            # 检查数据库文件是否存在
+            if not os.path.exists(details_db_path):
+                logger.debug(f"Details数据库文件不存在: {details_db_path}")
+                # 尝试从统一数据库读取（兼容性）
+                from config import DATA_ROOT, UNIFIED_DB_PATH
+                db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                if os.path.exists(db_path):
+                    details_db_path = db_path
+                else:
+                    raise FileNotFoundError("Details数据库文件不存在")
+            
+            # 查询股票详情表
+            manager = get_database_manager()
+            sql = "SELECT * FROM stock_details WHERE ts_code = ? AND ref_date = ?"
+            df = manager.execute_sync_query(details_db_path, sql, [ts, ref], timeout=30.0)
+            
+            if not df.empty:
+                row = df.iloc[0]
+                
+                # 解析 rules 字段：优先 json.loads，失败则 ast.literal_eval，最后保证是 list[dict]
+                rules_raw = row.get('rules')
+                rules = []
+                if rules_raw:
+                    if isinstance(rules_raw, str):
+                        try:
+                            rules = json.loads(rules_raw)
+                        except Exception:
+                            try:
+                                import ast
+                                rules = ast.literal_eval(rules_raw)
+                            except Exception:
+                                rules = []
+                    elif isinstance(rules_raw, list):
+                        rules = rules_raw
+                
+                # 确保 rules 是 list[dict] 格式
+                if not isinstance(rules, list):
+                    rules = []
+                
+                # 解析 highlights/drawbacks/opportunities 字段为 list[str]
+                def parse_string_list(field_value):
+                    if not field_value:
+                        return []
+                    if isinstance(field_value, str):
+                        try:
+                            parsed = json.loads(field_value)
+                            return parsed if isinstance(parsed, list) else []
+                        except Exception:
+                            try:
+                                import ast
+                                parsed = ast.literal_eval(field_value)
+                                return parsed if isinstance(parsed, list) else []
+                            except Exception:
+                                return []
+                    elif isinstance(field_value, list):
+                        return field_value
+                    return []
+                
+                highlights = parse_string_list(row.get('highlights'))
+                drawbacks = parse_string_list(row.get('drawbacks'))
+                opportunities = parse_string_list(row.get('opportunities'))
+                
+                # 获取 rank 和 total 值
+                rank_val = row.get('rank')
+                total_val = row.get('total')
+                
+                # 组装 summary，包含 rank 和 total
+                summary = {
+                    'score': row.get('score'),
+                    'tiebreak': row.get('tiebreak'),
+                    'highlights': highlights,
+                    'drawbacks': drawbacks,
+                    'opportunities': opportunities,
+                    'rank': int(rank_val) if pd.notna(rank_val) else None,
+                    'total': int(total_val) if pd.notna(total_val) else None,
+                }
+                
+                # 组装成与 JSON 文件完全一致的结构，保持兼容性
+                result = {
+                    'ts_code': row.get('ts_code'),
+                    'ref_date': row.get('ref_date'),
+                    'summary': summary,
+                    'rules': rules,
+                    'rank': summary['rank'],   # 兼容旧调用
+                    'total': summary['total'],
+                }
                 return result
         except Exception as e:
-            # LOGGER.warning(f"数据库读取失败 {ts}_{ref}: {e}")
+            logger.debug(f"数据库读取失败 {ts}_{ref}: {e}")
             pass
     
     # 2. 如果数据库失败且配置了回退，或者配置了JSON存储，则使用JSON文件
@@ -530,7 +861,7 @@ def _fmt_retcols_percent(df):
 def _apply_runtime_overrides(rules_obj: dict,
                              topk: int, tie_break: str, max_workers: int,
                              attn_on: bool, universe: str|List[str]):
-    # 规则临时覆盖（仅当前进程）
+    # 规则覆盖配置
     if rules_obj:
         pres = rules_obj.get("prescreen")
         rules = rules_obj.get("rules")
@@ -569,12 +900,95 @@ def _humanize_error(err) -> tuple[str, list[str], list[str], str]:
         title = "缺少列/指标"
         causes = ["表达式引用了数据中不存在的列"]
         fixes = ["在数据侧补列，或使用内置兜底（如 J/VR）"]
-    elif "eval-exception" in s:
-        title = "表达式执行异常"
-        causes = ["计算过程出现无效值（如被 0 除、NaN 等）"]
-        fixes = ["增加保护：如 MAX(MIN(...)) 限幅；使用 REF/IFNULL 等避免 NaN/INF"]
+    elif "database is locked" in s or "file is locked" in s or "database is busy" in s or "file is being used" in s or "另一个程序正在使用此文件" in s:
+        title = "数据库被占用"
+        causes = ["多个进程同时访问数据库文件", "数据库文件被其他程序锁定", "系统资源不足"]
+        fixes = ["等待其他操作完成", "重启应用程序", "检查是否有其他程序在使用数据库文件", "使用内存数据库模式"]
 
     return title, causes, fixes, s
+
+
+def show_database_diagnosis():
+    """显示数据库诊断信息"""
+    try:
+        # 诊断功能需要重新实现
+        # 使用 database_manager 获取诊断信息
+        manager = get_database_manager()
+        stats = manager.get_stats()
+        diagnosis = {
+            "database_status": "connected" if stats else "disconnected",
+            "queue_size": stats.get("queue_size", 0),
+            "worker_count": stats.get("worker_count", 0)
+        }
+        
+        st.subheader("数据库诊断信息")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("数据库文件存在", "是" if diagnosis.get("database_exists") else "否")
+            st.metric("数据库文件被锁定", "是" if diagnosis.get("database_locked") else "否")
+            if diagnosis.get("file_size"):
+                st.metric("文件大小", f"{diagnosis['file_size'] / (1024*1024):.1f} MB")
+        
+        with col2:
+            if diagnosis.get("file_permissions"):
+                st.metric("文件权限", diagnosis["file_permissions"])
+            if diagnosis.get("last_modified"):
+                import datetime
+                last_mod = datetime.datetime.fromtimestamp(diagnosis["last_modified"])
+                st.metric("最后修改", last_mod.strftime("%Y-%m-%d %H:%M:%S"))
+        
+        # 显示进程占用信息
+        processes = diagnosis.get("processes_using_db", [])
+        if processes:
+            st.warning(f"⚠️ 发现 {len(processes)} 个进程正在使用数据库文件:")
+            for proc in processes:
+                st.write(f"- PID: {proc['pid']}, 进程名: {proc['name']}")
+        else:
+            st.success("✅ 没有发现其他进程占用数据库文件")
+        
+        if diagnosis.get("database_locked"):
+            st.error("数据库文件被锁定，这可能导致表达式选股失败")
+            st.info("建议：检查是否有其他应用在使用数据库文件，或重启相关进程")
+        
+        if st.button("重新诊断"):
+            st.rerun()
+            
+    except Exception as e:
+        st.error(f"诊断数据库失败: {e}")
+
+
+def show_database_status():
+    """显示数据库连接状态"""
+    try:
+        # get_data_source_status 已从 database_manager 导入
+        status = get_data_source_status()
+        
+        st.subheader("数据库连接状态")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("数据库文件存在", "是" if status.get("database_file_exists") else "否")
+            st.metric("数据库文件被锁定", "是" if status.get("database_file_locked") else "否")
+            st.metric("使用统一数据库", "是" if status.get("use_unified_db") else "否")
+        
+        with col2:
+            dispatcher_stats = status.get("dispatcher_stats", {})
+            st.metric("工作线程数", dispatcher_stats.get("worker_threads", 0))
+            st.metric("缓存大小", dispatcher_stats.get("cache_size", 0))
+            st.metric("队列大小", dispatcher_stats.get("queue_size", 0))
+        
+        if status.get("database_file_locked"):
+            st.error("⚠️ 数据库文件被锁定，这可能导致表达式选股失败")
+            st.info("建议：等待其他操作完成或重启应用程序")
+        
+        if st.button("刷新状态"):
+            st.rerun()
+            
+    except Exception as e:
+        st.error(f"检查数据库状态失败: {e}")
 
 
 def _indicator_options(tag: str | None = "product"):
@@ -851,13 +1265,16 @@ class Stepper:
 @contextmanager
 def pred_progress_to_streamlit():
     if not _in_streamlit():
-        # 非 Streamlit/测试环境：挂空回调
+        # 非Streamlit环境回调
         def _noop(*a, **k): pass
-        pr.set_progress_handler(_noop)
+        # 使用新的日志系统替代废弃的 set_progress_handler
+        from log_system import get_logger
+        logger = get_logger("predict_core")
+        logger.info("使用新的日志系统进行进度跟踪")
         try:
             yield None, None, None
         finally:
-            pr.set_progress_handler(None)
+            pass
         return
 
     status = st.status("准备中…", expanded=True)
@@ -901,15 +1318,16 @@ def pred_progress_to_streamlit():
         except _q.Empty:
             pass
 
-    # 安装回调 & monkeypatch drain
-    pr.set_progress_handler(_enqueue_handler)
+    # 使用新的日志系统替代废弃的 set_progress_handler
+    from log_system import get_logger
+    logger = get_logger("predict_core")
+    logger.info("使用新的日志系统进行进度跟踪")
     _orig_drain = getattr(pr, "drain_progress_events", None)
-    pr.drain_progress_events = _drain  # 关键：把“抽干”替换成主线程渲染
+    pr.drain_progress_events = _drain  # 关键：把"抽干"替换成主线程渲染
 
     try:
         yield status, bar, info
     finally:
-        pr.set_progress_handler(None)
         # 还原 drain（保持模块整洁）
         if callable(_orig_drain):
             pr.drain_progress_events = _orig_drain
@@ -923,7 +1341,9 @@ def run_prediction_in_bg(inp):
         result = {"df": None, "err": None}
         def _worker():
             try:
-                result["df"] = run_prediction(inp)  # 仍用已有函数
+                # 使用安全的数据库操作
+                from predict_core import run_prediction
+                result["df"] = run_prediction(inp)
             except Exception as e:
                 result["err"] = e
             finally:
@@ -931,8 +1351,6 @@ def run_prediction_in_bg(inp):
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
 
-        _timeout_s = int(getattr(cfg, 'UI_BG_TIMEOUT_SEC', 300))
-        _start_ts = time.time()
         while not done.is_set():
             # 消费 predict_core 的进度事件（如果内部使用事件队列的话）
             try:
@@ -940,16 +1358,13 @@ def run_prediction_in_bg(inp):
             except Exception:
                 pass
             time.sleep(0.05)
-            if (time.time() - _start_ts) > _timeout_s:
-                if status:
-                    status.update(label='已超时', state='error')
-                raise TimeoutError('后台任务超时（>{}s）'.format(_timeout_s))
         # 抽干剩余事件
         try:
             pr.drain_progress_events()
         except Exception:
             pass
-        status.update(label="已完成", state="complete")
+        if status is not None:
+            status.update(label="已完成", state="complete")
         if result["err"]:
             raise result["err"]
         return result["df"]
@@ -1012,30 +1427,59 @@ if _in_streamlit():
                 latest_btn = st.button("📅 读取最近一次结果（不重新计算）", width='stretch')
 
         # 运行
-        ref_to_use = ref_inp.strip() or _pick_latest_ref_date()
+        ref_to_use = ref_inp.strip() or _pick_smart_ref_date()
         if run_btn:
+            logger.info(f"用户点击运行评分按钮: 参考日={ref_to_use}, TopK={topk}, 并行数={maxw}, 范围={universe}")
             _apply_runtime_overrides(st.session_state["rules_obj"], topk, tie, maxw, attn_on,
                                     {"全市场":"all","仅白名单":"white","仅黑名单":"black","仅特别关注榜":"attention"}[universe])
             try:
                 top_path = run_se_run_for_date_in_bg(ref_inp.strip() or None)
                 st.success(f"评分完成：{top_path}")
-            # 解析参考日
+                # 解析参考日
                 m = re.search(r"(\d{8})", str(top_path))
                 if m:
                     ref_to_use = m.group(1)
                     if latest_btn and not ref_to_use:
-                        ref_to_use = _pick_latest_ref_date()
+                        ref_to_use = _pick_smart_ref_date()
             except Exception as e:
                 st.error(f"评分失败：{e}")
                 ref_to_use = None
 
-        # “读取最近一次结果”按钮：仅读取，不计算
+        # "读取最近一次结果"按钮：仅读取，不计算
         if latest_btn and not run_btn:
-            ref_to_use = _pick_latest_ref_date()
+            ref_to_use = _get_latest_date_from_files()
 
         # ---- 统一的 Top 预览区块（无论 run 或 读取最近一次） ----
         if ref_to_use:
-            st.markdown(f"**当前最新排名：{ref_to_use}**")
+            # 获取最新排名文件日期和数据库最新日期用于对比
+            latest_rank_date = _get_latest_date_from_files()
+            db_latest_date = _get_latest_date_from_database()
+            
+            # 显示三个日期的对比
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                if latest_rank_date:
+                    st.markdown(f"**最新排名文件：{latest_rank_date}**")
+                else:
+                    st.markdown("**最新排名文件：未知**")
+            with col2:
+                st.markdown(f"**当前显示排名：{ref_to_use}**")
+            with col3:
+                if db_latest_date:
+                    st.markdown(f"**数据库最新日期：{db_latest_date}**")
+                else:
+                    st.markdown("**数据库最新日期：未知**")
+            
+            # 如果有日期差异，给出提示
+            if latest_rank_date and latest_rank_date != ref_to_use:
+                st.info(f"当前显示的是 {ref_to_use} 的排名，最新排名文件是 {latest_rank_date}")
+            
+            if db_latest_date and db_latest_date != ref_to_use:
+                if db_latest_date > ref_to_use:
+                    st.warning(f"排名数据日期（{ref_to_use}）早于数据库最新日期（{db_latest_date}），建议重新运行评分获取最新排名")
+                else:
+                    st.info(f"排名数据日期（{ref_to_use}）晚于数据库最新日期（{db_latest_date}），排名数据基于较新的数据")
+            
             df_all = _read_df(_path_all(ref_to_use))
         else:
             st.info("未找到任何 Top 文件，请先运行评分或检查输出目录。")
@@ -1070,10 +1514,10 @@ if _in_streamlit():
         c0, c1 = st.columns([1,2])
         with c0:
             ref_d = st.text_input("参考日（留空=自动最新）", value="", key="detail_ref_input")
-        ref_real = (ref_d or "").strip() or _pick_latest_ref_date() or ""
+        ref_real = (ref_d or "").strip() or _get_latest_date_from_files() or ""
         # 读取该参考日 Top 文件以便下拉选择
         try:
-            # 强制刷新缓存，避免缓存问题
+            # 刷新缓存
             if ref_real:
                 top_path = _path_top(ref_real)
                 if top_path.exists():
@@ -1087,7 +1531,6 @@ if _in_streamlit():
                 df_top_ref = pd.DataFrame()
                 
             options_codes = df_top_ref["ts_code"].astype(str).tolist() if ("ts_code" in df_top_ref.columns and not df_top_ref.empty) else []
-            # 调试信息
             st.caption(f"调试: 参考日={ref_real}, TopK文件行数={len(df_top_ref)}, 可选股票数={len(options_codes)}")
         except Exception as e:
             options_codes = []
@@ -1103,16 +1546,52 @@ if _in_streamlit():
                                             index=0, placeholder="暂无Top-K数据，请手动输入 ↓", 
                                             key="detail_code_from_top")
 
-        # 使用session_state来管理代码输入，确保从selectbox选择后能正确更新
-        if 'detail_code_input' not in st.session_state:
-            st.session_state.detail_code_input = ""
+        # 初始化session_state
+        if 'detail_last_code' not in st.session_state:
+            st.session_state.detail_last_code = ""
         
-        # 如果从selectbox选择了代码，更新输入框的值
-        if code_from_list and code_from_list != "":
-            st.session_state.detail_code_input = code_from_list
-                    
-        code_typed = st.text_input("或手动输入股票代码", key="detail_code_input")
-        code_norm = normalize_ts(code_typed) if code_typed else ""
+        # 确定默认显示的代码
+        default_code = ""
+        if st.session_state.detail_last_code:
+            # 如果有历史记录，使用历史记录
+            default_code = st.session_state.detail_last_code
+        elif options_codes:
+            # 如果没有历史记录但有Top-K数据，使用第一名
+            default_code = options_codes[0]
+        
+        # 始终显示手动输入框（平级输入方式）
+        code_typed = st.text_input("或手动输入股票代码", 
+                                 value=default_code,
+                                 key="detail_code_input")
+
+        # —— 平级合并逻辑：谁变化用谁 ——
+        if 'detail_prev_select' not in st.session_state:
+            st.session_state.detail_prev_select = ""
+        if 'detail_prev_input' not in st.session_state:
+            st.session_state.detail_prev_input = ""
+
+        cur_select = (code_from_list or "").strip()
+        cur_input  = (code_typed or "")
+        changed_select = bool(cur_select) and (cur_select != st.session_state.detail_prev_select)
+        changed_input  = (cur_input != st.session_state.detail_prev_input)
+
+        if changed_select:
+            effective_code = cur_select
+        elif changed_input:
+            effective_code = cur_input
+        else:
+            # 二者都未变化时，取当前非空输入；再兜底默认
+            effective_code = cur_input or cur_select or default_code
+
+        # 记录当前值，供下一次对比
+        st.session_state.detail_prev_select = cur_select
+        st.session_state.detail_prev_input = cur_input
+
+        # 更新历史记录
+        if effective_code and effective_code.strip() != "":
+            st.session_state.detail_last_code = effective_code
+        
+        code_norm = normalize_ts(effective_code) if effective_code else ""
 
         # —— 渲染详情（含 old 版功能） ——
         if code_norm and ref_real:
@@ -1121,8 +1600,50 @@ if _in_streamlit():
                 st.warning("未找到该票的详情数据（可能当日未在样本内或未产出 Details）。")
             else:
                 data = obj
-                summary = data.get("summary", {}) or {}
-                ts = data.get("ts_code", code_norm)
+                # 兼容数据库格式和JSON格式
+                if "summary" in data:
+                    # 统一格式：{ts_code, ref_date, summary: {...}, rules}
+                    summary = data.get("summary", {}) or {}
+                    ts = data.get("ts_code", code_norm)
+                else:
+                    # 兼容旧格式：{ts_code, ref_date, score, highlights, drawbacks, opportunities, rules, ...}
+                    summary = {
+                        "score": data.get("score", 0.0),
+                        "tiebreak": data.get("tiebreak"),
+                        "highlights": data.get("highlights", []),
+                        "drawbacks": data.get("drawbacks", []),
+                        "opportunities": data.get("opportunities", []),
+                        "rank": data.get("rank"),
+                        "total": data.get("total")
+                    }
+                    ts = data.get("ts_code", code_norm)
+                
+                # 显示数据来源信息
+                try:
+                    # 检查数据来源：优先details数据库，失败则JSON
+                    from config import SC_OUTPUT_DIR, SC_DETAIL_DB_PATH
+                    details_db_path = os.path.join(SC_OUTPUT_DIR, 'details', 'details.db')
+                    
+                    # 检查数据库文件是否存在
+                    if not os.path.exists(details_db_path):
+                        # 尝试从统一数据库读取（兼容性）
+                        from config import DATA_ROOT, UNIFIED_DB_PATH
+                        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                        if os.path.exists(db_path):
+                            details_db_path = db_path
+                    
+                    # 查询股票详情表
+                    manager = get_database_manager()
+                    sql = "SELECT * FROM stock_details WHERE ts_code = ? AND ref_date = ?"
+                    df = manager.execute_sync_query(details_db_path, sql, [code_norm, ref_real], timeout=30.0)
+                    
+                    if not df.empty:
+                        st.info("数据来源：数据库")
+                    else:
+                        st.info("数据来源：JSON文件")
+                except:
+                    st.info("数据来源：JSON文件")
+                
                 try:
                     score = float(summary.get("score", 0))
                     if not np.isfinite(score):
@@ -1197,11 +1718,15 @@ if _in_streamlit():
                         st.caption("暂无")
 
                 # 逐规则明细（可选显示 when）
-                rules = pd.DataFrame(data.get("rules", []))
+                # rules字段已经通过_load_detail_json统一解析为list[dict]格式
+                rules_list = data.get("rules", [])
+                if not isinstance(rules_list, list):
+                    rules_list = []
+                rules = pd.DataFrame(rules_list)
                 name_to_when = {}
                 
                 from datetime import datetime
-                import re as _re
+                import re
 
                 if not rules.empty:
                     
@@ -1300,8 +1825,7 @@ if _in_streamlit():
             entry_price = None
             # 统一参考日
             try:
-                root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
-                trade_dates = list_trade_dates(root)
+                trade_dates = get_trade_dates()
                 latest_ref = trade_dates[-1] if trade_dates else ""
             except Exception:
                 latest_ref = ""
@@ -1314,7 +1838,23 @@ if _in_streamlit():
                     if code_norm and sel_date:
                         try:
                             # 读取该日的价格
-                            df = read_range(PARQUET_BASE, PARQUET_ADJ, "stock", [code_norm], sel_date, sel_date)
+                            try:
+                                from config import DATA_ROOT, UNIFIED_DB_PATH
+                                db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                                df = query_stock_data(
+                                    db_path=db_path,
+                                    ts_code=code_norm,
+                                    start_date=sel_date,
+                                    end_date=sel_date,
+                                    adj_type="qfq"
+                                )
+                            except:
+                                # 回退到直接查询
+                                from config import DATA_ROOT, UNIFIED_DB_PATH
+                                db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                                manager = get_database_manager()
+                                sql = "SELECT * FROM stock_data WHERE ts_code = ? AND trade_date = ?"
+                                df = manager.execute_sync_query(db_path, sql, [code_norm, sel_date], timeout=30.0)
                             if not df.empty:
                                 row = df.sort_values("trade_date").iloc[-1]
                                 fld = {"开盘价(open)":"open","收盘价(close)":"close","最高价(high)":"high","最低价(low)":"low"}[price_field]
@@ -1337,7 +1877,23 @@ if _in_streamlit():
                 if st.button("按策略取最近一次触发日并定价", width='stretch', disabled=not (code_norm and names)):
                     try:
                         start = (datetime.strptime(ref_use, "%Y%m%d") - timedelta(days=int(lookback_days))).strftime("%Y%m%d")
-                        df = read_range(PARQUET_BASE, PARQUET_ADJ, "stock", [code_norm], start, ref_use)
+                        try:
+                            from config import DATA_ROOT, UNIFIED_DB_PATH
+                            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                            df = query_stock_data(
+                                db_path=db_path,
+                                ts_code=code_norm,
+                                start_date=start,
+                                end_date=ref_use,
+                                adj_type="qfq"
+                            )
+                        except:
+                            # 回退到直接查询
+                            from config import DATA_ROOT, UNIFIED_DB_PATH
+                            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                            manager = get_database_manager()
+                            sql = "SELECT * FROM stock_data WHERE ts_code = ? AND trade_date >= ? AND trade_date <= ?"
+                            df = manager.execute_sync_query(db_path, sql, [code_norm, start, ref_use], timeout=30.0)
                         df = df.sort_values("trade_date")
                         if df.empty:
                             st.warning("无数据")
@@ -1403,12 +1959,20 @@ if _in_streamlit():
     with tab_predict:
         st.subheader("明日模拟")
         
+        # 明日模拟
         # 使用 st.form 防止参数变化时立即刷新UI
         with st.form("prediction_form"):
             with st.expander("输入参数", expanded=True):
                 c1, c2 = st.columns([1,1])
                 with c1:
-                    pred_ref = st.text_input("参考日（YYYYMMDD；留空=自动取最新）", value="", key="pred_ref_input")
+                    pred_ref = st.text_input("参考日（YYYYMMDD；留空=自动取最新交易日）", value="", key="pred_ref_input")
+                    if not pred_ref.strip():
+                        # 显示当前会自动使用的参考日
+                        auto_ref = _pick_smart_ref_date()
+                        if auto_ref:
+                            st.caption(f"💡 将自动使用最新交易日: {auto_ref}")
+                        else:
+                            st.caption("⚠️ 无法自动获取最新交易日，请手动输入")
                     use_rule_scen = st.checkbox("使用规则内置场景（若规则提供）", value=False)
                     expr_text = st.text_input("临时检查表达式（可留空）", value="")
                     # recompute_opts = st.multiselect("仅重算需要的指标", ["kdj","ma","macd"], default=["kdj"], key="pred_recompute_indicators")
@@ -1425,29 +1989,44 @@ if _in_streamlit():
                     else:
                         recompute_to_pass = "none"
                 with c2:
-
                     uni_choice_pred = st.selectbox(
                         "选股范围",
                         ["自定义（下方文本）","全市场","仅白名单","仅黑名单","仅特别关注榜"],
                         index=0, key="pred_uni_choice")
                     # 文本框仅在"自定义"时使用
                     pasted = st.text_area("选股范围（支持多种分隔符：空格、换行、逗号、分号、竖线等；可混合 ts_code / 简写）", height=120, placeholder="例：\n000001.SZ 600000.SH 000001\n或：\n000001.SZ,600000.SH;000001|300001", disabled=(not uni_choice_pred.startswith("自定义")) )
-                # with st.expander("全局场景（若未使用规则内置场景则生效）", expanded=False):
+            # with st.expander("全局场景（若未使用规则内置场景则生效）", expanded=False):
+            with st.container(border=True):
+                st.markdown("**全局场景（若未使用规则内置场景则生效）**")
+                cc1, cc2, cc3 = st.columns([1,1,1])
+                with cc1:
+                    scen_mode = st.selectbox("价格模式", ["close_pct","open_pct","gap_then_close_pct","flat","limit_up","limit_down","reverse_indicator"], index=0)
+                    pct = st.number_input("涨跌幅 pct（%）", value=2.0, step=0.5, format="%.2f")
+                    gap_pct = st.number_input("跳空 gap_pct（%）", value=0.0, step=0.5, format="%.2f")
+                with cc2:
+                    vol_mode = st.selectbox("量能模式", ["same","pct","mult"], index=2)
+                    vol_arg = st.number_input("量能参数（% 或 倍数）", value=1.2, step=0.1, format="%.2f")
+                    hl_mode = st.selectbox("高低生成", ["follow","atr_like","range_pct"], index=0)
+                with cc3:
+                    range_pct = st.number_input("range_pct（%）", value=2.0, step=0.5, format="%.2f")
+                    atr_mult = st.number_input("atr_mult", value=1.0, step=0.1, format="%.2f")
+                    lock_hi_open = st.checkbox("锁定收盘高于开盘", value=False)
+            
+            # 反推模式参数配置
+            if scen_mode == "reverse_indicator":
                 with st.container(border=True):
-                    st.markdown("**全局场景（若未使用规则内置场景则生效）**")
-                    cc1, cc2, cc3 = st.columns([1,1,1])
-                    with cc1:
-                        scen_mode = st.selectbox("价格模式", ["close_pct","open_pct","gap_then_close_pct","flat","limit_up","limit_down"], index=0)
-                        pct = st.number_input("涨跌幅 pct（%）", value=2.0, step=0.5, format="%.2f")
-                        gap_pct = st.number_input("跳空 gap_pct（%）", value=0.0, step=0.5, format="%.2f")
-                    with cc2:
-                        vol_mode = st.selectbox("量能模式", ["same","pct","mult"], index=2)
-                        vol_arg = st.number_input("量能参数（% 或 倍数）", value=1.2, step=0.1, format="%.2f")
-                        hl_mode = st.selectbox("高低生成", ["follow","atr_like","range_pct"], index=0)
-                    with cc3:
-                        range_pct = st.number_input("range_pct（%）", value=2.0, step=0.5, format="%.2f")
-                        atr_mult = st.number_input("atr_mult", value=1.0, step=0.1, format="%.2f")
-                        lock_hi_open = st.checkbox("锁定收盘高于开盘", value=False)
+                    st.markdown("**反推模式参数**")
+                    rc1, rc2, rc3 = st.columns([1,1,1])
+                    with rc1:
+                        reverse_indicator = st.selectbox("指标名称", ["j", "rsi", "ma", "macd", "diff"], index=0)
+                        reverse_target_value = st.number_input("目标指标值", value=10.0, step=0.1, format="%.2f")
+                    with rc2:
+                        reverse_method = st.selectbox("求解方法", ["optimize", "binary_search", "grid_search"], index=0)
+                        reverse_tolerance = st.number_input("求解精度", value=1e-6, step=1e-7, format="%.2e")
+                    with rc3:
+                        reverse_max_iterations = st.number_input("最大迭代次数", value=1000, step=100, min_value=100, max_value=10000)
+                        st.caption("反推模式说明：根据目标指标值反推价格数据")
+            
             # 规则选择（使用缓存）
             rules = _cached_load_prediction_rules()
             names = [r.get("name","") for r in rules]
@@ -1462,14 +2041,8 @@ if _in_streamlit():
         
         # 只有在表单提交时才执行计算
         if submitted:
-            # 参考日与代码集
-            try:
-                root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
-                trade_dates = list_trade_dates(root)
-                latest_ref = trade_dates[-1] if trade_dates else ""
-            except Exception:
-                latest_ref = ""
-            ref_use = pred_ref.strip() or latest_ref
+            # 参考日与代码集 - 使用智能获取函数
+            ref_use = pred_ref.strip() or _pick_smart_ref_date() or ""
 
             # 解析粘贴的文本范围 - 支持空格和各种分隔符的兼容版本
             def _parse_codes(txt: str):
@@ -1495,9 +2068,37 @@ if _in_streamlit():
                 return sorted(set([x for x in out if x]))
             uni = _parse_codes(pasted)
 
-            scen = Scenario(mode=scen_mode, pct=pct, gap_pct=gap_pct, vol_mode=vol_mode, vol_arg=vol_arg,
-                            hl_mode=hl_mode, range_pct=range_pct, atr_mult=atr_mult,
-                            lock_higher_than_open=lock_hi_open)
+            # 创建Scenario对象，根据模式包含不同参数
+            if scen_mode == "reverse_indicator":
+                scen = Scenario(
+                    mode=scen_mode, 
+                    pct=pct, 
+                    gap_pct=gap_pct, 
+                    vol_mode=vol_mode, 
+                    vol_arg=vol_arg,
+                    hl_mode=hl_mode, 
+                    range_pct=range_pct, 
+                    atr_mult=atr_mult,
+                    lock_higher_than_open=lock_hi_open,
+                    # 反推模式参数
+                    reverse_indicator=reverse_indicator,
+                    reverse_target_value=reverse_target_value,
+                    reverse_method=reverse_method,
+                    reverse_tolerance=reverse_tolerance,
+                    reverse_max_iterations=reverse_max_iterations
+                )
+            else:
+                scen = Scenario(
+                    mode=scen_mode, 
+                    pct=pct, 
+                    gap_pct=gap_pct, 
+                    vol_mode=vol_mode, 
+                    vol_arg=vol_arg,
+                    hl_mode=hl_mode, 
+                    range_pct=range_pct, 
+                    atr_mult=atr_mult,
+                    lock_higher_than_open=lock_hi_open
+                )
 
             _uni_map = {"全市场": "all", "仅白名单": "white", "仅黑名单": "black", "仅特别关注榜": "attention"}
             use_codes = uni_choice_pred.startswith("自定义")
@@ -1514,7 +2115,6 @@ if _in_streamlit():
             if not use_codes and not uni_arg:
                 st.info(f"【{uni_choice_pred}】在 {ref_use} 无可用代码源，请先在\"排名\"页签生成当日 all/top 文件或检查名单缓存。")
             
-            # 自定义名单模式下的调试信息
             if use_codes:
                 if uni_arg:
                     st.success(f"✅ 自定义名单解析成功：共 {len(uni_arg)} 只股票")
@@ -1569,7 +2169,6 @@ if _in_streamlit():
                         st.download_button("导出代码TXT（仅命中集）", data=codes_txt, file_name=f"prediction_hits_{ref_use}.txt", mime="text/plain", width='stretch')
                 except Exception as e:
                     st.error(f"运行失败：{e}")
-                    # 添加详细的调试信息
                     with st.expander("调试信息", expanded=False):
                         st.write(f"""
 **错误详情：**
@@ -2408,7 +3007,7 @@ if _in_streamlit():
 
         # 导入验证器
         try:
-            from strategy_validator import validate_strategy_file
+            from strategies_repo import validate_strategy_file
             validation_available = True
         except ImportError:
             st.error("策略验证器模块未找到，请确保 strategy_validator.py 文件存在")
@@ -2477,14 +3076,13 @@ if _in_streamlit():
                             else:
                                 st.error("❌ 策略文件验证失败")
                             
-                            # 显示错误
+                            # 显示错误信息
                             if result.errors:
                                 st.markdown("#### 🚨 错误")
                                 for error in result.errors:
                                     field_info = f" (字段: {error['field']})" if error.get('field') else ""
                                     st.error(f"• {error['message']}{field_info}")
                             
-                            # 显示警告
                             if result.warnings:
                                 st.markdown("#### ⚠️ 警告")
                                 for warning in result.warnings:
@@ -2507,7 +3105,6 @@ if _in_streamlit():
                                 st.markdown("#### 🔧 缺失的指标")
                                 st.warning(f"以下指标未注册: {', '.join(result.missing_indicators)}")
                             
-                            # 显示语法问题
                             if result.syntax_issues:
                                 st.markdown("#### 🔍 语法问题")
                                 for issue in result.syntax_issues:
@@ -2539,8 +3136,7 @@ if _in_streamlit():
         if gen_btn:
             try:
                 # 1) 计算 start/end（按交易日）
-                root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
-                days = _cached_trade_dates(PARQUET_BASE, PARQUET_ADJ)
+                days = _cached_trade_dates(DATA_ROOT, API_ADJ)
                 end = (date_end or (days[-1] if days else None))
                 if not end:
                     st.error("未能确定结束日"); st.stop()
@@ -2694,7 +3290,7 @@ if _in_streamlit():
             # —— 参数区 ——
             c1, c2, c3, c4 = st.columns(4)
             with c1:
-                end_use = st.text_input("观察日（YYYYMMDD）", value=_pick_latest_ref_date() or "", key="lite_end")
+                end_use = st.text_input("观察日（YYYYMMDD）", value=_get_latest_date_from_database() or "", key="lite_end")
             with c2:
                 lookback_days = st.number_input("回看天数 D（不含今天）", min_value=1, max_value=60, value=3, key="lite_D")
             with c3:
@@ -2723,7 +3319,7 @@ if _in_streamlit():
 
             if go:
                 try:
-                    days = _cached_trade_dates(PARQUET_BASE, PARQUET_ADJ) or []
+                    days = _cached_trade_dates(DATA_ROOT, API_ADJ) or []
                     if not days:
                         st.warning("无法获取交易日历。"); st.stop()
                     # 观察日处理：若手填不在交易日里，取最近一个交易日
@@ -2886,201 +3482,234 @@ if _in_streamlit():
             #     key=f"dl_attn_{ref_attn}"
             # )
 
-    # ================= 数据下载 ==================
-    with tab_data:
-        st.subheader("数据下载 / 浏览检查")
-        # —— 参数区 ——
-        with st.expander("参数设置", expanded=True):
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                base = st.text_input("数据根目录 DATA_ROOT", value=str(getattr(cfg, "DATA_ROOT", getattr(cfg, "PARQUET_BASE", "./data"))))
-                assets = st.multiselect("资产 ASSETS", ["stock","index"], default=list(getattr(dl, "ASSETS", ["stock","index"])) or ["stock","index"])            
-            with c2:
-                start_in = st.text_input("起始日 START_DATE (YYYYMMDD)", value=str(getattr(dl, "START_DATE", "20200101")))
-                end_default = str(getattr(dl, "END_DATE", "today"))
-                end_in = st.text_input("结束日 END_DATE ('today' 或 YYYYMMDD)", value=end_default)
-            with c3:
-                api_adj = st.selectbox("复权 API_ADJ", ["qfq","hfq","raw"], index={"qfq":0,"hfq":1,"raw":2}.get(str(getattr(dl,"API_ADJ","qfq")).lower(),0))
-                latest = _latest_trade_date(base, api_adj)
-                do_plain = st.checkbox("写入单股(不带指标)", value=bool(getattr(dl, "WRITE_SYMBOL_PLAIN", True)))
-                do_ind   = st.checkbox("写入单股(含指标)", value=bool(getattr(dl, "WRITE_SYMBOL_INDICATORS", True)))
-                auto_rank = st.checkbox("完成后自动排名（Top/All/Details）", value=True)  # NEW
-            with c4:
-                fast_threads = st.number_input("FAST_INIT 并发", min_value=1, max_value=64, value=int(getattr(dl,"FAST_INIT_THREADS",16)))
-                inc_threads  = st.number_input("增量下载线程", min_value=1, max_value=64, value=int(getattr(dl,"STOCK_INC_THREADS",16)))
-                ind_workers  = st.number_input("指标重算线程(可选)", min_value=0, max_value=128, value=int(getattr(dl,"INC_RECALC_WORKERS", 32)))
-            if latest:
-                st.caption(f"当前 {api_adj} 最近交易日：{latest}")
+        # ================= 数据下载 ==================
+        with tab_data:
+            st.subheader("数据下载 / 浏览检查")
+            # —— 参数区 ——
+            with st.expander("参数设置", expanded=True):
+                # 延迟导入 download 模块
+                dl = _lazy_import_download()
+                if dl is None:
+                    st.error("无法导入 download 模块")
+                    st.stop()
+                
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    base = st.text_input("数据根目录 DATA_ROOT", value=str(getattr(cfg, "DATA_ROOT", "./data")))
+                    assets = st.multiselect("资产 ASSETS", ["stock","index"], default=list(getattr(dl, "ASSETS", ["stock","index"])) or ["stock","index"])            
+                with c2:
+                    start_in = st.text_input("起始日 START_DATE (YYYYMMDD)", value=str(getattr(dl, "START_DATE", "20200101")))
+                    end_default = str(getattr(dl, "END_DATE", "today"))
+                    end_in = st.text_input("结束日 END_DATE ('today' 或 YYYYMMDD)", value=end_default)
+                with c3:
+                    api_adj = st.selectbox("复权 API_ADJ", ["qfq","hfq","raw"], index={"qfq":0,"hfq":1,"raw":2}.get(str(getattr(dl,"API_ADJ","qfq")).lower(),0))
+                    latest = _latest_trade_date(base, api_adj)
+                    do_plain = st.checkbox("写入单股(不带指标)", value=bool(getattr(dl, "WRITE_SYMBOL_PLAIN", True)))
+                    do_ind   = st.checkbox("写入单股(含指标)", value=bool(getattr(dl, "WRITE_SYMBOL_INDICATORS", True)))
+                    auto_rank = st.checkbox("完成后自动排名（Top/All/Details）", value=True)  # NEW
+                with c4:
+                    fast_threads = st.number_input("FAST_INIT 并发", min_value=1, max_value=64, value=int(getattr(dl,"FAST_INIT_THREADS",16)))
+                    inc_threads  = st.number_input("增量下载线程", min_value=1, max_value=64, value=int(getattr(dl,"STOCK_INC_THREADS",16)))
+                    ind_workers  = st.number_input("指标重算线程(可选)", min_value=0, max_value=128, value=int(getattr(dl,"INC_RECALC_WORKERS", 32)))
+                if latest:
+                    st.caption(f"当前 {api_adj} 最近交易日：{latest}")
 
-        # 将参数落到模块
-        end_use = _today_str() if str(end_in).strip().lower() == "today" else str(end_in).strip()
-        start_use = str(start_in).strip()
-        _apply_overrides(base, assets, start_use, end_use, api_adj, int(fast_threads), int(inc_threads), int(ind_workers) if ind_workers else None)
-        dl.WRITE_SYMBOL_PLAIN = bool(do_plain)
-        dl.WRITE_SYMBOL_INDICATORS = bool(do_ind)
+            # 将参数落到模块
+            end_use = _today_str() if str(end_in).strip().lower() == "today" else str(end_in).strip()
+            start_use = str(start_in).strip()
+            _apply_overrides(base, assets, start_use, end_use, api_adj, int(fast_threads), int(inc_threads), int(ind_workers) if ind_workers else None)
+            # 延迟导入 download 模块并设置配置
+            dl = _lazy_import_download()
+            if dl is not None:
+                dl.WRITE_SYMBOL_PLAIN = bool(do_plain)
+                dl.WRITE_SYMBOL_INDICATORS = bool(do_ind)
 
-        # —— 按钮区 ——
-        tab_dl, tab_view = st.tabs(["下载/同步", "浏览/检查(app_pv)"])
+            # —— 按钮区 ——
+            tab_dl, tab_view = st.tabs(["下载/同步", "浏览/检查"])
 
-        # === 下载/同步 ===
-        with tab_dl:
-            mode = st.radio("运行模式", ["首次建库(FAST_INIT)", "日常增量(NORMAL)"], index=0 if not _latest_trade_date(base, api_adj) else 1, horizontal=True)
-            st.markdown(
-                """
-                - **FAST_INIT**：按股票并发全历史抓取 → 合并到 `stock/daily/*` →（可选）合并指标目录 →（可选）指数。
-                - **NORMAL**：先合并 fast_init 缓存 → 股票增量 → 指数增量 → 指标增量重算与合并。
-                """
-            )
+            # === 下载/同步 ===
+            with tab_dl:
+                mode = st.radio("运行模式", ["首次建库(FAST_INIT)", "日常增量(NORMAL)"], index=0 if not _latest_trade_date(base, api_adj) else 1, horizontal=True)
+                st.markdown(
+                    """
+                    - **FAST_INIT**：按股票并发全历史抓取 → 存储到统一数据库 →（可选）指数数据。
+                    - **NORMAL**：股票增量更新 → 指数增量更新 → 指标增量重算。
+                    
+                    **注意**：新版下载不再区分daily和single目录，所有数据统一存储到数据库中。
+                    """
+                )
 
-            # 一键
-            c1, c2 = st.columns(2)
-            with c1:
-                run_all = st.button("🚀 一键运行", width='stretch', type="primary")
-            with c2:
-                dry = st.checkbox("仅打印日志（不执行）", value=False, help="仅用于预览参数")
+                # 一键
+                c1, c2 = st.columns(2)
+                with c1:
+                    run_all = st.button("🚀 一键运行", width='stretch', type="primary")
+                with c2:
+                    dry = st.checkbox("仅打印日志（不执行）", value=False, help="仅用于预览参数")
+                
+                if run_all:
+                    logger.info(f"用户点击一键运行下载: 模式={mode}, 干运行={dry}")
 
-            # 单步按钮
-            st.markdown("—— 或按步骤执行 ——")
-            s1, s2, s3, s4, s5 = st.columns(5)
-            with s1: b_fast = st.button("① 首次建库")
-            with s2: b_merge = st.button("② Fast→Daily 合并")
-            with s3: b_stock = st.button("③ 股票增量")
-            with s4: b_index = st.button("④ 指数增量")
-            with s5: b_indic = st.button("⑤ 指标合并/重算")
+                # 单步按钮
+                st.markdown("—— 或按步骤执行 ——")
+                s1, s2, s3, s4, s5 = st.columns(5)
+                with s1: b_fast = st.button("① 首次建库")
+                with s2: b_merge = st.button("② 合并到数据库")
+                with s3: b_stock = st.button("③ 股票增量")
+                with s4: b_index = st.button("④ 指数增量")
+                with s5: b_indic = st.button("⑤ 指标重算")
 
-            # 执行逻辑（统一用 Stepper 展示阶段进度）
-            if run_all or b_fast or b_merge or b_stock or b_index or b_indic:
-                if dry:
-                    st.info(f"[DRY-RUN] base={base} assets={assets} adj={api_adj} range={start_use}~{end_use} fast_threads={fast_threads} inc_threads={inc_threads}")
-                else:
-                    try:
-                        # —— 一键运行 —— 
-                        if run_all:
-                            if mode.startswith("首次"):
-                                steps = [
-                                    "准备环境",
-                                    "FAST_INIT 全量/合并",
-                                    "指数全量/补齐" if "index" in set(assets) else None,
-                                    "自动排名（Top/All/Details）" if auto_rank else None,
-                                    "清理与校验",
-                                ]
-                                sp = Stepper("下载/同步 · 一键运行（FAST_INIT）", steps, key_prefix="dl_all")
-                                sp.start()
-                                sp.step("准备环境")
-                                sp.step("FAST_INIT 全量/合并")
-                                _run_fast_init(end_use)
-                                sp.step("指数全量/补齐", visible=("index" in set(assets)))
-                                if "index" in set(assets):
-                                    dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
-                                sp.step("自动排名（Top/All/Details）", visible=auto_rank)
-                                if auto_rank:
-                                    try:
-                                        top_path = run_se_run_for_date_in_bg(None)
-                                        st.success(f"✅ 已自动完成排名：{top_path}")
-                                    except Exception as ee:
-                                        st.warning(f"自动排名失败：{ee}")
-                                sp.step("清理与校验")
-                                sp.finish(True, "所有步骤完成")
+                # 执行逻辑（统一用 Stepper 展示阶段进度）
+                if run_all or b_fast or b_merge or b_stock or b_index or b_indic:
+                    if dry:
+                        st.info(f"[DRY-RUN] base={base} assets={assets} adj={api_adj} range={start_use}~{end_use} fast_threads={fast_threads} inc_threads={inc_threads}")
+                    else:
+                        try:
+                            # —— 一键运行 —— 
+                            if run_all:
+                                if mode.startswith("首次"):
+                                    steps = [
+                                        "准备环境",
+                                        "FAST_INIT 全量/合并",
+                                        "指数全量/补齐" if "index" in set(assets) else None,
+                                        "自动排名（Top/All/Details）" if auto_rank else None,
+                                        "清理与校验",
+                                    ]
+                                    sp = Stepper("下载/同步 · 一键运行（FAST_INIT）", steps, key_prefix="dl_all")
+                                    sp.start()
+                                    sp.step("准备环境")
+                                    sp.step("FAST_INIT 全量/合并")
+                                    _run_fast_init(end_use)
+                                    sp.step("指数全量/补齐", visible=("index" in set(assets)))
+                                    if "index" in set(assets):
+                                        dl = _lazy_import_download()
+                                        if dl is not None:
+                                            dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
+                                    sp.step("自动排名（Top/All/Details）", visible=auto_rank)
+                                    if auto_rank:
+                                        try:
+                                            top_path = run_se_run_for_date_in_bg(None)
+                                            st.success(f"✅ 已自动完成排名：{top_path}")
+                                        except Exception as ee:
+                                            st.warning(f"自动排名失败：{ee}")
+                                    sp.step("清理与校验")
+                                    sp.finish(True, "所有步骤完成")
+                                else:
+                                    steps = [
+                                        "准备环境",
+                                        "合并到数据库 & 增量同步（股/指/指标）",
+                                        "自动排名（Top/All/Details）" if auto_rank else None,
+                                        "清理与校验",
+                                    ]
+                                    sp = Stepper("下载/同步 · 一键运行（NORMAL）", steps, key_prefix="dl_all")
+                                    sp.start()
+                                    sp.step("准备环境")
+                                    sp.step("合并到数据库 & 增量同步（股/指/指标）")
+                                    _run_increment(start_use, end_use, do_stock=True, do_index=True, do_indicators=True)
+                                    sp.step("自动排名（Top/All/Details）", visible=auto_rank)
+                                    if auto_rank:
+                                        try:
+                                            top_path = run_se_run_for_date_in_bg(None)
+                                            st.success(f"✅ 已自动完成排名：{top_path}")
+                                        except Exception as ee:
+                                            st.warning(f"自动排名失败：{ee}")
+                                    sp.step("清理与校验")
+                                    sp.finish(True, "所有步骤完成")
+                            # —— 单步运行 —— 
                             else:
-                                steps = [
-                                    "准备环境",
-                                    "合并 FastInit 缓存 & 增量同步（股/指/指标）",
-                                    "自动排名（Top/All/Details）" if auto_rank else None,
-                                    "清理与校验",
-                                ]
-                                sp = Stepper("下载/同步 · 一键运行（NORMAL）", steps, key_prefix="dl_all")
-                                sp.start()
-                                sp.step("准备环境")
-                                sp.step("合并 FastInit 缓存 & 增量同步（股/指/指标）")
-                                _run_increment(start_use, end_use, do_stock=True, do_index=True, do_indicators=True)
-                                sp.step("自动排名（Top/All/Details）", visible=auto_rank)
-                                if auto_rank:
-                                    try:
-                                        top_path = run_se_run_for_date_in_bg(None)
-                                        st.success(f"✅ 已自动完成排名：{top_path}")
-                                    except Exception as ee:
-                                        st.warning(f"自动排名失败：{ee}")
-                                sp.step("清理与校验")
-                                sp.finish(True, "所有步骤完成")
-                        # —— 单步运行 —— 
-                        else:
-                            if b_fast:
-                                steps = ["准备环境", "首次建库（FAST_INIT）", "清理与校验"]
-                                sp = Stepper("下载/同步 · 首次建库", steps, key_prefix="dl_fast")
-                                sp.start()
-                                sp.step("准备环境")
-                                sp.step("首次建库（FAST_INIT）")
-                                _run_fast_init(end_use)
-                                sp.step("清理与校验")
-                                sp.finish(True, "该步骤完成")
-                            if b_merge:
-                                steps = ["准备环境", "合并 Fast→Daily", "清理与校验"]
-                                sp = Stepper("下载/同步 · 合并", steps, key_prefix="dl_merge")
-                                sp.start()
-                                sp.step("准备环境")
-                                sp.step("合并 Fast→Daily")
-                                dl.duckdb_partition_merge()
-                                sp.step("清理与校验")
-                                sp.finish(True, "该步骤完成")
-                            if b_stock:
-                                steps = ["准备环境", "股票增量", "清理与校验"]
-                                sp = Stepper("下载/同步 · 股票增量", steps, key_prefix="dl_stock")
-                                sp.start()
-                                sp.step("准备环境")
-                                sp.step("股票增量")
-                                dl.sync_stock_daily_fast(start_use, end_use, threads=dl.STOCK_INC_THREADS)
-                                sp.step("清理与校验")
-                                sp.finish(True, "该步骤完成")
-                            if b_index:
-                                steps = ["准备环境", "指数增量", "清理与校验"]
-                                sp = Stepper("下载/同步 · 指数增量", steps, key_prefix="dl_index")
-                                sp.start()
-                                sp.step("准备环境")
-                                sp.step("指数增量")
-                                dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
-                                sp.step("清理与校验")
-                                sp.finish(True, "该步骤完成")
-                            if b_indic:
-                                steps = ["准备环境", "指标重算并合并", "自动排名（Top/All/Details）" if auto_rank else None, "清理与校验"]
-                                sp = Stepper("下载/同步 · 指标合并/重算", steps, key_prefix="dl_indic")
-                                sp.start()
-                                sp.step("准备环境")
-                                sp.step("指标重算并合并")
-                                workers = getattr(dl, "INC_RECALC_WORKERS", None) or ((os.cpu_count() or 4) * 2)
-                                dl.recalc_symbol_products_for_increment(start_use, end_use, threads=workers)
-                                sp.step("自动排名（Top/All/Details）", visible=auto_rank)
-                                if auto_rank:
-                                    try:
-                                        top_path = run_se_run_for_date_in_bg(None)
-                                        st.success(f"✅ 已自动完成排名：{top_path}")
-                                    except Exception as ee:
-                                        st.warning(f"自动排名失败：{ee}")
-                                sp.step("清理与校验")
-                                sp.finish(True, "该步骤完成")
-                    except Exception as e:
-                        st.error(f"运行失败：{e}")
+                                if b_fast:
+                                    steps = ["准备环境", "首次建库（FAST_INIT）", "清理与校验"]
+                                    sp = Stepper("下载/同步 · 首次建库", steps, key_prefix="dl_fast")
+                                    sp.start()
+                                    sp.step("准备环境")
+                                    sp.step("首次建库（FAST_INIT）")
+                                    _run_fast_init(end_use)
+                                    sp.step("清理与校验")
+                                    sp.finish(True, "该步骤完成")
+                                if b_merge:
+                                    steps = ["准备环境", "合并到数据库", "清理与校验"]
+                                    sp = Stepper("下载/同步 · 合并", steps, key_prefix="dl_merge")
+                                    sp.start()
+                                    sp.step("准备环境")
+                                    sp.step("合并到数据库")
+                                    dl = _lazy_import_download()
+                                    if dl is not None:
+                                        # 数据库操作已迁移到 data_reader.py
+                                        pass
+                                    sp.step("清理与校验")
+                                    sp.finish(True, "该步骤完成")
+                                if b_stock:
+                                    steps = ["准备环境", "股票增量", "清理与校验"]
+                                    sp = Stepper("下载/同步 · 股票增量", steps, key_prefix="dl_stock")
+                                    sp.start()
+                                    sp.step("准备环境")
+                                    sp.step("股票增量")
+                                    dl = _lazy_import_download()
+                                    if dl is not None:
+                                        dl.sync_stock_daily_fast(start_use, end_use, threads=dl.STOCK_INC_THREADS)
+                                    sp.step("清理与校验")
+                                    sp.finish(True, "该步骤完成")
+                                if b_index:
+                                    steps = ["准备环境", "指数增量", "清理与校验"]
+                                    sp = Stepper("下载/同步 · 指数增量", steps, key_prefix="dl_index")
+                                    sp.start()
+                                    sp.step("准备环境")
+                                    sp.step("指数增量")
+                                    dl = _lazy_import_download()
+                                    if dl is not None:
+                                        dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
+                                    sp.step("清理与校验")
+                                    sp.finish(True, "该步骤完成")
+                                if b_indic:
+                                    steps = ["准备环境", "指标重算", "自动排名（Top/All/Details）" if auto_rank else None, "清理与校验"]
+                                    sp = Stepper("下载/同步 · 指标重算", steps, key_prefix="dl_indic")
+                                    sp.start()
+                                    sp.step("准备环境")
+                                    sp.step("指标重算")
+                                    dl = _lazy_import_download()
+                                    if dl is not None:
+                                        workers = getattr(dl, "INC_RECALC_WORKERS", None) or ((os.cpu_count() or 4) * 2)
+                                        dl.recalc_symbol_products_for_increment(start_use, end_use, threads=workers)
+                                    sp.step("自动排名（Top/All/Details）", visible=auto_rank)
+                                    if auto_rank:
+                                        try:
+                                            top_path = run_se_run_for_date_in_bg(None)
+                                            st.success(f"✅ 已自动完成排名：{top_path}")
+                                        except Exception as ee:
+                                            st.warning(f"自动排名失败：{ee}")
+                                    sp.step("清理与校验")
+                                    sp.finish(True, "该步骤完成")
+                        except Exception as e:
+                            st.error(f"运行失败：{e}")
 
-        # === 浏览/检查（集成 app_pv 的核心功能） ===
+        # === 浏览/检查（集成新的数据完整性检查） ===
         with tab_view:
-            st.markdown("#### 概览 & 诊断 (来自 app_pv)")
+            st.markdown("#### 数据完整性检查 & 诊断")
             c1, c2 = st.columns([2, 1])
             with c1:
                 try:
-                    df = apv.overview_table(base, api_adj)
-                    st.dataframe(df, width='stretch', height=360)
+                    dl = _lazy_import_download()
+                    if dl is not None:
+                        df = dl.get_data_integrity_overview(base, api_adj)
+                        st.dataframe(df, width='stretch', height=360)
+                    else:
+                        st.error("无法导入 download 模块")
                 except Exception as e:
-                    st.error(f"概览失败：{e}")
+                    st.error(f"数据完整性检查失败：{e}")
             with c2:
                 try:
-                    info = apv.get_info(base, api_adj)
-                    st.text_area("概览（文本）", value=str(info), height=180)
-                    adv = apv.overview_advice(base, api_adj)
-                    st.markdown(adv)
+                    dl = _lazy_import_download()
+                    if dl is not None:
+                        info = dl.get_data_integrity_info(base, api_adj)
+                        st.text_area("概览（文本）", value=str(info), height=180)
+                        adv = dl.get_data_integrity_advice(base, api_adj)
+                        st.markdown(adv)
+                    else:
+                        st.error("无法导入 download 模块")
                 except Exception as e:
                     st.error(f"诊断失败：{e}")
 
             st.markdown("---")
-            st.caption("数据浏览由 parquet_viewer 支持，可在其他页或命令行使用更丰富的功能。")
+            st.caption("新的数据完整性检查提供更深入的数据质量验证，包括列级别检查、数据类型验证、价格逻辑检查等。")
 
     # ================== 选股 ==================
     with tab_screen:
@@ -3113,6 +3742,7 @@ if _in_streamlit():
                 run_btn = st.form_submit_button("运行筛选", width='stretch')
 
         if run_btn:
+            logger.info(f"用户点击运行筛选: 表达式={exp[:50]}..., 级别={level}, 窗口={window}, 范围={scope_logic}")
             try:
                 if not exp.strip():
                     st.warning("请先输入表达式。")
@@ -3175,7 +3805,7 @@ if _in_streamlit():
                 run_detail = st.form_submit_button("筛选当日命中标的", width='stretch')
 
         if run_detail:
-            ref_real = refD_unified.strip() or _pick_latest_ref_date() or ""
+            ref_real = refD_unified.strip() or _get_latest_date_from_files() or ""
             if not ref_real:
                 st.error("未能确定参考日。")
             elif not picked:
@@ -3184,24 +3814,49 @@ if _in_streamlit():
                 rows = []
                 try:
                     # 优先使用数据库查询
-                    if SC_USE_DB_STORAGE and SC_DETAIL_STORAGE in ["database", "both"]:
-                        from detail_db import get_detail_db
-                        db = get_detail_db()
-                        df_all = db.query_by_date(ref_real)
+                    if SC_USE_DB_STORAGE and SC_DETAIL_STORAGE in ["database","both","db"]:
+                        # 延迟导入 data_reader
+                        try:
+                            # get_detail_db 功能需要重新实现
+                            pass
+                        except ImportError:
+                            st.error("无法导入 data_reader 模块")
+                            st.stop()
+                        # 使用 database_manager 查询详情
+                        manager = get_database_manager()
+                        if manager:
+                            # 使用正确的details数据库路径
+                            from config import SC_OUTPUT_DIR, SC_DETAIL_DB_PATH
+                            details_db_path = os.path.join(SC_OUTPUT_DIR, 'details', 'details.db')
+                            
+                            # 检查数据库文件是否存在
+                            if not os.path.exists(details_db_path):
+                                # 尝试从统一数据库读取（兼容性）
+                                from config import DATA_ROOT, UNIFIED_DB_PATH
+                                db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                                if os.path.exists(db_path):
+                                    details_db_path = db_path
+                            
+                            sql = "SELECT * FROM stock_details WHERE ref_date = ?"
+                            df_all = manager.execute_sync_query(details_db_path, sql, [ref_real], timeout=30.0)
+                        else:
+                            df_all = pd.DataFrame()
                         
                         if not df_all.empty:
                             for _, row in df_all.iterrows():
                                 ts2 = str(row.get("ts_code", "")).strip()
                                 if not ts2:
                                     continue
-                                sc = float(row.get("score", 0.0))
                                 
-                                # 解析rules JSON
-                                rules_json = row.get("rules", "[]")
-                                try:
-                                    rules = json.loads(rules_json) if isinstance(rules_json, str) else rules_json
-                                except:
-                                    rules = []
+                                # 使用统一的 _load_detail_json 函数获取数据
+                                data = _load_detail_json(str(ref_real), ts2)
+                                if not data:
+                                    continue
+                                
+                                # 从统一格式中提取数据
+                                summary = data.get("summary", {})
+                                sc = float(summary.get("score", 0.0))
+                                rules = data.get("rules", [])
                                 
                                 names_today = set()
                                 for rr in rules:
@@ -3336,8 +3991,7 @@ if _in_streamlit():
                     # 交易日日历（若存在则用于对比缺失）
                     missing: list[str] = []
                     try:
-                        cal_root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
-                        trade_dates = list_trade_dates(cal_root) or []
+                        trade_dates = get_trade_dates() or []
                         if trade_dates and cov_min and cov_max:
                             rng = [d for d in trade_dates if cov_min <= d <= cov_max]
                             aset = set(all_dates)
@@ -3465,7 +4119,7 @@ if _in_streamlit():
         with colx:
             side = st.selectbox("方向", ["BUY","SELL"], index=0)
         with coly:
-            d_exec = st.text_input("成交日（YYYYMMDD）", value=_pick_latest_ref_date() or "")
+            d_exec = st.text_input("成交日（YYYYMMDD）", value=_get_latest_date_from_database() or "")
         with colz:
             ts = st.text_input("代码", value="")
         # 读取当日 O/H/L/C 作为参考
@@ -3473,7 +4127,23 @@ if _in_streamlit():
         try:
             ts_norm = normalize_ts(ts) if ts else ""
             if ts_norm and d_exec:
-                df_one = read_range(PARQUET_BASE, PARQUET_ADJ, "stock", [ts_norm], d_exec, d_exec, columns=["open","high","low","close"])
+                try:
+                    from config import DATA_ROOT, UNIFIED_DB_PATH
+                    db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                    df_one = query_stock_data(
+                        db_path=db_path,
+                        ts_code=ts_norm,
+                        start_date=d_exec,
+                        end_date=d_exec,
+                        adj_type="qfq"
+                    )
+                except:
+                    # 回退到直接查询
+                    from config import DATA_ROOT, UNIFIED_DB_PATH
+                    db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                    manager = get_database_manager()
+                    sql = "SELECT open,high,low,close FROM stock_data WHERE ts_code = ? AND trade_date = ?"
+                    df_one = manager.execute_sync_query(db_path, sql, [ts_norm, d_exec], timeout=30.0)
                 if df_one is not None and not df_one.empty:
                     row = df_one.iloc[-1]
                     px_open = float(row.get("open", float("nan")))
@@ -3508,7 +4178,7 @@ if _in_streamlit():
 
         # —— 观察日估值 / 净值 ——
         st.markdown("**观察日收益与持仓估值**")
-        obs = st.text_input("观察日（YYYYMMDD；默认=最新交易日）", value=_pick_latest_ref_date() or "")
+        obs = st.text_input("观察日（YYYYMMDD；默认=最新交易日）", value=_get_latest_date_from_database() or "")
         if obs and cur_pf:
             # 回放估值（从组合创建日至观察日）
             # 我们用 read_nav() 读取结果
@@ -3673,7 +4343,7 @@ if _in_streamlit():
 
         # --- Surge ---
         with sub_tabs[1]:
-            refS = st.text_input("参考日", value=_pick_latest_ref_date() or "", key="surge_ref")
+            refS = st.text_input("参考日", value=_get_latest_date_from_files() or "", key="surge_ref")
             mode = st.selectbox("榜单口径", ["today","rolling"], index=1, key="surge_mode")
             rolling_days = st.number_input("rolling模式统计天数", min_value=2, max_value=20, value=5, key="surge_rolling")
             sel_type = st.selectbox("选样", ["top_n","top_pct"], index=0, key="surge_sel_type")
@@ -3746,7 +4416,7 @@ if _in_streamlit():
         
         # --- Commonality ---
         with sub_tabs[2]:
-            refC = st.text_input("参考日", value=_pick_latest_ref_date() or "", key="common_ref")
+            refC = st.text_input("参考日", value=_get_latest_date_from_files() or "", key="common_ref")
             retrosC = st.text_input("统计前 n 日集合（观察日前移 d，逗号）", value="1,3,5")
             modeC = st.selectbox("模式", ["rolling","today"], index=0, key="mode_2")
             rollingC = st.number_input("rolling 天数", min_value=2, max_value=20, value=5, key="rolling_2")

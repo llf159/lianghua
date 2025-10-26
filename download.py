@@ -1,1969 +1,1408 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+"""
+下载模块 - 基于database_manager的重构版本
+弃用data_reader，只使用database_manager进行数据管理
+
+新的下载流程：
+1. 从database_manager获取数据库状态
+2. 得到需要下载的数据参数传给tushare接口
+3. 按照原样下载原始数据到内存数据库
+4. 计算好指标，增量计算指标要warmup
+5. 按照database_manager的规范打包数据并由database_manager统一写入
+"""
+
 from __future__ import annotations
+
 import os
 import sys
 import time
 import json
-import glob
-from pathlib import Path
-import random
 import logging
-import pyarrow.dataset as ds
-import pyarrow as pa
-import datetime as dt
-from typing import List, Optional, Callable, Dict, Tuple
-from logging.handlers import TimedRotatingFileHandler
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from pathlib import Path
+from typing import List, Optional, Dict, Any, Tuple, Union, Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 import pandas as pd
-import duckdb
-from tqdm import tqdm
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
+from tqdm import tqdm
+
+# 忽略tushare的FutureWarning
 warnings.filterwarnings(
     "ignore",
     category=FutureWarning,
     module="tushare.pro.data_pro",
     message=".*fillna.*method.*deprecated.*"
 )
+
+# 导入配置和工具
 from config import *
-from tdx_compat import evaluate as tdx_eval
-import indicators as ind
-
-import threading
-# fcntl 在Windows上不可用，使用其他方式实现文件锁
-try:
-    import fcntl  # 用于文件锁
-except ImportError:
-    fcntl = None  # Windows系统
-_TLS = threading.local()
+from log_system import get_logger
+from database_manager import get_database_manager, DatabaseManager
+from indicators import compute, warmup_for, REGISTRY, get_all_indicator_names, outputs_for
 from utils import normalize_trade_date, normalize_ts
+from tdx_compat import evaluate as tdx_eval
 
-_pro = None  # 真正的客户端放这里
+# 初始化日志
+logger = get_logger(__name__)
 
-def _require_pro():
-    """只有在确实需要 Pro 接口时才初始化；否则不触发任何 token 读取。
-    优先使用 config.TOKEN，其次回退到环境变量 TUSHARE_TOKEN。
-    """
-    global _pro
-    if _pro is None:
-        # TOKEN 来自 `from config import *`
-        token = str(globals().get("TOKEN", "")).strip() or os.getenv("TUSHARE_TOKEN", "").strip()
-        if not token or token.startswith("在这里"):
-            # 明确报错，指导两种正确的配置方式
-            raise RuntimeError("Tushare Pro 未配置：请在 config.TOKEN 或环境变量 TUSHARE_TOKEN 中设置有效 token。")
-        # 再次设置一次 token 以保证 pro_api 使用到正确的 token（幂等）
-        ts.set_token(token)
-        _pro = ts.pro_api()
-    return _pro
-
-
-# 保持原有 `pro.xxx` 的调用习惯：只有访问属性时才会初始化
-class _LazyPro:
-    def __getattr__(self, name):
-        return getattr(_require_pro(), name)
-
-pro = _LazyPro()
-
-# --- 不走系统代理：仅对本进程生效 ---
-for k in ("http_proxy","https_proxy","all_proxy","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY"):
-    os.environ.pop(k, None)
-
-# 想让哪些域名/本地地址强制直连（可按需增删）
-os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost,api.tushare.pro,github.com,raw.githubusercontent.com,pypi.org,files.pythonhosted.org,huggingface.co,cdn-lfs.huggingface.co")
-os.environ.setdefault("no_proxy", os.environ["NO_PROXY"])
-
-EPS = 1e-12
-# ------------- 基本检查 -------------
+# 导入tushare
 try:
     import tushare as ts
 except ImportError:
-    sys.stderr.write("未安装 tushare: pip install tushare\n")
+    logger.error("未安装 tushare: pip install tushare")
     sys.exit(1)
 
-# Token 设置已移至 _require_pro() 函数中，避免重复设置
+# ================= 配置和常量 =================
 
-os.makedirs(DATA_ROOT, exist_ok=True)
+@dataclass
+class DownloadConfig:
+    """下载配置"""
+    start_date: str
+    end_date: str
+    adj_type: str = "qfq"
+    asset_type: str = "stock"  # "stock" or "index"
+    threads: int = 8
+    enable_warmup: bool = True
+    retry_times: int = 3
+    batch_size: int = 100
+    rate_limit_calls_per_min: int = 500
+    safe_calls_per_min: int = 490
+    enable_adaptive_rate_limit: bool = True
+    rate_limit_burst_capacity: int = 10
+    warmup_batch_size: int = 50  # warmup查询的批处理大小
 
-# ========== 限频与重试 ==========
-_CALL_TS: List[float] = []
-_CALL_TS_LOCK = threading.Lock()
-
-
-# === 全局日志策略 ======================================================
-# 1.  INFO 及以上 → fast_init.log(每天轮换，保留 7 份)
-# 2.  WARNING 及以上 → 终端 stdout(与 tqdm 共存)
-# =======================================================================
-
-# root = logging.getLogger()
-# root.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.DEBUG))
-root = logging.getLogger()
-# 始终开 DEBUG，让各 Handler 决定往哪儿输出；控制台仍用 LOG_LEVEL 过滤
-root.setLevel(logging.INFO)
-
-
-# 文件 Handler(轮换)
-LOG_DIR = os.path.join(".", "log")
-log_file_path = os.path.join(LOG_DIR, "fast_init.log")
-os.makedirs(LOG_DIR, exist_ok=True)
-file_hdl = TimedRotatingFileHandler(
-    log_file_path,
-    when="midnight",
-    backupCount=7,
-    encoding="utf-8"
-)
-file_fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
-file_hdl.setFormatter(file_fmt)
-file_hdl.setLevel(logging.INFO)
-root.addHandler(file_hdl)
-
-# 终端 Handler
-console_hdl = logging.StreamHandler(sys.stdout)
-console_hdl.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))  # ← 控制台仍按配置
-console_hdl.setFormatter(file_fmt)
-root.addHandler(console_hdl)
-log_dir = os.path.join(".", "log")
-os.makedirs(log_dir, exist_ok=True)
-log_path = os.path.join(log_dir, "download.log")
-
-# =======================================================================
-
-def _parse_indicators(arg: str):
-    if not arg:
-        logging.debug('[BRANCH] def _parse_indicators | IF not arg -> taken')
-        return []
-    if arg.lower().strip() == "all":
-        logging.debug('[BRANCH] def _parse_indicators | IF arg.lower().strip() == "all" -> taken')
-        return list(ind.REGISTRY.keys())
-    return [x.strip() for x in arg.split(",") if x.strip()]
-
-
-def _decide_symbol_adj_for_fast_init() -> str:
-    # Prefer per-thread override set by _with_api_adj; fallback to global API_ADJ
-    try:
-        aj = getattr(_TLS, "adj_override", None)
-        if aj:
-            return aj
-    except Exception:
-        pass
-    return (API_ADJ).lower()
-
-
-def _maybe_compact(dirpath: str):
-    mode = str(DUCKDB_ENABLE_COMPACT_AFTER).lower()
-    if mode in ("false", "0", "off", "none"):
-        logging.debug('[BRANCH] def _maybe_compact | IF mode in ("false", "0", "off", "none") -> taken')
-        return
-    # "if_needed" 的判定：仅当某些日期的 part 数超过阈值才做
-    if mode in ("if_needed", "auto"):
-        # 粗略检查：命中任何一个 trade_date 目录超过阈值就触发
-        logging.debug('[BRANCH] def _maybe_compact | IF mode in ("if_needed", "auto") -> taken')
-        over = False
-        for d in os.listdir(dirpath):
-            p = os.path.join(dirpath, d)
-            if d.startswith("trade_date=") and os.path.isdir(p):
-                logging.debug('[BRANCH] def _maybe_compact | IF d.startswith("trade_date=") and os.path.isdir(p) -> taken')
-                cnt = sum(1 for x in os.listdir(p) if x.endswith(".parquet"))
-                if cnt > COMPACT_MAX_FILES_PER_DATE:
-                    logging.debug('[BRANCH] def _maybe_compact | IF cnt > COMPACT_MAX_FILES_PER_DATE -> taken')
-                    over = True
-                    break
-        if not over:
-            logging.debug('[BRANCH] def _maybe_compact | IF not over -> taken')
-            return
-    # 其余视作强制压实
-    compact_daily_partitions(base_dir=dirpath)
-
-
-def _update_fast_init_cache(ts_code: str, df: pd.DataFrame, adj: str):
-    """
-    将 df 合并进 fast_init_symbol/<adj>/<ts_code>.parquet，按 trade_date 去重。
-    adj: 'raw' | 'qfq' | 'hfq' 的语义对应目录 raw/qfq/hfq
-    """
-    # adj -> 子目录名
-    sub = {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}.get(adj, "raw")
-    symbol_dir = os.path.join(FAST_INIT_STOCK_DIR, sub)
-    os.makedirs(symbol_dir, exist_ok=True)
-    fpath = os.path.join(symbol_dir, f"{ts_code}.parquet")
-
-    df2 = df.copy()
-    df2 = normalize_trade_date(df2)
-    df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-
-    if os.path.exists(fpath):
-        logging.debug('[BRANCH] def _update_fast_init_cache | IF os.path.exists(fpath) -> taken')
-        try:
-            old = pd.read_parquet(fpath)
-            old = normalize_trade_date(old)
-            both = pd.concat([old, df2], ignore_index=True)
-            both = both.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-            both.to_parquet(fpath, index=False)
-            return
-        except Exception as e:
-            logging.warning("[FAST_CACHE] 读取旧缓存失败 %s -> 覆盖写新: %s", ts_code, e)
-    df2.to_parquet(fpath, index=False)
-
-
-def _WRITE_SYMBOL_INDICATORS(ts_code: str, df: pd.DataFrame, end_date: str, prewarmed: bool = False):
-    """
-    把该 ts_code 的 DataFrame 计算指标后写入 by_symbol 成品(带 warm-up 增量)。
-    要求 df 至少包含: trade_date, open, high, low, close, vol[, amount, pre_close]
-    """
-    if not (WRITE_SYMBOL_PLAIN or WRITE_SYMBOL_INDICATORS):
-        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF not (WRITE_SYMBOL_PLAIN or WRITE_SYMBOL_INDICATORS) -> taken')
-        return
-        # 1) 选择输出目录（按你要求的命名）
-    adj = _decide_symbol_adj_for_fast_init()  # 'raw' | 'qfq' | 'hfq'
-    base_dir = DATA_ROOT
-
-    single_plain_dir = os.path.join(base_dir, "stock", "single", f"single_{adj}")
-    single_ind_dir   = os.path.join(base_dir, "stock", "single", f"single_{adj}_indicators")
-    single_plain_dir_csv = os.path.join(base_dir, "stock", "single", "csv", adj)
-    single_ind_dir_csv   = os.path.join(base_dir, "stock", "single", "csv", f"{adj}_indicators")
-    if WRITE_SYMBOL_PLAIN:
-        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF WRITE_SYMBOL_PLAIN -> taken')
-        os.makedirs(single_plain_dir, exist_ok=True)
-        os.makedirs(single_plain_dir_csv, exist_ok=True)
-    if WRITE_SYMBOL_INDICATORS:
-        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF WRITE_SYMBOL_INDICATORS -> taken')
-        os.makedirs(single_ind_dir, exist_ok=True)
-        os.makedirs(single_ind_dir_csv, exist_ok=True)
-
-    plain_parquet = os.path.join(single_plain_dir, f"{ts_code}.parquet")
-    plain_csv     = os.path.join(single_plain_dir_csv, f"{ts_code}.csv")
-    ind_out_path_parquet = os.path.join(single_ind_dir, f"{ts_code}.parquet")
-    ind_out_path_csv     = os.path.join(single_ind_dir_csv, f"{ts_code}.csv")
-
+@dataclass
+class DownloadStats:
+    """下载统计"""
+    total_stocks: int = 0
+    success_count: int = 0
+    skip_count: int = 0
+    error_count: int = 0
+    empty_count: int = 0
+    failed_stocks: List[Tuple[str, str]] = None  # (ts_code, error_msg)
     
-    # 2) 规范、排序、去重
-    df2 = df.copy()
-    if "trade_date" not in df2.columns:
-        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "trade_date" not in df2.columns -> taken')
-        raise ValueError("df 缺少 trade_date 列")
+    def __post_init__(self):
+        if self.failed_stocks is None:
+            self.failed_stocks = []
+
+# ================= 限频器 =================
+
+class RateLimiter:
+    """高级限频器，支持多种限频策略"""
     
-    df2 = df2.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-    df2 = normalize_trade_date(df2)
-    # —— 统一数值化，确保可计算
-    for c in ["open","high","low","close","vol","amount"]:
-        if c in df2.columns:
-            df2[c] = pd.to_numeric(df2[c], errors="coerce")
-
-    price_cols = ["open", "high", "low", "close"]
-    # 只保留常用基础行情列（存在即取），作为不带指标的成品
-    base_cols = ["ts_code","trade_date","open","high","low","close","vol","amount"]
-    cols = [c for c in base_cols if c in df2.columns]
-    df_plain = df2[cols].copy() if cols else df2.copy()
-
-    # ---------- plain：不带指标 ----------
-    old_plain = None
-    try:
-        if os.path.exists(plain_parquet):
-            old_plain = pd.read_parquet(plain_parquet)
-        elif os.path.exists(plain_csv):
-            old_plain = pd.read_csv(plain_csv, dtype=str)            
-            for c in ["open","high","low","close","vol","amount"]:
-                if c in old_plain.columns:
-                    old_plain[c] = pd.to_numeric(old_plain[c], errors="coerce")
-    except Exception as e:
-        logging.warning("[PRODUCT][%s] 读取旧 plain 失败，按覆盖写: %s", ts_code, e)
-        old_plain = None
-
-    merged_plain = df_plain
-    if isinstance(old_plain, pd.DataFrame) and not old_plain.empty:
-        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF isinstance(old_plain, pd.DataFrame) and not old_plain.empty -> taken')
-        old_plain = normalize_trade_date(old_plain)
-        merged_plain = pd.concat([old_plain, df_plain], ignore_index=True)
-        merged_plain = merged_plain.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-
-    for col in ["open","high","low","close","vol","amount"]:
-        if col in merged_plain.columns and pd.api.types.is_numeric_dtype(merged_plain[col]):
-            merged_plain[col] = merged_plain[col].round(2)
-
-    if "parquet" in SYMBOL_PRODUCT_FORMATS.get("plain", []):
-        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "parquet" in SYMBOL_PRODUCT_FORMATS.get("plain", []) -> taken')
-        merged_plain.to_parquet(plain_parquet, index=False, engine=PARQUET_ENGINE)
-    if "csv" in SYMBOL_PRODUCT_FORMATS.get("plain", []):
-        logging.debug('[BRANCH] def _WRITE_SYMBOL_INDICATORS | IF "csv" in SYMBOL_PRODUCT_FORMATS.get("plain", []) -> taken')
-        merged_plain.to_csv(plain_csv, index=False, encoding="utf-8-sig")
-
-    if WRITE_SYMBOL_INDICATORS:
-        logging.debug("[PRODUCT][%s] 写带指标成品… prewarmed=%s", ts_code, prewarmed)
-        ind_out_path_parquet = os.path.join(single_ind_dir, f"{ts_code}.parquet")
-        ind_out_path_csv     = os.path.join(single_ind_dir_csv, f"{ts_code}.csv")
-
-        old_ind = None
-        old_last = None
-        if os.path.exists(ind_out_path_parquet) or os.path.exists(ind_out_path_csv):
-            try:
-                old_ind = pd.read_parquet(ind_out_path_parquet) if os.path.exists(ind_out_path_parquet) \
-                          else pd.read_csv(ind_out_path_csv, dtype=str)
-                if isinstance(old_ind, pd.DataFrame) and not old_ind.empty:
-                    old_ind = normalize_trade_date(old_ind)
-                    old_last = pd.to_datetime(old_ind["trade_date"].astype(str), errors="coerce").max()
-            except Exception as e:
-                logging.warning("[PRODUCT][%s] 读取旧(ind)失败：%s -> 本次按无旧处理", ts_code, e)
-                old_ind, old_last = None, None
-
-        # 无增量直接跳过
-        new_last = pd.to_datetime(df2["trade_date"].astype(str), errors="coerce").max()
-        if old_last is not None and (new_last is not None) and new_last <= old_last:
-            logging.debug("[PRODUCT][%s] 无新增 trade_date（old_last=%s, new_last=%s），跳过指标重算。", 
-                         ts_code, old_last.strftime("%Y%m%d"), new_last.strftime("%Y%m%d"))
-            return
-
-        # 计算指标：两条路径
-        names = (SYMBOL_PRODUCT_INDICATORS or "all")
-        names = list(ind.REGISTRY.keys()) if str(names).lower() == "all" else [x.strip() for x in str(names).split(",") if x.strip()]
-        if prewarmed:
-            df2 = normalize_trade_date(df2).sort_values("trade_date")
-            start_dt = df2["trade_date"].min()
-
-            # 选一段旧成品(或旧 plain)作 warm-up：按指标元数据 + 配置兜底
-            try:
-                from indicators import warmup_for as _ind_warmup_for
-                warm_ind = int(_ind_warmup_for(names))
-            except Exception:
-                warm_ind = 0
-            need_tail = max(int(SYMBOL_PRODUCT_WARMUP_DAYS), int(warm_ind))
-            tail_old = None
-            if isinstance(old_ind, pd.DataFrame) and not old_ind.empty:
-                old_ind = normalize_trade_date(old_ind)
-                tail_old = old_ind[old_ind["trade_date"] < start_dt].tail(need_tail)
-            # 若没有旧 ind，就用 old_plain 的尾巴（如你前面已读到 old_plain）
-            if (tail_old is None or tail_old.empty) and isinstance(old_plain, pd.DataFrame) and not old_plain.empty:
-                old_plain = normalize_trade_date(old_plain)
-                tail_old = old_plain[old_plain["trade_date"] < start_dt].tail(need_tail)
-
-            # 参与计算的输入：旧尾巴 + 新增窗口
-            if tail_old is not None and not tail_old.empty:
-                calc_in = pd.concat([tail_old, df2], ignore_index=True)
-            else:
-                calc_in = df2.copy()
-
-            # 一起算 → 再裁掉 warm-up
-            calc_all = ind.compute(calc_in, names)
-            # round 指标列
-            decs = ind.outputs_for(names)
-            for col, n in decs.items():
-                if col in calc_all.columns and pd.api.types.is_numeric_dtype(calc_all[col]):
-                    calc_all[col] = calc_all[col].round(n)
-            for col in ["open","high","low","close","vol","amount"]:
-                if col in calc_all.columns and pd.api.types.is_numeric_dtype(calc_all[col]):
-                    calc_all[col] = calc_all[col].round(2)
-
-            # 仅保留真正新增区间
-            calc_df = calc_all[calc_all["trade_date"] >= start_dt].copy()
-
-            # 和老段拼起来写出
-            if isinstance(old_ind, pd.DataFrame) and not old_ind.empty:
-                keep_old = old_ind[old_ind["trade_date"] < start_dt].copy()
-                warm_df  = pd.concat([keep_old, calc_df], ignore_index=True)
-            else:
-                warm_df = calc_df
-        else:
-            # 原有 warm-up 逻辑保持不变（向后取窗口再整段计算）
-            warm_df = df2.copy()
-            try:
-                if isinstance(old_ind, pd.DataFrame) and not old_ind.empty:
-                    old_td = pd.to_datetime(old_ind["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
-                    last   = old_td.max()
-                    warmup_start = (last - pd.Timedelta(days=SYMBOL_PRODUCT_WARMUP_DAYS))
-                    try:
-                        warm_ind = int(ind.warmup_for(names))
-                    except Exception:
-                        warm_ind = 0
-                    warm_days = max(int(SYMBOL_PRODUCT_WARMUP_DAYS), warm_ind)
-                    warmup_start = (last - pd.Timedelta(days=warm_days))
-                    keep_old = old_ind.loc[old_td < warmup_start].copy()
-                    keep_old = normalize_trade_date(keep_old)
-                    new_part = df2.loc[pd.to_datetime(df2["trade_date"].astype(str), format="%Y%m%d", errors="coerce") >= warmup_start].copy()
-                    new_part = normalize_trade_date(new_part)
-                    warm_df  = pd.concat([keep_old, new_part], ignore_index=True)
-            except Exception as e:
-                logging.warning("[PRODUCT][%s] warm-up 读取旧失败，按全量重算：%s", ts_code, e)
-            # 计算
-            warm_df = ind.compute(warm_df, names)
-            decs = ind.outputs_for(names)
-            for col, n in decs.items():
-                if col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]):
-                    warm_df[col] = warm_df[col].round(n)
-            for col in price_cols:
-                if col in warm_df.columns and pd.api.types.is_numeric_dtype(warm_df[col]):
-                    warm_df[col] = warm_df[col].round(2)
-
-        warm_df = normalize_trade_date(warm_df)
-        warm_df = warm_df.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-
-        if "parquet" in SYMBOL_PRODUCT_FORMATS.get("ind", []):
-            warm_df.to_parquet(ind_out_path_parquet, index=False, engine=PARQUET_ENGINE)
-        if "csv" in SYMBOL_PRODUCT_FORMATS.get("ind", []):
-            warm_df.to_csv(ind_out_path_csv, index=False, encoding="utf-8-sig")
-        logging.debug("[PRODUCT][%s] 成品已写出 plain_dir=%s ind_dir=%s", ts_code, single_plain_dir, single_ind_dir)
-
-
-def _rate_limit():
-    now = time.time()
-    while True:
-        with _CALL_TS_LOCK:
-            # 清理过期记录
-            while _CALL_TS and now - _CALL_TS[0] > 60:
-                _CALL_TS.pop(0)
+    def __init__(self, calls_per_min: int = 500, safe_calls_per_min: int = 490, 
+                 adaptive: bool = True, burst_capacity: int = 10):
+        self.calls_per_min = calls_per_min
+        self.safe_calls_per_min = safe_calls_per_min
+        self.adaptive = adaptive
+        self.burst_capacity = burst_capacity
+        
+        # 调用时间记录
+        self._call_times = []
+        self._lock = threading.Lock()
+        
+        # 自适应参数
+        self._current_limit = safe_calls_per_min
+        self._error_count = 0
+        self._success_count = 0
+        self._last_adjustment = time.time()
+        
+        # 统计信息
+        self._total_calls = 0
+        self._total_wait_time = 0.0
+        self._rate_limit_hits = 0
+    
+    def wait_if_needed(self):
+        """检查是否需要等待，如果需要则等待"""
+        with self._lock:
+            now = time.time()
             
-            # 检查是否还有调用额度
-            if len(_CALL_TS) < CALLS_PER_MIN:
-                logging.debug('[BRANCH] def _rate_limit | IF len(_CALL_TS) < CALLS_PER_MIN -> taken')
-                _CALL_TS.append(now)
-                return
+            # 清理1分钟前的调用记录
+            self._call_times = [t for t in self._call_times if now - t < 60]
             
-            # 计算等待时间，添加安全检查
-            if _CALL_TS:
-                sleep_for = 60 - (now - _CALL_TS[0]) + 0.01
-            else:
-                sleep_for = 1.0  # 如果列表为空，等待1秒
+            # 检查是否需要等待
+            if len(self._call_times) >= self._current_limit:
+                # 计算需要等待的时间
+                oldest_call = self._call_times[0]
+                sleep_time = 60 - (now - oldest_call) + 0.1
                 
-        time.sleep(sleep_for)
+                if sleep_time > 0:
+                    self._total_wait_time += sleep_time
+                    self._rate_limit_hits += 1
+                    time.sleep(sleep_time)
+                    
+                    # 重新清理
+                    now = time.time()
+                    self._call_times = [t for t in self._call_times if now - t < 60]
+            
+            # 记录本次调用
+            self._call_times.append(now)
+            self._total_calls += 1
+    
+    def record_success(self):
+        """记录成功调用"""
+        with self._lock:
+            self._success_count += 1
+            if self.adaptive:
+                self._adjust_limit_after_success()
+    
+    def record_error(self, error_type: str = "unknown"):
+        """记录错误调用"""
+        with self._lock:
+            self._error_count += 1
+            if self.adaptive:
+                self._adjust_limit_after_error(error_type)
+    
+    def _adjust_limit_after_success(self):
+        """成功调用后调整限频"""
         now = time.time()
-
-
-def _retry(fn: Callable[[], pd.DataFrame], desc: str, retries: int = RETRY_TIMES) -> pd.DataFrame:
-    """
-    固定延迟序列重试：15s -> 10s -> 5s -> 5s ...
-    失败后等待时加入轻微随机抖动，减少多线程同时再次打接口。
-    :param fn: 无参调用(外部用 lambda 封装)
-    :param desc: 日志标识
-    :param retries: 最大尝试次数(包含第一次)
-    """
-    import random
-    last_msg = ""
-    for attempt in range(1, retries + 1):
-        try:
-            _rate_limit()          # 如果你后面换了 _rate_control_point()，这里对应改
-            return fn()
-        except (ConnectionError, TimeoutError, OSError) as e:
-            last_msg = f"网络错误: {str(e)}"
-            logging.warning("%s 失败 (%s) 尝试 %d/%d", desc, last_msg, attempt, retries)
-            if attempt == retries:
-                logging.debug('[BRANCH] def _retry | IF attempt == retries -> taken')
-                break  # 出循环抛错
-        except Exception as e:
-            last_msg = f"未知错误: {str(e)}"
-            logging.warning("%s 失败 (%s) 尝试 %d/%d", desc, last_msg, attempt, retries)
-            if attempt == retries:
-                logging.debug('[BRANCH] def _retry | IF attempt == retries -> taken')
-                break  # 出循环抛错
-            # 计算基础等待
-            if attempt <= len(RETRY_DELAY_SEQUENCE):
-                logging.debug('[BRANCH] def _retry | IF attempt <= len(RETRY_DELAY_SEQUENCE) -> taken')
-                base_wait = RETRY_DELAY_SEQUENCE[attempt - 1]
-            else:
-                logging.debug('[BRANCH] def _retry | ELSE of IF attempt <= len(RETRY_DELAY_SEQUENCE) -> taken')
-                base_wait = RETRY_DELAY_SEQUENCE[-1]
-            # 抖动
-            jitter = random.uniform(RETRY_JITTER_RANGE[0], RETRY_JITTER_RANGE[1])
-            wait_sec = max(0.1, base_wait + jitter)
-            if RETRY_LOG_LEVEL.upper() == "INFO":
-                logging.debug('[BRANCH] def _retry | IF RETRY_LOG_LEVEL.upper() == "INFO" -> taken')
-                logging.info("%s 重试前等待 %.2fs (base=%ds, jitter=%.2f)",
-                             desc, wait_sec, base_wait, jitter)
-            else:
-                logging.debug('[BRANCH] def _retry | ELSE of IF RETRY_LOG_LEVEL.upper() == "INFO" -> taken')
-                logging.debug("%s 重试前等待 %.2fs (base=%ds, jitter=%.2f)",
-                              desc, wait_sec, base_wait, jitter)
-            time.sleep(wait_sec)
-    raise RuntimeError(f"{desc} 最终失败: {last_msg}")
-
-
-def _trade_dates(start: str, end: str) -> List[str]:
-    cal = _retry(
-        lambda: pro.trade_cal(
-            exchange="SSE",
-            start_date=start,
-            end_date=end,
-            is_open=1,
-            fields="cal_date"
-        ),
-        "trade_cal"
-    )
-    if cal.empty:
-        logging.debug('[BRANCH] def _trade_dates | IF cal.empty -> taken')
-        raise RuntimeError(f"trade_cal 返回为空({start}~{end})")
-    return cal["cal_date"].astype(str).tolist()
-
-
-def _last_partition_date(root: str) -> Optional[str]:
-    if not os.path.exists(root):
-        logging.debug('[BRANCH] def _last_partition_date | IF not os.path.exists(root) -> taken')
-        return None
-    dates = [d.split("=")[-1] for d in os.listdir(root) if d.startswith("trade_date=")]
-    return max(dates) if dates else None
-
-
-def _save_partition(df: pd.DataFrame, root: str):
-    if df is None or df.empty:
-        logging.debug('[BRANCH] def _save_partition | IF df is None or df.empty -> taken')
-        return
-    for dt, sub in df.groupby("trade_date"):
-        pdir = os.path.join(root, f"trade_date={dt}")
-        os.makedirs(pdir, exist_ok=True)
-        fname = os.path.join(pdir, f"data_{int(time.time()*1e6)}.parquet")
-        _safe_write_parquet(sub, fname)
-
-def _clean_and_validate_dataframe(df: pd.DataFrame, ts_code: str = None) -> pd.DataFrame:
-    """清理和验证DataFrame，剔除异常行并告警"""
-    if df is None or df.empty:
-        logging.warning("数据为空: %s", ts_code or "未知")
-        return df
-    
-    # 检查必需列
-    required_cols = ["trade_date", "open", "high", "low", "close", "vol"]
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        logging.warning("缺少必需列 %s: %s", missing_cols, ts_code or "未知")
-        return df
-    
-    original_count = len(df)
-    df_clean = df.copy()
-    
-    try:
-        # 1. 清理价格数据：剔除NaN和<=0的行
-        price_cols = ["open", "high", "low", "close"]
-        for col in price_cols:
-            if col in df_clean.columns:
-                # 记录异常行
-                nan_mask = df_clean[col].isna()
-                zero_mask = df_clean[col] <= 0
-                invalid_mask = nan_mask | zero_mask
-                
-                if invalid_mask.any():
-                    invalid_count = invalid_mask.sum()
-                    invalid_dates = df_clean.loc[invalid_mask, "trade_date"].tolist() if "trade_date" in df_clean.columns else []
-                    logging.warning("剔除价格异常行 %s: %d行 (日期: %s)", 
-                                 f"{ts_code or '未知'}.{col}", invalid_count, invalid_dates[:5])
-                    df_clean = df_clean[~invalid_mask]
         
-        # 2. 清理成交量：剔除<0的行
-        if "vol" in df_clean.columns:
-            vol_mask = df_clean["vol"] < 0
-            if vol_mask.any():
-                invalid_count = vol_mask.sum()
-                invalid_dates = df_clean.loc[vol_mask, "trade_date"].tolist() if "trade_date" in df_clean.columns else []
-                logging.warning("剔除成交量异常行 %s: %d行 (日期: %s)", 
-                             ts_code or "未知", invalid_count, invalid_dates[:5])
-                df_clean = df_clean[~vol_mask]
+        # 每30秒调整一次
+        if now - self._last_adjustment < 30:
+            return
         
-        # 3. 清理高低价关系异常的行
-        if all(col in df_clean.columns for col in ["high", "low", "open", "close"]):
-            # 最高价 < 最低价
-            hl_mask = df_clean["high"] < df_clean["low"]
-            # 最高价 < 开盘价或收盘价
-            ho_mask = df_clean["high"] < df_clean["open"]
-            hc_mask = df_clean["high"] < df_clean["close"]
-            # 最低价 > 开盘价或收盘价
-            lo_mask = df_clean["low"] > df_clean["open"]
-            lc_mask = df_clean["low"] > df_clean["close"]
+        # 如果最近成功率很高，可以适当提高限频
+        if self._success_count > 50 and self._error_count < 5:
+            if self._current_limit < self.calls_per_min * 0.95:
+                self._current_limit = min(self._current_limit + 5, int(self.calls_per_min * 0.95))
+                logger.debug(f"限频器自适应调整: 提高限频到 {self._current_limit}")
+        
+        self._last_adjustment = now
+    
+    def _adjust_limit_after_error(self, error_type: str):
+        """错误调用后调整限频"""
+        now = time.time()
+        
+        # 每30秒调整一次
+        if now - self._last_adjustment < 30:
+            return
+        
+        # 如果是限频错误，降低限频
+        if "limit" in error_type.lower() or "quota" in error_type.lower():
+            self._current_limit = max(self._current_limit - 10, int(self.safe_calls_per_min * 0.8))
+            logger.warning(f"限频器自适应调整: 降低限频到 {self._current_limit}")
+        
+        self._last_adjustment = now
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """获取限频器统计信息"""
+        with self._lock:
+            now = time.time()
+            recent_calls = len([t for t in self._call_times if now - t < 60])
             
-            invalid_mask = hl_mask | ho_mask | hc_mask | lo_mask | lc_mask
-            
-            if invalid_mask.any():
-                invalid_count = invalid_mask.sum()
-                invalid_dates = df_clean.loc[invalid_mask, "trade_date"].tolist() if "trade_date" in df_clean.columns else []
-                logging.warning("剔除价格关系异常行 %s: %d行 (日期: %s)", 
-                             ts_code or "未知", invalid_count, invalid_dates[:5])
-                df_clean = df_clean[~invalid_mask]
+            return {
+                "current_limit": self._current_limit,
+                "recent_calls_per_min": recent_calls,
+                "total_calls": self._total_calls,
+                "success_count": self._success_count,
+                "error_count": self._error_count,
+                "total_wait_time": self._total_wait_time,
+                "rate_limit_hits": self._rate_limit_hits,
+                "success_rate": self._success_count / max(self._total_calls, 1) * 100
+            }
+    
+    def reset_stats(self):
+        """重置统计信息"""
+        with self._lock:
+            self._total_calls = 0
+            self._success_count = 0
+            self._error_count = 0
+            self._total_wait_time = 0.0
+            self._rate_limit_hits = 0
+
+# ================= Tushare接口管理 =================
+
+class TushareManager:
+    """Tushare接口管理器"""
+    
+    def __init__(self, token: str = None, rate_limiter: RateLimiter = None):
+        self.token = token or TOKEN
+        self._pro = None
+        self.rate_limiter = rate_limiter or RateLimiter()
         
-        # 4. 清理日期格式异常的行
-        if "trade_date" in df_clean.columns:
+        if not self.token or self.token.startswith("在这里"):
+            raise ValueError("Tushare Pro 未配置：请在 config.TOKEN 中设置有效 token")
+        
+        # 设置token
+        ts.set_token(self.token)
+        self._pro = ts.pro_api()
+        
+        # 设置代理
+        self._setup_proxy()
+    
+    def _setup_proxy(self):
+        """设置代理配置"""
+        # 不走系统代理：仅对本进程生效
+        for k in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            os.environ.pop(k, None)
+        
+        # 设置直连域名
+        os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost,api.tushare.pro,github.com,raw.githubusercontent.com,pypi.org,files.pythonhosted.org,huggingface.co,cdn-lfs.huggingface.co")
+        os.environ.setdefault("no_proxy", os.environ["NO_PROXY"])
+    
+    def _make_api_call(self, call_func, *args, **kwargs):
+        """统一的API调用方法，包含限频和错误处理"""
+        max_retries = 3
+        retry_delay = 1.0
+        
+        for attempt in range(max_retries):
+            self.rate_limiter.wait_if_needed()
+            
             try:
-                # 尝试解析日期，无法解析的会被标记为NaT
-                parsed_dates = pd.to_datetime(df_clean["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
-                date_mask = parsed_dates.isna()
-                
-                if date_mask.any():
-                    invalid_count = date_mask.sum()
-                    invalid_dates = df_clean.loc[date_mask, "trade_date"].tolist()
-                    logging.warning("剔除日期格式异常行 %s: %d行 (日期: %s)", 
-                                 ts_code or "未知", invalid_count, invalid_dates[:5])
-                    df_clean = df_clean[~date_mask]
+                result = call_func(*args, **kwargs)
+                self.rate_limiter.record_success()
+                return result
             except Exception as e:
-                logging.warning("日期解析异常 %s: %s", ts_code or "未知", e)
-        
-        # 5. 统计清理结果
-        cleaned_count = len(df_clean)
-        removed_count = original_count - cleaned_count
-        
-        if removed_count > 0:
-            logging.info("数据清理完成 %s: 原始%d行 -> 清理后%d行 (剔除%d行)", 
-                       ts_code or "未知", original_count, cleaned_count, removed_count)
-        
-        # 6. 如果清理后数据为空，记录警告但不返回空DataFrame
-        if df_clean.empty:
-            logging.warning("清理后数据为空: %s", ts_code or "未知")
-            return df_clean
-            
-    except Exception as e:
-        logging.warning("数据清理异常: %s - %s", ts_code or "未知", e)
-        return df
-    
-    return df_clean
-
-def _safe_write_parquet(df: pd.DataFrame, filepath: str, ts_code: str = None):
-    """安全写入Parquet文件，避免并发冲突"""
-    import tempfile
-    import shutil
-    
-    # 数据清理和验证
-    df_clean = _clean_and_validate_dataframe(df, ts_code)
-    
-    # 如果清理后数据为空，仍然写入空文件（保持一致性）
-    if df_clean.empty:
-        logging.warning("清理后数据为空，写入空文件: %s", filepath)
-    
-    # 使用临时文件避免并发写入冲突
-    temp_dir = os.path.dirname(filepath)
-    temp_fd, temp_path = tempfile.mkstemp(suffix='.parquet', dir=temp_dir)
-    
-    try:
-        # 写入临时文件
-        df_clean.to_parquet(temp_path, index=False, engine=PARQUET_ENGINE)
-        # 原子性移动到目标位置
-        shutil.move(temp_path, filepath)
-    except Exception as e:
-        logging.error("写入文件失败 %s: %s", filepath, e)
-        # 清理临时文件
-        try:
-            os.unlink(temp_path)
-        except:
-            pass
-        raise
-    finally:
-        try:
-            os.close(temp_fd)
-        except:
-            pass
-
-
-def _tqdm_iter(seq, desc: str, unit="日"):
-    return tqdm(seq,
-                total=len(seq),
-                desc=desc,
-                ncols=110,
-                unit=unit,
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
-
-
-def compact_daily_partitions(base_dir: str | None = None) -> None:
-    """
-    压实按日期分区目录：如果某日期下 parquet 文件数超过阈值，
-    以 DuckDB 读取后重写(尽量生成少量新文件)。
-    """
-    import duckdb, glob, shutil
-
-    daily_dir = os.path.join(DATA_ROOT, "stock", "daily")
-    if base_dir is not None:
-        logging.debug('[BRANCH] def compact_daily_partitions | IF base_dir is not None -> taken')
-        daily_dir = base_dir
-    else:
-        logging.debug('[BRANCH] def compact_daily_partitions | ELSE of IF base_dir is not None -> taken')
-        candidates = [
-            os.path.join(DATA_ROOT, "stock", "daily", "daily"),
-            os.path.join(DATA_ROOT, "stock", "daily"),
-        ]
-        daily_dir = next((p for p in candidates if os.path.isdir(p)), candidates[0])
-
-    if not os.path.isdir(daily_dir):
-        logging.debug('[BRANCH] def compact_daily_partitions | IF not os.path.isdir(daily_dir) -> taken')
-        logging.warning("[COMPACT] daily 目录不存在，跳过")
-        return
-
-    # 找出 trade_date=XXXX 目录
-    date_dirs = [d for d in os.listdir(daily_dir)
-                 if d.startswith("trade_date=") and os.path.isdir(os.path.join(daily_dir, d))]
-
-    if not date_dirs:
-        logging.debug('[BRANCH] def compact_daily_partitions | IF not date_dirs -> taken')
-        logging.info("[COMPACT] 无日期目录，跳过")
-        return
-
-    con = duckdb.connect()
-    con.execute(f"PRAGMA threads={DUCKDB_THREADS};")
-    con.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}';")
-    con.execute("PRAGMA preserve_insertion_order=false;")
-    os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
-    con.execute(f"PRAGMA temp_directory='{DUCKDB_TEMP_DIR}';")
-
-    compacted = 0
-    for d in date_dirs:
-        full = os.path.join(daily_dir, d)
-        parts = [p for p in os.listdir(full) if p.endswith(".parquet")]
-        if len(parts) <= COMPACT_MAX_FILES_PER_DATE:
-            logging.debug('[BRANCH] def compact_daily_partitions | IF len(parts) <= COMPACT_MAX_FILES_PER_DATE -> taken')
-            continue
-
-        # 计算合并批次数(近似控制输出文件数)
-        # DuckDB 的 COPY 不直接指定目标 part 个数，只能一次性写 -> 得到 1 个或少量 part
-        tmp_out = os.path.join(daily_dir, f"__tmp_compact_{d}")
-        shutil.rmtree(tmp_out, ignore_errors=True)
-        os.makedirs(tmp_out, exist_ok=True)
-
-        pattern = os.path.join(full, "*.parquet").replace("\\", "/")
-        logging.info("[COMPACT] %s 文件数=%d -> 压实", d, len(parts))
-        sql = f"""
-        COPY (
-          SELECT * FROM read_parquet('{pattern}')
-        ) TO '{tmp_out}'
-        (FORMAT PARQUET);
-        """
-        try:
-            con.execute(sql)
-        except Exception as e:
-            logging.error("[COMPACT] %s 压实失败: %s", d, e)
-            shutil.rmtree(tmp_out, ignore_errors=True)
-            continue
-
-        # 删除旧 part，移动新 part
-        for p in parts:
-            try:
-                os.remove(os.path.join(full, p))
-            except Exception:
-                pass
-        # 可能 tmp_out 下生成多个文件，将其移动进原日期目录
-        for newp in os.listdir(tmp_out):
-            shutil.move(os.path.join(tmp_out, newp), os.path.join(full, newp))
-        shutil.rmtree(tmp_out, ignore_errors=True)
-        compacted += 1
-
-    con.close()
-    logging.info("[COMPACT] 完成 压实日期数=%d", compacted)
-
-
-def read_tail_from_single(ts_code: str, start_date: int, end_date: int,
-                          root_single_dir: str, columns: list[str]):
-    """
-    从按股票存储的 Parquet 读取指定日期窗口与列。
-    start_date/end_date 形如 20240101 的 int。
-    """
-    path = os.path.join(root_single_dir, f"{ts_code}.parquet")
-    if not os.path.exists(path):
-        return pd.DataFrame(columns=columns)
-
-    # 懒加载/缺库兜底：环境缺少 pyarrow 时优雅退出
-    if ds is None or pa is None:
-        raise RuntimeError("需要 pyarrow 才能从单票 Parquet 读取（请先安装 pyarrow）")
-
-    dataset = ds.dataset(path, format="parquet")
-    filt = (ds.field("trade_date") >= pa.scalar(start_date, pa.int32())) & \
-           (ds.field("trade_date") <= pa.scalar(end_date,   pa.int32()))
-    table = dataset.to_table(filter=filt, columns=columns, use_threads=True)
-    return table.to_pandas(types_mapper=pd.ArrowDtype)
-
-
-def _need_duck_merge(daily_dir: str) -> bool:
-    """
-    返回 True 表示需要触发 duckdb 合并
-    规则：① parquet 最新 trade_date - duckdb 表最新 ≥ DUCK_MERGE_DAY_LAG
-         ② 或新增行数 ≥ DUCK_MERGE_MIN_ROWS
-    """
-    import duckdb, glob, os, datetime as dt
-
-    # parquet 端最新日期
-    last_parquet = _last_partition_date(daily_dir)
-    if last_parquet is None:
-        logging.debug('[BRANCH] def _need_duck_merge | IF last_parquet is None -> taken')
-        return True          # 本地还没任何 parquet，后面流程会自动全量建
-
-    con = duckdb.connect()    # 内存连接足够
-    try:
-        glob_path = os.path.join(daily_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
-        last_duck = con.sql(
-            f"SELECT max(trade_date) FROM parquet_scan('{glob_path}')"
-        ).fetchone()[0]
-    except duckdb.Error:
-        last_duck = None
-
-    if last_duck is not None:
-        logging.debug('[BRANCH] def _need_duck_merge | IF last_duck is not None -> taken')
-        pattern_new = (
-            f"{Path(daily_dir).as_posix()}/trade_date={int(last_duck)+1}%/data_*.parquet"
-        )
-        next_str = str(int(last_duck) + 1).zfill(8)
-        try:                                              # ← 加入 try‑except
-            new_rows = con.sql(
-                f"SELECT count(*) FROM parquet_scan('{daily_dir}/trade_date={next_str}%/data_*.parquet')"
-            ).fetchone()[0] or 0
-        except duckdb.IOException:                        # 分区还没生成 → 说明需要合并
-            return True
-    else:
-        logging.debug('[BRANCH] def _need_duck_merge | ELSE of IF last_duck is not None -> taken')
-        new_rows = 0
-
-    # ① 日期差 ≥ N 天
-    if last_duck is None:
-        logging.debug('[BRANCH] def _need_duck_merge | IF last_duck is None -> taken')
-        return True                             # duckdb 还没建过
-    lp = dt.datetime.strptime(str(last_parquet), "%Y%m%d")
-    ld = dt.datetime.strptime(str(last_duck), "%Y%m%d")
-    day_lag = (lp - ld).days
-    if day_lag >= DUCK_MERGE_DAY_LAG:
-        logging.debug('[BRANCH] def _need_duck_merge | IF day_lag >= DUCK_MERGE_DAY_LAG -> taken')
-        return True
-
-    # ② 或新增行数 ≥ 阈值
-    return new_rows >= DUCK_MERGE_MIN_ROWS
-
-
-# === 批量增量缓存器：一次性把所有股票的增量读入内存，避免逐股 parquet_scan ===
-def _build_cutoff_df(ts_codes: list[str], target_adj: str | None = None) -> pd.DataFrame:
-    if target_adj is None:
-        target_adj = _decide_symbol_adj_for_fast_init()  # 'raw'/'qfq'/'hfq'
-
-    """
-    生成每只股票的 'last_date'（single 尾部最后交易日）。
-    优先从 Parquet 读 trade_date 列的最后若干行；没有 single 文件者标记为 None。
-    """
-    rows = []
-    base_single_parquet_dir = os.path.join(DATA_ROOT, "stock", "single", f"single_{target_adj}")
-    base_single_csv_dir = os.path.join(DATA_ROOT, "stock", "single", "csv", target_adj)
-
-    for ts in ts_codes:
-        last_date = None
-        p_parquet = os.path.join(base_single_parquet_dir, f"{ts}.parquet")
-        p_csv = os.path.join(base_single_csv_dir, f"{ts}.csv")
-        try:
-            if os.path.exists(p_parquet):
-                # 只读 trade_date 列 + 取尾部（避免全表载入）
-                df_tail = pd.read_parquet(p_parquet, columns=["trade_date"])
-                if df_tail is not None and not df_tail.empty:
-                    last_date = pd.to_datetime(df_tail["trade_date"].astype(str), errors="coerce").max()
-            elif os.path.exists(p_csv):
-                # CSV 慢，尽量避免（建议把 single 都转成 parquet）
-                df_tail = pd.read_csv(p_csv, usecols=["trade_date"])
-                if df_tail is not None and not df_tail.empty:
-                    last_date = pd.to_datetime(df_tail["trade_date"].astype(str), errors="coerce").max()
-        except Exception as e:
-            logging.debug("[INC_IND] 读取 single 尾部失败 %s：%s", ts, e)
-
-        rows.append({
-            "ts_code": ts,
-            "last_date": None if last_date is None or pd.isna(last_date) else last_date.strftime("%Y%m%d")
-        })
-
-    cutoff = pd.DataFrame(rows)
-    # 拆分是否有基线日
-    cutoff["has_single"] = cutoff["last_date"].notna()
-    return cutoff
-
-
-class BatchIncCache:
-    """
-    把本轮所有股票的增量一次性查出来缓存：
-      1) 计算每股 last_date；
-      2) 以 min(last_date)+1 作为全局下界，扫最近分区；
-      3) 用 (ts_code, last_date) JOIN 进行逐股过滤；
-      4) 结果按 ts_code 切片缓存为 dict。
-    """
-    def __init__(self, ts_codes: list[str], target_adj: str | None = None):
-        self.ts_codes = ts_codes
-        self.target_adj = target_adj or _decide_symbol_adj_for_fast_init()
-        self.cutoff = _build_cutoff_df(ts_codes, self.target_adj)
-
-        self.inc_dict: dict[str, pd.DataFrame] = {}
-        self._loaded = False
-
-    def load_once(self):
-        if self._loaded:
-            return
-        # 对于没有 single 的股票，先不进“增量批量通道”，避免把全历史拉进来
-        have_base = self.cutoff[self.cutoff["has_single"]].copy()
-        if have_base.empty:
-            self._loaded = True
-            return
-
-        min_last = have_base["last_date"].min()
-        # 增量下界 = min(last_date)+1
-        start_inc = (pd.to_datetime(min_last) + pd.Timedelta(days=1)).strftime("%Y%m%d")
-
-        # 注册到 DuckDB
-        loc = duckdb.connect()
-        try:
-            loc.execute(f"PRAGMA threads={max(1, DUCKDB_THREADS)};")
-            loc.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}';")
-            os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
-            loc.execute(f"PRAGMA temp_directory='{DUCKDB_TEMP_DIR}';")
-            loc.execute("PRAGMA enable_object_cache;")  # 允许文件元数据缓存
-
-            glob_src = os.path.join(
-                DATA_ROOT, "stock", "daily", f"daily_{self.target_adj}", "trade_date=*/data_*.parquet"
-            ).replace("\\", "/")
-
-            # 只扫最近分区 + 逐股 last_date 过滤
-            loc.register("cutoff_df", have_base)
-
-            # 只取指标需要的基础列（按需增删）
-            base_cols = ["ts_code","trade_date","open","high","low","close","vol","amount"]
-            cols_sql = ", ".join(f"p.{c}" for c in base_cols)
-
-            inc_all = loc.sql(f"""
-                SELECT {cols_sql}
-                FROM parquet_scan('{glob_src}', hive_partitioning=1) AS p
-                JOIN cutoff_df AS c ON p.ts_code = c.ts_code
-                WHERE CAST(p.trade_date AS BIGINT) >= CAST('{start_inc}' AS BIGINT)  -- 强制同型比较
-                  AND CAST(p.trade_date AS BIGINT) >  CAST(c.last_date AS BIGINT)    -- 逐股精确过滤
-            """).df()
-
-            if inc_all is None or inc_all.empty:
-                self._loaded = True
-                return
-
-            # 规范化
-            inc_all["trade_date"] = pd.to_datetime(inc_all["trade_date"].astype(str), errors="coerce").dt.strftime("%Y%m%d")
-            inc_all = inc_all.sort_values(["ts_code","trade_date"])
-
-            # 切片缓存
-            for ts, g in inc_all.groupby("ts_code", sort=False):
-                self.inc_dict[ts] = g.reset_index(drop=True)
-
-            self._loaded = True
-        finally:
-            try:
-                loc.close()
-            except Exception:
-                pass
-
-    def get_inc(self, ts_code: str) -> Optional[pd.DataFrame]:
-        self.load_once()
-        return self.inc_dict.get(ts_code)
-
-
-def _recalc_increment_inmem(ts_list, last_duck_str: str, end: str, threads: int = 0):
-    """
-    一次性把本次涉及股票 + 各自 warm-up 窗口的数据拉到内存；
-    在内存里 groupby(ts_code) 统一计算指标；然后：
-      - 写回 single_* 与 single_*_indicators（prewarmed=True，跳过旧读）
-      - 增量 COPY 到按日分区（subset）
-    """
-    import duckdb, os, pandas as pd
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from tqdm import tqdm
-
-    target_adj = _decide_symbol_adj_for_fast_init()     # 'raw'/'qfq'/'hfq'
-    src_dir = os.path.join(DATA_ROOT, "stock", "daily", f"daily_{target_adj}")
-    dst_dir = os.path.join(DATA_ROOT, "stock", "daily", f"daily_{target_adj}_indicators")
-
-    if not os.path.isdir(src_dir):
-        logging.warning("[INC_IND][MEM] 源目录不存在：%s", src_dir)
-        return
-
-    con = duckdb.connect()
-    try:
-        con.execute(f"PRAGMA threads={DUCKDB_THREADS};")
-        con.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}';")
-        os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
-        con.execute(f"PRAGMA temp_directory='{DUCKDB_TEMP_DIR}';")
-        con.execute("PRAGMA enable_object_cache;")
-
-        # ① 估每股 last_date（只从“指标分区”回看近 N 天，避免全库扫）
-        con.register("ts_list", pd.DataFrame({"ts_code": ts_list}))
-        glob_dst = os.path.join(dst_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
-        cutoff_back = int(INC_INMEM_CUTOFF_BACK_DAYS or 365)
-        _base = pd.to_datetime(str(last_duck_str), format="%Y%m%d", errors="coerce")
-        if pd.isna(_base):
-            _base = pd.Timestamp("2005-01-01")
-        cutoff_start = (_base - pd.Timedelta(days=cutoff_back)).strftime("%Y%m%d")
-        _cutoff_i = int(cutoff_start)
-        _end_i = int(end)
-        if _cutoff_i > _end_i:
-            _cutoff_i = _end_i
-
-        # 从指标分区回看近 N 天取每股的 last_date
-        df_cut = con.sql(f"""
-            SELECT d.ts_code, max(d.trade_date) AS last_date
-            FROM parquet_scan('{glob_dst}', hive_partitioning=1) AS d
-            JOIN ts_list t ON d.ts_code = t.ts_code
-            WHERE CAST(d.trade_date AS BIGINT) >= {_cutoff_i}
-            GROUP BY d.ts_code
-        """).df()
-
-        cutoff = pd.DataFrame({"ts_code": ts_list})
-        mp = dict(zip(df_cut["ts_code"], df_cut["last_date"]))
-        cutoff["last_date"] = cutoff["ts_code"].map(mp).fillna(0).astype(int)
-
-        # 并入“指标最大 warm-up”
-        try:
-            cfg_names = (SYMBOL_PRODUCT_INDICATORS or "all")
-            names = list(ind.REGISTRY.keys()) if str(cfg_names).lower()=="all" else [x.strip() for x in str(cfg_names).split(",") if x.strip()]
-            warm_i = int(ind.warmup_for(names))
-        except Exception:
-            warm_i = 0
-        pad = int(INC_INMEM_PADDING_DAYS or 5)
-        need_warm = max(int(SYMBOL_PRODUCT_WARMUP_DAYS), warm_i)
-
-        # 注意把 warm_lower 存成整数，便于 DuckDB 无歧义比较
-        cutoff["warm_lower"] = (
-            pd.to_datetime(cutoff["last_date"].astype(str).str.zfill(8), errors="coerce").fillna(pd.Timestamp("2005-01-01"))
-            - pd.Timedelta(days=need_warm + pad)
-        ).dt.strftime("%Y%m%d").astype(int)
-
-        con.register("cutoff_df", cutoff)
-
-        # ② 只读本次涉及股票 + 各自窗口的基础列（DuckDB 一把拉进内存）
-        glob_src = os.path.join(src_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
-        base_cols = ["ts_code","trade_date","open","high","low","close","vol","amount"]
-        cols_sql = ", ".join(f"p.{c}" for c in base_cols)
-        # —— df_all 的 SQL：两端统一按整数比较 ——  （原来 warm_lower 是 str，end 也是 str）
-        df_all = con.sql(f"""
-            SELECT {cols_sql}
-            FROM parquet_scan('{glob_src}', hive_partitioning=1) AS p
-            JOIN cutoff_df AS c ON p.ts_code = c.ts_code
-            WHERE CAST(p.trade_date AS BIGINT) >= c.warm_lower
-            AND CAST(p.trade_date AS BIGINT) <= {_end_i}
-        """).df()
-
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-    if df_all.empty:
-        logging.info("[INC_IND][MEM] 本次无新增数据。")
-        return
-
-    df_all["trade_date"] = pd.to_datetime(df_all["trade_date"].astype(str), errors="coerce").dt.strftime("%Y%m%d")
-    df_all = df_all.sort_values(["ts_code","trade_date"]).reset_index(drop=True)
-
-    workers = max(1, int(threads or (os.cpu_count() or 4) - 1))
-    logging.info("[INC_IND][MEM] 使用线程数：%d", workers)
-
-    def _one(ts: str, g: pd.DataFrame):
-        try:
-            _with_api_adj(target_adj, _WRITE_SYMBOL_INDICATORS, ts, g, end, prewarmed=True)
-            _update_fast_init_cache(ts, g, target_adj)
-            return ts, None
-        except Exception as e:
-            return ts, str(e)
-
-    futs = []
-    ok = fail = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for ts, g in df_all.groupby("ts_code", sort=False):
-            futs.append(ex.submit(_one, ts, g))
-        for f in tqdm(as_completed(futs), total=len(futs), dynamic_ncols=True, desc="[INC_IND][MEM] 重算"):
-            ts, err = f.result()
-            if err:
-                logging.warning("[INC_IND][MEM][%s] 失败：%s", ts, err); fail += 1
-            else:
-                ok += 1
-    logging.info("[INC_IND][MEM] 单股写入完成：OK=%d FAIL=%d", ok, fail)
-
-    # ④ 增量 COPY 到 <adj>_indicators（只合并这批股票）
-    if WRITE_SYMBOL_INDICATORS and ts_list:
-        _with_api_adj(target_adj, duckdb_merge_symbol_products_to_daily_subset, ts_list)
-
-
-# ========== 按交易日批量模式(原有日常增量) ==========
-def sync_index_daily_fast(start: str, end: str, whitelist: List[str], threads: int = 8):
-    """
-    按“指数代码”一次性拉取区间数据(并发)，写出到 data/index/daily/trade_date=YYYYMMDD/data_*.parquet
-    比原来“按交易日 × 指数”快一个数量级以上。
-    """
-    import threading
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    root = os.path.join(DATA_ROOT, "index", "daily")
-    os.makedirs(root, exist_ok=True)
-
-    # 增量起始(沿用你现有的分区规则)
-    last = _last_partition_date(root)
-    actual_start = start if last is None else str(int(last) + 1)
-    if actual_start > end:
-        logging.debug('[BRANCH] def sync_index_daily_fast | IF actual_start > end -> taken')
-        logging.info("[index][FAST] 日线已最新 (last=%s)", last)
-        return
-
-    lock_io = threading.Lock()
-    ok = skip = err = empty = 0
-
-    def write_partition(df: pd.DataFrame):
-        """把单只指数的全量/增量数据，按 trade_date 分区写盘(带简单缓冲)。"""
-        # 只保留需要的列可以减小体积(按需裁剪)
-        # cols = ["ts_code","trade_date","open","high","low","close","pre_close","vol","amount"]
-        # df = df[cols]
-        for dt, sub in df.groupby("trade_date"):
-            if dt < actual_start or dt > end:
-                logging.debug('[BRANCH] def sync_index_daily_fast > def write_partition | IF dt < actual_start or dt > end -> taken')
-                continue
-            pdir = os.path.join(root, f"trade_date={dt}")
-            os.makedirs(pdir, exist_ok=True)
-            fname = os.path.join(pdir, f"data_{int(time.time()*1e6)}.parquet")
-            # IO 上锁，避免极端情况下文件名撞车
-            with lock_io:
-                sub.to_parquet(fname, index=False, engine=PARQUET_ENGINE)
-
-    def fetch_one(code: str):
-        # 先尝试 pro_bar(更稳)，失败再退回 pro.index_daily
-        def call_bar():
-            return ts.pro_bar(
-                ts_code=code,
-                start_date=actual_start,
-                end_date=end,
-                freq='D',
-                asset='I'   # 关键：指数
-            )
-        def call_daily():
-            return pro.index_daily(
-                ts_code=code,
-                start_date=actual_start,
-                end_date=end
-            )
-
-        try:
-            df = _retry(lambda: call_bar(), f"index_pro_bar_{code}")
-            if df is None or df.empty:
-                # 兜底再试一次 index_daily
-                logging.debug('[BRANCH] def sync_index_daily_fast > def fetch_one | IF df is None or df.empty -> taken')
-                df = _retry(lambda: call_daily(), f"index_daily_{code}")
-            if df is None or df.empty:
-                logging.debug('[BRANCH] def sync_index_daily_fast > def fetch_one | IF df is None or df.empty -> taken')
-                return code, "empty"
-            df = df.sort_values("trade_date")
-            df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
-            write_partition(df)
-            return code, "ok"
-        except Exception as e:
-            return code, f"err:{e}"
-
-    with ThreadPoolExecutor(max_workers=threads) as exe:
-        futs = {exe.submit(fetch_one, code): code for code in whitelist}
-        pbar = tqdm(as_completed(futs), total=len(futs), desc="指数(日线)并发拉取", ncols=120)
-        for fut in pbar:
-            code, st = fut.result()
-            if st == "ok": logging.debug('[BRANCH] def sync_index_daily_fast | IF st == "ok" -> taken'); ok += 1
-            elif st == "empty": logging.debug('[BRANCH] def sync_index_daily_fast | IF st == "empty" -> taken'); empty += 1
-            else: logging.debug('[BRANCH] def sync_index_daily_fast | ELSE of IF st == "empty" -> taken'); err += 1
-            pbar.set_postfix(ok=ok, empty=empty, err=err)
-        pbar.close()
-
-    logging.info("[index][FAST] 完成 ok=%d empty=%d err=%d 区间=%s~%s 起点=%s",
-                 ok, empty, err, start, end, actual_start)
-
-
-def sync_stock_daily_fast(start: str, end: str, threads: int = 8):
-    """
-    按“股票代码(ts_code)”一次性并发拉取区间(日线)，
-    写出到 data/stock/daily/trade_date=YYYYMMDD/data_*.parquet
-    """
-    adj = _decide_symbol_adj_for_fast_init()  # 返回 'raw' | 'qfq' | 'hfq'
-    adj_dir_map = {
-        "raw": os.path.join(DATA_ROOT, "stock", "daily", "daily_raw"),
-        "qfq": os.path.join(DATA_ROOT, "stock", "daily", "daily_qfq"),
-        "hfq": os.path.join(DATA_ROOT, "stock", "daily", "daily_hfq"),
-    }
-    dst_dir = adj_dir_map[adj]
-    os.makedirs(dst_dir, exist_ok=True)
-    
-
-    # 增量起点沿用你现有分区规则
-    last = _last_partition_date(dst_dir)
-    actual_start = start if last is None else str(int(last) + 1)
-    if actual_start > end:
-        logging.debug('[BRANCH] def sync_stock_daily_fast | IF actual_start > end -> taken')
-        logging.info("[stock][FAST] 日线已最新 (last=%s)", last)
-        return
-
-    # 文件名并发写入时做轻量互斥，避免极端时间戳撞名
-    lock_io = threading.Lock()
-    ok = empty = err = 0
-
-    def write_partition(df: pd.DataFrame):
-        for dt, sub in df.groupby("trade_date"):
-            if dt < actual_start or dt > end:
-                logging.debug('[BRANCH] def sync_stock_daily_fast > def write_partition | IF dt < actual_start or dt > end -> taken')
-                continue
-            pdir = os.path.join(dst_dir, f"trade_date={dt}")
-            os.makedirs(pdir, exist_ok=True)
-            fname = os.path.join(pdir, f"data_{int(time.time()*1e6)}.parquet")
-            with lock_io:
-                sub.to_parquet(fname, index=False, engine=PARQUET_ENGINE)
-
-    # 取股票清单（你已有缓存的封装）
-    stocks = _fetch_stock_list()   # fast_init 已用到它，带本地缓存。:contentReference[oaicite:3]{index=3}
-    codes = stocks.ts_code.astype(str).tolist()
-    logging.info("[stock][FAST] 准备并发拉取 股票数=%d 区间=%s~%s 起点=%s",
-                 len(codes), start, end, actual_start)
-
-    def fetch_one(ts_code: str):
-        # 优先 pro_bar（区间拉取），失败再兜底 pro.daily 分天拼
-        def call_bar():
-            return ts.pro_bar(
-                ts_code=ts_code,
-                start_date=actual_start,
-                end_date=end,
-                adj=None,       # NORMAL 模式落 raw 到 stock/daily
-                freq='D',
-                asset='E'
-            )
-        try:
-            df = _retry(lambda: call_bar(), f"stock_pro_bar_{ts_code}")
-            if df is None or df.empty:
-                logging.debug('[BRANCH] def sync_stock_daily_fast > def fetch_one | IF df is None or df.empty -> taken')
-                all_df = []
-                for d in _trade_dates(actual_start, end):  # 你已有交易日获取。
-                    try:
-                        df_d = _retry(lambda dd=d: pro.daily(trade_date=dd, ts_code=ts_code),
-                                    f"stock_daily_{ts_code}_{d}")
-                        if df_d is not None and not df_d.empty:
-                            logging.debug('[BRANCH] def sync_stock_daily_fast > def fetch_one | IF df_d is not None and not df_d.empty -> taken')
-                            all_df.append(df_d)
-                    except Exception:
+                error_msg = str(e)
+                error_lower = error_msg.lower()
+                
+                # 详细记录错误信息
+                logger.debug(f"Tushare API调用失败 (尝试 {attempt + 1}/{max_retries}): {error_msg}")
+                logger.debug(f"调用参数: {kwargs}")
+                
+                # 分类错误类型
+                if "limit" in error_lower or "quota" in error_lower or "频率" in error_lower:
+                    self.rate_limiter.record_error("rate_limit")
+                    logger.warning(f"API调用频率限制: {error_msg}")
+                    # 频率限制错误，等待更长时间
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)  # 指数退避
+                        logger.info(f"频率限制，等待 {wait_time:.1f} 秒后重试...")
+                        time.sleep(wait_time)
                         continue
-                df = pd.concat(all_df, ignore_index=True) if all_df else pd.DataFrame()
-            if df is None or df.empty:
-                logging.debug('[BRANCH] def sync_stock_daily_fast > def fetch_one | IF df is None or df.empty -> taken')
-                return ts_code, "empty"
-            df = df.sort_values("trade_date")
-            # —— 统一数值化（仅转型，不计算三列）
-            for c in ["open","high","low","close","vol","amount"]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-
-            df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
-            write_partition(df)
-            # return ts_code, "ok"
-            # ==== NEW: 边下载边算指标 ====
-            if INC_STREAM_COMPUTE_INDICATORS and WRITE_SYMBOL_INDICATORS:
-                try:
-                    # 1) 统一数值化 & 排序，作为 prewarmed 的新增窗口
-                    df_new = df.sort_values("trade_date")
-                    for c in ["open","high","low","close","vol","amount"]:
-                        if c in df_new.columns:
-                            df_new[c] = pd.to_numeric(df_new[c], errors="coerce")
-
-                    # 2) 计算哪个复权视角下写成品
-                    _adj_for_ind = _decide_symbol_adj_for_fast_init()   # 'raw' | 'qfq' | 'hfq'
-
-                    # 2.1 若目标是 raw，直接用刚下载的 df_new 计算
-                    if _adj_for_ind == "raw":
-                        _with_api_adj("raw", _WRITE_SYMBOL_INDICATORS, ts_code, df_new, end, prewarmed=True)
-                        if INC_STREAM_UPDATE_FAST_CACHE:
-                            _update_fast_init_cache(ts_code, df_new, "raw")
-
-                    # 2.2 若目标是 qfq/hfq，则再拉同区间的复权数据来算指标（避免用 raw 误算）
-                    else:
-                        def call_bar_adj():
-                            return ts.pro_bar(
-                                ts_code=ts_code,
-                                start_date=actual_start,
-                                end_date=end,
-                                adj=_adj_for_ind,
-                                freq='D',
-                                asset='E'
-                            )
-                        df_adj = _retry(lambda: call_bar_adj(), f"stock_pro_bar_{_adj_for_ind}_{ts_code}")
-                        if df_adj is not None and not df_adj.empty:
-                            df_adj = df_adj.sort_values("trade_date").drop(
-                                columns=[c for c in ("pre_close","change","pct_chg") if c in df_adj.columns],
-                                errors="ignore"
-                            )
-                            _with_api_adj(_adj_for_ind, _WRITE_SYMBOL_INDICATORS, ts_code, df_adj, end, prewarmed=True)
-                            if INC_STREAM_UPDATE_FAST_CACHE:
-                                _update_fast_init_cache(ts_code, df_adj, _adj_for_ind)
-                        # 也可选择顺手把 raw 版本回灌 fast_cache，加速后续合并
-                        if INC_STREAM_UPDATE_FAST_CACHE:
-                            _update_fast_init_cache(ts_code, df_new, "raw")
-
-                    # 3) （可选）把这只股票的指标合并到 daily_*_indicators 分区
-                    if INC_STREAM_MERGE_IND_SUBSET:
-                        _with_api_adj(_adj_for_ind, duckdb_merge_symbol_products_to_daily_subset, [ts_code])
-
-                except Exception as e_calc:
-                    # 保守起见：指标失败不影响主流程的“下载+落盘”
-                    logging.warning("[INC_STREAM][%s] 边下载边算失败：%s", ts_code, e_calc)
-            # ==== NEW END ====
-            return ts_code, "ok"
-
-        except Exception as e:
-            return ts_code, f"err:{e}"
-
-    with ThreadPoolExecutor(max_workers=threads) as exe:
-        futs = {exe.submit(fetch_one, code): code for code in codes}
-        pbar = tqdm(as_completed(futs), total=len(futs), desc="股票(日线)并发拉取", ncols=120)
-        for fut in pbar:
-            code, st = fut.result()
-            if st == "ok": logging.debug('[BRANCH] def sync_stock_daily_fast | IF st == "ok" -> taken'); ok += 1
-            elif st == "empty": logging.debug('[BRANCH] def sync_stock_daily_fast | IF st == "empty" -> taken'); empty += 1
-            else: logging.debug('[BRANCH] def sync_stock_daily_fast | ELSE of IF st == "empty" -> taken'); err += 1
-            pbar.set_postfix(ok=ok, empty=empty, err=err)
-        pbar.close()
-
-    logging.info("[stock][FAST] 完成 ok=%d empty=%d err=%d 区间=%s~%s 起点=%s",
-                 ok, empty, err, start, end, actual_start)
-
-
-# ========== FAST INIT (按股票多线程) ==========
-def _fetch_stock_list() -> pd.DataFrame:
-    cache = os.path.join(DATA_ROOT, "stock_list.csv")
-    if os.path.exists(cache):
-        logging.debug('[BRANCH] def _fetch_stock_list | IF os.path.exists(cache) -> taken')
-        return pd.read_csv(cache, dtype=str)
-    df = _retry(lambda: pro.stock_basic(exchange='', list_status='L',
-                                        fields='ts_code,name,list_date'),
-                "stock_basic_full")
-    df.to_csv(cache, index=False, encoding='utf-8-sig')
-    return df
-
-
-def fast_init_download(end_date: str):
-    """
-    第一阶段：多线程按股票全量下载到 fast_init_symbol 目录(一个股票一个文件)。
-    下载完自动执行一次失败股票补抓(若开启 FAILED_RETRY_ONCE)。
-    """
-    os.makedirs(FAST_INIT_STOCK_DIR, exist_ok=True)
-    stocks = _fetch_stock_list()
-    codes = stocks.ts_code.tolist()
-    logging.info("[FAST_INIT] 股票数=%d", len(codes))
-
-    lock_stats = threading.Lock()
-    ok = skip = empty = err = 0
-    failed = []   # 初次失败列表 (含异常信息)
-
-    def task(ts_code: str):
-        # 根据复权类型切换子目录，使用统一的映射关系
-        adj_folder = {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}.get(API_ADJ, "raw")
-        sub_dir = os.path.join(FAST_INIT_STOCK_DIR, adj_folder)
-        os.makedirs(sub_dir, exist_ok=True)
-        fpath = os.path.join(sub_dir, f"{ts_code}.parquet")
-
-        if os.path.exists(fpath) and CHECK_SKIP_MIN_MAX:
-            logging.debug('[BRANCH] def fast_init_download > def task | IF os.path.exists(fpath) and CHECK_SKIP_MIN_MAX -> taken')
-            need_redownload = False
-            min_d = max_d = None
-            try:
-                df_meta = pd.read_parquet(fpath, columns=CHECK_SKIP_READ_COLUMNS)
-                if df_meta.empty:
-                    logging.debug('[BRANCH] def fast_init_download > def task | IF df_meta.empty -> taken')
-                    need_redownload = True
+                elif "token" in error_lower or "auth" in error_lower or "1002" in error_msg:
+                    self.rate_limiter.record_error("auth_error")
+                    logger.error(f"Token认证失败: {error_msg}")
+                    # 认证错误不重试
+                    break
+                elif "network" in error_lower or "timeout" in error_lower or "connection" in error_lower:
+                    self.rate_limiter.record_error("network_error")
+                    logger.warning(f"网络连接问题: {error_msg}")
+                    # 网络错误可以重试
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        logger.info(f"网络问题，等待 {wait_time:.1f} 秒后重试...")
+                        time.sleep(wait_time)
+                        continue
                 else:
-                    # 仅用于日志，不参与判定
-                    logging.debug('[BRANCH] def fast_init_download > def task | ELSE of IF df_meta.empty -> taken')
-                    min_d = str(df_meta.trade_date.min())
-                    max_d = str(df_meta.trade_date.max())
-
-                    # ---- 尾部允许滞后判断 ----
-                    # 允许滞后 N 天：只要文件最大日期 >= (end_date - N天) 就视为完整
-                    lag_threshold = (
-                        dt.datetime.strptime(end_date, "%Y%m%d") -
-                        dt.timedelta(days=CHECK_SKIP_ALLOW_LAG_DAYS)
-                    ).strftime("%Y%m%d")
-
-                    if max_d < lag_threshold:
-                        logging.debug('[BRANCH] def fast_init_download > def task | IF max_d < lag_threshold -> taken')
-                        need_redownload = True
-
-            except (FileNotFoundError, PermissionError) as e:
-                need_redownload = True
-                logging.warning("文件访问错误 %s -> 强制重下 (%s)", ts_code, e)
-            except (pd.errors.EmptyDataError, pd.errors.ParserError) as e:
-                need_redownload = True
-                logging.warning("数据解析错误 %s -> 强制重下 (%s)", ts_code, e)
-            except Exception as e:
-                need_redownload = True
-                logging.warning("Skip 检查读取失败 %s -> 强制重下 (%s)", ts_code, e)
-
-            if not need_redownload:
-                # 可选调试
-                # logging.debug("[SKIP] %s min=%s max=%s lag_thr=%s", ts_code, min_d, max_d, lag_threshold)
-                logging.debug('[BRANCH] def fast_init_download > def task | IF not need_redownload -> taken')
-                return (ts_code, 'skip', None)
-            else:
-                logging.debug('[BRANCH] def fast_init_download > def task | ELSE of IF not need_redownload -> taken')
-                logging.info("文件尾部滞后 %s min=%s max=%s 需要>=%s(=end - %d天) -> 重下",
-                            ts_code, min_d, max_d, lag_threshold, CHECK_SKIP_ALLOW_LAG_DAYS)
-
-
-        def _call():
-            return ts.pro_bar(
-                ts_code=ts_code,
-                start_date=START_DATE,
-                end_date=end_date,
-                adj = None if API_ADJ == "raw" else API_ADJ,
-                freq = 'D',
-                asset='E'
-            )
-        try:
-            df = _retry(_call, f"pro_bar_{ts_code}")
-            if df is None or df.empty:
-                logging.debug('[BRANCH] def fast_init_download > def task | IF df is None or df.empty -> taken')
-                return (ts_code, 'empty', None)
-            
-            df = df.sort_values("trade_date")
-            df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
-            _safe_write_parquet(df, fpath, ts_code)
-
-            if API_ADJ != "raw":
-                logging.debug('[BRANCH] def fast_init_download > def task | IF API_ADJ != "raw" -> taken')
-                _WRITE_SYMBOL_INDICATORS(ts_code, df, end_date)
-            return (ts_code, 'ok', None)
-        except Exception as e:
-            return (ts_code, 'err', str(e))
-
-    with ThreadPoolExecutor(max_workers=FAST_INIT_THREADS) as exe:
-        futs = {exe.submit(task, c): c for c in codes}
-        pbar = tqdm(as_completed(futs), total=len(futs), desc="FAST_INIT 下载", ncols=120,
-                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
-        for fut in pbar:
-            ts_code, status, msg = fut.result()
-            with lock_stats:
-                if status == 'ok':
-                    ok += 1
-                elif status == 'skip':
-                    skip += 1
-                elif status == 'empty':
-                    empty += 1
-                else:
-                    err += 1
-                    failed.append((ts_code, msg))
-                    pbar.close()
-                    # 立即取消还在排队/执行的任务
-                    exe.shutdown(cancel_futures=True)
-                    raise RuntimeError(f"FAIL-FAST 触发：{ts_code} 指标/写盘报错：{msg}")
-            pbar.set_postfix(ok=ok, skip=skip, empty=empty, err=err)
-
-        pbar.close()
-
-    logging.info("[FAST_INIT] 初轮完成 ok=%d skip=%d empty=%d err=%d", ok, skip, empty, err)
-
-    failed_codes = [c for c,_ in failed]
-    if failed_codes:
-        # 写第一轮失败
-        logging.debug('[BRANCH] def fast_init_download | IF failed_codes -> taken')
-        with open(os.path.join(DATA_ROOT, "fast_init_failed_round1.txt"), "w", encoding="utf-8") as f:
-            for c,m in failed:
-                f.write(f"{c},{m}\n")
-
-    # ====== 自动失败补抓(一次) ======
-    if FAILED_RETRY_ONCE and failed_codes:
-        logging.debug('[BRANCH] def fast_init_download | IF FAILED_RETRY_ONCE and failed_codes -> taken')
-        logging.info("[FAST_INIT] 等待 %ds 后开始失败补抓，失败数=%d", FAILED_RETRY_WAIT, len(failed_codes))
-        time.sleep(FAILED_RETRY_WAIT)
-
-        def retry_task(ts_code: str):
-            # 使用统一的路径映射关系
-            adj_folder = {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}.get(API_ADJ, "raw")
-            fpath = os.path.join(FAST_INIT_STOCK_DIR, adj_folder, f"{ts_code}.parquet")
-            if os.path.exists(fpath):
-                logging.debug('[BRANCH] def fast_init_download > def retry_task | IF os.path.exists(fpath) -> taken')
-                return (ts_code, 'exists')
-            def _call():
-                return ts.pro_bar(
-                    ts_code=ts_code,
-                    start_date=START_DATE,
-                    end_date=end_date,
-                    adj = None if API_ADJ == "raw" else API_ADJ,
-                    freq = 'D',
-                    asset = 'E'
-                )
-            try:
-                df = _retry(_call, f"retry_pro_bar_{ts_code}")
-                if df is None or df.empty:
-                    logging.debug('[BRANCH] def fast_init_download > def retry_task | IF df is None or df.empty -> taken')
-                    return (ts_code, 'empty')
+                    self.rate_limiter.record_error("api_error")
+                    logger.error(f"API调用失败: {error_msg}")
+                    # 其他错误可以重试
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        logger.info(f"API错误，等待 {wait_time:.1f} 秒后重试...")
+                        time.sleep(wait_time)
+                        continue
                 
-                df = df.sort_values("trade_date")
-                df = df.drop(columns=[c for c in ("pre_close","change","pct_chg") if c in df.columns])
-                _safe_write_parquet(df, fpath, ts_code)
-
-                if API_ADJ != "raw":
-                    logging.debug('[BRANCH] def fast_init_download > def retry_task | IF API_ADJ != "raw" -> taken')
-                    _WRITE_SYMBOL_INDICATORS(ts_code, df, end_date)
-                return (ts_code, 'ok')
-            except Exception as e:
-                return (ts_code, f"err:{e}")
-
-        ok2 = empty2 = err2 = exists2 = 0
-        with ThreadPoolExecutor(max_workers=FAILED_RETRY_THREADS) as exe:
-            futs2 = {exe.submit(retry_task, c): c for c in failed_codes}
-            pbar2 = tqdm(as_completed(futs2), total=len(futs2), desc="失败补抓", ncols=120)
-            for fut in pbar2:
-                c, st = fut.result()
-                if st == 'ok':
-                    ok2 += 1
-                elif st == 'empty':
-                    empty2 += 1
-                elif st == 'exists':
-                    exists2 += 1
-                else:
-                    err2 += 1
-                pbar2.set_postfix(ok=ok2, empty=empty2, exists=exists2, err=err2)
-            pbar2.close()
-        logging.info("[FAST_INIT] 补抓完成 ok=%d empty=%d exists=%d err=%d", ok2, empty2, exists2, err2)
-
-        if err2 > 0:
-            logging.debug('[BRANCH] def fast_init_download | IF err2 > 0 -> taken')
-            final_failed = []
-            adj_folder = {"daily":"raw", "qfq":"qfq", "hfq":"hfq"}.get(API_ADJ, "raw")
-            for c in failed_codes:
-                fpath = os.path.join(FAST_INIT_STOCK_DIR, adj_folder, f"{c}.parquet")
-                if not os.path.exists(fpath):
-                    logging.debug('[BRANCH] def fast_init_download | IF not os.path.exists(fpath) -> taken')
-                    final_failed.append(c)
-            with open(os.path.join(DATA_ROOT, "fast_init_failed_final.txt"), "w", encoding="utf-8") as f:
-                for c in final_failed:
-                    f.write(c + "\n")
-            logging.warning("[FAST_INIT] 仍失败股票数=%d -> fast_init_failed_final.txt", len(final_failed))
-    else:
-        logging.debug('[BRANCH] def fast_init_download | ELSE of IF FAILED_RETRY_ONCE and failed_codes -> taken')
-        logging.info("[FAST_INIT] 无需补抓或无失败股票。")
-
-
-def duckdb_merge_symbol_products_to_daily(batch_days:int=30):
-    import duckdb, os
-    from math import ceil
-    from tqdm import tqdm
-
-    adj = _decide_symbol_adj_for_fast_init()
-    src_dir = os.path.join(DATA_ROOT, "stock", "single", f"single_{adj}_indicators")
-    dst_dir = os.path.join(DATA_ROOT, "stock", "daily", f"daily_{adj}_indicators")
-    if not os.path.isdir(src_dir):
-        logging.debug('[BRANCH] def duckdb_merge_symbol_products_to_daily | IF not os.path.isdir(src_dir) -> taken')
-        logging.warning("[DUCK MERGE IND] 源目录不存在：%s", src_dir)
-        return
-    os.makedirs(dst_dir, exist_ok=True)
-
-    con = duckdb.connect()
-    con.execute(f"PRAGMA threads={DUCKDB_THREADS};")
-    con.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}';")
-    os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
-    con.execute(f"PRAGMA temp_directory='{DUCKDB_TEMP_DIR}';")
-
-    # 目标端已有的最大日期
-    try:
-        glob_dst = os.path.join(dst_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
-        glob_dst_sql = glob_dst.replace("'", "''")
-        last_duck = con.sql(f"SELECT max(trade_date) FROM parquet_scan('{glob_dst_sql}')").fetchone()[0] or 0
-    except duckdb.Error:
-        last_duck = 0
-    last_duck_str = str(last_duck).zfill(8)
-
-    # 找出需要合并的“新增日期”清单
-    src_posix = src_dir.replace("\\", "/")
-    df_dates = con.sql(f"""
-        SELECT DISTINCT trade_date
-        FROM parquet_scan('{src_posix}/*.parquet')
-        WHERE trade_date > '{last_duck_str}'
-        ORDER BY trade_date
-    """).df()
-
-    if df_dates.empty:
-        logging.debug('[BRANCH] def duckdb_merge_symbol_products_to_daily | IF df_dates.empty -> taken')
-        logging.info("[DUCK MERGE IND] 已最新，跳过")
-        con.close()
-        return
-
-    dates = df_dates.trade_date.astype(str).tolist()
-    total_batches = ceil(len(dates)/batch_days)
-    pbar = tqdm(range(total_batches), desc=f"DUCK MERGE IND ({adj})", ncols=120)
-
-    for i in pbar:
-        chunk = dates[i*batch_days:(i+1)*batch_days]
-        mn, mx = chunk[0], chunk[-1]
-        sql = f"""
-        COPY (
-          SELECT *
-          FROM parquet_scan('{src_posix}/*.parquet')
-          WHERE trade_date BETWEEN '{mn}' AND '{mx}'
-        )
-        TO '{dst_dir}'
-        (FORMAT PARQUET, PARTITION_BY (trade_date), OVERWRITE_OR_IGNORE 1);
-        """
-        con.execute(sql)
-        pbar.set_postfix(batch=f"{i+1}/{total_batches}", days=len(chunk), rng=f"{mn}~{mx}")
-
-    con.close()
-    logging.info("[DUCK MERGE IND] 合并完成 新增日期数=%d", len(dates))
-    _maybe_compact(dst_dir)
-
-
-def duckdb_merge_symbol_products_to_daily_subset(ts_codes: list[str], batch_days: int = 30):
-    """
-    只从给定 ts_codes 的单股成品(含指标)里抽取新增日期，合并到 daily_<adj>_indicators。
-    减少 read_parquet 的文件枚举范围。
-    """
-    import duckdb
-    from math import ceil
-    adj = _decide_symbol_adj_for_fast_init()
-    src_dir = os.path.join(DATA_ROOT, "stock", "single", f"single_{adj}_indicators")
-    dst_dir = os.path.join(DATA_ROOT, "stock", "daily", f"daily_{adj}_indicators")
-    os.makedirs(dst_dir, exist_ok=True)
-
-    con = duckdb.connect()
-    con.execute(f"PRAGMA threads={DUCKDB_THREADS};")
-    con.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}';")
-    os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
-    con.execute(f"PRAGMA temp_directory='{DUCKDB_TEMP_DIR}';")
-
-    # 目标端已有的最大日期
-    try:
-        glob_dst = os.path.join(dst_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
-        last_duck = con.sql(f"SELECT max(trade_date) FROM parquet_scan('{glob_dst}')").fetchone()[0] or 0
-    except duckdb.Error:
-        last_duck = 0
-    last_duck_str = str(last_duck).zfill(8)
-
-    # 只拼接这些文件的绝对路径
-    files = [
-        os.path.join(src_dir, f"{c}.parquet").replace("\\", "/")
-        for c in ts_codes
-        if os.path.exists(os.path.join(src_dir, f"{c}.parquet"))
-    ]
-    if not files:
-        con.close()
-        logging.info("[DUCK MERGE IND][subset] 本次无可合并文件")
-        return
-
-    # 先取这些文件的“新增日期清单”
-    file_list_sql = ", ".join([f"'{p}'" for p in files])
-    df_dates = con.sql(f"""
-        SELECT DISTINCT trade_date
-        FROM read_parquet([{file_list_sql}])
-        WHERE trade_date > '{last_duck_str}'
-        ORDER BY trade_date
-    """).df()
-    if df_dates.empty:
-        con.close()
-        logging.info("[DUCK MERGE IND][subset] 已最新，跳过")
-        return
-
-    dates = df_dates.trade_date.astype(str).tolist()
-    total_batches = ceil(len(dates) / batch_days)
-    for i in range(total_batches):
-        chunk = dates[i*batch_days:(i+1)*batch_days]
-        mn, mx = chunk[0], chunk[-1]
-        sql = f"""
-        COPY (
-          SELECT * FROM read_parquet([{file_list_sql}])
-          WHERE trade_date BETWEEN '{mn}' AND '{mx}'
-        )
-        TO '{dst_dir}'
-        (FORMAT PARQUET, PARTITION_BY (trade_date), OVERWRITE_OR_IGNORE 1);
-        """
-        con.execute(sql)
-
-    con.close()
-    logging.info("[DUCK MERGE IND][subset] 完成，新增日期数=%d 涉及股票数=%d", len(dates), len(files))
-
-
-# ====== 增量重算：把新增日期涉及的股票，补齐“按股票成品(含指标)”并合并到按日分区 ======
-def _with_api_adj(temp_api_adj: str, fn, *args, **kwargs):
-    """
-    Temporarily set an *effective* API_ADJ for the current thread using thread-local storage,
-    so concurrent threads don't race on the global value.
-    """
-    prev = getattr(_TLS, "adj_override", None)
-    _TLS.adj_override = (temp_api_adj or "").lower()
-    try:
-        return fn(*args, **kwargs)
-    finally:
-        if prev is None:
-            try:
-                delattr(_TLS, "adj_override")
-            except Exception:
-                pass
-        else:
-            _TLS.adj_override = prev
-
-
-def recalc_symbol_products_for_increment(start: str, end: str, threads: int = 0):
-    """
-    NORMAL(日常增量)的核心补全：
-    1) 找出 stock/<target_adj> 新增日期涉及的 ts_code
-    2) 以 warm-up 窗口回看，抽取这批 ts_code 的历史数据
-    3) 用统一的 _WRITE_SYMBOL_INDICATORS() 重算单股成品(含指标)
-    4) 回灌 fast_init 缓存；再合并到 <adj>_indicators 分区
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    target_adj = _decide_symbol_adj_for_fast_init()     # raw / qfq / hfq
-    src_dir = os.path.join(DATA_ROOT, "stock", "daily", f"daily_{target_adj}")
-    dst_dir = os.path.join(DATA_ROOT, "stock", "daily", f"daily_{target_adj}_indicators")
-    if not os.path.isdir(src_dir):
-        logging.debug('[BRANCH] def recalc_symbol_products_for_increment | IF not os.path.isdir(src_dir) -> taken')
-        logging.warning("[INC_IND] 源目录不存在：%s(可能尚未构建 %s)", src_dir, target_adj)
-        return
-
-    con = duckdb.connect()
-    con.execute(f"PRAGMA threads={DUCKDB_THREADS};")
-    con.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}';")
-    os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
-    con.execute(f"PRAGMA temp_directory='{DUCKDB_TEMP_DIR}';")
+                # 如果所有重试都失败了，抛出异常
+                if attempt == max_retries - 1:
+                    logger.error(f"API调用最终失败，已重试 {max_retries} 次")
+                    raise
     
-    # ① 目的端已有最大交易日
-    try:
-        glob_dst = os.path.join(dst_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
-        glob_dst_sql = glob_dst.replace("'", "''")  # 防止路径中含有单引号
-        val = con.sql(f"SELECT max(trade_date) FROM parquet_scan('{glob_dst_sql}')").fetchone()[0]
-        last_duck = int(val) if val is not None else 0
-    except duckdb.Error as e:
-        print("DuckDB error (dst max trade_date):", e)
-        last_duck = 0
-
-    # 统一成 8 位字符串用于比较（如果 trade_date 是字符串类型）
-    last_duck_str = str(last_duck).zfill(8)
-
-    # 如果目的端还没有数据，用源端的最新日 - 1 与 start 取最大值做下限
-    if last_duck <= 0:
-        glob_src = os.path.join(src_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
-        glob_src_sql = glob_src.replace("'", "''")
+    def get_stock_list(self) -> pd.DataFrame:
+        """获取股票列表"""
         try:
-            val = con.sql(f"SELECT max(trade_date) FROM parquet_scan('{glob_src_sql}')").fetchone()[0]
-            last_src = int(val) if val is not None else 0
-        except duckdb.Error as e:
-            print("DuckDB error (src max trade_date):", e)
-            last_src = 0
-        last_duck = max(last_src - 1, int(start))
-        last_duck_str = str(last_duck).zfill(8)
-
-    # ② 源端新增日期涉及的 ts_code
-    glob_src = os.path.join(src_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
-    glob_src_sql = glob_src.replace("'", "''")
-
-    try:
-        df_codes = con.sql(f"""
-            SELECT DISTINCT ts_code
-            FROM parquet_scan('{glob_src_sql}')
-            WHERE trade_date > '{last_duck_str}' AND trade_date <= '{end}'
-        """).df()
-    except duckdb.Error as e:
-        print("DuckDB error (scan src for ts_code):", e)
-        df_codes = pd.DataFrame(columns=["ts_code"])
-
-    if df_codes.empty:
-        logging.debug('[BRANCH] def recalc_symbol_products_for_increment | IF df_codes.empty -> taken')
-        logging.info("[INC_IND] 指标分区已最新(last=%s，源端无新增日期)。", last_duck)
-        con.close()
-        return
-
-    ts_list = df_codes["ts_code"].dropna().astype(str).unique().tolist()
-    logging.info("[INC_IND] 需要补的股票数=%d (last_ind_date=%s)", len(ts_list), last_duck_str)
-
-    if INC_IND_ALL_INMEM and ts_list:
-        con.close()
-        return _recalc_increment_inmem(ts_list, last_duck_str, end, threads)
-
-
-def duckdb_partition_merge(batch_days:int=30):
-    """
-    增量合并 fast_init_symbol/{raw|qfq|hfq} 中 *新增* trade_date 到
-    stock/daily/{daily|qfq|hfq}/，按日期微批复制并显示进度。
-    """
-    import duckdb, os
-    from math import ceil
-    from tqdm import tqdm
-
-    merge_tasks = [
-        ("raw", os.path.join(FAST_INIT_STOCK_DIR, "raw"),
-                os.path.join(DATA_ROOT, "stock", "daily", "daily_raw")),
-        ("qfq", os.path.join(FAST_INIT_STOCK_DIR, "qfq"),
-                os.path.join(DATA_ROOT, "stock", "daily", "daily_qfq")),
-        ("hfq", os.path.join(FAST_INIT_STOCK_DIR, "hfq"),
-                os.path.join(DATA_ROOT, "stock", "daily", "daily_hfq")),
-    ]
-
-    for mode, src_dir, dst_dir in merge_tasks:
-        if not os.path.isdir(src_dir):
-            logging.debug('[BRANCH] def duckdb_partition_merge | IF not os.path.isdir(src_dir) -> taken')
-            logging.warning("[DUCK MERGE][%s] 源目录不存在，跳过", mode)
-            continue
-        os.makedirs(dst_dir, exist_ok=True)
-
-        con = duckdb.connect()
-        con.execute(f"PRAGMA threads={DUCKDB_THREADS};")
-        con.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}';")
-        os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
-        con.execute(f"PRAGMA temp_directory='{DUCKDB_TEMP_DIR}';")
-
-        # 目标端已有的最大 trade_date
-        try:
-            glob_dst = os.path.join(dst_dir, "trade_date=*/data_*.parquet").replace("\\", "/")
-            last_duck = con.sql(
-                f"SELECT max(trade_date) FROM parquet_scan('{glob_dst}')"
-            ).fetchone()[0] or 0
-        except duckdb.Error:
-            last_duck = 0
-        last_duck_str = str(last_duck).zfill(8)
-
-        # 计算新增日期清单
-        src_posix = src_dir.replace("\\", "/")
-        df_dates = con.sql(f"""
-            SELECT DISTINCT trade_date
-            FROM parquet_scan('{src_posix}/*.parquet')
-            WHERE trade_date > '{last_duck_str}'
-            ORDER BY trade_date
-        """).df()
-
-        if df_dates.empty:
-            logging.debug('[BRANCH] def duckdb_partition_merge | IF df_dates.empty -> taken')
-            logging.info("[DUCK MERGE][%s] 已最新，跳过", mode)
-            con.close()
-            continue
-
-        dates = df_dates.trade_date.astype(str).tolist()
-        total_batches = ceil(len(dates) / batch_days)
-        pbar = tqdm(range(total_batches), desc=f"DUCK MERGE [{mode}]", ncols=120)
-
-        for i in pbar:
-            chunk = dates[i*batch_days:(i+1)*batch_days]
-            mn, mx = chunk[0], chunk[-1]
-            sql = f"""
-            COPY (
-              SELECT *
-              FROM parquet_scan('{src_posix}/*.parquet')
-              WHERE trade_date BETWEEN '{mn}' AND '{mx}'
+            return self._make_api_call(
+                self._pro.stock_basic,
+                exchange='',
+                list_status='L',
+                fields='ts_code,symbol,name,area,industry,list_date'
             )
-            TO '{dst_dir}'
-            (FORMAT PARQUET, PARTITION_BY (trade_date), OVERWRITE_OR_IGNORE 1);
-            """
-            con.execute(sql)
-            pbar.set_postfix(batch=f"{i+1}/{total_batches}", days=len(chunk), rng=f"{mn}~{mx}")
+        except Exception as e:
+            logger.error(f"获取股票列表失败: {e}")
+            raise
+    
+    def get_stock_daily(self, ts_code: str, start_date: str, end_date: str, 
+                       adj: str = None) -> pd.DataFrame:
+        """获取股票日线数据（使用pro_bar接口获取原始数据）"""
+        try:
+            # 构建参数字典
+            params = {
+                'ts_code': ts_code,
+                'start_date': start_date,
+                'end_date': end_date,
+                'freq': 'D',
+                'asset': 'E'
+            }
+            
+            # 只有当adj不为None且不是'raw'时才添加adj参数
+            if adj and adj != 'raw':
+                params['adj'] = adj
+            
+            return self._make_api_call(
+                ts.pro_bar,
+                **params
+            )
+        except Exception as e:
+            logger.error(f"获取股票日线数据失败 {ts_code}: {e}")
+            raise
+    
+    def get_index_daily(self, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """获取指数日线数据（使用pro_bar接口获取原始数据）"""
+        try:
+            # 构建参数字典
+            params = {
+                'ts_code': ts_code,
+                'start_date': start_date,
+                'end_date': end_date,
+                'freq': 'D',
+                'asset': 'I'  # 指数
+            }
+            
+            return self._make_api_call(
+                ts.pro_bar,
+                **params
+            )
+        except Exception as e:
+            logger.error(f"获取指数日线数据失败 {ts_code}: {e}")
+            raise
+    
+    def get_trade_dates(self, start_date: str, end_date: str) -> List[str]:
+        """获取交易日列表（使用数据库管理器的统一方法）"""
+        try:
+            # 使用数据库管理器的统一方法
+            return self.db_manager.get_trade_dates_from_tushare(start_date, end_date)
+        except Exception as e:
+            logger.error(f"获取交易日列表失败: {e}")
+            raise
+    
+    def get_smart_end_date(self, end_date_config: str) -> str:
+        """
+        智能获取结束日期，考虑市场开盘时间和休盘情况（使用数据库管理器的统一方法）
+        
+        Args:
+            end_date_config: 结束日期配置 ("today" 或具体日期)
+            
+        Returns:
+            处理后的结束日期字符串
+        """
+        try:
+            # 使用数据库管理器的统一方法
+            return self.db_manager.get_smart_end_date(end_date_config)
+        except Exception as e:
+            logger.error(f"智能获取结束日期失败: {e}")
+            # 如果智能获取失败，返回原配置或今天
+            if end_date_config.lower() == "today":
+                return datetime.now().strftime("%Y%m%d")
+            return end_date_config
 
-        con.close()
-        logging.info("[DUCK MERGE][%s] 合并完成 新增日期数=%d", mode, len(dates))
-        _maybe_compact(dst_dir)  # 合并完成日志之后
+# ================= 数据处理器 =================
 
+class DataProcessor:
+    """数据处理器"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+        self.indicator_names = get_all_indicator_names()
+    
+    def clean_stock_data(self, df: pd.DataFrame, ts_code: str = None) -> pd.DataFrame:
+        """清理股票数据"""
+        if df is None or df.empty:
+            return df
+        
+        # 复制数据
+        df = df.copy()
+        
+        # 删除不需要的列
+        columns_to_drop = ["pre_close", "change", "pct_chg"]
+        for col in columns_to_drop:
+            if col in df.columns:
+                df = df.drop(columns=[col])
+        
+        # 数值化处理
+        numeric_columns = ["open", "high", "low", "close", "vol", "amount"]
+        for col in numeric_columns:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        
+        # 精度控制
+        price_columns = ["open", "high", "low", "close", "vol", "amount"]
+        for col in price_columns:
+            if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].astype(float).round(2)
+        
+        # 排序和去重
+        df = df.sort_values("trade_date")
+        df = df.drop_duplicates("trade_date", keep="last")
+        
+        # 规范化日期
+        df = normalize_trade_date(df)
+        
+        return df
+    
+    def compute_indicators_with_warmup(self, df: pd.DataFrame, ts_code: str, 
+                                     adj_type: str) -> pd.DataFrame:
+        """计算指标（包含warmup机制）"""
+        if df is None or df.empty:
+            return df
+        
+        try:
+            # 获取历史数据用于warmup
+            historical_data = self._get_historical_data_for_warmup(ts_code, adj_type, df)
+            
+            if historical_data is not None and not historical_data.empty:
+                # 合并历史数据和新增数据
+                combined_data = pd.concat([historical_data, df], ignore_index=True)
+                combined_data = combined_data.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+                
+                # 计算指标
+                df_with_indicators = compute(combined_data, self.indicator_names)
+                
+                # 只保留新增数据的部分
+                df_with_indicators = df_with_indicators[
+                    df_with_indicators['trade_date'] >= df['trade_date'].min()
+                ].copy()
+            else:
+                # 没有历史数据，直接计算
+                df_with_indicators = compute(df, self.indicator_names)
+            
+            # 精度控制
+            from indicators import outputs_for
+            decs = outputs_for(self.indicator_names)
+            for col, n in decs.items():
+                if col in df_with_indicators.columns and pd.api.types.is_numeric_dtype(df_with_indicators[col]):
+                    df_with_indicators[col] = df_with_indicators[col].round(n)
+            
+            return df_with_indicators
+            
+        except Exception as e:
+            logger.error(f"指标计算失败 {ts_code}: {e}")
+            return df
+    
+    def _get_historical_data_for_warmup(self, ts_code: str, adj_type: str, 
+                                       new_data: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """获取历史数据用于warmup"""
+        try:
+            # 计算需要的warmup天数
+            warmup_days = warmup_for(self.indicator_names)
+            if warmup_days <= 0:
+                return None
+            
+            # 获取新数据的最早日期
+            min_date = new_data['trade_date'].min()
+            
+            # 计算历史数据的结束日期（新数据开始日期的前一天）
+            from datetime import datetime, timedelta
+            min_date_obj = datetime.strptime(str(min_date), '%Y%m%d')
+            end_date_obj = min_date_obj - timedelta(days=1)
+            end_date = end_date_obj.strftime('%Y%m%d')
+            
+            # 计算历史数据的开始日期 - 减少查询范围
+            start_date_obj = min_date_obj - timedelta(days=warmup_days)  # 只取必要的warmup数据
+            start_date = start_date_obj.strftime('%Y%m%d')
+            
+            # 添加超时和重试机制
+            max_retries = 2
+            for attempt in range(max_retries + 1):
+                try:
+                    # 从数据库获取历史数据
+                    historical_df = self.db_manager.query_stock_data(
+                        ts_code=ts_code,
+                        start_date=start_date,
+                        end_date=end_date,
+                        adj_type=adj_type
+                    )
+                    
+                    if historical_df.empty:
+                        return None
+                    
+                    # 确保数据格式一致
+                    historical_df = self.clean_stock_data(historical_df, ts_code)
+                    
+                    logger.debug(f"获取历史数据用于warmup {ts_code}: {len(historical_df)} 行")
+                    return historical_df
+                    
+                except Exception as e:
+                    if attempt < max_retries and "timeout" in str(e).lower():
+                        logger.warning(f"warmup查询超时 {ts_code} (尝试 {attempt + 1}/{max_retries + 1}): {e}")
+                        time.sleep(1.0 * (attempt + 1))  # 指数退避
+                        continue
+                    else:
+                        logger.debug(f"获取历史数据失败 {ts_code}: {e}")
+                        return None
+            
+        except Exception as e:
+            logger.debug(f"获取历史数据失败 {ts_code}: {e}")
+            return None
+    
+    def prepare_data_for_database(self, df: pd.DataFrame, adj_type: str) -> pd.DataFrame:
+        """准备数据用于数据库写入"""
+        if df is None or df.empty:
+            return df
+        
+        # 添加复权类型列
+        df = df.copy()
+        df['adj_type'] = adj_type
+        
+        # 确保列顺序正确
+        base_columns = ['ts_code', 'trade_date', 'adj_type', 'open', 'high', 'low', 'close', 'vol', 'amount']
+        indicator_columns = [col for col in df.columns if col not in base_columns]
+        df = df[base_columns + indicator_columns]
+        
+        return df
 
-def streaming_merge_after_download():
-    """
-    第二阶段：将  下每个股票 parquet 文件流式合并到
-    data/stock/daily/ 和 data/stock/qfq/ 目录，分别处理原始和前复权数据。
-    """
-    merge_tasks = [
-    ("raw", os.path.join(FAST_INIT_STOCK_DIR, "raw"), os.path.join(DATA_ROOT, "stock", "daily", "daily_raw")),
-    ("qfq", os.path.join(FAST_INIT_STOCK_DIR, "qfq"), os.path.join(DATA_ROOT, "stock", "daily", "daily_qfq")),
-    ("hfq", os.path.join(FAST_INIT_STOCK_DIR, "hfq"), os.path.join(DATA_ROOT, "stock", "daily", "daily_hfq")),
-    ]
+# ================= 下载器 =================
 
-    for mode_label, symbol_dir, daily_root in merge_tasks:
-        stock_files = glob.glob(os.path.join(symbol_dir, "*.parquet"))
-        total_files = len(stock_files)
-        if total_files == 0:
-            logging.debug('[BRANCH] def streaming_merge_after_download | IF total_files == 0 -> taken')
-            logging.warning("[STREAM_MERGE][%s] 无股票文件可归并", mode_label)
-            continue
+class StockDownloader:
+    """股票数据下载器"""
+    
+    def __init__(self, config: DownloadConfig):
+        self.config = config
+        self.db_manager = get_database_manager()
+        
+        # 创建限频器
+        rate_limiter = RateLimiter(
+            calls_per_min=config.rate_limit_calls_per_min,
+            safe_calls_per_min=config.safe_calls_per_min,
+            adaptive=config.enable_adaptive_rate_limit,
+            burst_capacity=config.rate_limit_burst_capacity
+        )
+        
+        self.tushare_manager = TushareManager(rate_limiter=rate_limiter)
+        self.data_processor = DataProcessor(self.db_manager)
+        self.stats = DownloadStats()
+        self._lock = threading.Lock()
+    
+    def download_stock_data(self, ts_code: str) -> Tuple[str, str]:
+        """下载单只股票数据"""
+        try:
+            # 下载原始数据
+            logger.debug(f"开始下载 {ts_code} 的原始数据...")
+            raw_data = self.tushare_manager.get_stock_daily(
+                ts_code=ts_code,
+                start_date=self.config.start_date,
+                end_date=self.config.end_date,
+                adj=self.config.adj_type if self.config.adj_type != "raw" else None
+            )
+            
+            if raw_data is None or raw_data.empty:
+                logger.debug(f"{ts_code} 无数据")
+                return ts_code, "empty"
+            
+            logger.debug(f"{ts_code} 获取到 {len(raw_data)} 条原始数据")
+            
+            # 清理数据
+            logger.debug(f"清理 {ts_code} 数据...")
+            cleaned_data = self.data_processor.clean_stock_data(raw_data, ts_code)
+            
+            # 计算指标
+            if self.config.enable_warmup:
+                logger.debug(f"计算 {ts_code} 指标（包含warmup）...")
+                data_with_indicators = self.data_processor.compute_indicators_with_warmup(
+                    cleaned_data, ts_code, self.config.adj_type
+                )
+            else:
+                logger.debug(f"计算 {ts_code} 指标...")
+                data_with_indicators = compute(cleaned_data, self.data_processor.indicator_names)
+            
+            # 准备数据用于数据库写入
+            logger.debug(f"准备 {ts_code} 数据写入数据库...")
+            final_data = self.data_processor.prepare_data_for_database(
+                data_with_indicators, self.config.adj_type
+            )
+            
+            # 写入数据库
+            logger.debug(f"写入 {ts_code} 数据到数据库...")
+            self.db_manager.receive_stock_data(
+                source_module="download",
+                data=final_data,
+                mode="upsert"  # 使用upsert模式避免重复数据
+            )
+            
+            with self._lock:
+                self.stats.success_count += 1
+            
+            logger.debug(f"{ts_code} 下载完成，共 {len(final_data)} 条记录")
+            return ts_code, "success"
+            
+        except Exception as e:
+            error_msg = str(e)
+            with self._lock:
+                self.stats.error_count += 1
+                self.stats.failed_stocks.append((ts_code, error_msg))
+            
+            logger.error(f"下载股票数据失败 {ts_code}: {error_msg}")
+            return ts_code, f"error: {error_msg}"
+    
+    def download_all_stocks(self) -> DownloadStats:
+        """下载所有股票数据"""
+        logger.info("开始下载股票数据...")
+        
+        # 获取股票列表
+        stock_list = self.tushare_manager.get_stock_list()
+        stock_codes = stock_list['ts_code'].tolist()
+        
+        self.stats.total_stocks = len(stock_codes)
+        logger.info(f"准备下载 {len(stock_codes)} 只股票的数据")
+        
+        # 创建进度条
+        progress_bar = tqdm(
+            total=len(stock_codes),
+            desc="下载股票数据",
+            unit="只",
+            ncols=100,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+        )
+        
+        # 并发下载
+        with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
+            # 提交所有任务
+            future_to_code = {
+                executor.submit(self.download_stock_data, ts_code): ts_code 
+                for ts_code in stock_codes
+            }
+            
+            # 处理完成的任务
+            for future in as_completed(future_to_code):
+                ts_code = future_to_code[future]
+                try:
+                    result_code, status = future.result()
+                    if status == "empty":
+                        with self._lock:
+                            self.stats.empty_count += 1
+                    elif status == "success":
+                        logger.debug(f"成功下载 {result_code}")
+                    else:
+                        logger.warning(f"下载失败 {result_code}: {status}")
+                except Exception as e:
+                    logger.error(f"处理任务异常 {ts_code}: {e}")
+                    with self._lock:
+                        self.stats.error_count += 1
+                        self.stats.failed_stocks.append((ts_code, str(e)))
+                
+                # 更新进度条
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    '成功': self.stats.success_count,
+                    '空数据': self.stats.empty_count,
+                    '失败': self.stats.error_count
+                })
+        
+        # 关闭进度条
+        progress_bar.close()
+        
+        # 打印统计信息
+        logger.info(f"下载完成 - 成功: {self.stats.success_count}, 空数据: {self.stats.empty_count}, 失败: {self.stats.error_count}")
+        
+        # 打印限频器统计信息
+        rate_stats = self.tushare_manager.rate_limiter.get_stats()
+        logger.info(f"限频器统计 - 总调用: {rate_stats['total_calls']}, 成功率: {rate_stats['success_rate']:.1f}%, 等待时间: {rate_stats['total_wait_time']:.1f}s")
+        
+        return self.stats
 
-        os.makedirs(daily_root, exist_ok=True)
-        buffer: Dict[str, List[pd.DataFrame]] = {}
-        processed = 0
-        last_flush_time = time.time()
+class IndexDownloader:
+    """指数数据下载器"""
+    
+    def __init__(self, config: DownloadConfig):
+        self.config = config
+        self.db_manager = get_database_manager()
+        
+        # 创建限频器
+        rate_limiter = RateLimiter(
+            calls_per_min=config.rate_limit_calls_per_min,
+            safe_calls_per_min=config.safe_calls_per_min,
+            adaptive=config.enable_adaptive_rate_limit,
+            burst_capacity=config.rate_limit_burst_capacity
+        )
+        
+        self.tushare_manager = TushareManager(rate_limiter=rate_limiter)
+        self.stats = DownloadStats()
+        self._lock = threading.Lock()
+    
+    def download_index_data(self, ts_code: str) -> Tuple[str, str]:
+        """下载单只指数数据"""
+        try:
+            # 下载原始数据
+            logger.debug(f"开始下载 {ts_code} 的原始数据...")
+            raw_data = self.tushare_manager.get_index_daily(
+                ts_code=ts_code,
+                start_date=self.config.start_date,
+                end_date=self.config.end_date
+            )
+            
+            if raw_data is None or raw_data.empty:
+                logger.debug(f"{ts_code} 无数据")
+                return ts_code, "empty"
+            
+            logger.debug(f"{ts_code} 获取到 {len(raw_data)} 条原始数据")
+            
+            # 清理数据
+            logger.debug(f"清理 {ts_code} 数据...")
+            df = raw_data.copy()
+            
+            # 删除不需要的列
+            columns_to_drop = ["pre_close", "change", "pct_chg"]
+            for col in columns_to_drop:
+                if col in df.columns:
+                    df = df.drop(columns=[col])
+            
+            # 数值化处理
+            numeric_columns = ["open", "high", "low", "close", "vol", "amount"]
+            for col in numeric_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            
+            # 精度控制
+            price_columns = ["open", "high", "low", "close", "vol", "amount"]
+            for col in price_columns:
+                if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                    df[col] = df[col].astype(float).round(2)
+            
+            # 排序和去重
+            df = df.sort_values("trade_date")
+            df = df.drop_duplicates("trade_date", keep="last")
+            
+            # 规范化日期
+            df = normalize_trade_date(df)
+            
+            # 添加复权类型（指数使用ind）
+            df['adj_type'] = 'ind'
+            
+            # 确保列顺序正确
+            base_columns = ['ts_code', 'trade_date', 'adj_type', 'open', 'high', 'low', 'close', 'vol', 'amount']
+            df = df[base_columns]
+            
+            # 写入数据库
+            logger.debug(f"写入 {ts_code} 数据到数据库...")
+            self.db_manager.receive_stock_data(
+                source_module="download",
+                data=df,
+                mode="upsert"
+            )
+            
+            with self._lock:
+                self.stats.success_count += 1
+            
+            logger.debug(f"{ts_code} 下载完成，共 {len(df)} 条记录")
+            return ts_code, "success"
+            
+        except Exception as e:
+            error_msg = str(e)
+            with self._lock:
+                self.stats.error_count += 1
+                self.stats.failed_stocks.append((ts_code, error_msg))
+            
+            logger.error(f"下载指数数据失败 {ts_code}: {error_msg}")
+            return ts_code, f"error: {error_msg}"
+    
+    def download_all_indices(self, whitelist: List[str] = None) -> DownloadStats:
+        """下载所有指数数据"""
+        logger.info("开始下载指数数据...")
+        
+        # 使用白名单或默认指数列表
+        if whitelist is None:
+            whitelist = INDEX_WHITELIST
+        
+        self.stats.total_stocks = len(whitelist)
+        logger.info(f"准备下载 {len(whitelist)} 只指数的数据")
+        
+        # 创建进度条
+        progress_bar = tqdm(
+            total=len(whitelist),
+            desc="下载指数数据",
+            unit="只",
+            ncols=100,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+        )
+        
+        # 并发下载
+        with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
+            # 提交所有任务
+            future_to_code = {
+                executor.submit(self.download_index_data, ts_code): ts_code 
+                for ts_code in whitelist
+            }
+            
+            # 处理完成的任务
+            for future in as_completed(future_to_code):
+                ts_code = future_to_code[future]
+                try:
+                    result_code, status = future.result()
+                    if status == "empty":
+                        with self._lock:
+                            self.stats.empty_count += 1
+                    elif status == "success":
+                        logger.debug(f"成功下载 {result_code}")
+                    else:
+                        logger.warning(f"下载失败 {result_code}: {status}")
+                except Exception as e:
+                    logger.error(f"处理任务异常 {ts_code}: {e}")
+                    with self._lock:
+                        self.stats.error_count += 1
+                        self.stats.failed_stocks.append((ts_code, str(e)))
+                
+                # 更新进度条
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    '成功': self.stats.success_count,
+                    '空数据': self.stats.empty_count,
+                    '失败': self.stats.error_count
+                })
+        
+        # 关闭进度条
+        progress_bar.close()
+        
+        # 打印统计信息
+        logger.info(f"下载完成 - 成功: {self.stats.success_count}, 空数据: {self.stats.empty_count}, 失败: {self.stats.error_count}")
+        
+        # 打印限频器统计信息
+        rate_stats = self.tushare_manager.rate_limiter.get_stats()
+        logger.info(f"限频器统计 - 总调用: {rate_stats['total_calls']}, 成功率: {rate_stats['success_rate']:.1f}%, 等待时间: {rate_stats['total_wait_time']:.1f}s")
+        
+        return self.stats
 
-        def flush(reason: str):
-            nonlocal buffer
-            if not buffer:
-                logging.debug('[BRANCH] def streaming_merge_after_download > def flush | IF not buffer -> taken')
-                return
-            for dt, lst in buffer.items():
-                if not lst:
-                    logging.debug('[BRANCH] def streaming_merge_after_download > def flush | IF not lst -> taken')
-                    continue
-                df_day = pd.concat(lst, ignore_index=True)
-                pdir = os.path.join(daily_root, f"trade_date={dt}")
-                os.makedirs(pdir, exist_ok=True)
-                fname = os.path.join(pdir, f"data_merge-{int(time.time()*1e6)}.parquet")
-                df_day.to_parquet(fname, index=False)
-            logging.info("[STREAM_MERGE][%s] flush: %s 写出日期数=%d", mode_label, reason, len(buffer))
-            buffer = {}
+# ================= 主下载器 =================
 
-        pbar = tqdm(stock_files, desc=f"STREAM 合并 [{mode_label}]", ncols=120)
-        for f in pbar:
+class DownloadManager:
+    """下载管理器"""
+    
+    def __init__(self, config: DownloadConfig):
+        self.config = config
+        self.db_manager = get_database_manager()
+        self.tushare_manager = TushareManager()
+        
+        # 在数据库初始化之前判断是否为首次下载
+        self.is_first_download = self._check_if_first_download()
+        self._ensure_database_initialized()
+    
+    def _check_if_first_download(self) -> bool:
+        """检查是否为首次下载（在数据库初始化之前调用）"""
+        try:
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            
+            # 如果数据库文件不存在，则为首次下载
+            if not os.path.exists(db_path):
+                logger.info("数据库不存在，判断为首次下载")
+                return True
+            
+            # 使用数据库管理器获取最新日期
+            latest_date = self.db_manager.get_latest_trade_date(db_path)
+            if latest_date:
+                logger.info(f"数据库存在且有数据，最新日期: {latest_date}，判断为增量下载")
+                return False
+            else:
+                logger.info("数据库存在但无数据，判断为首次下载")
+                return True
+                
+        except Exception as e:
+            logger.warning(f"检查首次下载状态失败: {e}，假设为首次下载")
+            return True
+    
+    def _ensure_database_initialized(self):
+        """确保数据库已初始化"""
+        try:
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            
+            # 如果数据库不存在，初始化表结构
+            if not os.path.exists(db_path):
+                logger.info("数据库不存在，正在初始化...")
+                self.db_manager.init_stock_data_tables(db_path, "duckdb")
+                logger.info("数据库初始化完成")
+        except Exception as e:
+            logger.error(f"数据库初始化失败: {e}")
+            raise
+    
+    def get_database_status(self) -> Dict[str, Any]:
+        """获取数据库状态"""
+        return self.db_manager.get_data_source_status()
+    
+    def get_smart_end_date(self, end_date_config: str) -> str:
+        """
+        智能获取结束日期，考虑市场开盘时间和休盘情况（使用数据库管理器的统一方法）
+        
+        Args:
+            end_date_config: 结束日期配置 ("today" 或具体日期)
+            
+        Returns:
+            处理后的结束日期字符串
+        """
+        return self.db_manager.get_smart_end_date(end_date_config)
+    
+    def determine_download_strategy(self) -> Dict[str, Any]:
+        """确定下载策略"""
+        # 使用预先判断的首次下载状态
+        is_first_download = self.is_first_download
+        
+        # 获取最新数据日期
+        latest_date = None
+        if not is_first_download:
             try:
-                df = pd.read_parquet(f)
+                # 从数据库获取最新日期
+                latest_date = self.db_manager.get_latest_trade_date()
             except Exception as e:
-                logging.warning("[STREAM_MERGE][%s] 读失败 %s (%s)", mode_label, f, e)
-                continue
-            if df is None or df.empty:
-                continue
-            for dt, sub in df.groupby("trade_date"):
-                buffer.setdefault(dt, []).append(sub)
-            processed += 1
+                logger.warning(f"获取最新日期失败: {e}")
+        else:
+            # 首次下载，不需要查询数据库
+            logger.info("首次下载，跳过数据库查询")
+        
+        # 确定实际下载的日期范围
+        actual_start_date = self.config.start_date
+        if not is_first_download and latest_date:
+            # 增量下载：从最新日期的下一天开始
+            from datetime import datetime, timedelta
+            try:
+                latest_date_obj = datetime.strptime(str(latest_date), '%Y%m%d')
+                next_date_obj = latest_date_obj + timedelta(days=1)
+                actual_start_date = next_date_obj.strftime('%Y%m%d')
+                
+                # 如果计算出的开始日期晚于配置的结束日期，则跳过下载
+                if actual_start_date > self.config.end_date:
+                    logger.info(f"数据已是最新，无需下载 (最新日期: {latest_date}, 配置结束日期: {self.config.end_date})")
+                    return {"skip_download": True}
+            except Exception as e:
+                logger.warning(f"计算增量下载日期失败: {e}")
+        
+        strategy = {
+            "is_first_download": is_first_download,
+            "latest_date": latest_date,
+            "start_date": actual_start_date,
+            "end_date": self.config.end_date,
+            "adj_type": self.config.adj_type,
+            "asset_type": self.config.asset_type,
+            "skip_download": False
+        }
+        
+        return strategy
+    
+    def download_stocks(self, strategy: Dict[str, Any]) -> DownloadStats:
+        """下载股票数据"""
+        if strategy.get("skip_download", False):
+            logger.info("跳过股票数据下载")
+            return DownloadStats()
+        
+        stock_config = DownloadConfig(
+            start_date=strategy["start_date"],
+            end_date=strategy["end_date"],
+            adj_type=strategy["adj_type"],
+            asset_type="stock",
+            threads=self.config.threads,
+            enable_warmup=self.config.enable_warmup
+        )
+        
+        downloader = StockDownloader(stock_config)
+        return downloader.download_all_stocks()
+    
+    def download_indices(self, strategy: Dict[str, Any], whitelist: List[str] = None) -> DownloadStats:
+        """下载指数数据"""
+        if strategy.get("skip_download", False):
+            logger.info("跳过指数数据下载")
+            return DownloadStats()
+        
+        index_config = DownloadConfig(
+            start_date=strategy["start_date"],
+            end_date=strategy["end_date"],
+            adj_type="ind",  # 指数使用ind
+            asset_type="index",
+            threads=self.config.threads,
+            enable_warmup=False  # 指数不需要指标计算
+        )
+        
+        downloader = IndexDownloader(index_config)
+        return downloader.download_all_indices(whitelist)
+    
+    def run_download(self, assets: List[str] = None, index_whitelist: List[str] = None) -> Dict[str, DownloadStats]:
+        """运行下载任务"""
+        if assets is None:
+            assets = ["stock"]
+        
+        if index_whitelist is None:
+            index_whitelist = INDEX_WHITELIST
+        
+        # 确定下载策略
+        strategy = self.determine_download_strategy()
+        
+        # 添加智能日期判断的详细说明
+        if self.config.end_date.lower() == "today":
+            smart_end_date = self.get_smart_end_date("today")
+            logger.info("=" * 60)
+            logger.info("智能日期判断说明")
+            logger.info("=" * 60)
+            logger.info(f"• 配置的结束日期: today (今日)")
+            logger.info(f"• 智能判断后的实际结束日期: {smart_end_date}")
+            logger.info("• 智能判断逻辑:")
+            logger.info("  - 如果今天是交易日且当前时间 < 15:00，使用前一个交易日")
+            logger.info("  - 如果今天是交易日且当前时间 >= 15:00，使用今天")
+            logger.info("  - 如果今天不是交易日，使用最近的交易日")
+            logger.info("  - 如果无法获取交易日历，使用今天")
+            logger.info("=" * 60)
+        
+        # 显示中文下载策略信息
+        if self.config.end_date.lower() == "today":
+            smart_end_date = self.get_smart_end_date("today")
+            logger.info(f"下载策略: 首次下载={strategy['is_first_download']}, 最新日期={strategy['latest_date']}, 开始日期={strategy['start_date']}, 结束日期={smart_end_date}, 复权类型={strategy['adj_type']}, 资产类型={strategy['asset_type']}, 跳过下载={strategy['skip_download']}")
+        else:
+            logger.info(f"下载策略: 首次下载={strategy['is_first_download']}, 最新日期={strategy['latest_date']}, 开始日期={strategy['start_date']}, 结束日期={strategy['end_date']}, 复权类型={strategy['adj_type']}, 资产类型={strategy['asset_type']}, 跳过下载={strategy['skip_download']}")
+        
+        # 检查是否需要跳过下载
+        if strategy.get("skip_download", False):
+            logger.info("数据已是最新，跳过下载")
+            return {"stock": DownloadStats(), "index": DownloadStats()}
+        
+        results = {}
+        total_assets = len(assets)
+        current_asset = 0
+        
+        # 创建总体进度条
+        overall_progress = tqdm(
+            total=total_assets,
+            desc="总体下载进度",
+            unit="类",
+            ncols=100,
+            position=0,
+            leave=True
+        )
+        
+        try:
+            # 下载股票数据
+            if "stock" in assets:
+                current_asset += 1
+                overall_progress.set_description(f"下载股票数据 ({strategy['start_date']} - {strategy['end_date']})")
+                logger.info(f"开始下载股票数据: {strategy['start_date']} - {strategy['end_date']}")
+                results["stock"] = self.download_stocks(strategy)
+                overall_progress.update(1)
+                overall_progress.set_postfix({
+                    '股票成功': results["stock"].success_count,
+                    '股票失败': results["stock"].error_count
+                })
+            
+            # 下载指数数据
+            if "index" in assets:
+                current_asset += 1
+                overall_progress.set_description(f"下载指数数据 ({strategy['start_date']} - {strategy['end_date']})")
+                logger.info(f"开始下载指数数据: {strategy['start_date']} - {strategy['end_date']}")
+                results["index"] = self.download_indices(strategy, index_whitelist)
+                overall_progress.update(1)
+                overall_progress.set_postfix({
+                    '指数成功': results["index"].success_count,
+                    '指数失败': results["index"].error_count
+                })
+            
+            # 显示最终统计
+            overall_progress.set_description("下载完成")
+            total_success = sum(stats.success_count for stats in results.values())
+            total_error = sum(stats.error_count for stats in results.values())
+            total_empty = sum(stats.empty_count for stats in results.values())
+            
+            overall_progress.set_postfix({
+                '总成功': total_success,
+                '总失败': total_error,
+                '总空数据': total_empty
+            })
+            
+        finally:
+            overall_progress.close()
+        
+        # 打印最终统计信息
+        logger.info("=== 下载任务完成 ===")
+        for asset_type, stats in results.items():
+            logger.info(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
+            if stats.failed_stocks:
+                logger.warning(f"{asset_type} 失败股票: {[code for code, _ in stats.failed_stocks[:5]]}")
+        
+        logger.info(f"总计: 成功={total_success}, 空数据={total_empty}, 失败={total_error}")
+        
+        return results
 
-            if len(buffer) >= STREAM_FLUSH_DATE_BATCH:
-                flush(f"date_batch>= {STREAM_FLUSH_DATE_BATCH}")
-            elif processed % STREAM_FLUSH_STOCK_BATCH == 0:
-                flush(f"stock_batch {STREAM_FLUSH_STOCK_BATCH}")
-            elif time.time() - last_flush_time > 60:
-                flush("time>60s")
-                last_flush_time = time.time()
-            if processed % STREAM_LOG_EVERY == 0:
-                pbar.set_postfix(proc=processed, pct=f"{processed/total_files*100:.1f}%")
+# ================= 便捷函数 =================
 
-        flush("final")
-        pbar.close()
-        logging.info("[STREAM_MERGE][%s] 完成 处理股票文件=%d", mode_label, processed)
-
-
-# ========== 主入口 ==========
-def main():
-    global end_date
-    end_date = dt.date.today().strftime("%Y%m%d") if END_DATE.lower() == "today" else END_DATE
-    assets = {a.lower() for a in ASSETS}
-    is_first_download = input("是否是第一次下载？(y/n)") == "y"
-    logging.info(
-        "=== 启动 mode=%s assets=%s 区间=%s-%s 原始数据复权=%s ===",
-        "FAST_INIT" if is_first_download else "NORMAL",
-        sorted(assets), START_DATE, end_date, API_ADJ
+def download_data(start_date: str, end_date: str, adj_type: str = "qfq", 
+                 assets: List[str] = None, threads: int = 8, 
+                 enable_warmup: bool = True, enable_adaptive_rate_limit: bool = True) -> Dict[str, DownloadStats]:
+    """
+    便捷下载函数
+    
+    Args:
+        start_date: 开始日期 (YYYYMMDD)
+        end_date: 结束日期 (YYYYMMDD)
+        adj_type: 复权类型 ("qfq", "hfq", "raw")
+        assets: 资产类型列表 (["stock"], ["index"], ["stock", "index"])
+        threads: 并发线程数
+        enable_warmup: 是否启用指标warmup
+        enable_adaptive_rate_limit: 是否启用自适应限频
+    
+    Returns:
+        下载结果统计
+    """
+    if assets is None:
+        assets = ["stock"]
+    
+    config = DownloadConfig(
+        start_date=start_date,
+        end_date=end_date,
+        adj_type=adj_type,
+        threads=threads,
+        enable_warmup=enable_warmup,
+        enable_adaptive_rate_limit=enable_adaptive_rate_limit
     )
+    
+    manager = DownloadManager(config)
+    return manager.run_download(assets)
 
-    if is_first_download:
-        logging.debug('[BRANCH] def main | IF is_first_download -> taken')
-        fast_init_download(end_date)   # 这里 end_date 已经算好
-        if DUCK_MERGE_DAY_LAG >= 0:  # 简单开关，可设 -1 跳过
-            logging.debug('[BRANCH] def main | IF DUCK_MERGE_DAY_LAG >= 0 -> taken')
-            duckdb_partition_merge()
-        if WRITE_SYMBOL_INDICATORS:
-            logging.debug('[BRANCH] def main | IF WRITE_SYMBOL_INDICATORS -> taken')
-            duckdb_merge_symbol_products_to_daily()
-        if "index" in assets:
-            sync_index_daily_fast(START_DATE, end_date, INDEX_WHITELIST)
-    else:
-        # ======= 日常增量模式 =======
-        # 优先把 fastinit 缓存合并进 daily，避免全历史重拉
-        logging.debug('[BRANCH] def main | ELSE of IF is_first_download -> taken')
-        if any(
-            os.path.isdir(os.path.join(FAST_INIT_STOCK_DIR, d))
-            and len(glob.glob(os.path.join(FAST_INIT_STOCK_DIR, d, "*.parquet"))) > 0
-            for d in ("raw", "qfq", "hfq")
-        ):
-            logging.debug('[BRANCH] def main | IF any(fast_init has parquet) -> taken')
-            duckdb_partition_merge()
+def main():
+    """主函数"""
+    # 获取配置
+    start_date = START_DATE
+    end_date = END_DATE
+    adj_type = API_ADJ
+    assets = ASSETS
+    threads = STOCK_INC_THREADS
+    
+    logger.info("=" * 60)
+    logger.info("开始下载数据")
+    logger.info("=" * 60)
+    logger.info(f"日期范围: {start_date} - {end_date}")
+    logger.info(f"复权类型: {adj_type}")
+    logger.info(f"资产类型: {', '.join(assets)}")
+    logger.info("=" * 60)
+    
+    try:
+        # 执行下载
+        results = download_data(
+            start_date=start_date,
+            end_date=end_date,
+            adj_type=adj_type,
+            assets=assets,
+            threads=threads,
+            enable_warmup=True
+        )
+        
+        # 打印结果
+        for asset_type, stats in results.items():
+            logger.info(f"{asset_type} 下载结果: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
+            if stats.failed_stocks:
+                logger.warning(f"{asset_type} 失败股票: {[code for code, _ in stats.failed_stocks[:10]]}")
+        
+        logger.info("下载任务完成")
+        
+    except Exception as e:
+        logger.error(f"下载任务失败: {e}")
+        raise
 
-        if "stock" in assets:
-            logging.debug('[BRANCH] def main | IF "stock" in assets -> taken')
-            sync_stock_daily_fast(START_DATE, end_date, threads=STOCK_INC_THREADS)
-        if "index" in assets:
-            logging.debug('[BRANCH] def main | IF "index" in assets -> taken')
-            sync_index_daily_fast(START_DATE, end_date, INDEX_WHITELIST)
-        auto_workers = (os.cpu_count() or 4) * 2
-        workers = INC_RECALC_WORKERS or auto_workers
+def main_cli():
+    """命令行接口"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='股票数据下载工具')
+    parser.add_argument('--start', type=str, default=START_DATE, help='开始日期 (YYYYMMDD)')
+    parser.add_argument('--end', type=str, default=END_DATE, help='结束日期 (YYYYMMDD)')
+    parser.add_argument('--adj', type=str, default=API_ADJ, choices=['qfq', 'hfq', 'raw'], help='复权类型')
+    parser.add_argument('--assets', nargs='+', default=ASSETS, choices=['stock', 'index'], help='资产类型')
+    parser.add_argument('--threads', type=int, default=STOCK_INC_THREADS, help='并发线程数')
+    parser.add_argument('--no-warmup', action='store_true', help='禁用指标warmup')
+    parser.add_argument('--no-adaptive-rate-limit', action='store_true', help='禁用自适应限频')
+    parser.add_argument('--interactive', action='store_true', help='交互式模式')
+    
+    args = parser.parse_args()
+    
+    if args.interactive:
+        main_interactive()
+        return
+    
+    # 执行下载
+    results = download_data(
+        start_date=args.start,
+        end_date=args.end,
+        adj_type=args.adj,
+        assets=args.assets,
+        threads=args.threads,
+        enable_warmup=not args.no_warmup,
+        enable_adaptive_rate_limit=not args.no_adaptive_rate_limit
+    )
+    
+    # 打印结果
+    print("\n" + "=" * 30)
+    print("下载结果")
+    print("=" * 30)
+    for asset_type, stats in results.items():
+        print(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
+        if stats.failed_stocks:
+            print(f"失败股票: {[code for code, _ in stats.failed_stocks[:5]]}")
+    print("=" * 60)
 
-        recalc_symbol_products_for_increment(START_DATE, end_date, threads=workers)
+def main_interactive():
+    """交互式模式"""
+    print("=" * 60)
+    print("股票数据下载工具")
+    print("=" * 60)
+    print("基于database_manager的下载模块")
+    print()
+    
+    # 获取用户输入
+    start_date = input(f"开始日期 (默认: {START_DATE}): ").strip() or START_DATE
+    end_date = input(f"结束日期 (默认: {END_DATE}): ").strip() or END_DATE
+    
+    # 如果用户输入了today，给出智能判断说明
+    if end_date.lower() == "today":
+        print("\n 智能日期判断说明:")
+        print("   • 如果今天是交易日且当前时间 < 15:00，使用前一个交易日")
+        print("   • 如果今天是交易日且当前时间 >= 15:00，使用今天")
+        print("   • 如果今天不是交易日，使用最近的交易日")
+        print("   • 如果无法获取交易日历，使用今天")
+        print()
+    
+    adj_type = input(f"复权类型 (默认: {API_ADJ}): ").strip() or API_ADJ
+    threads = input(f"并发线程数 (默认: {STOCK_INC_THREADS}): ").strip()
+    threads = int(threads) if threads.isdigit() else STOCK_INC_THREADS
+    
+    # 限频器选项
+    adaptive_rate_limit = input("启用自适应限频? (Y/n, 默认: Y): ").strip().lower()
+    enable_adaptive_rate_limit = adaptive_rate_limit != 'n'
+    
+    # 选择资产类型
+    print("\n资产类型选择:")
+    print("1. 股票数据")
+    print("2. 指数数据")
+    print("3. 股票+指数")
+    
+    asset_choice = input("请选择 (1-3, 默认: 1): ").strip() or "1"
+    assets = []
+    if asset_choice in ['1', '3']:
+        assets.append('stock')
+    if asset_choice in ['2', '3']:
+        assets.append('index')
+    
+    # 确认配置
+    print(f"\n配置确认:")
+    print(f"  开始日期: {start_date}")
+    print(f"  结束日期: {end_date}")
+    if end_date.lower() == "today":
+        # 显示智能判断后的实际日期
+        try:
+            from database_manager import get_database_manager
+            db_manager = get_database_manager()
+            smart_end_date = db_manager.get_smart_end_date("today")
+            print(f"  智能判断后实际结束日期: {smart_end_date}")
+        except:
+            pass
+    print(f"  复权类型: {adj_type}")
+    print(f"  并发线程: {threads}")
+    print(f"  自适应限频: {'是' if enable_adaptive_rate_limit else '否'}")
+    print(f"  资产类型: {', '.join(assets)}")
+    
+    confirm = input("\n确认开始下载? (y/N): ").strip().lower()
+    if confirm != 'y':
+        print("已取消")
+        return
+    
+    # 执行下载
+    print("\n开始下载...")
+    try:
+        results = download_data(
+            start_date=start_date,
+            end_date=end_date,
+            adj_type=adj_type,
+            assets=assets,
+            threads=threads,
+            enable_warmup=True,
+            enable_adaptive_rate_limit=enable_adaptive_rate_limit
+        )
+        
+        # 打印结果
+        print("\n=== 下载结果 ===")
+        for asset_type, stats in results.items():
+            print(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
+            if stats.failed_stocks:
+                print(f"{asset_type} 失败股票: {[code for code, _ in stats.failed_stocks[:5]]}")
+        
+        print("\n下载完成!")
+        
+    except Exception as e:
+        print(f"\n下载失败: {e}")
+        logger.error(f"交互式下载失败: {e}")
 
-    # 写元数据
-    meta = {
-        "run_mode": "FAST_INIT" if is_first_download else "NORMAL",
-        "api_adj": API_ADJ if is_first_download else None,
-        "rebuilt_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "start_date": START_DATE,
-        "end_date": end_date,
-        "assets": sorted(list(assets))
-    }
-    with open(os.path.join(DATA_ROOT, "_META.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+# ================= 交易日相关函数 =================
 
-    logging.info("=== 结束 ===")
+def list_trade_dates(root: str) -> List[str]:
+    """
+    兼容现有系统的 list_trade_dates 函数
+    
+    Args:
+        root: 根目录路径
+        
+    Returns:
+        交易日期列表
+    """
+    try:
+        if not os.path.exists(root):
+            return []
+        
+        dates = []
+        for item in os.listdir(root):
+            if item.startswith("trade_date="):
+                date_str = item.replace("trade_date=", "")
+                if date_str.isdigit() and len(date_str) == 8:
+                    dates.append(date_str)
+        
+        return sorted(dates)
+        
+    except Exception as e:
+        logger.error(f"list_trade_dates 失败: {root}, 错误: {e}")
+        return []
 
+def get_trade_dates_from_tushare(start_date: str, end_date: str) -> List[str]:
+    """
+    从Tushare获取交易日列表的便捷函数（使用数据库管理器的统一方法）
+    
+    Args:
+        start_date: 开始日期 (YYYYMMDD)
+        end_date: 结束日期 (YYYYMMDD)
+        
+    Returns:
+        交易日期列表
+    """
+    try:
+        db_manager = get_database_manager()
+        return db_manager.get_trade_dates_from_tushare(start_date, end_date)
+    except Exception as e:
+        logger.error(f"获取交易日列表失败: {e}")
+        return []
+
+def get_trade_dates_from_database(db_path: str = None) -> List[str]:
+    """
+    从数据库获取交易日列表的便捷函数（使用数据库管理器的统一方法）
+    
+    Args:
+        db_path: 数据库路径，None时使用默认路径
+        
+    Returns:
+        交易日期列表
+    """
+    try:
+        db_manager = get_database_manager()
+        return db_manager.get_trade_dates(db_path)
+    except Exception as e:
+        logger.error(f"从数据库获取交易日列表失败: {e}")
+        return []
+
+def get_smart_end_date(end_date_config: str) -> str:
+    """
+    智能获取结束日期的便捷函数（使用数据库管理器的统一方法）
+    
+    Args:
+        end_date_config: 结束日期配置 ("today" 或具体日期)
+        
+    Returns:
+        处理后的结束日期字符串
+    """
+    try:
+        db_manager = get_database_manager()
+        return db_manager.get_smart_end_date(end_date_config)
+    except Exception as e:
+        logger.error(f"智能获取结束日期失败: {e}")
+        # 如果智能获取失败，返回原配置或今天
+        if end_date_config.lower() == "today":
+            return datetime.now().strftime("%Y%m%d")
+        return end_date_config
 
 if __name__ == "__main__":
-    logging.debug('[BRANCH] <module> | IF __name__ == "__main__" -> taken')
-    try:
+    if len(sys.argv) > 1:
+        main_cli()
+    else:
         main()
-    except KeyboardInterrupt:
-        logging.warning("手动中断程序。")

@@ -118,6 +118,12 @@ def compute(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
                 # 保底：兜底也失败就跳过，不阻塞其它指标
                 pass
 
+    # 应用精度控制
+    decs = outputs_for(names)
+    for col, n in decs.items():
+        if col in out_df.columns and pd.api.types.is_numeric_dtype(out_df[col]):
+            out_df[col] = out_df[col].round(n)
+
     return out_df
 
 
@@ -133,6 +139,51 @@ def outputs_for(names: List[str]) -> Dict[str, int]:
 
 def names_by_tag(tag: str) -> List[str]:
     return [n for n,m in REGISTRY.items() if tag in m.tags]
+
+
+# def names_in_expr(expr: str) -> List[str]:
+#     """
+#     从一条 TDX 表达式里解析可能涉及的指标名（返回 REGISTRY 的 key 列表，去重）。
+#     这里只做“足够用”的关键字映射，而不是完整解析器；不识别的符号会被忽略。
+#     """
+#     if not expr:
+#         return []
+#     import re
+#     tokens = set(re.findall(r'[A-Z_][A-Z0-9_]*', str(expr).upper()))
+#     # 避免把内置函数当成指标
+#     blacklist = {
+#         'OPEN','HIGH','LOW','CLOSE','V','VOL','AMOUNT','O','H','L','C',
+#         'MA','EMA','SMA','LLV','HHV','REF','CROSS','COUNT','IF','MIN','MAX',
+#         'ABS','STD','STDV','STDDEV','SUM','ZIG','FILTER','BACKSET','BARSLAST',
+#         'AND','OR','NOT','TRUE','FALSE','N','M','K','D','RSV','WMA','VAR','EXP',
+#         'SAFE_DIV','EPS','SLOPE','DIFF','SIGN','ROUND','FLOOR','CEIL','SQRT',
+#         'MACD','DEA','DI','ADX','ADXR','HHVBARS','LLVBARS','CONST','BETWEEN'
+#     }
+#     tokens = {t for t in tokens if t not in blacklist}
+#     # 关键字 → 指标名（REGISTRY 键）
+#     mapping = {
+#         'J': 'kdj',
+#         'KDJ_J': 'kdj',
+#         'VR': 'volume_ratio',
+#         'BBI': 'bbi',
+#         'RSI': 'rsi',
+#         'BUPIAO_SHORT': 'bupiao',
+#         'BUPIAO_LONG': 'bupiao',
+#         'DUOKONG_SHORT': 'duokong_short',
+#         'DUOKONG_LONG': 'duokong_long',
+#         'Z_SCORE': 'z_score',
+#     }
+#     out = []
+#     for t in tokens:
+#         key = mapping.get(t)
+#         if key and key in REGISTRY:
+#             out.append(key)
+#     # 去重并保持原顺序
+#     seen=set(); unique=[]
+#     for n in out:
+#         if n not in seen:
+#             seen.add(n); unique.append(n)
+#     return unique
 
 
 def names_in_expr(expr: str) -> list[str]:

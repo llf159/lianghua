@@ -1,8 +1,8 @@
 ﻿# -*- coding: utf-8-sig -*-
 from __future__ import annotations
 
-import logging
 import traceback
+from log_system import get_logger
 
 try:
     import config as _cfg
@@ -14,12 +14,19 @@ from pathlib import Path
 
 import math
 import json
+import os
 import numpy as np
 import pandas as pd
 import re
 import importlib
-from config import PARQUET_BASE, PARQUET_ADJ
-from parquet_viewer import asset_root, read_range, list_trade_dates
+from config import DATA_ROOT, API_ADJ
+# 使用 database_manager 替代 data_reader
+from database_manager import (
+    get_database_manager, query_stock_data, get_trade_dates, 
+    get_stock_list, get_latest_trade_date, get_smart_end_date
+)
+
+# 直接使用 database_manager 函数，不再需要包装器
 
 from typing import Iterable, Sequence, Dict, List, Optional, Callable, Any, Literal
 
@@ -30,7 +37,7 @@ SURGE_OUT_BASE = Path("output/surge_lists")
 COMMON_OUT_BASE = Path("output/commonality")
 TRACKING_OUT_BASE = Path("output/tracking")
 PORT_OUT_BASE = Path("output/portfolio")
-LOG = logging.getLogger("score.hooks")
+LOG = get_logger("stats_core")
 
 # --------- 读取可选配置（容错） ---------
 def _get(name: str, default):
@@ -222,8 +229,7 @@ def _ensure_dir(p: Path) -> None:
 
 
 def _pick_end_date(ref_date: str, max_window: int) -> str:
-    root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
-    days = list_trade_dates(root) or []
+    days = get_trade_dates() or []
     if ref_date not in days:
         raise ValueError(f"ref_date 不在交易日历内: {ref_date}")
     i = days.index(ref_date)
@@ -248,9 +254,67 @@ def _read_score_all(date_str: str) -> pd.DataFrame:
 
 
 def _read_stock_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
     cols = ["ts_code", "trade_date", "open", "close"]
-    df = read_range(PARQUET_BASE, "stock", PARQUET_ADJ, None, start, end, columns=cols)
+    
+    # 优先使用缓存读取（仅对单只股票）
+    if len(codes) == 1:
+        try:
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            df = query_stock_data(
+                db_path=db_path,
+                ts_code=codes[0],
+                start_date=start,
+                end_date=end,
+                adj_type="qfq"
+            )
+            if not df.empty:
+                df = normalize_trade_date(df, "trade_date")
+                return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+        except:
+            pass
+    
+    # 使用 database_manager 直接查询
+    try:
+        from config import DATA_ROOT, UNIFIED_DB_PATH
+        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+        
+        # 构建查询条件
+        conditions = []
+        params = []
+        
+        if codes:
+            placeholders = ",".join(["?"] * len(codes))
+            conditions.append(f"ts_code IN ({placeholders})")
+            params.extend(codes)
+        
+        if start:
+            conditions.append("trade_date >= ?")
+            params.append(start)
+            
+        if end:
+            conditions.append("trade_date <= ?")
+            params.append(end)
+            
+        conditions.append("adj_type = ?")
+        params.append(API_ADJ)
+        
+        # 构建SQL查询
+        select_cols = "*" if not cols else ", ".join(cols)
+        sql = f"SELECT {select_cols} FROM stock_data"
+        
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        
+        sql += " ORDER BY ts_code, trade_date"
+        
+        # 执行查询
+        manager = get_database_manager()
+        df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
+    except Exception as e:
+        LOG.error(f"读取数据范围失败: {e}")
+        df = pd.DataFrame()
+    
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=cols)
     df = normalize_trade_date(df, "trade_date")
@@ -261,9 +325,43 @@ def _read_stock_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFra
 def _read_index_prices(index_codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if not index_codes:
         return pd.DataFrame(columns=["index_code", "trade_date", "close"])    
-    root = asset_root(PARQUET_BASE, "index", "daily")
     cols = ["ts_code", "trade_date", "close"]
-    df = read_range(PARQUET_BASE, "index", "daily", None, start, end, columns=cols)
+    
+    # 使用 database_manager 直接查询指数数据
+    try:
+        from config import DATA_ROOT, UNIFIED_DB_PATH
+        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+        
+        # 构建查询条件
+        conditions = []
+        params = []
+        
+        if start:
+            conditions.append("trade_date >= ?")
+            params.append(start)
+            
+        if end:
+            conditions.append("trade_date <= ?")
+            params.append(end)
+            
+        conditions.append("adj_type = ?")
+        params.append("daily")
+        
+        # 构建SQL查询
+        select_cols = "*" if not cols else ", ".join(cols)
+        sql = f"SELECT {select_cols} FROM stock_data"
+        
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        
+        sql += " ORDER BY ts_code, trade_date"
+        
+        # 执行查询
+        manager = get_database_manager()
+        df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
+    except Exception as e:
+        LOG.error(f"读取指数数据失败: {e}")
+        df = pd.DataFrame()
 
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=["index_code", "trade_date", "close"]) 
@@ -348,8 +446,8 @@ def _to_long_summary(detail: pd.DataFrame, windows: Sequence[int], benchmarks: S
 class ScoreTrackingPlugin:
     """供 score_engine 调用的跟踪插件。"""
     def __init__(self, *, parquet_base: str | Path | None = None, parquet_adj: str | None = None, outdir: str | Path | None = None):
-        self.parquet_base = str(parquet_base or PARQUET_BASE)
-        self.parquet_adj = str(parquet_adj or PARQUET_ADJ)
+        self.data_root = str(parquet_base or DATA_ROOT)
+        self.api_adj = str(parquet_adj or API_ADJ)
         self.outdir = Path(outdir or TRACKING_OUT_BASE)
 
     # ---- 主入口：从 DataFrame（优先）或 score_all 文件计算 ----
@@ -474,8 +572,7 @@ def run_tracking(ref_date: str, windows: Sequence[int], benchmarks: Sequence[str
 
 def _pick_trade_dates(ref_date: str, back: int) -> List[str]:
     """返回 [ref_date-back, ..., ref_date] 范围内的交易日列表，用于价格与回看。"""
-    root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
-    days = list_trade_dates(root) or []
+    days = get_trade_dates() or []
     if ref_date not in days:
         raise ValueError(f"ref_date 不在交易日历内: {ref_date}")
     i = days.index(ref_date)
@@ -485,11 +582,72 @@ def _pick_trade_dates(ref_date: str, back: int) -> List[str]:
 
 def _read_stock_close(codes: Sequence[str], dates: List[str]) -> pd.DataFrame:
     """读取给定股票集合在若干日期的收盘价（前复权）。"""
-    root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
+    # 使用统一的数据库查询
     cols = ["ts_code", "trade_date", "close"]
     start = min(dates) if dates else None
     end = max(dates) if dates else None
-    df = read_range(PARQUET_BASE, "stock", PARQUET_ADJ, None, start, end, columns=cols)
+    
+    # 优先使用缓存读取（仅对单只股票）
+    if len(codes) == 1:
+        try:
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            df = query_stock_data(
+                db_path=db_path,
+                ts_code=codes[0],
+                start_date=start,
+                end_date=end,
+                adj_type="qfq"
+            )
+            if not df.empty:
+                df = normalize_trade_date(df, "trade_date")
+                df = df[df["ts_code"].isin(set(codes))]
+                df = df[df["trade_date"].isin(set(dates))]
+                return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+        except:
+            pass
+    
+    # 使用 database_manager 直接查询
+    try:
+        from config import DATA_ROOT, UNIFIED_DB_PATH
+        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+        
+        # 构建查询条件
+        conditions = []
+        params = []
+        
+        if codes:
+            placeholders = ",".join(["?"] * len(codes))
+            conditions.append(f"ts_code IN ({placeholders})")
+            params.extend(codes)
+        
+        if start:
+            conditions.append("trade_date >= ?")
+            params.append(start)
+            
+        if end:
+            conditions.append("trade_date <= ?")
+            params.append(end)
+            
+        conditions.append("adj_type = ?")
+        params.append(API_ADJ)
+        
+        # 构建SQL查询
+        select_cols = "*" if not cols else ", ".join(cols)
+        sql = f"SELECT {select_cols} FROM stock_data"
+        
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        
+        sql += " ORDER BY ts_code, trade_date"
+        
+        # 执行查询
+        manager = get_database_manager()
+        df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
+    except Exception as e:
+        LOG.error(f"读取数据范围失败: {e}")
+        df = pd.DataFrame()
+    
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=cols)
     df = normalize_trade_date(df, "trade_date")
@@ -757,8 +915,8 @@ def _load_callable(spec_or_fn: str | Callable) -> Callable:
 
 
 def _trade_calendar() -> List[str]:
-    root = asset_root(PARQUET_BASE, "stock", PARQUET_ADJ)
-    return list_trade_dates(root) or []
+    # 使用统一的数据库查询
+    return get_trade_dates() or []
 
 
 def _prev_trade_date(ref_date: str, d: int) -> str:
@@ -1113,14 +1271,72 @@ def _save_portfolios(ps: Dict[str, Portfolio]) -> None:
 
 
 def _read_trade_dates(asset: str = "stock") -> List[str]:
-    root = asset_root(PARQUET_BASE, asset, PARQUET_ADJ)
-    return list_trade_dates(root) or []
+    # 使用统一的数据库查询
+    return get_trade_dates() or []
 
 
 def _read_px(codes, start, end, *, asset="stock", cols=("open","close")) -> pd.DataFrame:
     sel = ["ts_code", "trade_date", *cols]
-    df = read_range(PARQUET_BASE, asset, PARQUET_ADJ,
-                    ts_code=None, start=start, end=end, columns=sel)
+    
+    # 优先使用缓存读取（仅对单只股票）
+    if len(codes) == 1 and asset == "stock":
+        try:
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            df = query_stock_data(
+                db_path=db_path,
+                ts_code=codes[0],
+                start_date=start,
+                end_date=end,
+                adj_type="qfq"
+            )
+            if not df.empty:
+                df = normalize_trade_date(df, "trade_date")
+                return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+        except:
+            pass
+    
+    # 使用 database_manager 直接查询
+    try:
+        from config import DATA_ROOT, UNIFIED_DB_PATH
+        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+        
+        # 构建查询条件
+        conditions = []
+        params = []
+        
+        if codes:
+            placeholders = ",".join(["?"] * len(codes))
+            conditions.append(f"ts_code IN ({placeholders})")
+            params.extend(codes)
+        
+        if start:
+            conditions.append("trade_date >= ?")
+            params.append(start)
+            
+        if end:
+            conditions.append("trade_date <= ?")
+            params.append(end)
+            
+        conditions.append("adj_type = ?")
+        params.append(API_ADJ)
+        
+        # 构建SQL查询
+        select_cols = "*" if not sel else ", ".join(sel)
+        sql = f"SELECT {select_cols} FROM stock_data"
+        
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        
+        sql += " ORDER BY ts_code, trade_date"
+        
+        # 执行查询
+        manager = get_database_manager()
+        df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
+    except Exception as e:
+        LOG.error(f"读取数据范围失败: {e}")
+        df = pd.DataFrame()
+    
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=sel)
     df = normalize_trade_date(df, "trade_date")
@@ -1395,7 +1611,7 @@ class PortfolioManager:
                     sell_qty = min(int(t.qty), holdings.get(t.ts_code, 0))
                     holdings[t.ts_code] = holdings.get(t.ts_code, 0) - sell_qty
                     amt_exec = sell_qty * t.exec_price
-                    fee_exec = amt_exec * fee_rate
+                    fee_exec = amt_exec * fee_sell
                     cash += (amt_exec - fee_exec)
             cash_series.loc[d] = cash
             nav = (cash + total_by_day.loc[d]) / float(self.get(pid).init_cash)

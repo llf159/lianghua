@@ -1,2 +1,9 @@
 output/
 !output/.gitkeep
+.vs/
+.vscode/
+/test/
+/__pycache__/
+/stock_data/
+/old/
+/log/

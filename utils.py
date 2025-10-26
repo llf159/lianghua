@@ -5,8 +5,11 @@
 
 import pandas as pd
 import os
-import logging
 import re
+from log_system import get_logger
+
+# 初始化日志记录器
+logger = get_logger("utils")
 
 def ensure_datetime_index(df, file_path=None):
     for date_col in ['trade_date', 'date', '交易日期', 'datetime']:
@@ -37,7 +40,7 @@ def normalize_trade_date(df: pd.DataFrame, col: str = "trade_date") -> pd.DataFr
     mask = td.notna()
     if not mask.all():
         bad_count = (~mask).sum()
-        logging.warning("丢弃无法解析的 %s 行（%d 条）", col, bad_count)
+        logger.warning("丢弃无法解析的 %s 行（%d 条）", col, bad_count)
     df = df.loc[mask].copy()
     df[col] = td.dt.strftime("%Y%m%d")
     return df
