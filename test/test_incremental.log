@@ -1,5 +1,0 @@
-2025-10-14 18:46:56,165 INFO [root] [stock][FAST] 日线已最新 (last=20251014)
-2025-10-14 18:46:56,178 INFO [root] [index][FAST] 日线已最新 (last=20251014)
-2025-10-14 18:46:57,869 WARNING [root] [DUCK MERGE][raw] 源目录不存在，跳过
-2025-10-14 18:47:05,274 INFO [root] [DUCK MERGE][qfq] 已最新，跳过
-2025-10-14 18:47:05,299 WARNING [root] [DUCK MERGE][hfq] 源目录不存在，跳过
