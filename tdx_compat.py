@@ -52,15 +52,20 @@ def _extract_bool_signal(res: dict, index, prefer_keys=("sig", "last_expr", "SIG
         if k in res:
             s = res[k]
             # s 可能是 ndarray / list / Series；统一成布尔 Series，并与 index 对齐
-            return pd.Series(s, index=index).fillna(False).astype(bool)
+            series = pd.Series(s, index=index, dtype=object)
+            # 使用条件表达式处理 NaN 以避免 downcasting 警告
+            series = series.where(series.notna(), False)
+            return series.infer_objects(copy=False).astype(bool)
 
     return pd.Series(False, index=index)
 
 # 统一把条件转成布尔并把 NaN 当 False
 def _as_bool(cond):
-    s = pd.Series(cond)
-    # NaN 一律按 False 处理，避免“开头数据不全”把条件误判为 True
-    return s.fillna(False).astype(bool)
+    s = pd.Series(cond, dtype=object)
+    # NaN 一律按 False 处理，避免"开头数据不全"把条件误判为 True
+    # 使用 where 而不是 replace/fillna 以避免 downcasting 警告
+    s = s.where(s.notna(), False)
+    return s.infer_objects(copy=False).astype(bool)
 
 def IF(cond, a, b):
     condb = _as_bool(cond)
@@ -74,7 +79,7 @@ def COUNT(cond, n):
 
 def BARSLAST(cond):
     cond = _as_bool(cond)
-    idx = pd.Series(np.where(cond, np.arange(len(cond)), np.nan), index=cond.index).ffill()
+    idx = pd.Series(np.where(cond, np.arange(len(cond)), np.nan), index=cond.index).ffill().infer_objects(copy=False)
     return pd.Series(np.arange(len(cond)), index=cond.index) - idx
 
 def MA(x, n):  
@@ -111,6 +116,10 @@ def MAX(a, b):
 def MIN(a, b):
     return np.minimum(a, b)
 
+def ATAN(x):
+    """计算反正切，返回弧度值"""
+    return np.arctan(x)
+
 def _ensure_series(x):
     if isinstance(x, pd.Series):
         return x
@@ -138,7 +147,6 @@ def RSV(C, H, L, n=9):
 
 def TS_PCT(x, n):
     """返回与 x 同索引的序列：每日对应“该日值在最近 n 天窗口内的百分位（0..1）”"""
-    import numpy as np, pandas as pd
     s = pd.Series(x)
     def pct(arr):
         last = arr[-1]
@@ -147,10 +155,8 @@ def TS_PCT(x, n):
 
 def TS_RANK(x, n):
     """返回每日对应“该日值在最近 n 天窗口内的名次（1..n）”"""
-    import numpy as np, pandas as pd
     s = pd.Series(x)
     def rk(arr):
-        import numpy as np
         last = arr[-1]
         return float((arr <= last).sum())
     return s.rolling(int(n), min_periods=1).apply(lambda a: rk(a.values), raw=False)
@@ -188,13 +194,20 @@ def _iter_custom_tag_series(pattern: str, df_index):
     return out
 
 def _coerce_bool_series(x):
-    import numpy as np, pandas as pd
+    # 先以原始类型创建 Series，避免强制转换为 object
     s = pd.Series(x)
     if s.dtype == bool:
-        return s.fillna(False)
+        # 对于已经是 bool 类型的，确保为 object 再进行 where 避免警告
+        s = s.astype(object)
+        s = s.where(s.notna(), False)
+        return s.infer_objects(copy=False)
     # 数值/字符串等：非零/非空视为 True
     if np.issubdtype(s.dtype, np.number):
-        return s.fillna(0) != 0
+        # 对于数值类型，先转为 object 避免警告
+        s = s.astype(object)
+        s = s.where(s.notna(), 0)
+        return (s.infer_objects(copy=False) != 0)
+    # 已经是 object 类型或其他类型
     return s.astype(object).apply(lambda v: bool(v) if v is not None and v == v else False)
 
 # —— 根据“标签”文本，自动搜列名并 OR 到一起；shift 可表示引用历史（1=昨日）——
@@ -293,7 +306,9 @@ def ANY_TAG(pattern: str, shift: int = 0):
     if agg is None:
         agg = pd.Series(False, index=df.index)
     if int(shift) != 0:
-        agg = agg.shift(int(shift)).fillna(False)
+        agg = agg.shift(int(shift))
+        agg = agg.where(agg.notna(), False)
+        agg = agg.infer_objects(copy=False)
     return agg
 
 # 语义糖：专指“昨日任意匹配标签为 True”
@@ -380,7 +395,9 @@ def TAG_HITS(pattern: str, shift: int = 0):
     if hits is None:
         hits = pd.Series(0, index=idx, dtype=int)
     if int(shift) != 0:
-        hits = hits.shift(int(shift)).fillna(0).astype(int)
+        hits = hits.shift(int(shift))
+        hits = hits.where(hits.notna(), 0)
+        hits = hits.infer_objects(copy=False).astype(int)
     return hits
 
 
@@ -396,6 +413,7 @@ def YDAY_TAG_HITS(pattern: str):
 def YDAY_ANY_TAG_AT_LEAST(pattern: str, k: int):
     return ANY_TAG_AT_LEAST(pattern, k, shift=1)
 
+
 def GET_LAST_CONDITION_PRICE(condition_expr: str, lookback: int = 100):
     """
     获取上一次满足指定条件的收盘价
@@ -407,9 +425,6 @@ def GET_LAST_CONDITION_PRICE(condition_expr: str, lookback: int = 100):
     返回:
     - 收盘价序列，如果该日满足条件则返回当日收盘价，否则返回NaN
     """
-    import pandas as pd
-    import numpy as np
-    
     df = EXTRA_CONTEXT.get("DF", None)
     if df is None or df.empty:
         return pd.Series(np.nan, index=getattr(df, "index", None))
@@ -438,16 +453,19 @@ def GET_LAST_CONDITION_PRICE(condition_expr: str, lookback: int = 100):
         
         try:
             # 评估条件表达式
-            condition_result = evaluate_bool(condition_expr, window_df)
+            # 使用 skip_var_replacement=False 以便变量替换正确处理表达式
+            condition_result = evaluate_bool(condition_expr, window_df, skip_var_replacement=False)
             if len(condition_result) > 0 and condition_result.iloc[-1]:
                 result.iloc[i] = close_values.iloc[i]
-        except Exception:
+        except Exception as e:
+            # 记录异常但继续处理
             pass
         finally:
             # 恢复原始DF
             EXTRA_CONTEXT["DF"] = original_df
     
     return result
+
 
 def FIND_LAST_LOWEST_J(threshold: float = 13.0, lookback: int = 100):
     """
@@ -458,11 +476,9 @@ def FIND_LAST_LOWEST_J(threshold: float = 13.0, lookback: int = 100):
     - lookback: 回看天数，默认100天
     
     返回:
-    - 收盘价序列，如果该日是符合条件的J值最低点则返回当日收盘价，否则返回NaN
+    - 收盘价序列，返回在lookback窗口内满足threshold条件的J值最低点对应的收盘价
+      用于获取买点参考价格
     """
-    import pandas as pd
-    import numpy as np
-    
     df = EXTRA_CONTEXT.get("DF", None)
     if df is None or df.empty:
         return pd.Series(np.nan, index=getattr(df, "index", None))
@@ -484,9 +500,10 @@ def FIND_LAST_LOWEST_J(threshold: float = 13.0, lookback: int = 100):
     close_values = pd.to_numeric(df[close_col], errors="coerce")
     result = pd.Series(np.nan, index=df.index)
     
-    # 按lookback窗口查找
+    # 对于每一天，回看lookback天，找到历史上满足条件的J值最低点
     for i in range(lookback, len(j_values)):
-        window = j_values.iloc[i-lookback:i+1]
+        # 回看窗口：从i-lookback到i（不包含i+1）
+        window = j_values.iloc[i-lookback:i]
         if window.isna().all():
             continue
             
@@ -495,7 +512,7 @@ def FIND_LAST_LOWEST_J(threshold: float = 13.0, lookback: int = 100):
         if not below_threshold.any():
             continue
             
-        # 在这些位置中找到最小值
+        # 在这些位置中找到最小值（历史最低点）
         valid_values = window[below_threshold]
         if valid_values.empty:
             continue
@@ -503,9 +520,11 @@ def FIND_LAST_LOWEST_J(threshold: float = 13.0, lookback: int = 100):
         min_j = valid_values.min()
         min_positions = valid_values[valid_values == min_j].index
         
-        # 如果最小值出现在窗口的最后位置（即当前日），则返回当日收盘价
-        if i in min_positions:
-            result.iloc[i] = close_values.iloc[i]
+        # 如果有多个位置都是最小值，取最近的一个（index最大的）
+        if len(min_positions) > 0:
+            latest_min_pos = max(min_positions)
+            # 返回历史最低点对应的收盘价
+            result.iloc[i] = close_values.iloc[latest_min_pos]
     
     return result
 
@@ -541,6 +560,7 @@ def find_last_diff_high(df, lookback_days=60):
         'index': max_diff_idx
     }
 
+
 def get_last_diff_high_price(df, lookback_days=60):
     """
     获取上次DIFF最高点时的收盘价
@@ -555,6 +575,7 @@ def get_last_diff_high_price(df, lookback_days=60):
     result = find_last_diff_high(df, lookback_days)
     return result['price'] if result else 0.0
 
+
 def get_last_diff_high_value(df, lookback_days=60):
     """
     获取上次DIFF最高点的数值
@@ -568,6 +589,7 @@ def get_last_diff_high_value(df, lookback_days=60):
     """
     result = find_last_diff_high(df, lookback_days)
     return result['diff_value'] if result else 0.0
+
 
 def reverse_price_to_diff_value(df, target_diff_value, method="optimize"):
     """
@@ -624,6 +646,7 @@ def reverse_price_to_diff_value(df, target_diff_value, method="optimize"):
     except Exception as e:
         print(f"反推价格失败: {e}")
         return float(df['close'].iloc[-1])
+
 
 def _verify_and_adjust_diff_price(df, initial_price, target_diff_value, max_iterations=10, tolerance=1e-4):
     """
@@ -692,6 +715,7 @@ def _verify_and_adjust_diff_price(df, initial_price, target_diff_value, max_iter
         print(f"价格验证调整失败: {e}")
         return initial_price
 
+
 def _calculate_macd_diff_for_verification(df):
     """
     为验证目的计算MACD和DIFF指标
@@ -717,6 +741,7 @@ def _calculate_macd_diff_for_verification(df):
     
     return df
 
+
 def GET_LAST_DIFF_HIGH_PRICE(lookback_days=60):
     """
     获取上次DIFF最高点时的收盘价
@@ -735,6 +760,7 @@ def GET_LAST_DIFF_HIGH_PRICE(lookback_days=60):
     except Exception:
         return 0.0
 
+
 def GET_LAST_DIFF_HIGH_VALUE(lookback_days=60):
     """
     获取上次DIFF最高点的数值
@@ -752,6 +778,7 @@ def GET_LAST_DIFF_HIGH_VALUE(lookback_days=60):
         return 0.0
     except Exception:
         return 0.0
+
 
 def REVERSE_PRICE_TO_DIFF(target_diff_value, method="optimize"):
     """
@@ -789,6 +816,7 @@ EXTRA_CONTEXT.update({
     "REVERSE_PRICE_TO_DIFF": REVERSE_PRICE_TO_DIFF,
 })
 
+
 VAR_MAP = {
     "C": "df['close']",
     "CLOSE": "df['close']",
@@ -820,6 +848,7 @@ VAR_MAP = {
     
 }
 
+
 FUNC_MAP = {
     "REF": "REF",
     "MA": "MA",
@@ -837,12 +866,14 @@ FUNC_MAP = {
     "CROSS": "CROSS",
     "BARSLAST": "BARSLAST",
     "TS_RANK": "TS_RANK",
+    "ATAN": "ATAN",
     "FIND_LAST_LOWEST_J": "FIND_LAST_LOWEST_J",
     "GET_LAST_CONDITION_PRICE": "GET_LAST_CONDITION_PRICE",
     "GET_LAST_DIFF_HIGH_PRICE": "GET_LAST_DIFF_HIGH_PRICE",
     "GET_LAST_DIFF_HIGH_VALUE": "GET_LAST_DIFF_HIGH_VALUE",
     "REVERSE_PRICE_TO_DIFF": "REVERSE_PRICE_TO_DIFF",
 }
+
 
 IGNORE_FUNCS = {
     "STICKLINE",
@@ -858,6 +889,7 @@ IGNORE_FUNCS = {
     "DOTLINE",
     "POINTDOT",
 }
+
 
 LOGICAL_MAP = {
     "AND": "&",
@@ -906,28 +938,60 @@ def _extra_ctx_from_df_columns(df) -> dict:
                 LOG.info(f"[TDX] 创建了 {len(ctx)} 个列别名 (示例: {list(ctx)[:5]})")
     return ctx
 
-def evaluate_bool(script: str, df, prefer_keys=("sig", "last_expr", "SIG", "LAST_EXPR")):
+
+def evaluate_bool(script: str, df, prefer_keys=("sig", "last_expr", "SIG", "LAST_EXPR"), skip_var_replacement=False):
     """
     便捷入口：直接返回一个布尔 Series（与 df.index 对齐）。
     自动将 df 中现有列注入上下文（原名 + 全大写）。
     使用LRU缓存优化重复表达式编译。
+    
+    Args:
+        skip_var_replacement: 如果为True，跳过变量替换步骤（用于处理字符串字面量中的表达式）
     """
     extra_ctx = _extra_ctx_from_df_columns(df)
     if EXTRA_CONTEXT:
         extra_ctx.update(EXTRA_CONTEXT)
+    
     res = evaluate(script, df, extra_context=extra_ctx)  # evaluate 会把 extra_context 合入 ctx 使用
     return _extract_bool_signal(res, df.index, prefer_keys=prefer_keys)
 
+
 def _replace_variables(expr):
     keys = sorted(VAR_MAP.keys(), key=len, reverse=True)
+    
+    # 保护字符串字面量，避免在字符串内进行替换
+    # 使用占位符临时替换字符串内容
+    import re
+    strings = {}
+    placeholders = []
+    counter = 0
+    
+    # 找到所有引号内的内容（支持单引号和双引号，处理转义字符）
+    def replace_string(match):
+        nonlocal counter
+        placeholder = f"__STRING_{counter}__"
+        strings[placeholder] = match.group(0)
+        placeholders.append(placeholder)
+        counter += 1
+        return placeholder
+    
+    # 使用更健壮的正则表达式匹配字符串字面量
+    # 匹配 '...' 或 "..." 形式的字符串，支持转义引号
+    pattern = r"""('[^'\\]*(?:\\.[^'\\]*)*')|("[^"\\]*(?:\\.[^"\\]*)*")"""
+    expr_protected = re.sub(pattern, replace_string, expr)
+    
+    # 在非字符串部分进行变量替换
     for k in keys:
-        # 只替换独立的变量名，不替换已经在 df['...'] 中的内容
-        # 检查是否已经包含该变量的替换结果
         replacement = VAR_MAP[k]
-        if replacement in expr:
+        if replacement in expr_protected:
             continue  # 如果已经替换过，跳过
-        expr = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(k)}(?![A-Za-z0-9_])', replacement, expr)
-    return expr
+        expr_protected = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(k)}(?![A-Za-z0-9_])', replacement, expr_protected)
+    
+    # 恢复字符串字面量
+    for placeholder in placeholders:
+        expr_protected = expr_protected.replace(placeholder, strings[placeholder])
+    
+    return expr_protected
 
 
 def _replace_functions(expr):
@@ -965,6 +1029,61 @@ def translate_expression(expr):
     return expr.strip()
 
 
+def _normalize_script_for_cache(script: str) -> str:
+    """
+    标准化脚本用于缓存，确保相同逻辑的脚本能命中相同的缓存
+    """
+    if not script:
+        return ""
+    
+    # 移除 \r
+    script = script.replace('\r', '')
+    
+    # 替换中文标点
+    script = script.translate(str.maketrans({'；': ';', '：': ':', '（': '(', '）': ')', '，': ','}))
+    
+    # 移除注释行
+    lines = [ln for ln in script.split('\n') if not COMMENT_RE.match(ln)]
+    script = '\n'.join(lines)
+    
+    # 移除多余的空格，但保留单词之间的分隔
+    script = re.sub(r'\s+', ' ', script).strip()
+    
+    # 先处理逻辑运算符（按长度从长到短）
+    logical_ops = ['AND', 'OR', 'NOT']
+    logical_ops.sort(key=len, reverse=True)
+    for op in logical_ops:
+        script = re.sub(rf'\b{re.escape(op.upper())}\b', f' {op.upper()} ', script)
+        script = re.sub(rf'\b{re.escape(op.lower())}\b', f' {op.upper()} ', script)
+    
+    # 在运算符前后添加空格（按长度从长到短处理，避免误匹配）
+    # 这样可以让相同逻辑的表达式标准化为相同格式
+    
+    # 分两步处理：
+    # 1. 先用占位符标记组合运算符
+    combined_ops = ['<=', '>=', '==', '!=', ':=', '&&', '||']
+    placeholders = {}
+    for idx, op in enumerate(combined_ops):
+        placeholder = f"__OP{idx}__"
+        script = script.replace(op, f' {placeholder} ')
+        placeholders[placeholder] = op
+    
+    # 2. 处理单个字符的运算符（使用正则表达式确保只匹配独立的字符）
+    single_ops = ['>', '<', '&', '|', '~', '=', '+', '-', '*', '/']
+    for op in single_ops:
+        # 使用正则表达式确保只匹配非字母数字的运算符
+        script = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(op)}(?![A-Za-z0-9_])', f' {op} ', script)
+    
+    # 3. 恢复组合运算符（加上空格）
+    for placeholder, op in placeholders.items():
+        script = script.replace(placeholder, f' {op} ')
+    
+    # 再次标准化空格
+    script = re.sub(r'\s+', ' ', script).strip()
+    
+    return script
+
+
 # LRU缓存：表达式文本 -> 编译后的程序
 @lru_cache(maxsize=1000)
 def _compile_script_cached(script: str) -> Tuple[Tuple[Tuple[str, str], ...], ...]:
@@ -975,10 +1094,12 @@ def _compile_script_cached(script: str) -> Tuple[Tuple[Tuple[str, str], ...], ..
     global _EXPR_CACHE_STATS
     _EXPR_CACHE_STATS["misses"] += 1
     
-    script = script.replace('\r', '')
-    script = script.translate(str.maketrans({'；': ';', '：': ':', '（': '(', '）': ')', '，': ','}))
-    lines = [ln for ln in script.split('\n') if not COMMENT_RE.match(ln)]
-    script = '\n'.join(lines)
+    # 记录编译日志（缓存未命中时）
+    if LOG.logger.isEnabledFor(logging.DEBUG):
+        # 简化表达式用于日志显示（避免过长）
+        expr_preview = script[:50] + "..." if len(script) > 50 else script
+        LOG.debug(f"[表达式编译] 编译表达式: {expr_preview}")
+    
     parts = [p.strip() for p in SEMICOL_SPLIT_RE.split(script) if p.strip()]
     program = []
     for part in parts:
@@ -997,19 +1118,36 @@ def _compile_script_cached(script: str) -> Tuple[Tuple[Tuple[str, str], ...], ..
     
     return tuple(program)
 
+
 def compile_script(script):
     """编译表达式脚本，使用LRU缓存优化重复编译"""
     global _EXPR_CACHE_STATS
     
+    # 先标准化脚本，确保相同逻辑的表达式能命中缓存
+    normalized_script = _normalize_script_for_cache(script)
+    
+    # 获取编译前的缓存信息
+    cache_info_before = _compile_script_cached.cache_info()
+    hits_before = cache_info_before.hits
+    misses_before = _EXPR_CACHE_STATS["misses"]
+    
     # 使用缓存版本
-    cached_program = _compile_script_cached(script)
+    cached_program = _compile_script_cached(normalized_script)
     
     # 检查缓存命中
     cache_info = _compile_script_cached.cache_info()
-    if cache_info.hits > _EXPR_CACHE_STATS["hits"]:
+    is_cache_hit = cache_info.hits > hits_before
+    
+    if is_cache_hit:
+        # 统计缓存命中（使用LRU缓存的累计命中数，保持一致性）
         _EXPR_CACHE_STATS["hits"] = cache_info.hits
+        # 记录缓存命中日志
+        expr_preview = normalized_script[:50] + "..." if len(normalized_script) > 50 else normalized_script
+        LOG.debug(f"[表达式缓存] 命中缓存: {expr_preview}")
     else:
-        _EXPR_CACHE_STATS["misses"] += 1
+        # 未命中，_compile_script_cached 内部已经增加了 misses
+        # 这里保持统计同步（misses 已在 _compile_script_cached 中递增）
+        pass
     
     # 转换为列表格式（保持向后兼容）
     return list(cached_program)
@@ -1029,6 +1167,7 @@ def evaluate(script, df, extra_context=None):
         "SAFE_DIV": SAFE_DIV,
         "RSV": RSV,
         "TS_RANK": TS_RANK,
+        "ATAN": ATAN,
         "FIND_LAST_LOWEST_J": FIND_LAST_LOWEST_J,
         "GET_LAST_CONDITION_PRICE": GET_LAST_CONDITION_PRICE,
         "GET_LAST_DIFF_HIGH_PRICE": GET_LAST_DIFF_HIGH_PRICE,
@@ -1070,6 +1209,7 @@ def evaluate(script, df, extra_context=None):
 def tdx_to_python(script):
     return compile_script(script)
 
+
 def get_expr_cache_stats() -> Dict[str, Any]:
     """获取表达式编译缓存统计信息"""
     global _EXPR_CACHE_STATS
@@ -1086,11 +1226,13 @@ def get_expr_cache_stats() -> Dict[str, Any]:
         "max_size": cache_info.maxsize
     }
 
+
 def clear_expr_cache():
     """清理表达式编译缓存"""
     global _EXPR_CACHE_STATS
     _compile_script_cached.cache_clear()
     _EXPR_CACHE_STATS = {"hits": 0, "misses": 0, "size": 0}
+
 
 def enable_expr_cache(enable: bool = True):
     """启用或禁用表达式缓存"""

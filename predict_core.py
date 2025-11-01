@@ -753,6 +753,7 @@ def _load_hist_window(
             sql += " ORDER BY ts_code, trade_date"
             
             # 执行查询
+            logger.info(f"[数据库连接] 开始获取数据库管理器实例 (读取股票数据用于预测: codes={len(codes) if codes else 'all'}, {start}~{ref_date})")
             manager = get_database_manager()
             df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
         except Exception as e:

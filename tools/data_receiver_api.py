@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # 获取数据库管理器
+print("[数据库连接] 开始获取数据库管理器实例 (初始化API数据接收器)")
 db_manager = get_database_manager()
 
 @app.route('/health', methods=['GET'])

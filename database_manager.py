@@ -22,8 +22,26 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# 配置日志
-logger = logging.getLogger(__name__)
+# 多进程环境检测
+try:
+    import multiprocessing
+    _MULTIPROCESSING_AVAILABLE = True
+    _get_current_process = multiprocessing.current_process
+except ImportError:
+    _MULTIPROCESSING_AVAILABLE = False
+    def _get_current_process():
+        class MockProcess:
+            name = "MainProcess"
+        return MockProcess()
+
+# 配置日志 - 使用统一的日志系统
+try:
+    from log_system import get_logger as get_module_logger
+    logger = get_module_logger("database_manager")
+except ImportError:
+    # 回退到标准logging
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
 
 class OperationType(Enum):
     """操作类型枚举"""
@@ -68,10 +86,9 @@ class DatabaseResponse:
 _DUCKDB_CONFIG = None
 _DUCKDB_CONFIG_LOCK = threading.Lock()
 
-# 新增：按数据库文件持久化配置，解决跨进程“不同配置”报错
-_DUCKDB_CONFIGS = {}  # key: absolute db_path -> config dict
-_DUCKDB_CONFIGS_LOCK = threading.Lock()
-_DUCKDB_CONFIG_SUFFIX = ".duckdb.cfg.json"
+def _abs_norm(p: str) -> str:
+    """标准化路径为绝对路径（统一使用/分隔符）"""
+    return os.path.abspath(p).replace("\\", "/")
 
 # 检测直接使用duckdb.connect的警告
 def _warn_direct_duckdb_usage():
@@ -85,123 +102,12 @@ def _warn_direct_duckdb_usage():
             break
 
 def get_duckdb_config(db_path: str | None = None):
-    """获取DuckDB配置。
-
-    - 若提供 db_path，则在数据库同目录持久化/读取配置，确保**跨进程**完全一致，避免
-      "Can't open a connection to same database file with a different configuration"。
-    - 若不提供 db_path，则返回进程级的默认配置（原行为）。
-    """
-    global _DUCKDB_CONFIG
-
-    # 1) 针对具体数据库（推荐所有调用方传 db_path）
-    if db_path:
-        abs_db = os.path.abspath(db_path)
-        cfg_file = abs_db + _DUCKDB_CONFIG_SUFFIX
-        with _DUCKDB_CONFIGS_LOCK:
-            # 已缓存则直接返回
-            if abs_db in _DUCKDB_CONFIGS:
-                return _DUCKDB_CONFIGS[abs_db]
-
-            # 若有持久化文件，加载之
-            if os.path.exists(cfg_file):
-                try:
-                    with open(cfg_file, "r", encoding="utf-8") as f:
-                        cfg = json.load(f)
-                    _DUCKDB_CONFIGS[abs_db] = cfg
-                    return cfg
-                except Exception as e:
-                    logger.warning(f"读取DuckDB配置文件失败 {cfg_file}: {e}，将根据环境生成并写入新配置")
-
-            # 文件不存在或读取失败：生成并落盘
-            # 自适应线程数配置，支持环境变量覆写，默认 16 线程
-            cpu_count = os.cpu_count() or 4
-            max_threads = 16  # 默认使用 16 线程，充分利用多核 CPU
-
-            env_threads = os.environ.get('DUCKDB_THREADS')
-            if env_threads:
-                try:
-                    threads = int(env_threads)
-                    threads = max(1, min(threads, 32))
-                except ValueError:
-                    threads = max_threads
-            else:
-                threads = max_threads
-
-            env_memory_mb = os.environ.get('DUCKDB_MEM_MB')
-            if env_memory_mb:
-                try:
-                    memory_mb = int(env_memory_mb)
-                    memory_mb = max(128, min(memory_mb, 8192))
-                    memory_limit = f"{memory_mb}MB"
-                except ValueError:
-                    memory_limit = '4096MB'
-            else:
-                memory_limit = '4096MB'  # 默认 4GB 内存，对 5k+ 股票批量扫描足够
-
-            cfg = {
-                'threads': threads,
-                'memory_limit': memory_limit,
-                'max_memory': memory_limit,
-                'checkpoint_threshold': '256MB',
-                'wal_autocheckpoint': '256MB'
-            }
-            # 写入文件（尽量原子）
-            try:
-                tmp_path = cfg_file + ".tmp"
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(cfg, f, ensure_ascii=False, indent=2)
-                os.replace(tmp_path, cfg_file)
-            except Exception as e:
-                logger.warning(f"写入DuckDB配置文件失败 {cfg_file}: {e}")
-            _DUCKDB_CONFIGS[abs_db] = cfg
-            logger.debug(f"DuckDB配置已初始化并持久化: {cfg} (CPU核心数: {cpu_count}, 文件: {cfg_file})")
-            return cfg
-
-    # 2) 没有 db_path：维持原先的进程级单例行为
-    if _DUCKDB_CONFIG is not None:
-        return _DUCKDB_CONFIG
+    """获取DuckDB配置（已废弃，始终返回None）。
     
-    with _DUCKDB_CONFIG_LOCK:
-        if _DUCKDB_CONFIG is not None:
-            return _DUCKDB_CONFIG
-        
-        # 自适应线程数配置，支持环境变量覆写，默认 16 线程
-        cpu_count = os.cpu_count() or 4
-        max_threads = 16  # 默认使用 16 线程，充分利用多核 CPU
-        
-        # 从环境变量读取线程数配置
-        env_threads = os.environ.get('DUCKDB_THREADS')
-        if env_threads:
-            try:
-                threads = int(env_threads)
-                threads = max(1, min(threads, 32))  # 限制在合理范围内
-            except ValueError:
-                threads = max_threads
-        else:
-            threads = max_threads
-        
-        # 从环境变量读取内存配置
-        env_memory_mb = os.environ.get('DUCKDB_MEM_MB')
-        if env_memory_mb:
-            try:
-                memory_mb = int(env_memory_mb)
-                memory_mb = max(128, min(memory_mb, 8192))  # 限制在128MB-8GB范围内
-                memory_limit = f"{memory_mb}MB"
-            except ValueError:
-                memory_limit = '4096MB'
-        else:
-            memory_limit = '4096MB'  # 默认 4GB 内存，对 5k+ 股票批量扫描足够
-        
-        _DUCKDB_CONFIG = {
-            'threads': threads,  # 自适应线程数，支持环境变量覆写
-            'memory_limit': memory_limit,  # 支持环境变量覆写的内存限制
-            'max_memory': memory_limit,    # 支持环境变量覆写的最大内存
-            'checkpoint_threshold': '256MB',  # 检查点阈值固定为256MB
-            'wal_autocheckpoint': '256MB'     # WAL自动检查点固定为256MB
-        }
-        
-        logger.debug(f"DuckDB配置已初始化: {_DUCKDB_CONFIG} (CPU核心数: {cpu_count})")
-        return _DUCKDB_CONFIG
+    为了保持向后兼容性，保留此函数但始终返回None，表示不使用任何配置参数。
+    """
+    # 不再使用任何配置参数，始终返回 None
+    return None
 
 
 class DatabaseConnectionPool:
@@ -235,19 +141,43 @@ class DatabaseConnectionPool:
         }
     
     def _create_connection(self, read_only: bool = True):
-        """创建新连接"""
+        """创建新连接
+        
+        注意：移除了所有重试和关闭连接解决冲突的逻辑。
+        遇到连接问题（包括配置冲突、数据库锁定等）将直接抛出异常，不再兜底。
+        原因：
+        1. 关闭连接无法确保资源真正释放，DuckDB的文件锁由操作系统和数据库引擎控制
+        2. 简单的重试和等待无法解决根本问题，反而可能掩盖问题
+        3. 连接问题应该通过合理的连接池管理、连接复用和架构设计来避免，而不是依赖兜底处理
+        """
+        import duckdb
+        
+        # 根据 read_only 参数创建相应类型的连接
+        use_read_only = read_only
+        if _MULTIPROCESSING_AVAILABLE:
+            current_process = _get_current_process()
+            if current_process.name != "MainProcess":
+                # 子进程的读取操作强制使用 read_only=True
+                if read_only:
+                    use_read_only = True
+                    logger.debug(f"子进程 {current_process.name} 读取操作使用 read_only=True 模式")
+                else:
+                    # 写入操作允许使用 read_only=False
+                    use_read_only = False
+                    logger.debug(f"子进程 {current_process.name} 写入操作使用 read_only=False 模式")
+        elif os.name == 'nt':  # Windows 单进程环境
+            # Windows 上，如果是只读操作，使用 read_only=True
+            # 这样可以允许多个进程同时打开同一个数据库文件
+            if read_only:
+                use_read_only = True
+            else:
+                use_read_only = False
+        
+        # 直接创建连接，不进行任何重试或兜底处理
+        # 如果连接失败（配置冲突、数据库锁定等），直接抛出异常
         try:
-            import duckdb
-            
-            # 使用统一的DuckDB配置
-            config = get_duckdb_config(self.db_path)
-            
-            # 根据 read_only 参数创建相应类型的连接
-            logger.debug(f"创建连接 - 只读: {read_only}, 配置: {config}")
-            
-            # 强制统一访问模式：所有连接都用读写模式（automatic）
-            # read_only 参数仅用于连接池标签，不传给 DuckDB
-            conn = duckdb.connect(self.db_path, read_only=False, config=config)
+            # 统一不使用任何配置参数，直接创建连接
+            conn = duckdb.connect(self.db_path, read_only=use_read_only)
             
             # 记录连接创建时间和类型
             conn_id = id(conn)
@@ -257,17 +187,27 @@ class DatabaseConnectionPool:
             self._connection_types[conn_id] = read_only
             
             self._stats['total_created'] += 1
-            logger.debug(f"创建新数据库连接成功: {self.db_path} (只读: {read_only}, 内存限制: {config['memory_limit']})")
+            logger.debug(
+                f"创建新数据库连接成功: {self.db_path} (只读: {use_read_only})"
+            )
             return conn
             
         except Exception as e:
+            # 连接创建失败，直接抛出异常，不进行重试或关闭连接等兜底操作
             self._stats['connection_errors'] += 1
-            logger.error(f"创建数据库连接失败: {e}")
-            logger.error(f"连接参数 - 只读: {read_only}, 配置: {get_duckdb_config(self.db_path)}")
+            logger.error(f"创建数据库连接失败 -> {self.db_path}: {e}")
             raise
     
     def _close_all_existing_connections(self):
-        """关闭所有现有连接"""
+        """关闭所有现有连接
+        
+        注意：此方法仅用于连接池的正常清理和关闭，不应依赖此方法来解决数据库占用问题。
+        原因：
+        1. 关闭连接无法确保数据库文件锁立即释放，DuckDB的文件锁由操作系统和数据库引擎控制
+        2. 简单的关闭操作无法解决多进程/多线程环境下的数据库占用问题
+        3. 如果遇到数据库占用问题，应该通过合理的连接池管理、连接复用和架构设计来避免，
+           而不是依赖关闭连接来解决。遇到连接问题时应该直接抛出异常，让调用方处理。
+        """
         try:
             # 关闭活跃连接
             for conn in list(self._active_connections):
@@ -282,9 +222,6 @@ class DatabaseConnectionPool:
                     self._close_connection(conn)
                 except queue.Empty:
                     break
-            
-            # 等待一段时间确保连接完全关闭
-            time.sleep(0.1)
             
             logger.debug("所有现有连接已关闭")
             
@@ -353,7 +290,7 @@ class DatabaseConnectionPool:
                 self._active_connections.add(conn)
                 self._stats['pool_misses'] += 1
                 self._stats['active_count'] = len(self._active_connections)
-                logger.debug(f"创建新数据库连接: {self.db_path} (只读: {read_only})")
+                logger.debug(f"[数据库连接] 创建新连接: {self.db_path} (只读: {read_only})")
                 return conn
                 
             except Exception as e:
@@ -406,7 +343,17 @@ class DatabaseConnectionPool:
                 self._condition.notify_all()
     
     def _close_connection(self, conn):
-        """关闭连接"""
+        """关闭连接
+        
+        注意：此方法仅用于正常的连接清理和连接池管理，不应依赖此方法来解决数据库占用问题。
+        原因：
+        1. DuckDB的文件锁是在操作系统和数据库引擎层面管理的，简单的 close() 调用
+           无法确保文件锁立即释放
+        2. 在多进程/多线程环境下，即使当前进程关闭了连接，其他进程的连接仍然可能
+           占用数据库文件
+        3. 如果遇到数据库占用问题，应该通过合理的架构设计（如连接池复用、read_only
+           模式、连接管理策略）来避免，而不是依赖关闭连接来解决
+        """
         try:
             conn_id = id(conn)
             # 清理连接记录
@@ -414,7 +361,27 @@ class DatabaseConnectionPool:
             self._connection_last_used.pop(conn_id, None)
             self._connection_types.pop(conn_id, None)
             # 关闭连接
-            conn.close()
+            try:
+                # 先尝试提交或回滚任何未完成的事务
+                try:
+                    conn.execute("ROLLBACK")
+                except:
+                    pass
+            except:
+                pass
+            # 关闭连接
+            try:
+                conn.close()
+                # DuckDB连接需要显式关闭
+                import duckdb
+                if hasattr(conn, 'close'):
+                    conn.close()
+            except Exception as close_error:
+                # 如果关闭失败，尝试强制关闭
+                try:
+                    del conn
+                except:
+                    pass
         except Exception as e:
             logger.warning(f"关闭数据库连接时出错: {e}")
     
@@ -496,6 +463,12 @@ class DatabaseManager:
             return
         
         self._initialized = True
+        
+        # 多进程环境检测
+        self._is_multiprocess = self._detect_multiprocess_environment()
+        self._process_id = os.getpid()
+        self._process_name = _get_current_process().name if _MULTIPROCESSING_AVAILABLE else "MainProcess"
+        
         # 两套连接池：读写分离
         self._read_pools: Dict[str, DatabaseConnectionPool] = {}  # 只读连接池
         self._write_pools: Dict[str, DatabaseConnectionPool] = {}  # 读写连接池
@@ -510,7 +483,7 @@ class DatabaseManager:
         self._max_queue_size = max_queue_size
         self._queue_full_count = 0  # 队列满的次数统计
         
-        # 查询缓存机制
+        # 查询缓存机制（多进程环境下每个进程独立缓存）
         self._query_cache: Dict[str, Tuple[pd.DataFrame, float]] = {}
         self._cache_lock = threading.RLock()
         self._cache_max_size = 100  # 最大缓存条目数
@@ -519,7 +492,21 @@ class DatabaseManager:
         # 启动工作线程
         self._start_workers()
         
-        logger.info(f"数据库管理器初始化完成 (队列大小限制: {max_queue_size}, 缓存大小: {self._cache_max_size}, 读写分离: 启用)")
+        env_info = f"进程 {self._process_name} (PID: {self._process_id})"
+        if self._is_multiprocess:
+            env_info += " [多进程模式]"
+        logger.info(f"数据库管理器初始化完成 {env_info} (队列大小限制: {max_queue_size}, 缓存大小: {self._cache_max_size}, 读写分离: 启用)")
+    
+    def _detect_multiprocess_environment(self) -> bool:
+        """检测是否在多进程环境下运行"""
+        try:
+            if not _MULTIPROCESSING_AVAILABLE:
+                return False
+            current_process = _get_current_process()
+            # 如果不是主进程，说明在多进程环境下
+            return current_process.name != "MainProcess"
+        except Exception:
+            return False
     
     def _get_cache_key(self, ts_codes: List[str] = None, start_date: str = None, 
                       end_date: str = None, columns: List[str] = None, adj_type: str = "qfq") -> str:
@@ -586,53 +573,166 @@ class DatabaseManager:
             logger.debug(f"缓存设置: {cache_key}")
     
     def _start_workers(self):
-        """启动工作线程，线程数与评分并发 SC_MAX_WORKERS 对齐（至多 16）"""
+        """启动工作线程，线程数与评分并发 SC_MAX_WORKERS 对齐（至多 16）
+        
+        在多进程环境下，每个进程的工作线程数应该适当减少，避免总线程数过多
+        """
         # 尝试获取 SC_MAX_WORKERS 配置，以便与评分并发对齐
         try:
             from config import SC_MAX_WORKERS
-            worker_count = SC_MAX_WORKERS or min(os.cpu_count() or 4, 8)
+            base_worker_count = SC_MAX_WORKERS or min(os.cpu_count() or 4, 8)
         except ImportError:
-            worker_count = min(os.cpu_count() or 4, 8)
+            base_worker_count = min(os.cpu_count() or 4, 8)
         
-        # 限制最多 16 个 DB 工作线程
-        worker_count = min(worker_count, 16)
+        # 在多进程环境下，每个进程的工作线程数应该适当减少
+        if self._is_multiprocess:
+            # 在多进程环境下，每个进程使用较少的工作线程
+            # 假设有 N 个进程，每个进程最多使用 base_worker_count / N 个线程
+            try:
+                # 尝试从环境变量获取进程数（由父进程设置）
+                proc_count = int(os.environ.get('DB_PROCESS_COUNT', '1'))
+                if proc_count > 1:
+                    # 每个进程使用较少的线程，但至少保证有 2 个线程
+                    worker_count = max(2, base_worker_count // proc_count)
+                    worker_count = min(worker_count, 8)  # 每个进程最多 8 个线程
+                else:
+                    worker_count = min(base_worker_count, 8)
+            except (ValueError, KeyError):
+                # 无法确定进程数，保守估计使用较少线程
+                worker_count = min(base_worker_count // 2, 8)
+                worker_count = max(worker_count, 2)
+            logger.info(f"多进程环境检测：每个进程使用 {worker_count} 个工作线程")
+        else:
+            # 单进程环境，可以使用更多线程
+            worker_count = min(base_worker_count, 16)
         
         for i in range(worker_count):
+            worker_name = f"DBWorker-{self._process_name}-{i}"
+            # 在多进程环境下，使用daemon线程，避免阻塞子进程退出
+            # 主进程使用非daemon线程，确保任务完成
+            use_daemon = self._is_multiprocess
             worker = threading.Thread(
                 target=self._worker_loop, 
-                name=f"DBWorker-{i}",
-                daemon=False  # 改为非daemon线程，确保任务完成
+                name=worker_name,
+                daemon=use_daemon
             )
             worker.start()
             self._worker_threads.append(worker)
     
     def _get_connection_pool(self, db_path: str, read_only: bool = True) -> DatabaseConnectionPool:
-        """获取连接池 - 支持读写分离"""
+        """获取连接池 - 支持读写分离，不同数据库路径完全独立
+        
+        每个数据库路径的读取和写入连接池完全独立，互不干扰。
+        例如：读取stockdata数据库和写入details数据库可以并行执行，不会冲突。
+        
+        注意：DuckDB 不允许同一个数据库文件同时存在 read_only=True 和 read_only=False 的连接。
+        如果已经创建了读写连接池，所有连接（包括只读）都必须使用读写连接池。
+        如果已经创建了只读连接池，需要读写连接时必须先关闭只读连接池。
+        
+        优化策略：
+        - 对于需要写入的数据库（如details.db），直接使用读写连接池，避免先创建只读连接池后关闭
+        - 对于只读数据库（如stock_data.db），使用只读连接池
+        
+        在多进程环境下，每个进程的连接池大小应该适当减少，避免总连接数过多
+        """
         if not db_path:
             raise ValueError("数据库路径不能为空")
         abs_path = os.path.abspath(db_path)
         
-        # 根据 read_only 参数选择相应的连接池
-        if read_only:
-            if abs_path not in self._read_pools:
-                with self._lock:
-                    if abs_path not in self._read_pools:
-                        # 连接池上限：max(SC_MAX_WORKERS, 16)，避免"评分线程 → DB 请求队列 → 等待连接"的级联阻塞
-                        try:
-                            from config import SC_MAX_WORKERS
-                            max_connections = max(SC_MAX_WORKERS or 16, 16)
-                        except ImportError:
-                            max_connections = 16
-                        self._read_pools[abs_path] = DatabaseConnectionPool(abs_path, max_connections=max_connections)
-            return self._read_pools[abs_path]
-        else:
-            if abs_path not in self._write_pools:
-                with self._lock:
-                    if abs_path not in self._write_pools:
-                        # 写入连接池保持较小（避免写锁冲突）
+        # 判断数据库是否需要写入操作（通常details.db需要写入，stock_data.db只需要读取）
+        db_path_lower = abs_path.lower().replace('\\', '/')
+        is_write_database = 'details' in db_path_lower or 'detail' in db_path_lower
+        
+        with self._lock:
+            # DuckDB 限制：同一个数据库文件的所有连接必须使用相同的 read_only 配置
+            # 如果已有读写连接池，必须使用读写连接池（即使是只读操作）
+            if abs_path in self._write_pools:
+                if read_only:
+                    # 已有读写连接池，只读操作也使用读写连接池
+                    logger.debug(f"数据库 {abs_path} 已有读写连接池，只读操作使用读写连接池")
+                return self._write_pools[abs_path]
+            
+            # 优化：对于需要写入的数据库，即使当前是只读操作，也优先创建读写连接池
+            # 这样可以避免后续需要写入时关闭只读连接池的代价
+            if is_write_database and read_only and abs_path not in self._read_pools:
+                # 对于需要写入的数据库，直接创建读写连接池（即使是只读操作）
+                logger.debug(
+                    f"数据库 {abs_path} 需要写入操作，只读操作也使用读写连接池，"
+                    f"避免后续切换连接池的代价"
+                )
+                # 创建读写连接池而不是只读连接池
+                if abs_path not in self._write_pools:
+                    if self._is_multiprocess:
+                        max_connections = 4
+                    else:
                         max_connections = 10
-                        self._write_pools[abs_path] = DatabaseConnectionPool(abs_path, max_connections=max_connections)
-            return self._write_pools[abs_path]
+                    self._write_pools[abs_path] = DatabaseConnectionPool(abs_path, max_connections=max_connections)
+                    logger.debug(f"创建读写连接池: {abs_path} (最大连接数: {max_connections})")
+                return self._write_pools[abs_path]
+            
+            # 如果需要读写连接，但已有只读连接池，必须先关闭只读连接池
+            if not read_only and abs_path in self._read_pools:
+                logger.warning(
+                    f"数据库 {abs_path} 已有只读连接池，需要读写连接，"
+                    f"正在关闭只读连接池并创建读写连接池"
+                )
+                try:
+                    # 关闭只读连接池中的所有连接
+                    read_pool = self._read_pools[abs_path]
+                    read_pool.close_all()
+                    # 移除只读连接池
+                    del self._read_pools[abs_path]
+                except Exception as e:
+                    logger.warning(f"关闭只读连接池时出错: {e}")
+            
+            # 根据 read_only 参数选择相应的连接池
+            if read_only:
+                # 只读连接池：每个数据库路径独立管理
+                if abs_path not in self._read_pools:
+                    # 计算连接池大小
+                    try:
+                        from config import SC_MAX_WORKERS
+                        base_max_connections = max(SC_MAX_WORKERS or 16, 16)
+                    except ImportError:
+                        base_max_connections = 16
+                    
+                    # 在多进程环境下，每个进程的连接池应该适当减少
+                    if self._is_multiprocess:
+                        try:
+                            # 尝试从环境变量获取进程数
+                            proc_count = int(os.environ.get('DB_PROCESS_COUNT', '1'))
+                            if proc_count > 1:
+                                # 每个进程使用较少的连接，但至少保证有 4 个连接
+                                max_connections = max(4, base_max_connections // proc_count)
+                                max_connections = min(max_connections, 12)  # 每个进程最多 12 个连接
+                            else:
+                                max_connections = min(base_max_connections, 12)
+                        except (ValueError, KeyError):
+                            # 无法确定进程数，保守估计使用较少连接
+                            max_connections = max(4, base_max_connections // 2)
+                            max_connections = min(max_connections, 12)
+                        logger.debug(f"多进程环境：只读连接池 [{abs_path}] 大小调整为 {max_connections}")
+                    else:
+                        # 单进程环境，可以使用更多连接
+                        max_connections = base_max_connections
+                    
+                    # 为每个数据库路径创建独立的只读连接池
+                    self._read_pools[abs_path] = DatabaseConnectionPool(abs_path, max_connections=max_connections)
+                    logger.debug(f"创建只读连接池: {abs_path} (最大连接数: {max_connections})")
+                return self._read_pools[abs_path]
+            else:
+                # 读写连接池：每个数据库路径独立管理
+                if abs_path not in self._write_pools:
+                    # 写入连接池保持较小（避免写锁冲突）
+                    # 在多进程环境下，写入连接应该更少
+                    if self._is_multiprocess:
+                        max_connections = 4  # 多进程环境下每个进程最多 4 个写连接
+                    else:
+                        max_connections = 10  # 单进程环境可以使用更多写连接
+                    # 为每个数据库路径创建独立的读写连接池
+                    self._write_pools[abs_path] = DatabaseConnectionPool(abs_path, max_connections=max_connections)
+                    logger.debug(f"创建读写连接池: {abs_path} (最大连接数: {max_connections})")
+                return self._write_pools[abs_path]
     
     def _worker_loop(self):
         """工作线程循环"""
@@ -664,21 +764,35 @@ class DatabaseManager:
         logger.debug(f"数据库工作线程结束: {thread_name}")
     
     def _process_request(self, request: DatabaseRequest):
-        """处理数据库请求"""
+        """处理数据库请求
+        
+        不同数据库路径的读取和写入操作完全独立，不会互相阻塞。
+        例如：读取stockdata数据库和写入details数据库可以并行执行。
+        """
         start_time = time.time()
         response = None
         max_retries = 3
         retry_delay = 1.0
         
-        logger.debug(f"开始处理数据库请求: {request.request_id}")
+        # 获取数据库路径的规范化表示（用于日志）
+        abs_db_path = os.path.abspath(request.db_path) if request.db_path else "unknown"
+        
+        logger.debug(
+            f"开始处理数据库请求: {request.request_id} "
+            f"[数据库: {abs_db_path}, 操作: {request.operation_type.value}]"
+        )
         
         for attempt in range(max_retries + 1):
             try:
                 # 根据操作类型选择连接池
+                # 每个数据库路径的读取和写入连接池完全独立，互不干扰
                 is_read_operation = request.operation_type in [OperationType.READ, OperationType.BATCH_READ]
                 pool = self._get_connection_pool(request.db_path, read_only=is_read_operation)
                 
-                logger.debug(f"使用{'只读' if is_read_operation else '读写'}连接进行 {request.operation_type.value} 操作")
+                logger.debug(
+                    f"使用{'只读' if is_read_operation else '读写'}连接进行 {request.operation_type.value} 操作 "
+                    f"[数据库: {abs_db_path}]"
+                )
                 
                 # 获取相应类型的连接
                 conn = pool.get_connection(read_only=is_read_operation, timeout=request.timeout)
@@ -756,17 +870,71 @@ class DatabaseManager:
     
     @contextmanager
     def get_connection(self, db_path: str, read_only: bool = True, timeout: float = 30.0):
-        """获取数据库连接的上下文管理器"""
-        pool = self._get_connection_pool(db_path, read_only=read_only)
-        conn = None
+        """获取数据库连接的上下文管理器
         
+        不同数据库路径的读取和写入操作完全独立，互不干扰。
+        例如：读取stockdata数据库和写入details数据库可以并行执行，不会冲突。
+        
+        每个数据库路径有独立的读取和写入连接池，确保不同数据库的操作不会互相阻塞。
+        """
+        # 在多进程环境下，如果是子进程且要写入details数据库，应该拒绝或强制改为只读模式
+        # details数据库应该只有主进程才能写入，避免多进程写入冲突
+        actual_read_only = read_only
+        abs_db_path = os.path.abspath(db_path) if db_path else "unknown"
+        
+        if _MULTIPROCESSING_AVAILABLE:
+            current_process = _get_current_process()
+            if current_process.name != "MainProcess":
+                # 子进程：检查是否是details数据库且要写入
+                db_path_lower = abs_db_path.lower().replace('\\', '/')
+                is_details_db = 'details' in db_path_lower and db_path_lower.endswith('.db')
+                if is_details_db and not read_only:
+                    # 子进程不允许写入details数据库，强制改为只读模式
+                    actual_read_only = True
+                    logger.warning(
+                        f"子进程 {current_process.name} 尝试写入details数据库 {abs_db_path}，"
+                        f"已强制改为只读模式。details数据库应该只有主进程才能写入。"
+                    )
+        
+        # 获取连接池：每个数据库路径的读取和写入连接池完全独立
+        # 注意：_get_connection_pool 已经处理了 DuckDB 连接配置冲突的问题
+        # 如果已有读写连接池，只读操作也会使用读写连接池；如果已有只读连接池，需要读写连接时会先关闭只读连接池
+        pool = self._get_connection_pool(db_path, read_only=actual_read_only)
+        logger.debug(
+            f"[数据库连接] 开始获取连接: {abs_db_path} "
+            f"[{'只读' if actual_read_only else '读写'}模式]"
+        )
+        conn = None
         try:
-            # 根据 read_only 参数获取相应类型的连接
-            conn = pool.get_connection(read_only=read_only, timeout=timeout)
+            conn = pool.get_connection(read_only=actual_read_only, timeout=timeout)
+            logger.debug(f"[数据库连接] 成功获取连接: {abs_db_path} [{'只读' if actual_read_only else '读写'}模式]")
+            
+            # 对于details数据库的写入操作，验证连接确实是读写连接
+            if not actual_read_only:
+                db_path_lower = os.path.abspath(db_path).lower().replace('\\', '/')
+                is_details_db = 'details' in db_path_lower and db_path_lower.endswith('.db')
+                if is_details_db:
+                    # 验证连接支持写入操作
+                    try:
+                        # 测试连接是否支持写入
+                        conn.execute("CREATE TEMP TABLE write_test (id INTEGER)")
+                        conn.execute("DROP TABLE write_test")
+                        logger.debug("details数据库写入连接验证成功")
+                    except Exception as verify_error:
+                        # 如果连接不支持写入，关闭连接并抛出异常
+                        pool.return_connection(conn)
+                        logger.error(f"details数据库写入连接验证失败: {verify_error}")
+                        raise RuntimeError(f"无法获取details数据库的写入连接: {verify_error}")
+            
+            # 使用yield提供连接给调用方
             yield conn
         finally:
             if conn:
-                pool.return_connection(conn)
+                try:
+                    pool.return_connection(conn)
+                    logger.debug(f"[数据库连接] 连接已归还: {abs_db_path} [{'只读' if actual_read_only else '读写'}模式]")
+                except Exception as e:
+                    logger.error(f"[数据库连接] 归还连接时出错: {abs_db_path}, 错误: {e}")
     
     def execute_query(self, db_path: str, sql: str, params: Optional[List[Any]] = None, 
                      timeout: float = 30.0, callback: Optional[Callable] = None) -> str:
@@ -818,7 +986,11 @@ class DatabaseManager:
     
     def execute_sync_query(self, db_path: str, sql: str, params: Optional[List[Any]] = None,
                           timeout: float = 30.0) -> pd.DataFrame:
-        """同步执行查询 - 优化版：只读查询直接执行，但受连接池上限约束"""
+        """同步执行查询 - 优化版：只读查询直接执行，但受连接池上限约束
+        
+        不同数据库路径的查询操作使用独立的连接池，不会互相阻塞。
+        例如：读取stockdata数据库和写入details数据库可以并行执行，不会冲突。
+        """
         # 检查是否为只读查询（SELECT语句）
         sql_upper = sql.strip().upper()
         is_read_only = sql_upper.startswith('SELECT') or sql_upper.startswith('WITH')
@@ -828,17 +1000,28 @@ class DatabaseManager:
         is_same_process = True  # 假设都在同一进程中
         
         # 如果是只读查询且在同一进程中，直接执行，但受连接池上限约束
+        # 每个数据库路径的只读连接池完全独立，不会互相影响
         if is_read_only and is_same_process:
             try:
-                logger.debug(f"直接执行只读查询，受连接池约束: {sql[:100]}...")
+                abs_db_path = os.path.abspath(db_path) if db_path else "unknown"
+                logger.debug(
+                    f"直接执行只读查询，受连接池约束: {sql[:100]}... "
+                    f"[数据库: {abs_db_path}]"
+                )
+                # 获取该数据库路径的独立只读连接池（与其他数据库路径完全独立）
                 pool = self._get_connection_pool(db_path, read_only=True)
                 
                 # 检查连接池状态，如果接近上限则等待
+                # 注意：这个连接池只针对当前数据库路径，不会影响其他数据库的操作
                 if pool._stats['active_count'] >= pool.max_connections * 0.9:  # 90%阈值
-                    logger.debug(f"连接池接近上限 ({pool._stats['active_count']}/{pool.max_connections})，等待可用连接")
+                    logger.debug(
+                        f"连接池接近上限 ({pool._stats['active_count']}/{pool.max_connections})，"
+                        f"等待可用连接 [数据库: {abs_db_path}]"
+                    )
                     # 使用连接池的阻塞等待机制，确保真正的限流
                     # 这里会触发连接池内部的阻塞等待逻辑
                 
+                # 从该数据库路径的独立只读连接池获取连接
                 conn = pool.get_connection(read_only=True, timeout=timeout)
                 
                 try:
@@ -859,7 +1042,6 @@ class DatabaseManager:
                 finally:
                     pool.return_connection(conn)
             except Exception as e:
-                logger.warning(f"直接查询执行失败，回退到队列模式: {e}")
                 # 回退到原有的队列模式
                 pass
         
@@ -1002,15 +1184,7 @@ class DatabaseManager:
             elif self._write_pools:
                 sample_db_path = next(iter(self._write_pools.keys()))
             
-            if sample_db_path:
-                duckdb_config = get_duckdb_config(sample_db_path)
-                stats['duckdb_config'] = {
-                    'threads': duckdb_config.get('threads', 'unknown'),
-                    'memory_limit': duckdb_config.get('memory_limit', 'unknown'),
-                    'max_memory': duckdb_config.get('max_memory', 'unknown'),
-                    'checkpoint_threshold': duckdb_config.get('checkpoint_threshold', 'unknown'),
-                    'wal_autocheckpoint': duckdb_config.get('wal_autocheckpoint', 'unknown')
-                }
+            # 不再使用配置参数，移除配置统计
         except Exception as e:
             logger.debug(f"获取连接统计失败: {e}")
         
@@ -1239,18 +1413,18 @@ class DatabaseManager:
                                     break
                             
                             if prev_trading_day:
-                                logger.info(f"[SMART] 收盘前运行，使用前一个交易日: {prev_trading_day}")
+                                logger.debug(f"[SMART] 收盘前运行，使用前一个交易日: {prev_trading_day}")
                                 return prev_trading_day
                             else:
                                 logger.warning(f"[SMART] 未找到前一个交易日，使用今天: {today_str}")
                                 return today_str
                         else:
-                            logger.info(f"[SMART] 收盘后运行，使用今天: {today_str}")
+                            logger.debug(f"[SMART] 收盘后运行，使用今天: {today_str}")
                             return today_str
                     else:
                         # 今天不开盘，使用最近的交易日
                         latest_trading_day = trading_days_list[-1]
-                        logger.info(f"[SMART] 今天休盘，使用最近交易日: {latest_trading_day}")
+                        logger.debug(f"[SMART] 今天休盘，使用最近交易日: {latest_trading_day}")
                         return latest_trading_day
                 else:
                     # 无法获取交易日历，使用今天
@@ -1274,7 +1448,7 @@ class DatabaseManager:
                 df = pd.read_csv(cache_file, dtype=str)
                 if not df.empty and "ts_code" in df.columns:
                     codes = df["ts_code"].tolist()
-                    logger.info(f"从缓存获取股票列表: {len(codes)} 只股票")
+                    logger.debug(f"从缓存获取股票列表: {len(codes)} 只股票")
                     return codes
             
             logger.warning("股票列表缓存不存在")
@@ -1322,7 +1496,7 @@ class DatabaseManager:
             count_df = self.execute_sync_query(db_path, count_sql, [adj_type], timeout=30.0)
             
             if count_df.empty or count_df["count"].iloc[0] == 0:
-                logger.info(f"数据库中没有 {adj_type} 类型的数据")
+                logger.debug(f"数据库中没有 {adj_type} 类型的数据")
                 return []
             
             sql = "SELECT DISTINCT ts_code FROM stock_data WHERE adj_type = ? ORDER BY ts_code"
@@ -1338,7 +1512,7 @@ class DatabaseManager:
             return []
     
     def query_stock_data(self, db_path: str = None, ts_code: str = None, start_date: str = None, 
-                        end_date: str = None, columns: List[str] = None, adj_type: str = "qfq") -> pd.DataFrame:
+                        end_date: str = None, columns: List[str] = None, adj_type: str = "qfq", limit: Optional[int] = None) -> pd.DataFrame:
         """查询股票数据 - 统一接口"""
         try:
             if db_path is None:
@@ -1377,6 +1551,15 @@ class DatabaseManager:
                 sql += " WHERE " + " AND ".join(conditions)
             
             sql += " ORDER BY ts_code, trade_date"
+
+            # 限制返回行数（如提供）
+            if limit is not None:
+                try:
+                    limit_int = int(limit)
+                    if limit_int > 0:
+                        sql += f" LIMIT {limit_int}"
+                except Exception:
+                    pass
             
             # 执行查询
             df = self.execute_sync_query(db_path, sql, params, timeout=120.0)
@@ -1385,6 +1568,52 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"查询股票数据失败: {e}")
             return pd.DataFrame()
+
+    def count_stock_data(self, db_path: str = None, ts_code: str = None, start_date: str = None,
+                         end_date: str = None, adj_type: str = "qfq") -> int:
+        """统计股票数据总行数（不受 LIMIT 影响）"""
+        try:
+            if db_path is None:
+                from config import DATA_ROOT, UNIFIED_DB_PATH
+                db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+
+            if not os.path.exists(db_path):
+                logger.warning(f"数据库文件不存在: {db_path}")
+                return 0
+
+            conditions: List[str] = []
+            params: List[Any] = []
+
+            if ts_code:
+                conditions.append("ts_code = ?")
+                params.append(ts_code)
+
+            if start_date:
+                conditions.append("trade_date >= ?")
+                params.append(start_date)
+
+            if end_date:
+                conditions.append("trade_date <= ?")
+                params.append(end_date)
+
+            if adj_type:
+                conditions.append("adj_type = ?")
+                params.append(adj_type)
+
+            sql = "SELECT COUNT(*) AS total FROM stock_data"
+            if conditions:
+                sql += " WHERE " + " AND ".join(conditions)
+
+            df = self.execute_sync_query(db_path, sql, params, timeout=60.0)
+            if not df.empty and "total" in df.columns:
+                try:
+                    return int(df["total"].iloc[0])
+                except Exception:
+                    return 0
+            return 0
+        except Exception as e:
+            logger.error(f"统计股票数据总行数失败: {e}")
+            return 0
     
     def batch_query_stock_data(self, db_path: str = None, ts_codes: List[str] = None, 
                               start_date: str = None, end_date: str = None, 
@@ -1691,13 +1920,25 @@ _database_manager = None
 _database_manager_lock = threading.Lock()
 
 def get_database_manager() -> DatabaseManager:
-    """获取数据库管理器实例"""
+    """获取数据库管理器实例
+    
+    在多进程环境下，每个进程会创建自己的 DatabaseManager 实例。
+    这是正常行为，因为进程间不能共享线程锁和队列等资源。
+    
+    每个进程的 DatabaseManager 会：
+    1. 自动检测是否在多进程环境下
+    2. 根据进程数调整连接池大小
+    3. 使用持久化的 DuckDB 配置确保跨进程一致性
+    """
     global _database_manager
     
     if _database_manager is None:
         with _database_manager_lock:
             if _database_manager is None:
                 _database_manager = DatabaseManager()
+                # 在多进程环境下，确保子进程能正确初始化
+                if _database_manager._is_multiprocess:
+                    logger.info(f"子进程 {_database_manager._process_name} (PID: {_database_manager._process_id}) 的 DatabaseManager 初始化完成")
     
     return _database_manager
 
@@ -1727,6 +1968,7 @@ def close_all_connections():
     manager = get_database_manager()
     manager.close_all()
 
+
 def clear_connections_only():
     """仅清理连接池，不关闭工作线程 - 用于评分线程中的轻量级清理"""
     manager = get_database_manager()
@@ -1750,10 +1992,16 @@ def get_stock_list(db_path: str = None, adj_type: str = "raw") -> List[str]:
     return manager.get_stock_list(db_path, adj_type)
 
 def query_stock_data(db_path: str = None, ts_code: str = None, start_date: str = None, 
-                    end_date: str = None, columns: List[str] = None, adj_type: str = "qfq") -> pd.DataFrame:
+                    end_date: str = None, columns: List[str] = None, adj_type: str = "qfq", limit: Optional[int] = None) -> pd.DataFrame:
     """查询股票数据的便捷函数"""
     manager = get_database_manager()
-    return manager.query_stock_data(db_path, ts_code, start_date, end_date, columns, adj_type)
+    return manager.query_stock_data(db_path, ts_code, start_date, end_date, columns, adj_type, limit)
+
+def count_stock_data(db_path: str = None, ts_code: str = None, start_date: str = None,
+                    end_date: str = None, adj_type: str = "qfq") -> int:
+    """统计股票数据总行数的便捷函数"""
+    manager = get_database_manager()
+    return manager.count_stock_data(db_path, ts_code, start_date, end_date, adj_type)
 
 def batch_query_stock_data(db_path: str = None, ts_codes: List[str] = None, 
                           start_date: str = None, end_date: str = None, 
@@ -1839,6 +2087,13 @@ class DatabaseSchemaManager:
     
     def init_stock_data_tables(self, db_path: str, db_type: str = "duckdb"):
         """初始化股票数据表结构"""
+        # 在多进程环境下，如果是子进程，跳过初始化（表结构应该已经在主进程中创建）
+        if _MULTIPROCESSING_AVAILABLE:
+            current_process = _get_current_process()
+            if current_process.name != "MainProcess":
+                logger.debug(f"子进程 {current_process.name} 跳过表结构初始化（表结构应在主进程中创建）")
+                return
+        
         try:
             # 确保数据库目录存在
             db_dir = os.path.dirname(db_path)
@@ -1862,10 +2117,15 @@ class DatabaseSchemaManager:
         """初始化DuckDB股票数据表结构"""
         import duckdb
         
-        # 使用统一的DuckDB配置
-        config = get_duckdb_config(db_path)
+        # 在多进程环境下，如果是子进程，跳过初始化（表结构应该已经在主进程中创建）
+        if _MULTIPROCESSING_AVAILABLE:
+            current_process = _get_current_process()
+            if current_process.name != "MainProcess":
+                logger.debug(f"子进程 {current_process.name} 跳过表结构初始化（表结构应在主进程中创建）")
+                return
         
-        with duckdb.connect(db_path, read_only=False, config=config) as conn:
+        # 不使用配置参数
+        with duckdb.connect(db_path, read_only=False) as conn:
             # 构建指标列定义
             indicator_cols_sql = self._build_indicator_columns_sql()
             
@@ -1984,6 +2244,13 @@ class DatabaseSchemaManager:
     
     def init_stock_details_tables(self, db_path: str, db_type: str = "duckdb"):
         """初始化股票详情表结构"""
+        # 在多进程环境下，如果是子进程，跳过初始化（表结构应该已经在主进程中创建）
+        if _MULTIPROCESSING_AVAILABLE:
+            current_process = _get_current_process()
+            if current_process.name != "MainProcess":
+                logger.debug(f"子进程 {current_process.name} 跳过表结构初始化（表结构应在主进程中创建）")
+                return
+        
         try:
             if db_type.lower() == "duckdb":
                 self._init_duckdb_details_tables(db_path)
@@ -2004,26 +2271,60 @@ class DatabaseSchemaManager:
         """初始化DuckDB股票详情表结构"""
         import duckdb
         
-        # 使用统一的DuckDB配置
-        config = get_duckdb_config(db_path)
+        # 在多进程环境下，如果是子进程，跳过初始化（表结构应该已经在主进程中创建）
+        if _MULTIPROCESSING_AVAILABLE:
+            current_process = _get_current_process()
+            if current_process.name != "MainProcess":
+                logger.debug(f"子进程 {current_process.name} 跳过表结构初始化（表结构应在主进程中创建）")
+                return
         
-        with duckdb.connect(db_path, read_only=False, config=config) as conn:
-            create_table_sql = """
-            CREATE TABLE IF NOT EXISTS stock_details (
-                ts_code VARCHAR,
-                ref_date VARCHAR,
-                score DOUBLE,
-                tiebreak DOUBLE,
-                highlights JSON,
-                drawbacks JSON,
-                opportunities JSON,
-                rank INTEGER,
-                total INTEGER,
-                rules JSON,
-                PRIMARY KEY (ts_code, ref_date)
-            )
-            """
-            conn.execute(create_table_sql)
+        # 通过DatabaseManager的连接池创建连接
+        try:
+            logger.info(f"[数据库初始化] 开始初始化details数据库表结构: {db_path}")
+            # 通过连接管理器创建连接
+            with self.db_manager.get_connection(db_path, read_only=False) as conn:
+                create_table_sql = """
+                CREATE TABLE IF NOT EXISTS stock_details (
+                    ts_code VARCHAR,
+                    ref_date VARCHAR,
+                    score DOUBLE,
+                    tiebreak DOUBLE,
+                    highlights JSON,
+                    drawbacks JSON,
+                    opportunities JSON,
+                    rank INTEGER,
+                    total INTEGER,
+                    rules JSON,
+                    PRIMARY KEY (ts_code, ref_date)
+                )
+                """
+                conn.execute(create_table_sql)
+                logger.info(f"[数据库初始化] stock_details表结构初始化完成: {db_path}")
+        except Exception as e:
+            # 如果通过连接池失败，回退到直连
+            logger.warning(f"通过连接池初始化表结构失败，回退到直连: {e}")
+            try:
+                conn_ctx = duckdb.connect(db_path, read_only=False)
+                with conn_ctx as conn:
+                    create_table_sql = """
+                    CREATE TABLE IF NOT EXISTS stock_details (
+                        ts_code VARCHAR,
+                        ref_date VARCHAR,
+                        score DOUBLE,
+                        tiebreak DOUBLE,
+                        highlights JSON,
+                        drawbacks JSON,
+                        opportunities JSON,
+                        rank INTEGER,
+                        total INTEGER,
+                        rules JSON,
+                        PRIMARY KEY (ts_code, ref_date)
+                    )
+                    """
+                    conn.execute(create_table_sql)
+            except Exception as e2:
+                logger.error(f"直接连接初始化表结构也失败: {e2}")
+                raise
     
     def _init_sqlite_details_tables(self, db_path: str):
         """初始化SQLite股票详情表结构"""
@@ -2463,7 +2764,7 @@ class DataReceiver:
                     return {"imported": len(df), "skipped": 0}
                 
                 elif mode == "upsert":
-                    # 更新插入模式：使用DuckDB的INSERT OR REPLACE
+                    # 更新插入模式：使用ON CONFLICT DO UPDATE，只更新传入的字段，保留其他字段的值
                     with TempFileManager() as tmp_file:
                         df.to_csv(tmp_file.name, index=False)
                         
@@ -2480,11 +2781,72 @@ class DataReceiver:
                         if not common_columns:
                             raise ValueError("没有匹配的列可以插入")
                         
+                        # 尝试获取主键信息
+                        primary_key_columns = []
+                        try:
+                            # 查询表的主键约束
+                            # 对于DuckDB，可以通过PRAGMA或查询系统表获取主键
+                            # 简化处理：如果是stock_details表，主键是(ts_code, ref_date)
+                            if table_name == "stock_details":
+                                primary_key_columns = ["ts_code", "ref_date"]
+                            else:
+                                # 对于其他表，尝试从表结构推断主键（NOT NULL且唯一）
+                                # 如果无法确定，使用所有匹配的列作为主键
+                                table_info = conn.execute(f"DESCRIBE {table_name}").df()
+                                # 检查是否有明确的PRIMARY KEY约束信息
+                                # 如果没有，回退到使用所有common_columns
+                                primary_key_columns = common_columns
+                        except Exception as e:
+                            logger.warning(f"无法获取表 {table_name} 的主键信息: {e}，使用所有列作为键")
+                            primary_key_columns = common_columns
+                        
+                        # 如果没有明确的主键，使用所有列作为键（但这可能导致问题）
+                        if not primary_key_columns:
+                            primary_key_columns = common_columns
+                        
+                        # 确定需要更新的列（排除主键列，只更新非主键列）
+                        update_columns = [col for col in common_columns if col not in primary_key_columns]
+                        
                         # 构建列名列表
                         columns_str = ', '.join(common_columns)
                         values_str = ', '.join([f"{col}" for col in common_columns])
+                        primary_key_str = ', '.join(primary_key_columns)
                         
-                        conn.execute(f"INSERT OR REPLACE INTO {table_name} ({columns_str}) SELECT {values_str} FROM {temp_table_name}")
+                        # 使用UPDATE + INSERT方式实现upsert
+                        # 这样可以只更新传入的字段，保留其他字段的值
+                        if update_columns:
+                            # 先更新已存在的记录（只更新非主键字段）
+                            # 使用子查询方式，兼容DuckDB语法
+                            update_set_clause = ', '.join([f"{col} = (SELECT {col} FROM {temp_table_name} WHERE {' AND '.join([f'{temp_table_name}.{pk} = {table_name}.{pk}' for pk in primary_key_columns])})" for col in update_columns])
+                            where_clause = f"EXISTS (SELECT 1 FROM {temp_table_name} WHERE {' AND '.join([f'{temp_table_name}.{pk} = {table_name}.{pk}' for pk in primary_key_columns])})"
+                            
+                            # 使用子查询方式进行UPDATE
+                            update_sql = f"""
+                                UPDATE {table_name} 
+                                SET {update_set_clause}
+                                WHERE {where_clause}
+                            """
+                            conn.execute(update_sql)
+                            
+                            # 然后插入不存在的记录
+                            # 找出temp_table中存在但目标表中不存在的记录
+                            join_condition = ' AND '.join([f"temp.{pk} = target.{pk}" for pk in primary_key_columns])
+                            # 明确指定使用temp表的列，避免列名歧义
+                            values_str_with_alias = ', '.join([f"temp.{col}" for col in common_columns])
+                            insert_sql = f"""
+                                INSERT INTO {table_name} ({columns_str})
+                                SELECT {values_str_with_alias} FROM {temp_table_name} AS temp
+                                LEFT JOIN {table_name} AS target ON {join_condition}
+                                WHERE target.{primary_key_columns[0]} IS NULL
+                            """
+                            conn.execute(insert_sql)
+                        else:
+                            # 只有主键列，使用INSERT OR IGNORE（不更新）
+                            insert_sql = f"""
+                                INSERT OR IGNORE INTO {table_name} ({columns_str}) 
+                                SELECT {values_str} FROM {temp_table_name}
+                            """
+                            conn.execute(insert_sql)
                         conn.execute(f"DROP TABLE {temp_table_name}")
                     
                     return {"imported": len(df), "skipped": 0}
@@ -2524,7 +2886,7 @@ class DataReceiver:
             )
             
             self._import_queue.put(request)
-            logger.info(f"数据导入请求已提交: {request_id} (来源: {source_module}, 类型: {data_type})")
+            logger.debug(f"数据导入请求已提交: {request_id} (来源: {source_module}, 类型: {data_type})")
             return request_id
             
         except Exception as e:
@@ -2605,7 +2967,7 @@ class DataReceiver:
             
             # 直接处理请求
             result = self._process_import_request(request)
-            logger.info(f"同步导入完成: {request_id}, 结果: {result}")
+            logger.debug(f"同步导入完成: {request_id}, 结果: {result}")
             return result
             
         except Exception as e:
@@ -2827,6 +3189,342 @@ def list_trade_dates(root: str) -> List[str]:
     except Exception as e:
         logger.error(f"list_trade_dates 失败: {e}")
         return []
+
+# ==================== Details数据库读取功能 ====================
+
+def is_details_db_reading_enabled() -> bool:
+    """
+    检查details数据库读取是否启用
+    
+    优先从streamlit session_state读取，如果没有streamlit环境则返回False
+    
+    Returns:
+        bool: 如果数据库读取已启用返回True，否则返回False
+    """
+    try:
+        # 尝试从streamlit session_state读取
+        import streamlit as st
+        return st.session_state.get("details_db_reading_enabled", False)
+    except (ImportError, AttributeError, RuntimeError):
+        # 如果没有streamlit环境或不在streamlit上下文中，返回False
+        return False
+
+def get_details_db_path_with_fallback(db_path: Optional[str] = None, fallback_to_unified: bool = True) -> Optional[str]:
+    """
+    获取Details数据库路径，包含回退到统一数据库的逻辑
+    
+    Args:
+        db_path: 指定数据库路径，如果为None则使用配置文件中的路径
+        fallback_to_unified: 如果details数据库不存在，是否回退到统一数据库（默认True）
+        
+    Returns:
+        数据库文件路径，如果不存在且不启用回退则返回None
+    """
+    # 首先尝试使用指定的路径或默认路径
+    if db_path:
+        details_db_path = _abs_norm(db_path)
+    else:
+        details_db_path = get_details_db_path()
+    
+    # 检查数据库文件是否存在
+    if os.path.exists(details_db_path):
+        return details_db_path
+    
+    # 如果不存在且启用回退，尝试从统一数据库读取（兼容性）
+    if fallback_to_unified:
+        try:
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            unified_db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            if os.path.exists(unified_db_path):
+                logger.debug(f"Details数据库不存在，使用统一数据库: {unified_db_path}")
+                return _abs_norm(unified_db_path)
+        except (ImportError, AttributeError):
+            pass
+    
+    # 如果都不存在，返回None
+    logger.debug(f"Details数据库文件不存在: {details_db_path}")
+    return None
+
+def is_details_db_available(check_file_exists: bool = True) -> bool:
+    """
+    检查details数据库是否可用（配置支持且文件存在）
+    
+    Args:
+        check_file_exists: 是否检查文件存在（默认True）
+        
+    Returns:
+        bool: 如果数据库可用返回True，否则返回False
+    """
+    try:
+        from config import SC_USE_DB_STORAGE, SC_DETAIL_STORAGE
+        
+        # 检查配置是否支持数据库存储
+        if not SC_USE_DB_STORAGE:
+            return False
+        
+        if SC_DETAIL_STORAGE not in ["database", "both", "db"]:
+            return False
+        
+        # 如果不需要检查文件存在，仅检查配置即可
+        if not check_file_exists:
+            return True
+        
+        # 检查数据库文件是否存在
+        db_path = get_details_db_path_with_fallback(fallback_to_unified=True)
+        return db_path is not None and os.path.exists(db_path)
+        
+    except (ImportError, AttributeError):
+        return False
+
+def get_details_db_path(db_path: Optional[str] = None) -> str:
+    """
+    获取Details数据库路径
+    
+    Args:
+        db_path: 指定数据库路径，如果为None则使用配置文件中的路径
+        
+    Returns:
+        数据库文件路径
+    """
+    if db_path:
+        return _abs_norm(db_path)
+    
+    try:
+        from config import SC_OUTPUT_DIR, SC_DETAIL_DB_TYPE, SC_DETAIL_DB_PATH
+        if SC_DETAIL_DB_TYPE == "duckdb":
+            return _abs_norm(os.path.join(SC_OUTPUT_DIR, 'details', 'details.db'))
+        else:
+            return _abs_norm(os.path.join(SC_OUTPUT_DIR, SC_DETAIL_DB_PATH))
+    except ImportError:
+        # 如果无法导入配置，使用默认路径
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        return _abs_norm(os.path.join(base_dir, 'output', 'score', 'details', 'details.db'))
+
+def get_details_table_info(db_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    获取Details数据库表信息
+    
+    Args:
+        db_path: 数据库文件路径，如果为None则使用配置文件中的路径
+        
+    Returns:
+        包含表结构、记录数、日期范围等信息的字典
+    """
+    try:
+        db_path = get_details_db_path(db_path)
+        
+        if not os.path.exists(db_path):
+            return {'error': f'数据库文件不存在: {db_path}'}
+        
+        manager = get_database_manager()
+        
+        # 获取表结构
+        sql = "DESCRIBE stock_details"
+        df = manager.execute_sync_query(db_path, sql, timeout=30.0)
+        
+        # 获取记录数
+        count_sql = "SELECT COUNT(*) as total FROM stock_details"
+        count_df = manager.execute_sync_query(db_path, count_sql, timeout=30.0)
+        total_count = count_df.iloc[0]['total'] if not count_df.empty else 0
+        
+        # 获取日期范围
+        date_sql = """
+        SELECT 
+            MIN(ref_date) as min_date,
+            MAX(ref_date) as max_date,
+            COUNT(DISTINCT ref_date) as date_count
+        FROM stock_details
+        """
+        date_df = manager.execute_sync_query(db_path, date_sql, timeout=30.0)
+        
+        # 获取股票数量
+        stock_sql = "SELECT COUNT(DISTINCT ts_code) as stock_count FROM stock_details"
+        stock_df = manager.execute_sync_query(db_path, stock_sql, timeout=30.0)
+        
+        return {
+            'table_structure': df.to_dict('records') if not df.empty else [],
+            'total_records': total_count,
+            'date_range': date_df.to_dict('records')[0] if not date_df.empty else {},
+            'stock_count': stock_df.iloc[0]['stock_count'] if not stock_df.empty else 0,
+            'database_path': db_path
+        }
+    except Exception as e:
+        logger.error(f"get_details_table_info 失败: {e}")
+        return {'error': str(e)}
+
+def query_details_by_stock(ts_code: str, limit: int = 10, db_path: Optional[str] = None) -> pd.DataFrame:
+    """
+    根据股票代码查询Details数据
+    
+    Args:
+        ts_code: 股票代码
+        limit: 返回记录数限制
+        db_path: 数据库文件路径，如果为None则使用配置文件中的路径
+        
+    Returns:
+        包含股票详情的DataFrame
+    """
+    try:
+        db_path = get_details_db_path(db_path)
+        manager = get_database_manager()
+        
+        sql = """
+        SELECT * FROM stock_details 
+        WHERE ts_code = ? 
+        ORDER BY ref_date DESC 
+        LIMIT ?
+        """
+        return manager.execute_sync_query(db_path, sql, [ts_code, limit], timeout=30.0)
+    except Exception as e:
+        logger.error(f"query_details_by_stock 失败: {e}")
+        return pd.DataFrame()
+
+def query_details_by_date(ref_date: str, limit: int = 100, db_path: Optional[str] = None) -> pd.DataFrame:
+    """
+    根据日期查询Details数据
+    
+    Args:
+        ref_date: 参考日期 (YYYYMMDD)
+        limit: 返回记录数限制
+        db_path: 数据库文件路径，如果为None则使用配置文件中的路径
+        
+    Returns:
+        包含该日期所有股票详情的DataFrame
+    """
+    try:
+        db_path = get_details_db_path(db_path)
+        manager = get_database_manager()
+        
+        sql = """
+        SELECT * FROM stock_details 
+        WHERE ref_date = ? 
+        ORDER BY score DESC, rank ASC
+        LIMIT ?
+        """
+        return manager.execute_sync_query(db_path, sql, [ref_date, limit], timeout=30.0)
+    except Exception as e:
+        logger.error(f"query_details_by_date 失败: {e}")
+        return pd.DataFrame()
+
+def query_details_top_stocks(ref_date: str, top_k: int = 50, db_path: Optional[str] = None) -> pd.DataFrame:
+    """
+    查询指定日期的Top-K股票
+    
+    Args:
+        ref_date: 参考日期 (YYYYMMDD)
+        top_k: 返回前K名股票
+        db_path: 数据库文件路径，如果为None则使用配置文件中的路径
+        
+    Returns:
+        包含Top-K股票详情的DataFrame
+    """
+    try:
+        db_path = get_details_db_path(db_path)
+        manager = get_database_manager()
+        
+        sql = """
+        SELECT * FROM stock_details 
+        WHERE ref_date = ? 
+        ORDER BY score DESC, rank ASC
+        LIMIT ?
+        """
+        return manager.execute_sync_query(db_path, sql, [ref_date, top_k], timeout=30.0)
+    except Exception as e:
+        logger.error(f"query_details_top_stocks 失败: {e}")
+        return pd.DataFrame()
+
+def query_details_score_range(ref_date: str, min_score: float, max_score: float, 
+                              db_path: Optional[str] = None) -> pd.DataFrame:
+    """
+    查询指定分数范围的股票
+    
+    Args:
+        ref_date: 参考日期 (YYYYMMDD)
+        min_score: 最低分数
+        max_score: 最高分数
+        db_path: 数据库文件路径，如果为None则使用配置文件中的路径
+        
+    Returns:
+        包含分数范围内股票详情的DataFrame
+    """
+    try:
+        db_path = get_details_db_path(db_path)
+        manager = get_database_manager()
+        
+        sql = """
+        SELECT * FROM stock_details 
+        WHERE ref_date = ? AND score >= ? AND score <= ?
+        ORDER BY score DESC, rank ASC
+        """
+        return manager.execute_sync_query(db_path, sql, [ref_date, min_score, max_score], timeout=30.0)
+    except Exception as e:
+        logger.error(f"query_details_score_range 失败: {e}")
+        return pd.DataFrame()
+
+def query_details_recent_dates(days: int = 7, db_path: Optional[str] = None) -> List[str]:
+    """
+    查询最近的N个交易日
+    
+    Args:
+        days: 查询最近几天
+        db_path: 数据库文件路径，如果为None则使用配置文件中的路径
+        
+    Returns:
+        最近N个交易日的日期列表
+    """
+    try:
+        db_path = get_details_db_path(db_path)
+        logger.debug(f"[数据库连接] 开始获取数据库管理器实例 (查询最近{days}个交易日的details数据)")
+        manager = get_database_manager()
+        
+        sql = """
+        SELECT DISTINCT ref_date 
+        FROM stock_details 
+        ORDER BY ref_date DESC 
+        LIMIT ?
+        """
+        df = manager.execute_sync_query(db_path, sql, [days], timeout=30.0)
+        return df['ref_date'].tolist() if not df.empty else []
+    except Exception as e:
+        logger.error(f"query_details_recent_dates 失败: {e}")
+        return []
+
+def get_details_stock_summary(ts_code: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    获取股票的历史评分摘要
+    
+    Args:
+        ts_code: 股票代码
+        db_path: 数据库文件路径，如果为None则使用配置文件中的路径
+        
+    Returns:
+        包含股票历史评分摘要的字典
+    """
+    try:
+        db_path = get_details_db_path(db_path)
+        manager = get_database_manager()
+        
+        sql = """
+        SELECT 
+            ts_code,
+            COUNT(*) as total_days,
+            MIN(ref_date) as first_date,
+            MAX(ref_date) as last_date,
+            AVG(score) as avg_score,
+            MIN(score) as min_score,
+            MAX(score) as max_score,
+            AVG(rank) as avg_rank,
+            MIN(rank) as best_rank,
+            MAX(rank) as worst_rank
+        FROM stock_details 
+        WHERE ts_code = ?
+        GROUP BY ts_code
+        """
+        df = manager.execute_sync_query(db_path, sql, [ts_code], timeout=30.0)
+        return df.to_dict('records')[0] if not df.empty else {}
+    except Exception as e:
+        logger.error(f"get_details_stock_summary 失败: {e}")
+        return {}
 
 # 清理函数
 import atexit

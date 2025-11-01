@@ -141,6 +141,10 @@ def names_by_tag(tag: str) -> List[str]:
     return [n for n,m in REGISTRY.items() if tag in m.tags]
 
 
+def get_all_indicator_names():
+    """获取所有指标名称"""
+    return list(REGISTRY.keys())
+
 # def names_in_expr(expr: str) -> List[str]:
 #     """
 #     从一条 TDX 表达式里解析可能涉及的指标名（返回 REGISTRY 的 key 列表，去重）。

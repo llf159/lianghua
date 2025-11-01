@@ -13,6 +13,31 @@ import logging
 import logging.handlers
 # 避免logging内部报错打断业务
 logging.raiseExceptions = False
+
+# 在Windows上设置控制台编码为UTF-8，避免中文乱码
+if sys.platform == 'win32':
+    try:
+        # 尝试设置控制台代码页为UTF-8
+        import subprocess
+        subprocess.run(['chcp', '65001'], shell=True, capture_output=True, check=False)
+    except Exception:
+        pass
+    
+    try:
+        # 确保标准输出使用UTF-8编码
+        if hasattr(sys.stdout, 'buffer'):
+            import io
+            # 检查当前编码，如果不是UTF-8则重新配置
+            if not hasattr(sys.stdout, '_encoding') or (hasattr(sys.stdout, 'encoding') and sys.stdout.encoding != 'utf-8'):
+                try:
+                    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+                    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+                except (AttributeError, ValueError):
+                    # 某些环境可能不支持，使用备用方案
+                    pass
+    except Exception:
+        # 如果设置失败，忽略错误（某些环境可能不支持）
+        pass
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -22,6 +47,10 @@ import time
 import threading
 from contextlib import contextmanager
 import multiprocessing
+
+# ========== 自定义等级：PREP（介于 INFO 与 WARNING 之间） ==========
+PREP_LEVEL_NUM = logging.INFO + 5  # 25
+logging.addLevelName(PREP_LEVEL_NUM, "PREP")
 
 def _is_main_process() -> bool:
     try:
@@ -36,6 +65,7 @@ class ColoredFormatter(logging.Formatter):
     COLORS = {
         'DEBUG': '\033[36m',    # 青色
         'INFO': '\033[32m',     # 绿色
+        'PREP': '\033[34m',     # 蓝色
         'WARNING': '\033[33m',  # 黄色
         'ERROR': '\033[31m',    # 红色
         'CRITICAL': '\033[35m', # 紫色
@@ -43,17 +73,46 @@ class ColoredFormatter(logging.Formatter):
     }
     
     def format(self, record):
+        # 确保消息使用UTF-8编码处理
+        try:
+            if hasattr(record, 'msg') and isinstance(record.msg, str):
+                # 确保消息是UTF-8编码
+                if isinstance(record.msg, bytes):
+                    record.msg = record.msg.decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        
         if hasattr(record, 'levelname') and record.levelname in self.COLORS:
             record.levelname = f"{self.COLORS[record.levelname]}{record.levelname}{self.COLORS['RESET']}"
-        return super().format(record)
+        
+        try:
+            result = super().format(record)
+            # 确保返回的字符串是有效的UTF-8
+            if isinstance(result, bytes):
+                result = result.decode('utf-8', errors='replace')
+            return result
+        except UnicodeEncodeError:
+            # 如果编码失败，尝试使用错误替换
+            try:
+                result = super().format(record)
+                return result.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+            except Exception:
+                # 最后的备用方案
+                return f"{record.levelname} [{record.name}] {record.getMessage()}"
 
 class PerformanceLogger:
     """性能监控日志记录器"""
     
-    def __init__(self, logger: logging.Logger):
+    def __init__(self, logger: logging.Logger, debug_logger: Optional['DebugLogger'] = None):
         self.logger = logger
+        self.debug_logger = debug_logger  # 保存 DebugLogger 引用，用于调用 performance 方法
         self._timers: Dict[str, float] = {}
         self._lock = threading.Lock()
+    
+    def __call__(self, message: str, **kwargs):
+        """使 PerformanceLogger 可以像函数一样被调用"""
+        # 仍用 WARNING 级别，让控制台能看到性能提醒，但普通等级文件已排除 [PERF]
+        self.logger.warning(f"[PERF] {message}", **kwargs)
     
     def start_timer(self, operation: str) -> None:
         """开始计时"""
@@ -61,21 +120,27 @@ class PerformanceLogger:
             self._timers[operation] = time.time()
             self.logger.debug(f"开始执行: {operation}")
     
-    def end_timer(self, operation: str, log_level: int = logging.WARNING) -> float:
+    def end_timer(self, operation: str, log_level: int = logging.DEBUG) -> float:
         """结束计时并记录"""
         with self._lock:
             if operation in self._timers:
                 duration = time.time() - self._timers[operation]
                 del self._timers[operation]
-                if isinstance(log_level, int):
+                # 使用 performance() 方法记录性能日志，确保写入性能日志文件
+                if self.debug_logger is not None:
+                    # 如果有 DebugLogger 引用，使用它的 performance 方法
+                    self.debug_logger.performance(f"完成执行: {operation} (耗时: {duration:.3f}s)")
+                elif log_level >= logging.INFO:
+                    # 如果 log_level >= INFO，使用指定的级别记录
                     self.logger.log(log_level, f"完成执行: {operation} (耗时: {duration:.3f}s)")
                 else:
-                    self.logger.debug(f"完成执行: {operation} (耗时: {duration:.3f}s)")
+                    # 默认使用 WARNING 级别，直接添加 [PERF] 前缀，会被性能日志过滤器捕获
+                    self.logger.warning(f"[PERF] 完成执行: {operation} (耗时: {duration:.3f}s)")
                 return duration
             return 0.0
     
     @contextmanager
-    def timer(self, operation: str, log_level: int = logging.WARNING):
+    def timer(self, operation: str, log_level: int = logging.DEBUG):
         """上下文管理器形式的计时器"""
         self.start_timer(operation)
         try:
@@ -93,15 +158,18 @@ class DebugLogger:
         
         # 创建主日志记录器
         self.logger = logging.getLogger(name)
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.INFO)  # 设置最低级别为INFO，不记录DEBUG
         self.logger.propagate = False
+        
+        # 队列监听器引用（仅主进程使用）
+        self._queue_listener: Optional[logging.handlers.QueueListener] = None
         
         # 避免重复添加处理器
         if not self.logger.handlers:
             self._setup_handlers()
         
-        # 性能监控器
-        self.perf = PerformanceLogger(self.logger)
+        # 性能监控器（传入 self 引用，用于调用 performance 方法）
+        self.perf = PerformanceLogger(self.logger, debug_logger=self)
         
         # 错误统计
         self._error_count = 0
@@ -110,8 +178,9 @@ class DebugLogger:
     
     def _setup_handlers(self):
         """设置日志处理器"""
-        # 控制台处理器
+        # 控制台处理器（所有进程都使用）
         console_handler = logging.StreamHandler(sys.stdout)
+        # 设为 WARNING：控制台显示 WARNING/ERROR/CRITICAL（包括带[PERF]前缀的性能日志）
         console_handler.setLevel(logging.WARNING)
         console_formatter = ColoredFormatter(
             '%(asctime)s %(levelname)s [%(name)s] %(message)s',
@@ -119,118 +188,236 @@ class DebugLogger:
         )
         console_handler.setFormatter(console_formatter)
 
-        # 进程后缀（子进程写独立文件，避免与主进程轮转冲突）
-        pid_suffix = "" if _is_main_process() else f".{os.getpid()}"
-
-        # 文件处理器 - 所有级别
-        if _is_main_process():
-            file_handler = logging.handlers.RotatingFileHandler(
-                self.log_dir / f"{self.name}.log",
-                maxBytes=10*1024*1024,  # 10MB
-                backupCount=5,
-                encoding='utf-8',
-                delay=True
-            )
-        else:
-            file_handler = logging.FileHandler(
-                self.log_dir / f"{self.name}{pid_suffix}.log",
-                mode="a",
-                encoding='utf-8',
-                delay=True
-            )
-        file_handler.setLevel(logging.WARNING)
+        # 文件格式化器
         file_formatter = logging.Formatter(
-            '%(asctime)s %(levelname)s [%(name)s] %(filename)s:%(lineno)d %(funcName)s - %(message)s',
+            '%(asctime)s %(levelname)s [%(name)s] [PID:%(process)d] %(filename)s:%(lineno)d %(funcName)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
-        file_handler.setFormatter(file_formatter)
+        
+        # 多进程日志处理：使用队列统一写入
+        log_queue = _get_log_queue()
+        is_main = _is_main_process()
+        
+        # 如果是子进程且有队列，使用 QueueHandler；否则直接使用文件处理器
+        if not is_main and log_queue is not None:
+            # 子进程：使用 QueueHandler 发送日志到队列
+            queue_handler = logging.handlers.QueueHandler(log_queue)
+            self.logger.addHandler(queue_handler)
+            # 控制台输出仍然保留
+            self.logger.addHandler(console_handler)
+            return  # 子进程只使用队列，不直接写文件
 
-        # 错误文件处理器
-        if _is_main_process():
-            error_handler = logging.handlers.RotatingFileHandler(
-                self.log_dir / f"{self.name}_error.log",
-                maxBytes=5*1024*1024,  # 5MB
-                backupCount=3,
-                encoding='utf-8',
-                delay=True
-            )
-        else:
-            error_handler = logging.FileHandler(
-                self.log_dir / f"{self.name}_error{pid_suffix}.log",
-                mode="a",
-                encoding='utf-8',
-                delay=True
-            )
+        # ---- 只通过"某个精确等级"的过滤器 ----
+        class _LevelOnly(logging.Filter):
+            def __init__(self, levelno: int):
+                super().__init__()
+                self.levelno = levelno
+            def filter(self, record: logging.LogRecord) -> bool:
+                return record.levelno == self.levelno
+
+        # 排除 [PERF] 到普通等级日志文件，避免重复
+        class _ExcludePerf(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                try:
+                    return not str(record.getMessage()).startswith("[PERF]")
+                except Exception:
+                    return True
+
+        # ---- 按等级分别落盘（仅主进程） ----
+        # 主进程：创建文件处理器并设置监听器
+        handlers = []
+        
+        # DEBUG 日志已关闭（不写入文件）
+        # debug_handler = logging.handlers.RotatingFileHandler(
+        #     self.log_dir / f"{self.name}_debug.log",
+        #     maxBytes=10*1024*1024, backupCount=5,
+        #     encoding='utf-8', delay=True
+        # )
+        # debug_handler.setLevel(logging.DEBUG)
+        # debug_handler.addFilter(_LevelOnly(logging.DEBUG))
+        # debug_handler.addFilter(_ExcludePerf())
+        # debug_handler.setFormatter(file_formatter)
+        # handlers.append(debug_handler)
+
+        info_handler = logging.handlers.RotatingFileHandler(
+            self.log_dir / f"{self.name}_info.log",
+            maxBytes=10*1024*1024, backupCount=5,
+            encoding='utf-8', delay=True
+        )
+        info_handler.setLevel(logging.INFO)
+        info_handler.addFilter(_LevelOnly(logging.INFO))
+        info_handler.addFilter(_ExcludePerf())
+        info_handler.setFormatter(file_formatter)
+        handlers.append(info_handler)
+
+        prep_handler = logging.handlers.RotatingFileHandler(
+            self.log_dir / f"{self.name}_prep.log",
+            maxBytes=10*1024*1024, backupCount=5,
+            encoding='utf-8', delay=True
+        )
+        prep_handler.setLevel(PREP_LEVEL_NUM)
+        prep_handler.addFilter(_LevelOnly(PREP_LEVEL_NUM))
+        prep_handler.addFilter(_ExcludePerf())
+        prep_handler.setFormatter(file_formatter)
+        handlers.append(prep_handler)
+
+        warning_handler = logging.handlers.RotatingFileHandler(
+            self.log_dir / f"{self.name}_warning.log",
+            maxBytes=10*1024*1024, backupCount=5,
+            encoding='utf-8', delay=True
+        )
+        warning_handler.setLevel(logging.WARNING)
+        warning_handler.addFilter(_LevelOnly(logging.WARNING))
+        warning_handler.addFilter(_ExcludePerf())
+        warning_handler.setFormatter(file_formatter)
+        handlers.append(warning_handler)
+
+        error_handler = logging.handlers.RotatingFileHandler(
+            self.log_dir / f"{self.name}_error.log",
+            maxBytes=10*1024*1024, backupCount=5,
+            encoding='utf-8', delay=True
+        )
         error_handler.setLevel(logging.ERROR)
+        error_handler.addFilter(_LevelOnly(logging.ERROR))
+        error_handler.addFilter(_ExcludePerf())
         error_handler.setFormatter(file_formatter)
+        handlers.append(error_handler)
+
+        critical_handler = logging.handlers.RotatingFileHandler(
+            self.log_dir / f"{self.name}_critical.log",
+            maxBytes=10*1024*1024, backupCount=5,
+            encoding='utf-8', delay=True
+        )
+        critical_handler.setLevel(logging.CRITICAL)
+        critical_handler.addFilter(_LevelOnly(logging.CRITICAL))
+        critical_handler.addFilter(_ExcludePerf())
+        critical_handler.setFormatter(file_formatter)
+        handlers.append(critical_handler)
 
         # 性能文件处理器
-        if _is_main_process():
-            perf_handler = logging.handlers.RotatingFileHandler(
-                self.log_dir / f"{self.name}_performance.log",
-                maxBytes=5*1024*1024,  # 5MB
-                backupCount=2,
-                encoding='utf-8',
-                delay=True
-            )
-        else:
-            perf_handler = logging.FileHandler(
-                self.log_dir / f"{self.name}_performance{pid_suffix}.log",
-                mode="a",
-                encoding='utf-8',
-                delay=True
-            )
-        perf_handler.setLevel(logging.INFO)
         perf_formatter = logging.Formatter(
             '%(asctime)s [PERF] %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
+        perf_handler = logging.handlers.RotatingFileHandler(
+            self.log_dir / f"{self.name}_performance.log",
+            maxBytes=10*1024*1024, backupCount=5,
+            encoding='utf-8', delay=True
+        )
+        perf_handler.setLevel(logging.INFO)
         perf_handler.setFormatter(perf_formatter)
+        # 仅写入 [PERF] 开头的记录
+        class _PerfOnly(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                try:
+                    return str(record.getMessage()).startswith("[PERF]")
+                except Exception:
+                    return False
+        perf_handler.addFilter(_PerfOnly())
+        handlers.append(perf_handler)
 
-        # 添加处理器（先清空，避免重复添加）
-        self.logger.handlers = []
+        # 主进程：直接使用文件处理器（不走队列，提高效率）
+        # 子进程：已经通过队列发送，不执行到这里
+        for handler in handlers:
+            self.logger.addHandler(handler)
+        
+        # 所有进程都添加控制台处理器
         self.logger.addHandler(console_handler)
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(error_handler)
-        self.logger.addHandler(perf_handler)
+        
+        # 主进程：启动监听器处理子进程发送到队列的日志
+        log_queue = _get_log_queue()
+        if is_main and log_queue is not None and self._queue_listener is None:
+            # 为当前logger创建监听器，处理子进程发送的该logger的日志
+            # 注意：每个logger创建自己的监听器，监听同一个队列
+            # QueueListener会从队列中取出日志并发送到handler
+            # handler会根据logger名称自动过滤，所以每个监听器只处理自己的日志
+            # 为了避免日志丢失，我们使用一个过滤器确保只处理当前logger的日志
+            class LoggerNameFilter(logging.Filter):
+                def __init__(self, logger_name):
+                    super().__init__()
+                    self.logger_name = logger_name
+                def filter(self, record):
+                    return record.name == self.logger_name
+            
+            # 为每个handler添加logger名称过滤器
+            filtered_handlers = []
+            for handler in handlers:
+                handler.addFilter(LoggerNameFilter(self.logger.name))
+                filtered_handlers.append(handler)
+            
+            listener = logging.handlers.QueueListener(
+                log_queue, 
+                *filtered_handlers, 
+                respect_handler_level=True
+            )
+            listener.start()
+            self._queue_listener = listener
 
     
     def debug(self, message: str, **kwargs):
         """调试日志"""
+        # 确保消息是UTF-8编码的字符串
+        if isinstance(message, bytes):
+            message = message.decode('utf-8', errors='replace')
         self.logger.debug(message, **kwargs)
     
     def info(self, message: str, **kwargs):
         """信息日志"""
+        # 确保消息是UTF-8编码的字符串
+        if isinstance(message, bytes):
+            message = message.decode('utf-8', errors='replace')
         self.logger.info(message, **kwargs)
     
     def warning(self, message: str, **kwargs):
         """警告日志"""
+        # 确保消息是UTF-8编码的字符串
+        if isinstance(message, bytes):
+            message = message.decode('utf-8', errors='replace')
         with self._lock:
             self._warning_count += 1
         self.logger.warning(message, **kwargs)
     
     def error(self, message: str, exc_info: bool = True, **kwargs):
         """错误日志"""
+        # 确保消息是UTF-8编码的字符串
+        if isinstance(message, bytes):
+            message = message.decode('utf-8', errors='replace')
         with self._lock:
             self._error_count += 1
         self.logger.error(message, exc_info=exc_info, **kwargs)
     
     def critical(self, message: str, exc_info: bool = True, **kwargs):
         """严重错误日志"""
+        # 确保消息是UTF-8编码的字符串
+        if isinstance(message, bytes):
+            message = message.decode('utf-8', errors='replace')
         with self._lock:
             self._error_count += 1
         self.logger.critical(message, exc_info=exc_info, **kwargs)
     
     def exception(self, message: str, **kwargs):
         """异常日志（自动包含异常信息）"""
+        # 确保消息是UTF-8编码的字符串
+        if isinstance(message, bytes):
+            message = message.decode('utf-8', errors='replace')
         with self._lock:
             self._error_count += 1
         self.logger.exception(message, **kwargs)
     
     def performance(self, message: str, **kwargs):
         """性能日志"""
-        # 使用 WARNING 级别，与控制台输出保持一致
+        # 确保消息是UTF-8编码的字符串
+        if isinstance(message, bytes):
+            message = message.decode('utf-8', errors='replace')
+        # 仍用 WARNING 级别，让控制台能看到性能提醒，但普通等级文件已排除 [PERF]
         self.logger.warning(f"[PERF] {message}", **kwargs)
+
+    # 新增：PREP 等级便捷方法
+    def prep(self, message: str, **kwargs):
+        # 确保消息是UTF-8编码的字符串
+        if isinstance(message, bytes):
+            message = message.decode('utf-8', errors='replace')
+        self.logger.log(PREP_LEVEL_NUM, message, **kwargs)
     
     def log_function_call(self, func_name: str, args: tuple = (), kwargs: dict = None):
         """记录函数调用"""
@@ -291,7 +478,7 @@ def log_function_calls(logger: DebugLogger):
         return wrapper
     return decorator
 
-def log_performance(logger: DebugLogger, operation: str, log_level: int = logging.WARNING):
+def log_performance(logger: DebugLogger, operation: str, log_level: int = logging.DEBUG):
     """装饰器：记录性能"""
     def decorator(func):
         @functools.wraps(func)
@@ -304,8 +491,39 @@ def log_performance(logger: DebugLogger, operation: str, log_level: int = loggin
 # 全局日志记录器实例
 _global_loggers: Dict[str, DebugLogger] = {}
 
+# 多进程日志队列和监听器
+_log_queue: Optional[multiprocessing.Queue] = None
+_log_listener: Optional[logging.handlers.QueueListener] = None
+_log_queue_lock = threading.Lock()
+
+def _get_log_queue() -> Optional[multiprocessing.Queue]:
+    """获取全局日志队列（仅在主进程中创建）"""
+    global _log_queue
+    if _log_queue is None and _is_main_process():
+        with _log_queue_lock:
+            if _log_queue is None:
+                _log_queue = multiprocessing.Queue(-1)  # 无限制队列
+    return _log_queue
+
+# 注意：每个logger创建自己的监听器，监听同一个队列
+# QueueListener会从队列中取出日志，并发送到所有提供的handler
+# 由于handler会根据logger名称过滤，多个监听器可能导致日志丢失
+# 实际方案：每个logger创建监听器，但只监听自己logger的日志
+# 这是通过handler的filter机制实现的
+
+def _stop_queue_listener():
+    """停止队列监听器（应在程序退出时调用）"""
+    global _log_listener
+    if _log_listener is not None:
+        try:
+            _log_listener.stop()
+        except Exception:
+            pass
+        _log_listener = None
+
 def get_logger(name: str, log_dir: str = "log") -> DebugLogger:
     """获取全局日志记录器"""
+    # 队列会在创建logger时自动初始化（通过 _get_log_queue()）
     if name not in _global_loggers:
         _global_loggers[name] = create_logger(name, log_dir)
     return _global_loggers[name]
@@ -405,6 +623,11 @@ def performance_log(message: str, logger_name: str = "default"):
     logger = get_logger(logger_name)
     logger.performance(message)
 
+def prep_log(message: str, logger_name: str = "default"):
+    """快速 PREP 级别日志"""
+    logger = get_logger(logger_name)
+    logger.prep(message)
+
 def log_data_processing(logger_name: str, operation: str, data_shape: tuple = None, 
                        duration: float = None, success: bool = True):
     """记录数据处理操作"""
@@ -473,6 +696,7 @@ __all__ = [
     'warning_log',
     'critical_log',
     'performance_log',
+    'prep_log',
     'log_data_processing',
     'log_database_operation',
     'log_file_operation',
@@ -492,6 +716,15 @@ if __name__ == "__main__":
     test_logger.info("日志系统测试成功")
     test_logger.debug("这是调试信息")
     test_logger.warning("这是警告信息")
-    test_logger.error("这是错误信息")
+    test_logger.error("这是错误信息", exc_info=False)
+    test_logger.critical("这是严重错误", exc_info=False)
+    
+    # 测试性能日志
+    test_logger.performance("这是性能测试日志")
+    test_logger.performance("操作耗时: 1.234秒")
+    
+    # 测试性能监控器
+    with test_logger.perf.timer("测试操作", log_level=logging.WARNING):
+        time.sleep(0.1)
     
     print("日志系统测试完成")

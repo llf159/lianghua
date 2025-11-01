@@ -20,7 +20,7 @@ DATA_ROOT = os.path.join(BASE_DIR, "stock_data")
 
 # 数据下载配置
 ASSETS = ["stock", "index"]  # 可选: ["stock"], ["index"], ["stock","index"]
-START_DATE = "20220101"
+START_DATE = "20250101"
 END_DATE = "today"  # today或具体日期 'YYYYMMDD'
 
 # 指数白名单
@@ -96,6 +96,10 @@ DB_QUERY_TIMEOUT = 30
 DB_ENABLE_INDEXES = True
 DB_BATCH_SIZE = 1000
 
+# 评分系统数据库查询缓存配置
+SC_DB_CACHE_TTL = 900    # 缓存有效期（秒），尽量覆盖一整轮评分时间（默认15分钟）
+SC_DB_CACHE_MAX = 128    # 最大缓存条目数
+
 # ================= 数据处理配置 =================
 # 流式处理配置
 STREAM_FLUSH_DATE_BATCH = 80      # 缓冲多少个不同 trade_date 就刷盘一次
@@ -142,7 +146,7 @@ FAST_INIT_STOCK_DIR = os.path.join(DATA_ROOT, "fast_init_symbol")
 CLEAR_CACHE_AFTER_FAST_INIT = True       # 快速初始化完成后清除缓存文件
 
 # 日志配置
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "INFO"  # 已关闭DEBUG级别日志
 
 # ================= 评分系统配置 =================
 # 基础配置
@@ -164,6 +168,17 @@ import multiprocessing
 _SC_DEFAULT_WORKERS = min((multiprocessing.cpu_count() or 4) * 2, 16)
 SC_MAX_WORKERS = _SC_DEFAULT_WORKERS  # 默认 min(2*CPU, 16)，UI 可覆盖
 SC_READ_TAIL_DAYS = None       # 若不为 None，则强制只读最近 N 天数据
+
+# 执行器选择（实验特性）：是否在安全条件下使用进程池
+SC_USE_PROCESS_POOL = True
+
+# 记录与注入开关（性能测试用）
+SC_ENABLE_RULE_DETAILS = True          # 规则明细与批量缓冲
+SC_ENABLE_CUSTOM_TAGS = True           # 自定义标签注入
+SC_ENABLE_VERBOSE_SCORE_LOG = True     # 评分过程中的细粒度调试日志
+SC_ENABLE_VECTOR_BOOL = False          # 启用向量化布尔求值（实验）
+SC_ENABLE_BATCH_XSEC = False           # 启用横截面批量排名（实验）
+SC_DYNAMIC_RESAMPLE = True             # 仅当规则用到 W/M 时才触发重采样
 
 # 输出目录
 SC_OUTPUT_DIR = os.path.join(BASE_DIR, "output", "score")

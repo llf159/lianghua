@@ -63,6 +63,7 @@ def check_database_status():
         db_info = get_database_info()
         
         # 获取数据库管理器统计信息
+        logger.info("[数据库连接] 开始获取数据库管理器实例")
         manager = get_database_manager()
         enhanced_stats = manager.get_stats()
         
@@ -96,7 +97,8 @@ from database_manager import (
     get_database_manager, query_stock_data, get_trade_dates, 
     get_stock_list, get_latest_trade_date, get_smart_end_date,
     get_database_info, get_data_source_status, close_all_connections,
-    clear_connections_only
+    clear_connections_only,
+    is_details_db_reading_enabled, get_details_db_path_with_fallback, is_details_db_available
 )
 
 def _lazy_import_download():
@@ -183,35 +185,17 @@ def _init_session_state():
             if k not in st.session_state:
                 st.session_state[k] = v
         
-        # 初始化数据库连接管理
-        if "db_initialized" not in st.session_state:
-            try:
-                # 设置数据库连接为延迟初始化模式（不触发连接）
-                # 使用 database_manager 进行初始化
-                try:
-                    # 数据库管理器已经自动初始化
-                    logger = get_logger("score_ui")
-                    logger.info("数据库管理器已初始化")
-                    
-                    # 注册退出时清理函数（不立即执行）
-                    # close_all_connections 已从 database_manager 导入
-                    import atexit
-                    atexit.register(close_all_connections)
-                except ImportError as e:
-                    logger = get_logger("score_ui")
-                    logger.warning(f"无法导入 data_reader 模块: {e}")
-                except Exception as e:
-                    logger = get_logger("score_ui")
-                    logger.warning(f"数据库连接管理初始化失败: {e}")
-                
-                st.session_state["db_initialized"] = True
-            except Exception as e:
-                logger = get_logger("score_ui")
-                logger.warning(f"数据库连接管理初始化失败: {e}")
-        
         # 添加表达式选股时的数据库连接管理
         if "expression_screening_active" not in st.session_state:
             st.session_state["expression_screening_active"] = False
+        
+        # 添加details数据库读取控制标记，默认不读取数据库避免写入冲突
+        if "details_db_reading_enabled" not in st.session_state:
+            st.session_state["details_db_reading_enabled"] = False
+        
+        # 添加数据查看页面的数据库查询控制标记，默认不查询数据库避免写入冲突
+        if "data_view_db_enabled" not in st.session_state:
+            st.session_state["data_view_db_enabled"] = False
     except Exception:
         pass
 
@@ -439,6 +423,7 @@ def run_se_run_for_date_in_bg(arg):
                 
                 # 在子线程中运行评分，但确保数据库连接正确初始化
                 from database_manager import get_database_manager
+                logger.info("[数据库连接] 开始获取数据库管理器实例 (评分线程)")
                 manager = get_database_manager()
                 
                 # 确保数据库管理器已正确初始化，避免连接问题
@@ -684,26 +669,25 @@ def _rule_to_screen_args(rule: dict):
 def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
     """
     加载个股详情，优先从数据库读取，失败时回退到JSON文件
+    注意：只有当 details_db_reading_enabled 为 True 时才会读取数据库，避免与写入操作冲突
     """
-    # 1. 优先从数据库读取
-    if SC_USE_DB_STORAGE and SC_DETAIL_STORAGE in ["database","both","db"]:
+    # 检查是否允许读取数据库（使用统一的函数）
+    db_reading_enabled = is_details_db_reading_enabled()
+    
+    # 1. 优先从数据库读取（只有当db_reading_enabled为True且数据库可用时才读取）
+    if db_reading_enabled and is_details_db_available():
+        db_success = False
         try:
-            # 使用正确的details数据库路径
-            from config import SC_OUTPUT_DIR, SC_DETAIL_DB_PATH
-            details_db_path = os.path.join(SC_OUTPUT_DIR, 'details', 'details.db')
-            
-            # 检查数据库文件是否存在
-            if not os.path.exists(details_db_path):
-                logger.debug(f"Details数据库文件不存在: {details_db_path}")
-                # 尝试从统一数据库读取（兼容性）
-                from config import DATA_ROOT, UNIFIED_DB_PATH
-                db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
-                if os.path.exists(db_path):
-                    details_db_path = db_path
-                else:
-                    raise FileNotFoundError("Details数据库文件不存在")
+            # 使用统一的函数获取details数据库路径（包含回退逻辑）
+            details_db_path = get_details_db_path_with_fallback()
+            if not details_db_path:
+                # 数据库文件不存在，回退到JSON
+                logger.debug(f"数据库文件不存在，回退到JSON: {ts}_{ref}")
+                db_success = False
+                raise FileNotFoundError("Details数据库文件不存在")
             
             # 查询股票详情表
+            logger.info(f"[数据库连接] 开始获取数据库管理器实例 (查询股票详情: {ts}, {ref})")
             manager = get_database_manager()
             sql = "SELECT * FROM stock_details WHERE ts_code = ? AND ref_date = ?"
             df = manager.execute_sync_query(details_db_path, sql, [ts, ref], timeout=30.0)
@@ -778,22 +762,49 @@ def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
                     'rank': summary['rank'],   # 兼容旧调用
                     'total': summary['total'],
                 }
+                db_success = True
                 return result
+            else:
+                # 数据库查询成功但无数据，回退到JSON
+                logger.debug(f"数据库查询为空，回退到JSON: {ts}_{ref}")
+                db_success = False
         except Exception as e:
-            logger.debug(f"数据库读取失败 {ts}_{ref}: {e}")
+            # 数据库读取失败，回退到JSON
+            logger.debug(f"数据库读取失败，回退到JSON {ts}_{ref}: {e}")
+            db_success = False
+        
+        # 如果数据库读取失败（异常或查询为空），回退到JSON
+        if not db_success:
+            # 继续下面的JSON回退逻辑
+            pass
+        else:
+            # 数据库读取成功，已返回结果，不应该到达这里
             pass
     
-    # 2. 如果数据库失败且配置了回退，或者配置了JSON存储，则使用JSON文件
-    if (SC_DB_FALLBACK_TO_JSON) or SC_DETAIL_STORAGE in ["json", "both"]:
-        p = _path_detail(ref, ts)
-        if not p.exists(): 
-            return None
+    # 2. 如果数据库失败且配置了回退，或者配置了JSON存储，或者未启用数据库读取，则使用JSON文件
+    if (not db_reading_enabled) or (SC_DB_FALLBACK_TO_JSON) or SC_DETAIL_STORAGE in ["json", "both"]:
         try:
-            return json.loads(p.read_text(encoding="utf-8-sig"))
+            p = _path_detail(ref, ts)
+            if not p.exists(): 
+                # JSON文件不存在，正常返回None，不报错
+                return None
+            try:
+                data = json.loads(p.read_text(encoding="utf-8-sig"))
+                return data
+            except json.JSONDecodeError as e:
+                # JSON解析失败，记录日志但不报错
+                logger.debug(f"JSON文件解析失败 {ts}_{ref}: {e}")
+                return None
+            except Exception as e:
+                # 其他读取异常，记录日志但不报错
+                logger.debug(f"JSON文件读取失败 {ts}_{ref}: {e}")
+                return None
         except Exception as e:
-            # LOGGER.warning(f"JSON文件读取失败 {ts}_{ref}: {e}")
+            # 路径构建或其他异常，记录日志但不报错
+            logger.debug(f"JSON文件路径处理失败 {ts}_{ref}: {e}")
             return None
     
+    # 兜底：所有路径都失败，返回None
     return None
 
 
@@ -913,6 +924,7 @@ def show_database_diagnosis():
     try:
         # 诊断功能需要重新实现
         # 使用 database_manager 获取诊断信息
+        logger.info("[数据库连接] 开始获取数据库管理器实例 (数据库诊断)")
         manager = get_database_manager()
         stats = manager.get_stats()
         diagnosis = {
@@ -1397,8 +1409,8 @@ if _in_streamlit():
         st.session_state["export_pref"] = {"style": "space", "with_suffix": True}
 
     # ===== 顶层页签 =====
-    tab_rank, tab_detail, tab_position, tab_predict, tab_rules, tab_attn, tab_data, tab_screen, tab_tools, tab_port, tab_stats, tab_logs, = st.tabs(
-        ["排名", "个股详情", "持仓建议", "明日模拟", "规则编辑", "强度榜", "数据下载/浏览", "选股", "工具箱", "组合模拟/持仓", "统计", "日志"])
+    tab_rank, tab_detail, tab_position, tab_predict, tab_rules, tab_attn, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
+        ["排名", "个股详情", "持仓建议", "明日模拟", "规则编辑", "强度榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
 
     # ================== 排名 ==================
     with tab_rank:
@@ -1510,6 +1522,25 @@ if _in_streamlit():
     with tab_detail:
         st.subheader("个股详情")
 
+        # —— 数据库读取控制按钮 ——
+        db_reading_enabled = is_details_db_reading_enabled()
+        col_db_ctrl1, col_db_ctrl2 = st.columns([3, 1])
+        with col_db_ctrl1:
+            if db_reading_enabled:
+                st.success("✅ 数据库读取已启用（数据将从数据库读取）")
+            else:
+                st.info("ℹ️ 数据库读取未启用（避免与写入操作冲突）")
+        with col_db_ctrl2:
+            if not db_reading_enabled:
+                if st.button("🔓 启用数据库读取", key="enable_db_reading"):
+                    st.session_state["details_db_reading_enabled"] = True
+                    st.rerun()
+            else:
+                # 一旦启用就不再显示按钮，保持启用状态
+                pass
+        
+        st.divider()
+
         # —— 选择参考日 + 代码（支持从 Top-K 下拉选择） ——
         c0, c1 = st.columns([1,2])
         with c0:
@@ -1618,31 +1649,29 @@ if _in_streamlit():
                     }
                     ts = data.get("ts_code", code_norm)
                 
-                # 显示数据来源信息
-                try:
-                    # 检查数据来源：优先details数据库，失败则JSON
-                    from config import SC_OUTPUT_DIR, SC_DETAIL_DB_PATH
-                    details_db_path = os.path.join(SC_OUTPUT_DIR, 'details', 'details.db')
-                    
-                    # 检查数据库文件是否存在
-                    if not os.path.exists(details_db_path):
-                        # 尝试从统一数据库读取（兼容性）
-                        from config import DATA_ROOT, UNIFIED_DB_PATH
-                        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
-                        if os.path.exists(db_path):
-                            details_db_path = db_path
-                    
-                    # 查询股票详情表
-                    manager = get_database_manager()
-                    sql = "SELECT * FROM stock_details WHERE ts_code = ? AND ref_date = ?"
-                    df = manager.execute_sync_query(details_db_path, sql, [code_norm, ref_real], timeout=30.0)
-                    
-                    if not df.empty:
-                        st.info("数据来源：数据库")
-                    else:
+                # 显示数据来源信息（只有在允许读取数据库时才查询数据库状态）
+                db_reading_enabled = is_details_db_reading_enabled()
+                if db_reading_enabled:
+                    try:
+                        # 使用统一的函数获取details数据库路径（包含回退逻辑）
+                        details_db_path = get_details_db_path_with_fallback()
+                        if details_db_path:
+                            # 查询股票详情表
+                            logger.info(f"[数据库连接] 开始获取数据库管理器实例 (查询股票详情: {code_norm}, {ref_real})")
+                            manager = get_database_manager()
+                            sql = "SELECT * FROM stock_details WHERE ts_code = ? AND ref_date = ?"
+                            df = manager.execute_sync_query(details_db_path, sql, [code_norm, ref_real], timeout=30.0)
+                            
+                            if not df.empty:
+                                st.info("数据来源：数据库")
+                            else:
+                                st.info("数据来源：JSON文件")
+                        else:
+                            st.info("数据来源：JSON文件")
+                    except:
                         st.info("数据来源：JSON文件")
-                except:
-                    st.info("数据来源：JSON文件")
+                else:
+                    st.info("数据来源：JSON文件（数据库读取未启用）")
                 
                 try:
                     score = float(summary.get("score", 0))
@@ -1852,6 +1881,7 @@ if _in_streamlit():
                                 # 回退到直接查询
                                 from config import DATA_ROOT, UNIFIED_DB_PATH
                                 db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                                logger.info(f"[数据库连接] 开始获取数据库管理器实例 (回退查询单日数据: {code_norm}, {sel_date})")
                                 manager = get_database_manager()
                                 sql = "SELECT * FROM stock_data WHERE ts_code = ? AND trade_date = ?"
                                 df = manager.execute_sync_query(db_path, sql, [code_norm, sel_date], timeout=30.0)
@@ -1891,6 +1921,7 @@ if _in_streamlit():
                             # 回退到直接查询
                             from config import DATA_ROOT, UNIFIED_DB_PATH
                             db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                            logger.info(f"[数据库连接] 开始获取数据库管理器实例 (回退查询日期范围数据: {code_norm}, {start}~{ref_use})")
                             manager = get_database_manager()
                             sql = "SELECT * FROM stock_data WHERE ts_code = ? AND trade_date >= ? AND trade_date <= ?"
                             df = manager.execute_sync_query(db_path, sql, [code_norm, start, ref_use], timeout=30.0)
@@ -1903,23 +1934,75 @@ if _in_streamlit():
                             if not expr:
                                 st.warning("策略没有 when/check 表达式")
                             else:
-                                ctx = {
-                                    "OPEN": df["open"].astype(float).values,
-                                    "HIGH": df["high"].astype(float).values,
-                                    "LOW": df["low"].astype(float).values,
-                                    "CLOSE": df["close"].astype(float).values,
-                                    "V": df["vol"].astype(float).values,
-                                }
-                                sig = tdx.evaluate_bool(expr, pd.DataFrame(ctx))
-                                idx = [i for i, v in enumerate(sig) if bool(v)]
-                                if not idx:
-                                    st.info("回看期内无触发")
-                                else:
-                                    last_i = idx[-1]
-                                    row = df.iloc[last_i]
-                                    fld = {"开盘价(open)":"open","收盘价(close)":"close","最高价(high)":"high","最低价(low)":"low"}[price_field]
-                                    entry_price = float(row[fld])
-                                    st.success(f"触发日 {row['trade_date']}，买点={entry_price:.4f}")
+                                # 计算指标（扩展数据）
+                                try:
+                                    # 确保数据格式正确
+                                    df['open'] = pd.to_numeric(df['open'], errors='coerce')
+                                    df['high'] = pd.to_numeric(df['high'], errors='coerce')
+                                    df['low'] = pd.to_numeric(df['low'], errors='coerce')
+                                    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+                                    df['vol'] = pd.to_numeric(df['vol'], errors='coerce')
+                                    
+                                    # 计算KDJ指标
+                                    if 'j' in expr.lower():
+                                        df['j'] = ind.kdj(df)
+                                    
+                                    # 扩展ctx，包含指标
+                                    ctx = {}
+                                    for col in df.columns:
+                                        if col.lower() not in ['trade_date', 'ts_code', 'adj_factor']:
+                                            try:
+                                                ctx[col.upper()] = pd.to_numeric(df[col], errors='coerce').values
+                                            except:
+                                                pass
+                                    
+                                    # 如果ctx为空，使用基础OHLCV
+                                    if not ctx:
+                                        ctx = {
+                                            "OPEN": df["open"].astype(float).values,
+                                            "HIGH": df["high"].astype(float).values,
+                                            "LOW": df["low"].astype(float).values,
+                                            "CLOSE": df["close"].astype(float).values,
+                                            "V": df["vol"].astype(float).values,
+                                        }
+                                    
+                                    # 设置EXTRA_CONTEXT以便GET_LAST_CONDITION_PRICE等函数使用
+                                    original_ctx_df = None
+                                    try:
+                                        from tdx_compat import EXTRA_CONTEXT
+                                        original_ctx_df = EXTRA_CONTEXT.get("DF")
+                                        # 创建包含所有列的DataFrame
+                                        ctx_df = pd.DataFrame(ctx)
+                                        # 确保列名小写（tdx_compat需要）
+                                        ctx_df.columns = ctx_df.columns.str.lower()
+                                        EXTRA_CONTEXT["DF"] = ctx_df
+                                    except:
+                                        pass
+                                    
+                                    try:
+                                        # 使用evaluate_bool评估表达式
+                                        sig = tdx.evaluate_bool(expr, pd.DataFrame(ctx))
+                                    finally:
+                                        # 恢复原始EXTRA_CONTEXT
+                                        if original_ctx_df is not None:
+                                            try:
+                                                from tdx_compat import EXTRA_CONTEXT
+                                                EXTRA_CONTEXT["DF"] = original_ctx_df
+                                            except:
+                                                pass
+                                    idx = [i for i, v in enumerate(sig) if bool(v)]
+                                    if not idx:
+                                        st.info("回看期内无触发")
+                                    else:
+                                        last_i = idx[-1]
+                                        row = df.iloc[last_i]
+                                        fld = {"开盘价(open)":"open","收盘价(close)":"close","最高价(high)":"high","最低价(low)":"low"}[price_field]
+                                        entry_price = float(row[fld])
+                                        st.success(f"触发日 {row['trade_date']}，买点={entry_price:.4f}")
+                                except Exception as e2:
+                                    st.error(f"计算失败：{e2}")
+                                    import traceback
+                                    st.code(traceback.format_exc())
                     except Exception as e:
                         st.error(f"策略取价失败：{e}")
 
@@ -2891,26 +2974,41 @@ if _in_streamlit():
                         st.success("配置已复制到剪贴板（请手动复制）")
             else:
                 # 其他策略类型使用when字段
-                if not use_clauses and when_expr:
-                    rule_config["when"] = when_expr
-                elif use_clauses:
-                    st.warning("请在上方clauses字段中配置多子句组合")
-                else:
-                    # 验证必填字段
-                    if not when_expr:
-                        st.error("❌ 缺少必填字段：条件表达式 (when)")
+                config_error = None
+                
+                if use_clauses:
+                    # 使用多子句组合
+                    if not clauses_config:
+                        config_error = "❌ 缺少必填字段：子句配置 (clauses)"
                     else:
-                        # 显示生成的配置
-                        st.success("✅ 规则配置生成成功！")
-                        
-                        # 显示JSON格式
-                        st.markdown("**生成的规则配置：**")
-                        st.code(json.dumps(rule_config, ensure_ascii=False, indent=2), language="json")
-                        
-                        # 提供复制功能
-                        if st.button("📋 复制配置"):
-                            st.code(json.dumps(rule_config, ensure_ascii=False, indent=2))
-                            st.success("配置已复制到剪贴板（请手动复制）")
+                        try:
+                            # 解析JSON格式的clauses配置
+                            import json as json_module
+                            clauses_parsed = json_module.loads(clauses_config)
+                            rule_config["clauses"] = clauses_parsed
+                        except json_module.JSONDecodeError as e:
+                            config_error = f"❌ 子句配置格式错误：{str(e)}"
+                else:
+                    # 使用单条件表达式
+                    if not when_expr:
+                        config_error = "❌ 缺少必填字段：条件表达式 (when)"
+                    else:
+                        rule_config["when"] = when_expr
+                
+                # 显示配置或错误
+                if config_error:
+                    st.error(config_error)
+                else:
+                    # 显示生成的配置
+                    st.success("✅ 规则配置生成成功！")
+                    st.markdown("**生成的规则配置：**")
+                    st.code(json.dumps(rule_config, ensure_ascii=False, indent=2), language="json")
+                    
+                    # 提供复制功能
+                    copy_key = f"copy_config_{'clauses' if use_clauses else 'when'}"
+                    if st.button("📋 复制配置", key=copy_key):
+                        st.code(json.dumps(rule_config, ensure_ascii=False, indent=2))
+                        st.success("配置已复制到剪贴板（请手动复制）")
             
             # 验证规则
             if validate_btn:
@@ -3482,234 +3580,6 @@ if _in_streamlit():
             #     key=f"dl_attn_{ref_attn}"
             # )
 
-        # ================= 数据下载 ==================
-        with tab_data:
-            st.subheader("数据下载 / 浏览检查")
-            # —— 参数区 ——
-            with st.expander("参数设置", expanded=True):
-                # 延迟导入 download 模块
-                dl = _lazy_import_download()
-                if dl is None:
-                    st.error("无法导入 download 模块")
-                    st.stop()
-                
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    base = st.text_input("数据根目录 DATA_ROOT", value=str(getattr(cfg, "DATA_ROOT", "./data")))
-                    assets = st.multiselect("资产 ASSETS", ["stock","index"], default=list(getattr(dl, "ASSETS", ["stock","index"])) or ["stock","index"])            
-                with c2:
-                    start_in = st.text_input("起始日 START_DATE (YYYYMMDD)", value=str(getattr(dl, "START_DATE", "20200101")))
-                    end_default = str(getattr(dl, "END_DATE", "today"))
-                    end_in = st.text_input("结束日 END_DATE ('today' 或 YYYYMMDD)", value=end_default)
-                with c3:
-                    api_adj = st.selectbox("复权 API_ADJ", ["qfq","hfq","raw"], index={"qfq":0,"hfq":1,"raw":2}.get(str(getattr(dl,"API_ADJ","qfq")).lower(),0))
-                    latest = _latest_trade_date(base, api_adj)
-                    do_plain = st.checkbox("写入单股(不带指标)", value=bool(getattr(dl, "WRITE_SYMBOL_PLAIN", True)))
-                    do_ind   = st.checkbox("写入单股(含指标)", value=bool(getattr(dl, "WRITE_SYMBOL_INDICATORS", True)))
-                    auto_rank = st.checkbox("完成后自动排名（Top/All/Details）", value=True)  # NEW
-                with c4:
-                    fast_threads = st.number_input("FAST_INIT 并发", min_value=1, max_value=64, value=int(getattr(dl,"FAST_INIT_THREADS",16)))
-                    inc_threads  = st.number_input("增量下载线程", min_value=1, max_value=64, value=int(getattr(dl,"STOCK_INC_THREADS",16)))
-                    ind_workers  = st.number_input("指标重算线程(可选)", min_value=0, max_value=128, value=int(getattr(dl,"INC_RECALC_WORKERS", 32)))
-                if latest:
-                    st.caption(f"当前 {api_adj} 最近交易日：{latest}")
-
-            # 将参数落到模块
-            end_use = _today_str() if str(end_in).strip().lower() == "today" else str(end_in).strip()
-            start_use = str(start_in).strip()
-            _apply_overrides(base, assets, start_use, end_use, api_adj, int(fast_threads), int(inc_threads), int(ind_workers) if ind_workers else None)
-            # 延迟导入 download 模块并设置配置
-            dl = _lazy_import_download()
-            if dl is not None:
-                dl.WRITE_SYMBOL_PLAIN = bool(do_plain)
-                dl.WRITE_SYMBOL_INDICATORS = bool(do_ind)
-
-            # —— 按钮区 ——
-            tab_dl, tab_view = st.tabs(["下载/同步", "浏览/检查"])
-
-            # === 下载/同步 ===
-            with tab_dl:
-                mode = st.radio("运行模式", ["首次建库(FAST_INIT)", "日常增量(NORMAL)"], index=0 if not _latest_trade_date(base, api_adj) else 1, horizontal=True)
-                st.markdown(
-                    """
-                    - **FAST_INIT**：按股票并发全历史抓取 → 存储到统一数据库 →（可选）指数数据。
-                    - **NORMAL**：股票增量更新 → 指数增量更新 → 指标增量重算。
-                    
-                    **注意**：新版下载不再区分daily和single目录，所有数据统一存储到数据库中。
-                    """
-                )
-
-                # 一键
-                c1, c2 = st.columns(2)
-                with c1:
-                    run_all = st.button("🚀 一键运行", width='stretch', type="primary")
-                with c2:
-                    dry = st.checkbox("仅打印日志（不执行）", value=False, help="仅用于预览参数")
-                
-                if run_all:
-                    logger.info(f"用户点击一键运行下载: 模式={mode}, 干运行={dry}")
-
-                # 单步按钮
-                st.markdown("—— 或按步骤执行 ——")
-                s1, s2, s3, s4, s5 = st.columns(5)
-                with s1: b_fast = st.button("① 首次建库")
-                with s2: b_merge = st.button("② 合并到数据库")
-                with s3: b_stock = st.button("③ 股票增量")
-                with s4: b_index = st.button("④ 指数增量")
-                with s5: b_indic = st.button("⑤ 指标重算")
-
-                # 执行逻辑（统一用 Stepper 展示阶段进度）
-                if run_all or b_fast or b_merge or b_stock or b_index or b_indic:
-                    if dry:
-                        st.info(f"[DRY-RUN] base={base} assets={assets} adj={api_adj} range={start_use}~{end_use} fast_threads={fast_threads} inc_threads={inc_threads}")
-                    else:
-                        try:
-                            # —— 一键运行 —— 
-                            if run_all:
-                                if mode.startswith("首次"):
-                                    steps = [
-                                        "准备环境",
-                                        "FAST_INIT 全量/合并",
-                                        "指数全量/补齐" if "index" in set(assets) else None,
-                                        "自动排名（Top/All/Details）" if auto_rank else None,
-                                        "清理与校验",
-                                    ]
-                                    sp = Stepper("下载/同步 · 一键运行（FAST_INIT）", steps, key_prefix="dl_all")
-                                    sp.start()
-                                    sp.step("准备环境")
-                                    sp.step("FAST_INIT 全量/合并")
-                                    _run_fast_init(end_use)
-                                    sp.step("指数全量/补齐", visible=("index" in set(assets)))
-                                    if "index" in set(assets):
-                                        dl = _lazy_import_download()
-                                        if dl is not None:
-                                            dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
-                                    sp.step("自动排名（Top/All/Details）", visible=auto_rank)
-                                    if auto_rank:
-                                        try:
-                                            top_path = run_se_run_for_date_in_bg(None)
-                                            st.success(f"✅ 已自动完成排名：{top_path}")
-                                        except Exception as ee:
-                                            st.warning(f"自动排名失败：{ee}")
-                                    sp.step("清理与校验")
-                                    sp.finish(True, "所有步骤完成")
-                                else:
-                                    steps = [
-                                        "准备环境",
-                                        "合并到数据库 & 增量同步（股/指/指标）",
-                                        "自动排名（Top/All/Details）" if auto_rank else None,
-                                        "清理与校验",
-                                    ]
-                                    sp = Stepper("下载/同步 · 一键运行（NORMAL）", steps, key_prefix="dl_all")
-                                    sp.start()
-                                    sp.step("准备环境")
-                                    sp.step("合并到数据库 & 增量同步（股/指/指标）")
-                                    _run_increment(start_use, end_use, do_stock=True, do_index=True, do_indicators=True)
-                                    sp.step("自动排名（Top/All/Details）", visible=auto_rank)
-                                    if auto_rank:
-                                        try:
-                                            top_path = run_se_run_for_date_in_bg(None)
-                                            st.success(f"✅ 已自动完成排名：{top_path}")
-                                        except Exception as ee:
-                                            st.warning(f"自动排名失败：{ee}")
-                                    sp.step("清理与校验")
-                                    sp.finish(True, "所有步骤完成")
-                            # —— 单步运行 —— 
-                            else:
-                                if b_fast:
-                                    steps = ["准备环境", "首次建库（FAST_INIT）", "清理与校验"]
-                                    sp = Stepper("下载/同步 · 首次建库", steps, key_prefix="dl_fast")
-                                    sp.start()
-                                    sp.step("准备环境")
-                                    sp.step("首次建库（FAST_INIT）")
-                                    _run_fast_init(end_use)
-                                    sp.step("清理与校验")
-                                    sp.finish(True, "该步骤完成")
-                                if b_merge:
-                                    steps = ["准备环境", "合并到数据库", "清理与校验"]
-                                    sp = Stepper("下载/同步 · 合并", steps, key_prefix="dl_merge")
-                                    sp.start()
-                                    sp.step("准备环境")
-                                    sp.step("合并到数据库")
-                                    dl = _lazy_import_download()
-                                    if dl is not None:
-                                        # 数据库操作已迁移到 data_reader.py
-                                        pass
-                                    sp.step("清理与校验")
-                                    sp.finish(True, "该步骤完成")
-                                if b_stock:
-                                    steps = ["准备环境", "股票增量", "清理与校验"]
-                                    sp = Stepper("下载/同步 · 股票增量", steps, key_prefix="dl_stock")
-                                    sp.start()
-                                    sp.step("准备环境")
-                                    sp.step("股票增量")
-                                    dl = _lazy_import_download()
-                                    if dl is not None:
-                                        dl.sync_stock_daily_fast(start_use, end_use, threads=dl.STOCK_INC_THREADS)
-                                    sp.step("清理与校验")
-                                    sp.finish(True, "该步骤完成")
-                                if b_index:
-                                    steps = ["准备环境", "指数增量", "清理与校验"]
-                                    sp = Stepper("下载/同步 · 指数增量", steps, key_prefix="dl_index")
-                                    sp.start()
-                                    sp.step("准备环境")
-                                    sp.step("指数增量")
-                                    dl = _lazy_import_download()
-                                    if dl is not None:
-                                        dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
-                                    sp.step("清理与校验")
-                                    sp.finish(True, "该步骤完成")
-                                if b_indic:
-                                    steps = ["准备环境", "指标重算", "自动排名（Top/All/Details）" if auto_rank else None, "清理与校验"]
-                                    sp = Stepper("下载/同步 · 指标重算", steps, key_prefix="dl_indic")
-                                    sp.start()
-                                    sp.step("准备环境")
-                                    sp.step("指标重算")
-                                    dl = _lazy_import_download()
-                                    if dl is not None:
-                                        workers = getattr(dl, "INC_RECALC_WORKERS", None) or ((os.cpu_count() or 4) * 2)
-                                        dl.recalc_symbol_products_for_increment(start_use, end_use, threads=workers)
-                                    sp.step("自动排名（Top/All/Details）", visible=auto_rank)
-                                    if auto_rank:
-                                        try:
-                                            top_path = run_se_run_for_date_in_bg(None)
-                                            st.success(f"✅ 已自动完成排名：{top_path}")
-                                        except Exception as ee:
-                                            st.warning(f"自动排名失败：{ee}")
-                                    sp.step("清理与校验")
-                                    sp.finish(True, "该步骤完成")
-                        except Exception as e:
-                            st.error(f"运行失败：{e}")
-
-        # === 浏览/检查（集成新的数据完整性检查） ===
-        with tab_view:
-            st.markdown("#### 数据完整性检查 & 诊断")
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                try:
-                    dl = _lazy_import_download()
-                    if dl is not None:
-                        df = dl.get_data_integrity_overview(base, api_adj)
-                        st.dataframe(df, width='stretch', height=360)
-                    else:
-                        st.error("无法导入 download 模块")
-                except Exception as e:
-                    st.error(f"数据完整性检查失败：{e}")
-            with c2:
-                try:
-                    dl = _lazy_import_download()
-                    if dl is not None:
-                        info = dl.get_data_integrity_info(base, api_adj)
-                        st.text_area("概览（文本）", value=str(info), height=180)
-                        adv = dl.get_data_integrity_advice(base, api_adj)
-                        st.markdown(adv)
-                    else:
-                        st.error("无法导入 download 模块")
-                except Exception as e:
-                    st.error(f"诊断失败：{e}")
-
-            st.markdown("---")
-            st.caption("新的数据完整性检查提供更深入的数据质量验证，包括列级别检查、数据类型验证、价格逻辑检查等。")
 
     # ================== 选股 ==================
     with tab_screen:
@@ -3813,32 +3683,22 @@ if _in_streamlit():
             else:
                 rows = []
                 try:
-                    # 优先使用数据库查询
-                    if SC_USE_DB_STORAGE and SC_DETAIL_STORAGE in ["database","both","db"]:
-                        # 延迟导入 data_reader
-                        try:
-                            # get_detail_db 功能需要重新实现
-                            pass
-                        except ImportError:
-                            st.error("无法导入 data_reader 模块")
-                            st.stop()
+                    # 检查是否允许读取数据库（使用统一的函数）
+                    db_reading_enabled = is_details_db_reading_enabled()
+                    
+                    # 优先使用数据库查询（只有当db_reading_enabled为True且数据库可用时才读取数据库）
+                    if db_reading_enabled and is_details_db_available():
                         # 使用 database_manager 查询详情
+                        logger.info("[数据库连接] 开始获取数据库管理器实例 (查询股票详情用于UI显示)")
                         manager = get_database_manager()
                         if manager:
-                            # 使用正确的details数据库路径
-                            from config import SC_OUTPUT_DIR, SC_DETAIL_DB_PATH
-                            details_db_path = os.path.join(SC_OUTPUT_DIR, 'details', 'details.db')
-                            
-                            # 检查数据库文件是否存在
-                            if not os.path.exists(details_db_path):
-                                # 尝试从统一数据库读取（兼容性）
-                                from config import DATA_ROOT, UNIFIED_DB_PATH
-                                db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
-                                if os.path.exists(db_path):
-                                    details_db_path = db_path
-                            
-                            sql = "SELECT * FROM stock_details WHERE ref_date = ?"
-                            df_all = manager.execute_sync_query(details_db_path, sql, [ref_real], timeout=30.0)
+                            # 使用统一的函数获取details数据库路径（包含回退逻辑）
+                            details_db_path = get_details_db_path_with_fallback()
+                            if details_db_path:
+                                sql = "SELECT * FROM stock_details WHERE ref_date = ?"
+                                df_all = manager.execute_sync_query(details_db_path, sql, [ref_real], timeout=30.0)
+                            else:
+                                df_all = pd.DataFrame()
                         else:
                             df_all = pd.DataFrame()
                         
@@ -4141,6 +4001,7 @@ if _in_streamlit():
                     # 回退到直接查询
                     from config import DATA_ROOT, UNIFIED_DB_PATH
                     db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                    logger.info(f"[数据库连接] 开始获取数据库管理器实例 (回退查询K线数据: {ts_norm}, {d_exec})")
                     manager = get_database_manager()
                     sql = "SELECT open,high,low,close FROM stock_data WHERE ts_code = ? AND trade_date = ?"
                     df_one = manager.execute_sync_query(db_path, sql, [ts_norm, d_exec], timeout=30.0)
@@ -4536,6 +4397,523 @@ if _in_streamlit():
 
                 except Exception as e:
                     st.error(f"Commonality 失败：{e}")
+
+    # ================== 数据管理 ==================
+    with tab_data_view:
+        st.subheader("数据管理")
+        
+        # ===== 数据库基础检查和下载按钮 =====
+        # 延迟导入 download 模块
+        dl = _lazy_import_download()
+        if dl is None:
+            st.error("无法导入 download 模块")
+        else:
+            # 获取基础配置（优先使用config，如果没有则使用download模块的默认值）
+            base = str(getattr(cfg, "DATA_ROOT", "./data"))
+            api_adj = str(getattr(cfg, "API_ADJ", getattr(dl, "API_ADJ", "qfq"))).lower()
+            
+            # 下载配置项
+            st.markdown("#### 数据下载配置")
+            with st.expander("下载参数配置", expanded=False):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    # 从config获取默认值，如果没有则使用download模块的值
+                    start_default = str(getattr(cfg, "START_DATE", getattr(dl, "START_DATE", "20200101")))
+                    start_use = st.text_input("起始日 START_DATE (YYYYMMDD)", value=start_default, key="dl_start_date")
+                    
+                    end_default_cfg = getattr(cfg, "END_DATE", "today")
+                    if str(end_default_cfg).strip().lower() == "today":
+                        end_default = "today"
+                    else:
+                        end_default = str(end_default_cfg)
+                    end_input = st.text_input("结束日 END_DATE ('today' 或 YYYYMMDD)", value=end_default, key="dl_end_date")
+                    
+                    assets_default = list(getattr(cfg, "ASSETS", getattr(dl, "ASSETS", ["stock", "index"]))) or ["stock", "index"]
+                    assets = st.multiselect("资产 ASSETS", ["stock", "index"], default=assets_default, key="dl_assets")
+                
+                with c2:
+                    api_adj_options = ["qfq", "hfq", "raw"]
+                    api_adj_index = api_adj_options.index(api_adj) if api_adj in api_adj_options else 0
+                    api_adj = st.selectbox("复权 API_ADJ", api_adj_options, index=api_adj_index, key="dl_api_adj").lower()
+                    
+                    fast_threads_default = int(getattr(cfg, "FAST_INIT_THREADS", getattr(dl, "FAST_INIT_THREADS", 16)))
+                    fast_threads = st.number_input("FAST_INIT 并发", min_value=1, max_value=64, value=fast_threads_default, key="dl_fast_threads")
+                    
+                    inc_threads_default = int(getattr(cfg, "STOCK_INC_THREADS", getattr(dl, "STOCK_INC_THREADS", 16)))
+                    inc_threads = st.number_input("增量下载线程", min_value=1, max_value=64, value=inc_threads_default, key="dl_inc_threads")
+                
+                with c3:
+                    ind_workers_default = int(getattr(cfg, "INC_RECALC_WORKERS", getattr(dl, "INC_RECALC_WORKERS", 32)))
+                    ind_workers = st.number_input("指标重算线程(可选)", min_value=0, max_value=128, value=ind_workers_default, key="dl_ind_workers")
+                    
+                    st.caption(f"数据根目录: {base}")
+            
+            # 处理结束日期
+            end_use = _today_str() if str(end_input).strip().lower() == "today" else str(end_input).strip()
+            start_use = str(start_use).strip()
+            
+            # 应用参数
+            _apply_overrides(base, assets, start_use, end_use, api_adj, int(fast_threads), int(inc_threads), int(ind_workers) if ind_workers else None)
+            
+            # 显示当前状态
+            latest = _latest_trade_date(base, api_adj)
+            if latest:
+                st.caption(f"当前 {api_adj} 最近交易日：{latest}")
+            
+            # 下载按钮
+            run_download = st.button("🚀 运行下载", width='stretch', type="primary", key="run_download_btn")
+            
+            if run_download:
+                logger.info(f"用户点击运行下载: 起始日期={start_use}, 结束日期={end_use}")
+                try:
+                    # 直接调用download模块，让它自己判断是否为增量
+                    steps = [
+                        "准备环境",
+                        "数据下载（自动判断首次/增量）",
+                        "清理与校验",
+                    ]
+                    sp = Stepper("数据下载", steps, key_prefix="dl_auto")
+                    sp.start()
+                    sp.step("准备环境")
+                    sp.step("数据下载（自动判断首次/增量）")
+                    
+                    # 调用download模块的主函数，让它自己判断
+                    dl = _lazy_import_download()
+                    if dl is not None:
+                        results = dl.download_data(
+                            start_date=start_use,
+                            end_date=end_use,
+                            adj_type=api_adj,
+                            assets=assets,
+                            threads=int(inc_threads),
+                            enable_warmup=True,
+                            enable_adaptive_rate_limit=True
+                        )
+                        # 显示下载结果
+                        for asset_type, stats in results.items():
+                            st.success(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
+                    
+                    sp.step("清理与校验")
+                    sp.finish(True, "下载完成")
+                except Exception as e:
+                    st.error(f"下载失败：{e}")
+            
+            st.divider()
+        
+        # ===== 数据浏览（保留原有功能） =====
+        st.markdown("#### 数据浏览")
+        st.info("用于可视化读取数据库原数据")
+        
+        # 数据源选择
+        data_source = st.radio(
+            "选择数据源",
+            ["Details数据库", "股票原数据"],
+            horizontal=True,
+            help="Details: 存储评分详情数据 | 股票原数据: 存储股票行情和指标数据"
+        )
+        
+        if data_source == "Details数据库":
+            # Details数据库查看
+            try:
+                from database_manager import (
+                    query_details_by_date,
+                    query_details_by_stock,
+                    query_details_top_stocks,
+                    query_details_score_range,
+                    query_details_recent_dates,
+                    get_details_table_info,
+                    get_details_db_path_with_fallback,
+                    is_details_db_available
+                )
+                import os
+                
+                # 使用统一的函数获取details数据库路径（包含回退逻辑）
+                db_path = get_details_db_path_with_fallback()
+                
+                if not db_path or not is_details_db_available():
+                    st.warning(f"Details数据库不可用: {db_path if db_path else '路径获取失败'}")
+                else:
+                    # —— 数据库查询控制按钮 ——
+                    data_view_db_enabled = st.session_state.get("data_view_db_enabled", False)
+                    col_db_ctrl1, col_db_ctrl2 = st.columns([3, 1])
+                    with col_db_ctrl1:
+                        if data_view_db_enabled:
+                            st.success("✅ 数据库查询已启用（可以查询数据库）")
+                        else:
+                            st.info("ℹ️ 数据库查询未启用（点击按钮后才会查询数据库，避免与写入操作冲突）")
+                    with col_db_ctrl2:
+                        if not data_view_db_enabled:
+                            if st.button("🔓 启用数据库查询", key="enable_data_view_db"):
+                                st.session_state["data_view_db_enabled"] = True
+                                st.rerun()
+                        else:
+                            # 一旦启用就不再显示按钮，保持启用状态
+                            pass
+                    
+                    # 只有在启用数据库查询后才执行查询操作
+                    if not data_view_db_enabled:
+                        st.warning("⚠️ 请先点击「启用数据库查询」按钮，然后才能查询数据库数据")
+                        st.stop()
+                    
+                    # 以下是所有数据库查询操作，只有在启用后才会执行
+                    # 查询类型选择
+                    query_type = st.selectbox(
+                        "查询类型",
+                        ["按日期查看", "按股票代码查看", "Top-K股票", "分数范围查询"],
+                        key="details_query_type"
+                    )
+                    
+                    # 获取并缓存最新日期（延迟加载，避免UI启动时建立连接）
+                    @st.cache_data
+                    def get_latest_details_date():
+                        try:
+                            dates = query_details_recent_dates(1, db_path)
+                            return dates[0] if dates else None
+                        except:
+                            return None
+                    
+                    # 只在需要显示时才调用，避免UI启动时建立连接
+                    latest_date = None
+                    if query_type == "按日期查看":
+                        latest_date = get_latest_details_date()
+                    
+                    if query_type == "按日期查看":
+                        # 如果还没有设置默认日期，使用最新日期
+                        if "details_date_value" not in st.session_state:
+                            st.session_state["details_date_value"] = latest_date if latest_date else ""
+                        
+                        limit_param = st.number_input("返回记录数", min_value=1, max_value=1000, value=200, key="details_limit")
+                        
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            ref_date = st.text_input(
+                                "参考日期（YYYYMMDD，留空=最新）",
+                                value=st.session_state["details_date_value"],
+                                key="details_date"
+                            )
+                        with col2:
+                            st.write("")  # 占位
+                            st.write("")
+                            refresh_btn = st.button("刷新", key="details_refresh_btn")
+                        
+                        # 处理刷新或查询
+                        date_to_use = ref_date.strip() if ref_date.strip() else latest_date
+                        
+                        if refresh_btn or date_to_use:
+                            try:
+                                df = query_details_by_date(date_to_use, limit=limit_param, db_path=db_path)
+                                if not df.empty:
+                                    st.dataframe(df, width='stretch')
+                                    st.info(f"共找到 {len(df)} 条记录 | 查询日期: {date_to_use}")
+                                else:
+                                    st.warning("未找到数据")
+                            except Exception as e:
+                                st.error(f"查询失败: {e}")
+                        
+                        # 显示最近的日期列表
+                        try:
+                            recent_dates = query_details_recent_dates(7, db_path)
+                            if recent_dates:
+                                st.caption(f"最近的交易日: {', '.join(recent_dates)}")
+                        except Exception as e:
+                            pass
+                    
+                    elif query_type == "按股票代码查看":
+                        ts_code = st.text_input("股票代码（如000001）", key="details_ts_code")
+                        limit = st.number_input("返回记录数", min_value=1, max_value=100, value=10)
+                        
+                        if ts_code:
+                            try:
+                                df = query_details_by_stock(ts_code, limit, db_path)
+                                if not df.empty:
+                                    st.dataframe(df, width='stretch')
+                                else:
+                                    st.warning("未找到该股票的数据")
+                            except Exception as e:
+                                st.error(f"查询失败: {e}")
+                    
+                    elif query_type == "Top-K股票":
+                        # 如果还没有设置默认日期，使用最新日期
+                        if "details_topk_date_value" not in st.session_state:
+                            st.session_state["details_topk_date_value"] = latest_date if latest_date else ""
+                        
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            ref_date = st.text_input("参考日期（YYYYMMDD）", value=st.session_state["details_topk_date_value"], key="details_topk_date")
+                        with col2:
+                            st.write("")  # 占位
+                            st.write("")
+                            refresh_topk_btn = st.button("刷新", key="details_topk_refresh_btn")
+                        
+                        top_k = st.number_input("Top-K", min_value=1, max_value=500, value=50)
+                        
+                        date_to_use = ref_date.strip() if ref_date.strip() else latest_date
+                        
+                        if refresh_topk_btn or date_to_use:
+                            try:
+                                df = query_details_top_stocks(date_to_use, top_k, db_path)
+                                if not df.empty:
+                                    st.dataframe(df, width='stretch')
+                                    st.info(f"查询日期: {date_to_use}")
+                                else:
+                                    st.warning("未找到数据")
+                            except Exception as e:
+                                st.error(f"查询失败: {e}")
+                    
+                    elif query_type == "分数范围查询":
+                        # 如果还没有设置默认日期，使用最新日期
+                        if "details_score_date_value" not in st.session_state:
+                            st.session_state["details_score_date_value"] = latest_date if latest_date else ""
+                        
+                        col1_date, col2_date = st.columns([3, 1])
+                        with col1_date:
+                            ref_date = st.text_input("参考日期（YYYYMMDD）", value=st.session_state["details_score_date_value"], key="details_score_date")
+                        with col2_date:
+                            st.write("")  # 占位
+                            st.write("")
+                            refresh_score_btn = st.button("刷新", key="details_score_refresh_btn")
+                        
+                        col1_score, col2_score = st.columns(2)
+                        with col1_score:
+                            min_score = st.number_input("最低分数", value=50.0, key="details_score_min")
+                        with col2_score:
+                            max_score = st.number_input("最高分数", value=100.0, key="details_score_max")
+                        
+                        date_to_use = ref_date.strip() if ref_date.strip() else latest_date
+                        
+                        if refresh_score_btn or date_to_use:
+                            try:
+                                df = query_details_score_range(date_to_use, min_score, max_score, db_path)
+                                if not df.empty:
+                                    st.dataframe(df, width='stretch')
+                                    st.info(f"共找到 {len(df)} 条记录 | 查询日期: {date_to_use}")
+                                else:
+                                    st.warning("未找到数据")
+                            except Exception as e:
+                                st.error(f"查询失败: {e}")
+                    
+                    # 数据库信息
+                    with st.expander("数据库信息"):
+                        try:
+                            info = get_details_table_info(db_path)
+                            st.json(info)
+                        except Exception as e:
+                            st.error(f"获取信息失败: {e}")
+            
+            except Exception as e:
+                st.error(f"初始化Details数据库读取器失败: {e}")
+                import traceback
+                st.text(traceback.format_exc())
+        
+        else:
+            # 股票原数据查看
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            
+            if not os.path.exists(db_path):
+                st.warning(f"股票数据数据库不存在: {db_path}")
+            else:
+                # 查询参数
+                col1, col2 = st.columns(2)
+                with col1:
+                    asset_type = st.selectbox("资产类型", ["stock", "index"], index=0)
+                    # 根据资产类型设置默认adj
+                    default_adj = "ind" if asset_type == "index" else "qfq"
+                with col2:
+                    adj_type = st.selectbox(
+                        "复权类型",
+                        ["raw", "qfq", "hfq", "ind"],
+                        index=["raw", "qfq", "hfq", "ind"].index(default_adj)
+                    )
+                
+                view_mode = st.radio(
+                    "查看模式",
+                    ["单日查看", "区间查询", "单股历史"],
+                    horizontal=True
+                )
+                
+                @st.cache_data
+                def get_trade_dates_list():
+                    """获取交易日期列表"""
+                    try:
+                        dates = get_trade_dates(db_path)
+                        return dates
+                    except Exception as e:
+                        st.error(f"获取交易日期失败: {e}")
+                        return []
+                
+                # 延迟加载交易日期
+                if 'trade_dates' not in st.session_state:
+                    with st.spinner("正在加载交易日期..."):
+                        st.session_state['trade_dates'] = get_trade_dates_list()
+                
+                if view_mode == "单日查看":
+                    trade_dates = st.session_state['trade_dates']
+                    if trade_dates:
+                        selected_date = st.selectbox(
+                            "选择日期",
+                            trade_dates,
+                            index=len(trade_dates)-1 if trade_dates else 0
+                        )
+                        
+                        limit = st.number_input("显示行数（-1为全部）", value=100, min_value=-1, max_value=5000, step=50)
+                        if limit == -1:
+                            limit = None
+                        
+                        if st.button("查询", key="btn_query_day"):
+                            try:
+                                df = query_stock_data(
+                                    db_path=db_path,
+                                    start_date=selected_date,
+                                    end_date=selected_date,
+                                    adj_type=adj_type if asset_type != "index" else "ind",
+                                    limit=limit
+                                )
+                                if not df.empty:
+                                    st.dataframe(df, width='stretch')
+                                    # 统计总行数（忽略limit）
+                                    try:
+                                        from database_manager import count_stock_data as _count_stock_data
+                                        total_rows = _count_stock_data(
+                                            db_path=db_path,
+                                            ts_code=None,
+                                            start_date=selected_date,
+                                            end_date=selected_date,
+                                            adj_type=adj_type if asset_type != "index" else "ind"
+                                        )
+                                    except Exception:
+                                        total_rows = len(df)
+                                    st.info(f"总行数: {total_rows} | 本次显示: {len(df)}")
+                                else:
+                                    st.warning("未找到数据")
+                            except Exception as e:
+                                st.error(f"查询失败: {e}")
+                    else:
+                        st.warning("无法获取交易日期列表")
+                
+                elif view_mode == "区间查询":
+                    trade_dates = st.session_state['trade_dates']
+                    if trade_dates:
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            start_date = st.selectbox("起始日期", trade_dates, index=len(trade_dates)-10 if len(trade_dates) >= 10 else 0)
+                        with col2:
+                            end_date = st.selectbox("结束日期", trade_dates, index=len(trade_dates)-1)
+                        
+                        ts_code = st.text_input("股票代码（留空=全市场，如000001.SZ）")
+                        
+                        columns_input = st.text_input("指定列（用逗号分隔，留空=所有列）", placeholder="如: trade_date,open,high,low,close,vol")
+                        columns = [c.strip() for c in columns_input.split(",")] if columns_input else None
+                        
+                        limit = st.number_input("显示行数（-1为全部）", value=200, min_value=-1, max_value=10000, step=100)
+                        if limit == -1:
+                            limit = None
+                        
+                        if st.button("查询", key="btn_query_range"):
+                            try:
+                                df = query_stock_data(
+                                    db_path=db_path,
+                                    ts_code=ts_code if ts_code else None,
+                                    start_date=start_date,
+                                    end_date=end_date,
+                                    columns=columns,
+                                    adj_type=adj_type if asset_type != "index" else "ind",
+                                    limit=limit
+                                )
+                                if not df.empty:
+                                    st.dataframe(df, width='stretch')
+                                    # 统计总行数（忽略limit）
+                                    try:
+                                        from database_manager import count_stock_data as _count_stock_data
+                                        total_rows = _count_stock_data(
+                                            db_path=db_path,
+                                            ts_code=ts_code if ts_code else None,
+                                            start_date=start_date,
+                                            end_date=end_date,
+                                            adj_type=adj_type if asset_type != "index" else "ind"
+                                        )
+                                    except Exception:
+                                        total_rows = len(df)
+                                    st.info(f"总行数: {total_rows} | 本次显示: {len(df)}")
+                                else:
+                                    st.warning("未找到数据")
+                            except Exception as e:
+                                st.error(f"查询失败: {e}")
+                    
+                    if not trade_dates:
+                        st.warning("无法获取交易日期列表")
+                
+                elif view_mode == "单股历史":
+                    ts_code = st.text_input("股票代码（如000001.SZ）", key="single_stock_code")
+                    
+                    trade_dates = st.session_state.get('trade_dates', [])
+                    if not trade_dates:
+                        st.warning("无法获取交易日期列表")
+                    elif ts_code:
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            start_date = st.selectbox("起始日期", trade_dates, index=len(trade_dates)-60 if len(trade_dates) >= 60 else 0, key="single_start")
+                        with col2:
+                            end_date = st.selectbox("结束日期", trade_dates, index=len(trade_dates)-1, key="single_end")
+                    
+                    columns_input = st.text_input("指定列（用逗号分隔，留空=所有列）", placeholder="如: trade_date,open,high,low,close,vol,kdj_k,kdj_d,rsi", key="single_columns")
+                    columns = [c.strip() for c in columns_input.split(",")] if columns_input else None
+                    
+                    limit = st.number_input("显示行数（-1为全部）", value=-1, min_value=-1, max_value=10000, step=100, key="single_limit")
+                    if limit == -1:
+                        limit = None
+                    
+                    if st.button("查询", key="btn_query_single"):
+                        if not ts_code:
+                            st.error("请输入股票代码")
+                        else:
+                            try:
+                                df = query_stock_data(
+                                    db_path=db_path,
+                                    ts_code=ts_code,
+                                    start_date=start_date,
+                                    end_date=end_date,
+                                    columns=columns,
+                                    adj_type=adj_type if asset_type != "index" else "ind",
+                                    limit=limit
+                                )
+                                if not df.empty:
+                                    st.dataframe(df, width='stretch')
+                                    
+                                    # 如果有收盘价数据，绘制图表
+                                    if "close" in df.columns and "trade_date" in df.columns:
+                                        try:
+                                            df_chart = df.copy()
+                                            df_chart["trade_date"] = pd.to_datetime(df_chart["trade_date"])
+                                            st.line_chart(df_chart.set_index("trade_date")[["close"]])
+                                        except Exception as e:
+                                            st.warning(f"无法绘制图表: {e}")
+                                    # 统计总行数（忽略limit）
+                                    try:
+                                        from database_manager import count_stock_data as _count_stock_data
+                                        total_rows = _count_stock_data(
+                                            db_path=db_path,
+                                            ts_code=ts_code,
+                                            start_date=start_date,
+                                            end_date=end_date,
+                                            adj_type=adj_type if asset_type != "index" else "ind"
+                                        )
+                                    except Exception:
+                                        total_rows = len(df)
+                                    st.info(f"总行数: {total_rows} | 本次显示: {len(df)}")
+                                else:
+                                    st.warning("未找到该股票的数据")
+                            except Exception as e:
+                                st.error(f"查询失败: {e}")
+                
+                # 数据库信息
+                with st.expander("数据库信息"):
+                    try:
+                        info = get_database_info()
+                        st.json(info)
+                    except Exception as e:
+                        st.error(f"获取信息失败: {e}")
 
     # ================== 日志 ==================
     with tab_logs:

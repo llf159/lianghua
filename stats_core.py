@@ -309,6 +309,7 @@ def _read_stock_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFra
         sql += " ORDER BY ts_code, trade_date"
         
         # 执行查询
+        LOG.info(f"[数据库连接] 开始获取数据库管理器实例 (读取股票价格数据: codes={len(codes) if codes else 'all'}, {start}~{end})")
         manager = get_database_manager()
         df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
     except Exception as e:
@@ -357,6 +358,7 @@ def _read_index_prices(index_codes: Sequence[str], start: str, end: str) -> pd.D
         sql += " ORDER BY ts_code, trade_date"
         
         # 执行查询
+        LOG.info(f"[数据库连接] 开始获取数据库管理器实例 (读取指数价格数据: {len(index_codes)}个指数, {start}~{end})")
         manager = get_database_manager()
         df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
     except Exception as e:
@@ -642,6 +644,7 @@ def _read_stock_close(codes: Sequence[str], dates: List[str]) -> pd.DataFrame:
         sql += " ORDER BY ts_code, trade_date"
         
         # 执行查询
+        LOG.info(f"[数据库连接] 开始获取数据库管理器实例 (读取股票收盘价数据: {len(codes)}只股票, {len(dates)}个日期)")
         manager = get_database_manager()
         df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
     except Exception as e:
@@ -1331,6 +1334,7 @@ def _read_px(codes, start, end, *, asset="stock", cols=("open","close")) -> pd.D
         sql += " ORDER BY ts_code, trade_date"
         
         # 执行查询
+        LOG.info(f"[数据库连接] 开始获取数据库管理器实例 (读取价格数据用于回测: codes={len(codes) if codes else 'all'}, {start}~{end})")
         manager = get_database_manager()
         df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
     except Exception as e:

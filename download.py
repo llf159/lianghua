@@ -18,13 +18,10 @@ from __future__ import annotations
 import os
 import sys
 import time
-import json
-import logging
 import threading
-from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple, Union, Callable
+from typing import List, Optional, Dict, Any, Tuple
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 import pandas as pd
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,7 +45,7 @@ from utils import normalize_trade_date, normalize_ts
 from tdx_compat import evaluate as tdx_eval
 
 # 初始化日志
-logger = get_logger(__name__)
+logger = get_logger("download")
 
 # 导入tushare
 try:
@@ -553,6 +550,7 @@ class StockDownloader:
     
     def __init__(self, config: DownloadConfig):
         self.config = config
+        logger.info("[数据库连接] 开始获取数据库管理器实例 (初始化股票下载器)")
         self.db_manager = get_database_manager()
         
         # 创建限频器
@@ -700,6 +698,7 @@ class IndexDownloader:
     
     def __init__(self, config: DownloadConfig):
         self.config = config
+        logger.info("[数据库连接] 开始获取数据库管理器实例 (初始化指数下载器)")
         self.db_manager = get_database_manager()
         
         # 创建限频器
@@ -863,6 +862,7 @@ class DownloadManager:
     
     def __init__(self, config: DownloadConfig):
         self.config = config
+        logger.info("[数据库连接] 开始获取数据库管理器实例 (初始化下载管理器)")
         self.db_manager = get_database_manager()
         self.tushare_manager = TushareManager()
         
@@ -1024,8 +1024,8 @@ class DownloadManager:
             logger.info("=" * 60)
             logger.info("智能日期判断说明")
             logger.info("=" * 60)
-            logger.info(f"• 配置的结束日期: today (今日)")
-            logger.info(f"• 智能判断后的实际结束日期: {smart_end_date}")
+            logger.perf(f"• 配置的结束日期: today (今日)")
+            logger.perf(f"• 智能判断后的实际结束日期: {smart_end_date}")
             logger.info("• 智能判断逻辑:")
             logger.info("  - 如果今天是交易日且当前时间 < 15:00，使用前一个交易日")
             logger.info("  - 如果今天是交易日且当前时间 >= 15:00，使用今天")
@@ -1064,7 +1064,7 @@ class DownloadManager:
             if "stock" in assets:
                 current_asset += 1
                 overall_progress.set_description(f"下载股票数据 ({strategy['start_date']} - {strategy['end_date']})")
-                logger.info(f"开始下载股票数据: {strategy['start_date']} - {strategy['end_date']}")
+                logger.perf(f"开始下载股票数据: {strategy['start_date']} - {strategy['end_date']}")
                 results["stock"] = self.download_stocks(strategy)
                 overall_progress.update(1)
                 overall_progress.set_postfix({
@@ -1076,7 +1076,7 @@ class DownloadManager:
             if "index" in assets:
                 current_asset += 1
                 overall_progress.set_description(f"下载指数数据 ({strategy['start_date']} - {strategy['end_date']})")
-                logger.info(f"开始下载指数数据: {strategy['start_date']} - {strategy['end_date']}")
+                logger.perf(f"开始下载指数数据: {strategy['start_date']} - {strategy['end_date']}")
                 results["index"] = self.download_indices(strategy, index_whitelist)
                 overall_progress.update(1)
                 overall_progress.set_postfix({
@@ -1100,13 +1100,13 @@ class DownloadManager:
             overall_progress.close()
         
         # 打印最终统计信息
-        logger.info("=== 下载任务完成 ===")
+        logger.perf("=== 下载任务完成 ===")
         for asset_type, stats in results.items():
-            logger.info(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
+            logger.perf(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
             if stats.failed_stocks:
                 logger.warning(f"{asset_type} 失败股票: {[code for code, _ in stats.failed_stocks[:5]]}")
         
-        logger.info(f"总计: 成功={total_success}, 空数据={total_empty}, 失败={total_error}")
+        logger.perf(f"总计: 成功={total_success}, 空数据={total_empty}, 失败={total_error}")
         
         return results
 
@@ -1154,13 +1154,13 @@ def main():
     assets = ASSETS
     threads = STOCK_INC_THREADS
     
-    logger.info("=" * 60)
-    logger.info("开始下载数据")
-    logger.info("=" * 60)
-    logger.info(f"日期范围: {start_date} - {end_date}")
-    logger.info(f"复权类型: {adj_type}")
-    logger.info(f"资产类型: {', '.join(assets)}")
-    logger.info("=" * 60)
+    logger.perf("=" * 60)
+    logger.perf("开始下载数据")
+    logger.perf("=" * 60)
+    logger.perf(f"日期范围: {start_date} - {end_date}")
+    logger.perf(f"复权类型: {adj_type}")
+    logger.perf(f"资产类型: {', '.join(assets)}")
+    logger.perf("=" * 60)
     
     try:
         # 执行下载
@@ -1175,11 +1175,11 @@ def main():
         
         # 打印结果
         for asset_type, stats in results.items():
-            logger.info(f"{asset_type} 下载结果: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
+            logger.perf(f"{asset_type} 下载结果: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
             if stats.failed_stocks:
                 logger.warning(f"{asset_type} 失败股票: {[code for code, _ in stats.failed_stocks[:10]]}")
         
-        logger.info("下载任务完成")
+        logger.perf("下载任务完成")
         
     except Exception as e:
         logger.error(f"下载任务失败: {e}")
@@ -1276,6 +1276,7 @@ def main_interactive():
         # 显示智能判断后的实际日期
         try:
             from database_manager import get_database_manager
+            logger.info("[数据库连接] 开始获取数据库管理器实例 (获取智能结束日期)")
             db_manager = get_database_manager()
             smart_end_date = db_manager.get_smart_end_date("today")
             print(f"  智能判断后实际结束日期: {smart_end_date}")
@@ -1358,6 +1359,7 @@ def get_trade_dates_from_tushare(start_date: str, end_date: str) -> List[str]:
         交易日期列表
     """
     try:
+        logger.info(f"[数据库连接] 开始获取数据库管理器实例 (从Tushare获取交易日列表: {start_date}~{end_date})")
         db_manager = get_database_manager()
         return db_manager.get_trade_dates_from_tushare(start_date, end_date)
     except Exception as e:
@@ -1375,6 +1377,7 @@ def get_trade_dates_from_database(db_path: str = None) -> List[str]:
         交易日期列表
     """
     try:
+        logger.info(f"[数据库连接] 开始获取数据库管理器实例 (从数据库获取交易日列表: {db_path})")
         db_manager = get_database_manager()
         return db_manager.get_trade_dates(db_path)
     except Exception as e:
@@ -1392,6 +1395,7 @@ def get_smart_end_date(end_date_config: str) -> str:
         处理后的结束日期字符串
     """
     try:
+        logger.info(f"[数据库连接] 开始获取数据库管理器实例 (智能获取结束日期: {end_date_config})")
         db_manager = get_database_manager()
         return db_manager.get_smart_end_date(end_date_config)
     except Exception as e:

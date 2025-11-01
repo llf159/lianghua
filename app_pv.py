@@ -42,6 +42,7 @@ class DatabaseAdapter:
     
     def __init__(self):
         # 使用统一的数据库管理器
+        logger.info("[数据库连接] 开始获取数据库管理器实例 (初始化数据库适配器)")
         self.db_manager = get_database_manager()
         # 添加数据库路径用于直接查询
         from config import DATA_ROOT, UNIFIED_DB_PATH

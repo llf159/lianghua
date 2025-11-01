@@ -20,18 +20,6 @@ FILTER_RULES = [
 # 模拟策略
 PREDICTION_RULES = [
     # {
-    #     "name": "DIFF回到高点且价格更高",
-    #     "check": "c > GET_LAST_DIFF_HIGH_PRICE(60)",
-    #     "scenario": 
-    #     {
-    #         "mode": "reverse_price_to_diff",  # 反推价格到指定DIFF值
-    #         "reverse_target_value": "GET_LAST_DIFF_HIGH_VALUE(60)", # 目标DIFF值
-    #         "hl_mode": "follow",              # 高低点跟随
-    #         "vol_mode": "same",               # 成交量保持不变
-    #         "lock_higher_than_open": False    # 不锁定收盘价不低于开盘价
-    #     }
-    # },
-    # {
     #     "name": "反推KDJ-J买点",
     #     "check": "j <= 13",
     #     "scenario": {
@@ -66,7 +54,6 @@ PREDICTION_RULES = [
 
 # 个股持仓检查策略（仅用于个股页签的触发表展示，不生成动作）
 POSITION_POLICIES = [
-    
 ]
 
 # 个股买点策略（用于给出买点价格来源；可选，不影响持仓检查）
@@ -242,8 +229,8 @@ class StrategyValidator:
     
     # 可选字段
     OPTIONAL_FIELDS = {
-        "ranking": ["name", "timeframe", "window", "scope", "points", "explain", "show_reason", "as", "gate", "clauses", "dist_points"],
-        "filter": ["name", "timeframe", "window", "scope", "reason", "hard_penalty", "gate", "clauses"],
+        "ranking": ["name", "timeframe", "window", "score_windows", "scope", "points", "explain", "show_reason", "as", "gate", "clauses", "dist_points"],
+        "filter": ["name", "timeframe", "window", "score_windows", "scope", "reason", "hard_penalty", "gate", "clauses"],
         "prediction": ["name", "scenario"],
         "position": ["name", "explain"],
         "opportunity": ["name", "explain"]
@@ -399,6 +386,12 @@ class StrategyValidator:
             window = rule["window"]
             if not isinstance(window, (int, float)) or window <= 0:
                 result.add_error(f"window必须是正整数: {window}", "window")
+        
+        # 检查score_windows（可选）
+        if "score_windows" in rule:
+            score_windows = rule["score_windows"]
+            if score_windows is not None and (not isinstance(score_windows, (int, float)) or score_windows <= 0):
+                result.add_error(f"score_windows必须是正整数: {score_windows}", "score_windows")
         
         # 检查scope
         if "scope" in rule:
