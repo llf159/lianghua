@@ -14,8 +14,36 @@ import logging.handlers
 # 避免logging内部报错打断业务
 logging.raiseExceptions = False
 
+# 检查是否在 streamlit 环境中运行
+def _is_streamlit_env() -> bool:
+    """检查是否在 streamlit 环境中运行"""
+    try:
+        # 优先检查环境变量（最可靠，streamlit 启动时会设置）
+        streamlit_env_vars = [
+            'STREAMLIT_SERVER_PORT',
+            'STREAMLIT_BROWSER_GATHER_USAGE_STATS',
+            'STREAMLIT_SERVER_ADDRESS',
+            'STREAMLIT_SERVER_HEADLESS'
+        ]
+        if any(os.environ.get(var) for var in streamlit_env_vars):
+            return True
+        # 检查是否已经导入了 streamlit
+        if 'streamlit' in sys.modules:
+            return True
+        # 检查命令行参数是否包含 streamlit 相关命令或脚本
+        # streamlit run 会启动一个 Python 进程，argv[0] 通常是脚本路径
+        # 但更可靠的是检查 sys.executable 和模块路径
+        for arg in sys.argv:
+            arg_lower = arg.lower()
+            if 'streamlit' in arg_lower:
+                return True
+    except Exception:
+        pass
+    return False
+
 # 在Windows上设置控制台编码为UTF-8，避免中文乱码
-if sys.platform == 'win32':
+# 注意：在 streamlit 环境下不重定向 stdout/stderr，避免干扰 streamlit 的启动消息
+if sys.platform == 'win32' and not _is_streamlit_env():
     try:
         # 尝试设置控制台代码页为UTF-8
         import subprocess
@@ -28,6 +56,7 @@ if sys.platform == 'win32':
         if hasattr(sys.stdout, 'buffer'):
             import io
             # 检查当前编码，如果不是UTF-8则重新配置
+            # 仅在非 streamlit 环境下重定向
             if not hasattr(sys.stdout, '_encoding') or (hasattr(sys.stdout, 'encoding') and sys.stdout.encoding != 'utf-8'):
                 try:
                     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)

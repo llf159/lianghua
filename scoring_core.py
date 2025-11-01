@@ -3,7 +3,6 @@
 scoring_core.py — 股票评分系统核心模块
 提供完整的股票评分、排名和筛选功能
 """
-
 from __future__ import annotations
 
 import os
@@ -2414,7 +2413,7 @@ def _scope_hit(s_bool: pd.Series, scope: str) -> bool:
 
     # 默认当作 ANY
     try:
-        LOGGER.warning(f"[SCOPE] 未识别的 scope='{scope}'，按 ANY 处理")
+        LOGGER.warning(f"[SCOPE] 未识别的 scope='{scope}' (规范化后='{ss}')，按 ANY 处理。支持的 scope: LAST, ANY, ALL, COUNT>=k, CONSEC>=m, ANY_n, ALL_n")
     except Exception:
         pass
     return bool(s.any())

@@ -1441,7 +1441,21 @@ if _in_streamlit():
         # 运行
         ref_to_use = ref_inp.strip() or _pick_smart_ref_date()
         if run_btn:
-            logger.info(f"用户点击运行评分按钮: 参考日={ref_to_use}, TopK={topk}, 并行数={maxw}, 范围={universe}")
+            # 禁用details数据库读取，避免写入冲突
+            st.session_state["details_db_reading_enabled"] = False
+            logger.info(f"用户点击运行评分按钮: 参考日={ref_to_use}, TopK={topk}, 并行数={maxw}, 范围={universe}，已禁用details数据库读取")
+            
+            # 关闭details数据库的连接池，断开所有连接
+            try:
+                manager = get_database_manager()
+                if manager:
+                    details_db_path = get_details_db_path_with_fallback()
+                    if details_db_path:
+                        manager.close_db_pools(details_db_path)
+                        logger.info(f"已关闭details数据库连接池: {details_db_path}")
+            except Exception as e:
+                logger.warning(f"关闭details数据库连接池时出错: {e}")
+            
             _apply_runtime_overrides(st.session_state["rules_obj"], topk, tie, maxw, attn_on,
                                     {"全市场":"all","仅白名单":"white","仅黑名单":"black","仅特别关注榜":"attention"}[universe])
             try:
@@ -3675,6 +3689,10 @@ if _in_streamlit():
                 run_detail = st.form_submit_button("筛选当日命中标的", width='stretch')
 
         if run_detail:
+            # 自动启用数据库读取（和个股详情里的解锁逻辑一样）
+            if not is_details_db_reading_enabled():
+                st.session_state["details_db_reading_enabled"] = True
+            
             ref_real = refD_unified.strip() or _get_latest_date_from_files() or ""
             if not ref_real:
                 st.error("未能确定参考日。")

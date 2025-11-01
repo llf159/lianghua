@@ -1190,6 +1190,34 @@ class DatabaseManager:
         
         return stats
     
+    def close_db_pools(self, db_path: str):
+        """关闭指定数据库路径的所有连接池（只读和读写）"""
+        if not db_path:
+            return
+        
+        abs_path = os.path.abspath(db_path)
+        logger.info(f"开始关闭数据库连接池: {abs_path}")
+        
+        # 关闭只读连接池
+        if abs_path in self._read_pools:
+            try:
+                pool = self._read_pools[abs_path]
+                pool.close_all()
+                del self._read_pools[abs_path]
+                logger.info(f"只读连接池已关闭: {abs_path}")
+            except Exception as e:
+                logger.error(f"关闭只读连接池失败 {abs_path}: {e}")
+        
+        # 关闭读写连接池
+        if abs_path in self._write_pools:
+            try:
+                pool = self._write_pools[abs_path]
+                pool.close_all()
+                del self._write_pools[abs_path]
+                logger.info(f"读写连接池已关闭: {abs_path}")
+            except Exception as e:
+                logger.error(f"关闭读写连接池失败 {abs_path}: {e}")
+    
     def clear_connections_only(self):
         """仅清理连接池，不关闭工作线程 - 用于轻量级清理"""
         logger.info("开始清理数据库连接池...")

@@ -12,7 +12,7 @@ import datetime as dt
 import re
 import warnings
 from scipy.optimize import minimize, minimize_scalar
-from log_system import get_logger, log_function_calls, log_performance, log_data_processing, log_algorithm_execution
+from log_system import get_logger, log_function_calls, log_data_processing, log_algorithm_execution
 
 # 初始化日志记录器
 logger = get_logger("predict_core")
@@ -271,7 +271,6 @@ class PriceSolver:
             "close": float(last_row.get("close", 10.0))
         }
     
-    @log_performance(logger, "价格优化求解")
     def _solve_optimize(self, condition: str, target_value: float, 
                        historical_data: pd.DataFrame, price_bounds: PriceBounds,
                        initial_guess: Dict[str, float]) -> SolveResult:
@@ -373,7 +372,6 @@ class PriceSolver:
                 message=f"求解异常: {str(e)}"
             )
     
-    @log_performance(logger, "二分搜索求解")
     def _solve_binary_search(self, condition: str, target_value: float,
                            historical_data: pd.DataFrame, price_bounds: PriceBounds,
                            initial_guess: Dict[str, float]) -> SolveResult:
@@ -438,7 +436,6 @@ class PriceSolver:
             message="二分搜索完成"
         )
     
-    @log_performance(logger, "网格搜索求解")
     def _solve_grid_search(self, condition: str, target_value: float,
                           historical_data: pd.DataFrame, price_bounds: PriceBounds,
                           initial_guess: Dict[str, float]) -> SolveResult:
@@ -1001,7 +998,6 @@ def _apply_reverse_scenario_row_with_history(latest: pd.Series, scen: Scenario, 
 
 
 # ---------------- 主流程函数 ----------------
-@log_performance(logger, "明日模拟")
 def simulate_next_day(
     ref_date: str,
     universe_codes: List[str],
@@ -1237,7 +1233,6 @@ def _build_eval_ctx(sub: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(ctx)
 
 
-@log_performance(logger, "规则判定")
 def eval_when_exprs(
     df_concat: pd.DataFrame,
     sim_date: str,
@@ -1361,7 +1356,6 @@ class PredictionInput:
     cache_dir: Optional[str] = None          # 缓存目录
 
 
-@log_performance(logger, "预测执行")
 def run_prediction(inp: PredictionInput) -> pd.DataFrame:
     """
     执行股票预测分析
