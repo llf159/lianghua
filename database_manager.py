@@ -101,23 +101,291 @@ def _warn_direct_duckdb_usage():
             logger.warning("建议使用get_database_manager()或get_connection()统一管理连接")
             break
 
-def get_duckdb_config(db_path: str | None = None):
-    """获取DuckDB配置（已废弃，始终返回None）。
+
+class DatabaseConnectionConfigManager:
+    """统一的数据库连接配置管理器
     
-    为了保持向后兼容性，保留此函数但始终返回None，表示不使用任何配置参数。
+    确保所有数据库连接使用相同的配置参数，避免配置不一致导致的错误。
+    采用单例模式，保证全局唯一配置。
     """
-    # 不再使用任何配置参数，始终返回 None
-    return None
+    _instance = None
+    _lock = threading.Lock()
+    _config = None
+    _initialized = False
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+        
+        with self._lock:
+            if self._initialized:
+                return
+            
+            # 检测进程信息（用于日志）
+            process_name = "MainProcess"
+            process_id = os.getpid()
+            if _MULTIPROCESSING_AVAILABLE:
+                try:
+                    current_process = _get_current_process()
+                    process_name = current_process.name
+                except:
+                    pass
+            
+            self._config = self._load_config()
+            self._initialized = True
+            logger.info(
+                f"数据库连接配置管理器初始化完成 "
+                f"(进程: {process_name}, PID: {process_id})"
+            )
+    
+    def _load_config(self) -> Dict[str, Dict[str, Any]]:
+        """从config.py加载数据库配置，分别管理只读和读写配置"""
+        try:
+            from config import (
+                DUCKDB_THREADS,
+                DUCKDB_MEMORY_LIMIT,
+                DUCKDB_TEMP_DIR,
+                DB_QUERY_TIMEOUT,
+                DB_ENABLE_INDEXES,
+                DB_BATCH_SIZE,
+                DUCKDB_CLEAR_DAILY_BEFORE,
+            )
+            
+            # 只读连接配置（优化为并发读取）
+            read_config = {
+                'threads': DUCKDB_THREADS,  # 只读连接可以使用更多线程
+                'memory_limit': DUCKDB_MEMORY_LIMIT,
+                'temp_directory': DUCKDB_TEMP_DIR,
+                'query_timeout': DB_QUERY_TIMEOUT,
+                'enable_indexes': DB_ENABLE_INDEXES,
+                'batch_size': DB_BATCH_SIZE,
+                # 只读连接不需要清理配置
+            }
+            
+            # 读写连接配置（优化为写操作）
+            write_config = {
+                'threads': max(4, DUCKDB_THREADS // 2),  # 写操作使用较少线程，避免锁冲突
+                'memory_limit': DUCKDB_MEMORY_LIMIT,
+                'temp_directory': DUCKDB_TEMP_DIR,
+                'query_timeout': DB_QUERY_TIMEOUT * 2,  # 写操作可能需要更长时间
+                'enable_indexes': DB_ENABLE_INDEXES,
+                'batch_size': DB_BATCH_SIZE,
+                'clear_daily_before': DUCKDB_CLEAR_DAILY_BEFORE,
+            }
+            
+            config = {
+                'read': read_config,
+                'write': write_config,
+            }
+            
+            logger.debug(f"加载数据库配置 - 只读: {read_config}, 读写: {write_config}")
+            return config
+            
+        except ImportError as e:
+            logger.warning(f"无法从config导入配置，使用默认配置: {e}")
+            # 使用默认配置
+            read_config = {
+                'threads': 16,
+                'memory_limit': '18GB',
+                'temp_directory': None,
+                'query_timeout': 30,
+                'enable_indexes': True,
+                'batch_size': 1000,
+            }
+            write_config = {
+                'threads': 8,
+                'memory_limit': '18GB',
+                'temp_directory': None,
+                'query_timeout': 60,
+                'enable_indexes': True,
+                'batch_size': 1000,
+                'clear_daily_before': False,
+            }
+            return {
+                'read': read_config,
+                'write': write_config,
+            }
+        except Exception as e:
+            logger.error(f"加载数据库配置时出错: {e}")
+            # 使用安全的默认配置
+            read_config = {
+                'threads': 16,
+                'memory_limit': '18GB',
+                'temp_directory': None,
+                'query_timeout': 30,
+                'enable_indexes': True,
+                'batch_size': 1000,
+            }
+            write_config = {
+                'threads': 8,
+                'memory_limit': '18GB',
+                'temp_directory': None,
+                'query_timeout': 60,
+                'enable_indexes': True,
+                'batch_size': 1000,
+                'clear_daily_before': False,
+            }
+            return {
+                'read': read_config,
+                'write': write_config,
+            }
+    
+    def get_connection_config(self, read_only: bool = True) -> Dict[str, Any]:
+        """获取连接配置字典
+        
+        Args:
+            read_only: 是否为只读连接
+            
+        Returns:
+            配置字典，可直接用于duckdb.connect()或conn.execute()设置配置
+        """
+        if not self._config:
+            logger.warning("配置未初始化，返回空配置")
+            return {}
+        
+        # 根据只读/读写模式返回对应的配置
+        if read_only:
+            return self._config.get('read', {}).copy()
+        else:
+            return self._config.get('write', {}).copy()
+    
+    def apply_config_to_connection(self, conn, read_only: bool = True):
+        """将配置应用到已创建的连接
+        
+        Args:
+            conn: DuckDB连接对象
+            read_only: 是否为只读连接
+        """
+        config = self.get_connection_config(read_only)
+        
+        try:
+            # 应用线程配置
+            if 'threads' in config and config['threads']:
+                conn.execute(f"SET threads={config['threads']}")
+            
+            # 应用内存限制
+            if 'memory_limit' in config and config['memory_limit']:
+                conn.execute(f"SET memory_limit='{config['memory_limit']}'")
+            
+            # 应用临时目录
+            if 'temp_directory' in config and config['temp_directory']:
+                temp_dir = config['temp_directory']
+                # 确保临时目录存在，如果不存在则创建
+                if temp_dir:
+                    try:
+                        os.makedirs(temp_dir, exist_ok=True)
+                        conn.execute(f"SET temp_directory='{temp_dir}'")
+                    except Exception as dir_error:
+                        logger.warning(f"无法创建或使用临时目录 {temp_dir}: {dir_error}")
+            
+            # 应用查询超时
+            if 'query_timeout' in config and config['query_timeout']:
+                conn.execute(f"SET query_timeout={config['query_timeout']}")
+            
+            # 应用索引配置（如果支持）
+            if 'enable_indexes' in config:
+                # DuckDB默认启用索引，这里主要用于记录配置状态
+                pass
+            
+            logger.debug(f"已应用配置到连接: {config}")
+            
+        except Exception as e:
+            logger.warning(f"应用配置到连接时出错（部分配置可能未生效）: {e}")
+    
+    def get_config_summary(self, read_only: bool = None) -> str:
+        """获取配置摘要（用于日志和调试）
+        
+        Args:
+            read_only: 如果指定，返回对应模式的配置摘要；如果为None，返回所有配置摘要
+        """
+        if not self._config:
+            return "配置未初始化"
+        
+        if read_only is not None:
+            config = self.get_connection_config(read_only)
+            mode = "只读" if read_only else "读写"
+            summary = ", ".join([f"{k}={v}" for k, v in config.items()])
+            return f"数据库配置({mode}): {summary}"
+        else:
+            read_summary = ", ".join([f"{k}={v}" for k, v in self._config.get('read', {}).items()])
+            write_summary = ", ".join([f"{k}={v}" for k, v in self._config.get('write', {}).items()])
+            return f"数据库配置(只读): {read_summary} | 数据库配置(读写): {write_summary}"
+    
+    def reload_config(self):
+        """重新加载配置（用于配置更新后刷新）"""
+        with self._lock:
+            old_config = self._config.copy() if self._config else None
+            self._config = self._load_config()
+            logger.info(f"配置已重新加载: 旧配置={old_config}, 新配置={self._config}")
+
+
+# 全局配置管理器实例
+_config_manager = None
+_config_manager_lock = threading.Lock()
+
+def get_config_manager() -> DatabaseConnectionConfigManager:
+    """获取数据库连接配置管理器实例（单例）
+    
+    在多进程环境下，每个进程会创建自己的配置管理器实例。
+    这是正常行为，因为进程间不能共享内存，每个进程需要独立加载配置。
+    
+    每个进程的配置管理器会：
+    1. 从 config.py 加载相同的配置参数
+    2. 确保该进程内的所有连接使用统一的配置
+    3. 避免同一进程内不同连接使用不同配置导致的冲突
+    """
+    global _config_manager
+    
+    if _config_manager is None:
+        with _config_manager_lock:
+            if _config_manager is None:
+                # 检测是否为子进程（用于日志）
+                process_name = "MainProcess"
+                process_id = os.getpid()
+                if _MULTIPROCESSING_AVAILABLE:
+                    try:
+                        current_process = _get_current_process()
+                        process_name = current_process.name
+                    except:
+                        pass
+                
+                _config_manager = DatabaseConnectionConfigManager()
+                if process_name != "MainProcess":
+                    logger.info(
+                        f"子进程 {process_name} (PID: {process_id}) 已创建配置管理器实例，"
+                        f"确保该子进程的所有数据库连接使用统一配置"
+                    )
+    
+    return _config_manager
+
+
+def get_duckdb_config(db_path: str | None = None):
+    """获取DuckDB配置（已废弃，保留用于向后兼容）。
+    
+    现在返回配置管理器实例，但建议直接使用get_config_manager()。
+    """
+    return get_config_manager()
 
 
 class DatabaseConnectionPool:
     """数据库连接池"""
     
-    def __init__(self, db_path: str, max_connections: int = 10):
+    def __init__(self, db_path: str, max_connections: int = 10, 
+                 read_only: bool = True, config_manager: Optional[DatabaseConnectionConfigManager] = None):
         if not db_path:
             raise ValueError("数据库路径不能为空")
         self.db_path = os.path.abspath(db_path)
         self.max_connections = max_connections
+        self.read_only = read_only  # 连接池模式：只读或读写
+        # 配置管理器：如果未传入则使用单例
+        self._config_manager = config_manager if config_manager is not None else get_config_manager()
         self._pool = queue.Queue(maxsize=max_connections)
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)  # 条件变量用于阻塞等待
@@ -154,17 +422,21 @@ class DatabaseConnectionPool:
         
         # 根据 read_only 参数创建相应类型的连接
         use_read_only = read_only
+        process_name = "MainProcess"
+        process_id = os.getpid()
+        
         if _MULTIPROCESSING_AVAILABLE:
             current_process = _get_current_process()
+            process_name = current_process.name
             if current_process.name != "MainProcess":
                 # 子进程的读取操作强制使用 read_only=True
                 if read_only:
                     use_read_only = True
-                    logger.debug(f"子进程 {current_process.name} 读取操作使用 read_only=True 模式")
+                    logger.debug(f"子进程 {process_name} (PID: {process_id}) 读取操作使用 read_only=True 模式")
                 else:
                     # 写入操作允许使用 read_only=False
                     use_read_only = False
-                    logger.debug(f"子进程 {current_process.name} 写入操作使用 read_only=False 模式")
+                    logger.debug(f"子进程 {process_name} (PID: {process_id}) 写入操作使用 read_only=False 模式")
         elif os.name == 'nt':  # Windows 单进程环境
             # Windows 上，如果是只读操作，使用 read_only=True
             # 这样可以允许多个进程同时打开同一个数据库文件
@@ -173,11 +445,39 @@ class DatabaseConnectionPool:
             else:
                 use_read_only = False
         
+        # 记录连接创建尝试的详细信息
+        logger.debug(
+            f"[连接创建] 进程: {process_name} (PID: {process_id}), "
+            f"数据库: {self.db_path}, "
+            f"请求模式: read_only={read_only}, "
+            f"实际模式: read_only={use_read_only}"
+        )
+        
         # 直接创建连接，不进行任何重试或兜底处理
         # 如果连接失败（配置冲突、数据库锁定等），直接抛出异常
         try:
-            # 统一不使用任何配置参数，直接创建连接
+            # 使用连接池的配置管理器（已在初始化时传入或获取单例）
+            # 注意：使用连接池的 read_only 模式，而不是参数中的 read_only
+            # 这样可以确保连接池中所有连接使用相同的配置模式
+            pool_read_only = self.read_only
+            
+            # 创建连接（先创建基础连接）
             conn = duckdb.connect(self.db_path, read_only=use_read_only)
+            
+            # 应用统一配置到连接（使用连接池的模式）
+            try:
+                self._config_manager.apply_config_to_connection(conn, read_only=pool_read_only)
+                # 记录进程信息，确保子进程也使用统一配置
+                logger.debug(
+                    f"已应用统一配置到连接(进程: {process_name}, PID: {process_id}, "
+                    f"连接池模式: {'只读' if pool_read_only else '读写'}): "
+                    f"{self._config_manager.get_config_summary(read_only=pool_read_only)}"
+                )
+            except Exception as config_error:
+                # 配置应用失败不应该阻止连接创建，但需要记录警告
+                logger.warning(
+                    f"应用配置到连接时出错（连接已创建但配置可能未完全生效）: {config_error}"
+                )
             
             # 记录连接创建时间和类型
             conn_id = id(conn)
@@ -188,14 +488,24 @@ class DatabaseConnectionPool:
             
             self._stats['total_created'] += 1
             logger.debug(
-                f"创建新数据库连接成功: {self.db_path} (只读: {use_read_only})"
+                f"创建新数据库连接成功: {self.db_path} "
+                f"(进程: {process_name}, PID: {process_id}, 只读: {use_read_only})"
             )
             return conn
             
         except Exception as e:
             # 连接创建失败，直接抛出异常，不进行重试或关闭连接等兜底操作
             self._stats['connection_errors'] += 1
-            logger.error(f"创建数据库连接失败 -> {self.db_path}: {e}")
+            error_msg = (
+                f"创建数据库连接失败 -> {self.db_path}\n"
+                f"  进程: {process_name} (PID: {process_id})\n"
+                f"  请求模式: read_only={read_only}\n"
+                f"  实际模式: read_only={use_read_only}\n"
+                f"  错误: {e}\n"
+                f"  可能原因: 其他进程已使用不同的 read_only 配置打开该数据库，"
+                f"或配置参数不一致导致连接冲突"
+            )
+            logger.error(error_msg)
             raise
     
     def _close_all_existing_connections(self):
@@ -639,9 +949,22 @@ class DatabaseManager:
             raise ValueError("数据库路径不能为空")
         abs_path = os.path.abspath(db_path)
         
-        # 判断数据库是否需要写入操作（通常details.db需要写入，stock_data.db只需要读取）
+        # 判断数据库是否需要写入操作
+        # details.db 总是需要写入
+        # 在多进程环境下，stock_data.db 也需要写入（子进程下载时会写入），
+        #   为了避免配置冲突（read_only=True vs read_only=False），统一使用 read_only=False
         db_path_lower = abs_path.lower().replace('\\', '/')
         is_write_database = 'details' in db_path_lower or 'detail' in db_path_lower
+        
+        # 在多进程环境下，stock_data.db 也识别为写入数据库
+        # 这样可以避免主进程创建 read_only=True 连接，子进程创建 read_only=False 连接的配置冲突
+        if self._is_multiprocess:
+            if 'stock_data' in db_path_lower and db_path_lower.endswith('.db'):
+                is_write_database = True
+                logger.debug(
+                    f"多进程环境：数据库 {abs_path} 识别为写入数据库，"
+                    f"所有连接将使用 read_only=False 以避免配置冲突"
+                )
         
         with self._lock:
             # DuckDB 限制：同一个数据库文件的所有连接必须使用相同的 read_only 配置
@@ -654,19 +977,48 @@ class DatabaseManager:
             
             # 优化：对于需要写入的数据库，即使当前是只读操作，也优先创建读写连接池
             # 这样可以避免后续需要写入时关闭只读连接池的代价
-            if is_write_database and read_only and abs_path not in self._read_pools:
+            # 如果已经存在只读连接池，需要先关闭它（因为写入数据库必须使用读写连接池）
+            if is_write_database:
+                if abs_path in self._read_pools:
+                    # 写入数据库已经存在只读连接池，需要关闭它并切换到读写连接池
+                    logger.warning(
+                        f"数据库 {abs_path} 已识别为写入数据库（多进程环境），但已有只读连接池，"
+                        f"正在关闭只读连接池并切换到读写连接池以避免配置冲突"
+                    )
+                    try:
+                        # 关闭只读连接池中的所有连接
+                        read_pool = self._read_pools[abs_path]
+                        read_pool.close_all()
+                        # 等待一小段时间，确保连接真正关闭
+                        time.sleep(0.1)
+                        # 移除只读连接池
+                        del self._read_pools[abs_path]
+                        logger.debug(f"已关闭只读连接池并切换到读写连接池: {abs_path}")
+                    except Exception as e:
+                        logger.warning(f"关闭只读连接池时出错: {e}")
+                        # 即使关闭失败，也尝试删除连接池，避免后续错误
+                        try:
+                            del self._read_pools[abs_path]
+                        except:
+                            pass
+                
                 # 对于需要写入的数据库，直接创建读写连接池（即使是只读操作）
-                logger.debug(
-                    f"数据库 {abs_path} 需要写入操作，只读操作也使用读写连接池，"
-                    f"避免后续切换连接池的代价"
-                )
-                # 创建读写连接池而不是只读连接池
                 if abs_path not in self._write_pools:
+                    logger.debug(
+                        f"数据库 {abs_path} 需要写入操作，只读操作也使用读写连接池，"
+                        f"避免后续切换连接池的代价"
+                    )
                     if self._is_multiprocess:
                         max_connections = 4
                     else:
                         max_connections = 10
-                    self._write_pools[abs_path] = DatabaseConnectionPool(abs_path, max_connections=max_connections)
+                    config_manager = get_config_manager()
+                    self._write_pools[abs_path] = DatabaseConnectionPool(
+                        abs_path, 
+                        max_connections=max_connections,
+                        read_only=False,  # 读写连接池
+                        config_manager=config_manager
+                    )
                     logger.debug(f"创建读写连接池: {abs_path} (最大连接数: {max_connections})")
                 return self._write_pools[abs_path]
             
@@ -717,7 +1069,13 @@ class DatabaseManager:
                         max_connections = base_max_connections
                     
                     # 为每个数据库路径创建独立的只读连接池
-                    self._read_pools[abs_path] = DatabaseConnectionPool(abs_path, max_connections=max_connections)
+                    config_manager = get_config_manager()
+                    self._read_pools[abs_path] = DatabaseConnectionPool(
+                        abs_path, 
+                        max_connections=max_connections,
+                        read_only=True,  # 只读连接池
+                        config_manager=config_manager
+                    )
                     logger.debug(f"创建只读连接池: {abs_path} (最大连接数: {max_connections})")
                 return self._read_pools[abs_path]
             else:
@@ -730,7 +1088,13 @@ class DatabaseManager:
                     else:
                         max_connections = 10  # 单进程环境可以使用更多写连接
                     # 为每个数据库路径创建独立的读写连接池
-                    self._write_pools[abs_path] = DatabaseConnectionPool(abs_path, max_connections=max_connections)
+                    config_manager = get_config_manager()
+                    self._write_pools[abs_path] = DatabaseConnectionPool(
+                        abs_path, 
+                        max_connections=max_connections,
+                        read_only=False,  # 读写连接池
+                        config_manager=config_manager
+                    )
                     logger.debug(f"创建读写连接池: {abs_path} (最大连接数: {max_connections})")
                 return self._write_pools[abs_path]
     
@@ -2143,8 +2507,6 @@ class DatabaseSchemaManager:
     
     def _init_duckdb_stock_tables(self, db_path: str):
         """初始化DuckDB股票数据表结构"""
-        import duckdb
-        
         # 在多进程环境下，如果是子进程，跳过初始化（表结构应该已经在主进程中创建）
         if _MULTIPROCESSING_AVAILABLE:
             current_process = _get_current_process()
@@ -2152,8 +2514,9 @@ class DatabaseSchemaManager:
                 logger.debug(f"子进程 {current_process.name} 跳过表结构初始化（表结构应在主进程中创建）")
                 return
         
-        # 不使用配置参数
-        with duckdb.connect(db_path, read_only=False) as conn:
+        # 通过DatabaseManager的连接池创建连接，避免配置冲突
+        logger.info(f"[数据库初始化] 开始初始化stock_data数据库表结构: {db_path}")
+        with self.db_manager.get_connection(db_path, read_only=False) as conn:
             # 构建指标列定义
             indicator_cols_sql = self._build_indicator_columns_sql()
             
@@ -2297,8 +2660,6 @@ class DatabaseSchemaManager:
     
     def _init_duckdb_details_tables(self, db_path: str):
         """初始化DuckDB股票详情表结构"""
-        import duckdb
-        
         # 在多进程环境下，如果是子进程，跳过初始化（表结构应该已经在主进程中创建）
         if _MULTIPROCESSING_AVAILABLE:
             current_process = _get_current_process()
@@ -2306,53 +2667,27 @@ class DatabaseSchemaManager:
                 logger.debug(f"子进程 {current_process.name} 跳过表结构初始化（表结构应在主进程中创建）")
                 return
         
-        # 通过DatabaseManager的连接池创建连接
-        try:
-            logger.info(f"[数据库初始化] 开始初始化details数据库表结构: {db_path}")
-            # 通过连接管理器创建连接
-            with self.db_manager.get_connection(db_path, read_only=False) as conn:
-                create_table_sql = """
-                CREATE TABLE IF NOT EXISTS stock_details (
-                    ts_code VARCHAR,
-                    ref_date VARCHAR,
-                    score DOUBLE,
-                    tiebreak DOUBLE,
-                    highlights JSON,
-                    drawbacks JSON,
-                    opportunities JSON,
-                    rank INTEGER,
-                    total INTEGER,
-                    rules JSON,
-                    PRIMARY KEY (ts_code, ref_date)
-                )
-                """
-                conn.execute(create_table_sql)
-                logger.info(f"[数据库初始化] stock_details表结构初始化完成: {db_path}")
-        except Exception as e:
-            # 如果通过连接池失败，回退到直连
-            logger.warning(f"通过连接池初始化表结构失败，回退到直连: {e}")
-            try:
-                conn_ctx = duckdb.connect(db_path, read_only=False)
-                with conn_ctx as conn:
-                    create_table_sql = """
-                    CREATE TABLE IF NOT EXISTS stock_details (
-                        ts_code VARCHAR,
-                        ref_date VARCHAR,
-                        score DOUBLE,
-                        tiebreak DOUBLE,
-                        highlights JSON,
-                        drawbacks JSON,
-                        opportunities JSON,
-                        rank INTEGER,
-                        total INTEGER,
-                        rules JSON,
-                        PRIMARY KEY (ts_code, ref_date)
-                    )
-                    """
-                    conn.execute(create_table_sql)
-            except Exception as e2:
-                logger.error(f"直接连接初始化表结构也失败: {e2}")
-                raise
+        # 通过DatabaseManager的连接池创建连接，避免配置冲突
+        logger.info(f"[数据库初始化] 开始初始化details数据库表结构: {db_path}")
+        # 通过连接管理器创建连接，不使用直连避免配置冲突
+        with self.db_manager.get_connection(db_path, read_only=False) as conn:
+            create_table_sql = """
+            CREATE TABLE IF NOT EXISTS stock_details (
+                ts_code VARCHAR,
+                ref_date VARCHAR,
+                score DOUBLE,
+                tiebreak DOUBLE,
+                highlights JSON,
+                drawbacks JSON,
+                opportunities JSON,
+                rank INTEGER,
+                total INTEGER,
+                rules JSON,
+                PRIMARY KEY (ts_code, ref_date)
+            )
+            """
+            conn.execute(create_table_sql)
+            logger.info(f"[数据库初始化] stock_details表结构初始化完成: {db_path}")
     
     def _init_sqlite_details_tables(self, db_path: str):
         """初始化SQLite股票详情表结构"""

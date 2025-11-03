@@ -82,6 +82,7 @@ def compute(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
             continue
 
         tdx_ok = False
+        tdx_error = None
         if meta.tdx:
             try:
                 res = tdx_eval(meta.tdx, out_df)
@@ -96,8 +97,9 @@ def compute(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
                 # 若 TDX 把所有声明列都填好了，就视为成功
                 if filled == len(meta.out):
                     tdx_ok = True
-            except Exception:
+            except Exception as e:
                 tdx_ok = False  # TDX 报错则回退
+                tdx_error = e
 
         # 若 TDX 未成功或未填全 → Python 兜底补齐缺列
         if (not tdx_ok) and meta.py_func:
@@ -114,9 +116,21 @@ def compute(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
                 else:
                     only_col = next(iter(meta.out.keys()))
                     out_df[only_col] = res
-            except Exception:
-                # 保底：兜底也失败就跳过，不阻塞其它指标
-                pass
+            except Exception as e:
+                # 指标计算失败，直接抛出异常以保证数据完整性
+                error_msg = f"指标计算失败: {name}"
+                if tdx_error:
+                    error_msg += f"\n  TDX计算错误: {tdx_error}"
+                error_msg += f"\n  Python计算错误: {e}"
+                raise RuntimeError(error_msg) from e
+        
+        # 如果既没有TDX也没有Python实现，或者TDX失败但没有Python实现，直接报错
+        if not tdx_ok and not meta.py_func:
+            error_msg = f"指标计算失败: {name}"
+            if tdx_error:
+                error_msg += f"\n  TDX计算错误: {tdx_error}"
+            error_msg += "\n  没有可用的Python实现作为兜底"
+            raise RuntimeError(error_msg)
 
     # 应用精度控制
     decs = outputs_for(names)

@@ -20,7 +20,7 @@ DATA_ROOT = os.path.join(BASE_DIR, "stock_data")
 
 # 数据下载配置
 ASSETS = ["stock", "index"]  # 可选: ["stock"], ["index"], ["stock","index"]
-START_DATE = "20250101"
+START_DATE = "20250101"  # 数据下载开始日期 'YYYYMMDD'
 END_DATE = "today"  # today或具体日期 'YYYYMMDD'
 
 # 指数白名单
@@ -77,24 +77,16 @@ UNIFIED_DB_TYPE = "duckdb"  # 推荐使用DuckDB，性能更好
 UNIFIED_DB_PATH = "stock_data.db"
 KEEP_PARQUET_FILES = True  # 是否保留原有Parquet文件（用于迁移和备份）
 
-# DuckDB配置
-DUCKDB_BATCH_SIZE = 300
-DUCKDB_THREADS = 16
-DUCKDB_MEMORY_LIMIT = "18GB"
-DUCKDB_TEMP_DIR = os.path.join(DATA_ROOT, "duckdb_tmp")
-DUCKDB_CLEAR_DAILY_BEFORE = False
-DUCKDB_COLUMNS = "*"
-DUCKDB_ENABLE_COMPACT_AFTER = True
-COMPACT_MAX_FILES_PER_DATE = 12
-COMPACT_TMP_DIR = "compact_tmp"
-DUCK_MERGE_DAY_LAG = 5
-DUCK_MERGE_MIN_ROWS = 1_000_000
+# DuckDB连接配置（由数据库连接配置管理器统一管理）
+DUCKDB_THREADS = 16  # DuckDB使用的线程数（只读连接使用完整线程数，读写连接使用一半）
+DUCKDB_MEMORY_LIMIT = "18GB"  # DuckDB内存限制
+DUCKDB_TEMP_DIR = os.path.join(DATA_ROOT, "duckdb_tmp")  # 临时文件目录
+DUCKDB_CLEAR_DAILY_BEFORE = False  # 是否在写入前清理每日数据
 
-# 数据库连接配置
-DB_POOL_SIZE = 16  # 与 SC_MAX_WORKERS 对齐，避免连接池成为瓶颈
-DB_QUERY_TIMEOUT = 30
-DB_ENABLE_INDEXES = True
-DB_BATCH_SIZE = 1000
+# 数据库连接配置（由数据库连接配置管理器统一应用）
+DB_QUERY_TIMEOUT = 30  # 查询超时时间（秒），读写连接为2倍
+DB_ENABLE_INDEXES = True  # 是否启用索引
+DB_BATCH_SIZE = 1000  # 批处理大小
 
 # 评分系统数据库查询缓存配置
 SC_DB_CACHE_TTL = 900    # 缓存有效期（秒），尽量覆盖一整轮评分时间（默认15分钟）
@@ -157,9 +149,9 @@ SC_LOOKBACK_D = 60     # 打分窗口（日线）
 SC_PRESCREEN_LOOKBACK_D = 180  # 初选窗口（多用于周/月线）
 
 # 评分参数
-SC_BASE_SCORE = 50
-SC_MIN_SCORE = 0
-SC_TOP_K = 100
+SC_BASE_SCORE = 50  # 基础分数
+SC_MIN_SCORE = 0  # 最低分数
+SC_TOP_K = 100  # 输出前K名
 SC_TIE_BREAK = "kdj_j_asc"  # 并列打破：使用 KDJ 的 J 值（越小越靠前）
 
 # 并行与读取优化
@@ -188,8 +180,8 @@ SC_CACHE_DIR = os.path.join(BASE_DIR, "cache", "scorelists")
 SC_DETAIL_STORAGE = "database"     # 存储方式：'json' | 'database' | 'both'
 SC_DETAIL_DB_TYPE = "duckdb"     # 数据库类型：'sqlite' | 'duckdb' | 'postgres'
 SC_DETAIL_DB_PATH = "details/details.db"   # 数据库文件路径（相对于SC_OUTPUT_DIR，postgres模式下忽略）
-SC_USE_DB_STORAGE = True
-SC_DB_FALLBACK_TO_JSON = True
+SC_USE_DB_STORAGE = True  # 是否使用数据库存储
+SC_DB_FALLBACK_TO_JSON = True  # 数据库存储失败时是否回退到JSON
 
 # PostgreSQL 配置
 SC_PG_DSN = "postgresql://postgres:password@localhost:5432/stock_data"  # 通用PostgreSQL连接字符串
@@ -199,7 +191,6 @@ SC_DETAIL_DB_DSN = "postgresql://postgres:password@localhost:5432/stock_details"
 SC_DETAIL_WRITE_MODE = "json_then_import"  # 写入策略: "immediate" | "queued" | "json_then_import"
 # SQLite busy_timeout 毫秒（写锁冲突时的等待时间）
 SC_SQLITE_BUSY_TIMEOUT_MS = 60000
-
 
 # 名单配置
 SC_WRITE_WHITELIST = True   # 写白名单 cache/…/whitelist.csv
@@ -225,8 +216,8 @@ SC_TOPK_ROWS = 30                   # UI：Top-K 显示行数（仅用于前端�
 # ================= 回测配置 =================
 # 策略参数
 HOLD_DAYS = 2                       # 买入持有天数
-STRATEGY_START_DATE = "20220601"
-STRATEGY_END_DATE = "20250801"
+STRATEGY_START_DATE = "20220601"  # 回测开始日期 'YYYYMMDD'
+STRATEGY_END_DATE = "20250801"  # 回测结束日期 'YYYYMMDD'
 MAX_HOLD_DAYS = 60                  # -1 表示不限制持有天数，其他正整数表示最多持有几天
 
 # 交易模式
@@ -235,17 +226,17 @@ SELL_MODE = "other"                 # 可选: "open" | "close" | "strategy" | "o
 FALLBACK_SELL_MODE = "open"         # 超过持有天数后强制卖出的模式
 
 # 数据目录（回测用）
-DATA_DIR = "E://gupiao-hfq"
+DATA_DIR = "E://gupiao-hfq"  # 回测数据目录路径
 
 # TDX规则文件路径
-TDX_BUY_PATH = "./buy_rules.txt"
-TDX_SELL_PATH = "./sell_rules.txt"
-TDX_SELL_OPEN_PATH = "./sell_open_rules.txt"
-TDX_SELL_CLOSE_PATH = "./sell_close_rules.txt"
+TDX_BUY_PATH = "./buy_rules.txt"  # 买入规则文件路径
+TDX_SELL_PATH = "./sell_rules.txt"  # 卖出规则文件路径
+TDX_SELL_OPEN_PATH = "./sell_open_rules.txt"  # 开盘卖出规则文件路径
+TDX_SELL_CLOSE_PATH = "./sell_close_rules.txt"  # 收盘卖出规则文件路径
 
 # ================= 投资组合配置 =================
 # 账本配置
-PF_LEDGER_NAME = "default"
+PF_LEDGER_NAME = "default"  # 账本名称
 
 # 费率配置（以 BP 为单位，1bp = 0.01%）
 PF_FEE_BPS_BUY = 15     # 买入费率
@@ -253,26 +244,8 @@ PF_FEE_BPS_SELL = 15    # 卖出费率
 PF_MIN_FEE = 0.0        # 最低费用（元）
 
 # 资金配置
-PF_INIT_CASH = 1_000_000.0
-PF_INIT_AVAILABLE = PF_INIT_CASH
+PF_INIT_CASH = 1_000_000.0  # 初始资金（元）
+PF_INIT_AVAILABLE = PF_INIT_CASH  # 初始可用资金（元）
 
 # 成交价模式
 PF_TRADE_PRICE_MODE = "next_open"  # 可选: "next_open" | "close"
-
-# ================= 兼容性配置（已废弃，保留用于向后兼容） =================
-# 以下配置项已废弃，建议使用上述新的配置结构
-USE_PARQUET = True  # 已废弃，现在使用统一数据库存储
-PARQUET_BASE = DATA_ROOT  # 已废弃，现在使用DATA_ROOT
-PARQUET_ADJ = API_ADJ  # 已废弃，现在使用API_ADJ
-PARQUET_USE_INDICATORS = True  # 已废弃，现在统一使用指标计算
-PARQUET_ENGINE = "pyarrow"  # 已废弃
-
-# ================= 数据库适配器配置 =================
-# 数据库适配器配置，用于让核心模块兼容新的统一数据库存储
-ENABLE_DATABASE_ADAPTER = True  # 是否启用数据库适配器
-ADAPTER_FALLBACK_TO_PARQUET = False  # 适配器失败时是否回退到Parquet文件（已弃用Parquet）
-ADAPTER_LOG_LEVEL = "INFO"  # 适配器日志级别
-
-# 数据读取配置
-PARQUET_USE_INDICATORS = True  # 使用指标数据
-DATA_BASE = DATA_ROOT  # 数据基础目录

@@ -468,8 +468,10 @@ class DataProcessor:
             return df_with_indicators
             
         except Exception as e:
-            logger.error(f"指标计算失败 {ts_code}: {e}")
-            return df
+            # 指标计算失败影响数据完整性，直接抛出异常
+            error_msg = f"指标计算失败 {ts_code}: {e}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
     
     def _get_historical_data_for_warmup(self, ts_code: str, adj_type: str, 
                                        new_data: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -620,6 +622,20 @@ class StockDownloader:
             
         except Exception as e:
             error_msg = str(e)
+            error_msg_lower = error_msg.lower()
+            
+            # 如果是指标计算或数据库连接/写入错误，影响数据完整性，直接抛出异常
+            if any(keyword in error_msg_lower for keyword in [
+                "指标计算失败", "indicator", "计算失败", "compute",
+                "数据库连接", "database connection", "connection", "connect",
+                "数据库写入", "database write", "写入失败", "write",
+                "数据库错误", "database error", "database", "query",
+                "无法获取", "获取失败", "访问失败"
+            ]):
+                logger.error(f"下载股票数据失败（影响数据完整性）{ts_code}: {error_msg}")
+                raise RuntimeError(f"下载股票数据失败（影响数据完整性）{ts_code}: {error_msg}") from e
+            
+            # 其他错误（如下载失败等）可以返回错误状态，不影响其他股票下载
             with self._lock:
                 self.stats.error_count += 1
                 self.stats.failed_stocks.append((ts_code, error_msg))
@@ -782,6 +798,19 @@ class IndexDownloader:
             
         except Exception as e:
             error_msg = str(e)
+            error_msg_lower = error_msg.lower()
+            
+            # 如果是数据库连接/写入错误，影响数据完整性，直接抛出异常
+            if any(keyword in error_msg_lower for keyword in [
+                "数据库连接", "database connection", "connection", "connect",
+                "数据库写入", "database write", "写入失败", "write",
+                "数据库错误", "database error", "database", "query",
+                "无法获取", "获取失败", "访问失败"
+            ]):
+                logger.error(f"下载指数数据失败（影响数据完整性）{ts_code}: {error_msg}")
+                raise RuntimeError(f"下载指数数据失败（影响数据完整性）{ts_code}: {error_msg}") from e
+            
+            # 其他错误（如下载失败等）可以返回错误状态，不影响其他指数下载
             with self._lock:
                 self.stats.error_count += 1
                 self.stats.failed_stocks.append((ts_code, error_msg))

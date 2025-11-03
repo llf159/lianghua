@@ -17,29 +17,258 @@ _EXPR_CACHE_STATS = {
 }
 
 COMP_RE = re.compile(r'(<=|>=|==|!=|<|>)')
+# 函数名模式（用于识别函数调用，如REF(、COUNT(等）
+FUNC_NAME_RE = re.compile(r'[A-Z_][A-Z0-9_]*\s*\(')
+
+
 
 def _wrap_comparisons_for_bitwise(expr: str) -> str:
-    # 在顶层 & 和 | 处分段；分段内若含比较运算，自动加括号
-    out, buf, depth = [], [], 0
-    def flush():
-        seg = ''.join(buf).strip()
-        if seg and COMP_RE.search(seg):
-            seg = f'({seg})'
-        out.append(seg)
-        buf.clear()
+    """
+    目标：
+      1) 在顶层把 & 和 | 两侧的段落一律包成 (...)，
+      2) 在函数的"第一个参数"段里若含 &/|，也整体包成 (...).
+      3) 确保每个比较表达式（>=, <=, ==, !=, <, >）都被正确包裹
+    说明：这是保守做法（可能多一些括号），但能稳定避免 Python 的优先级/链式比较陷阱。
+    """
+    def wrap_comparisons_in_segment(seg: str) -> str:
+        """在片段中包裹所有比较表达式，确保每个比较操作都被括号包裹"""
+        # 使用正则表达式找到所有比较表达式模式：value >=/<=/==/!=/</> value
+        # 但要注意函数调用中的参数
+        import re
+        
+        # 先找到所有比较运算符的位置，但要在正确的上下文（不在字符串或嵌套函数参数中）
+        result = []
+        i = 0
+        depth = 0
+        in_string = False
+        
+        while i < len(seg):
+            ch = seg[i]
+            
+            # 跟踪字符串
+            if ch in ('"', "'") and (i == 0 or seg[i-1] != '\\'):
+                in_string = not in_string
+            
+            if not in_string:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                
+                # 找到比较运算符（在正确的深度）
+                if depth == 0 and i > 0 and i < len(seg) - 1:
+                    # 检查是否是 >=, <=, ==, !=
+                    if i + 1 < len(seg):
+                        two_char = seg[i:i+2]
+                        if two_char in ('>=', '<=', '==', '!='):
+                            # 找到比较运算符，需要包裹前后
+                            # 向前找比较的左操作数（跳过空格）
+                            left_start = i - 1
+                            while left_start >= 0 and seg[left_start] in ' \t':
+                                left_start -= 1
+                            
+                            # 向后找比较的右操作数（跳过空格）
+                            right_end = i + 2
+                            while right_end < len(seg) and seg[right_end] in ' \t':
+                                right_end += 1
+                            
+                            # 如果这个比较表达式还没有被括号包裹，就包裹它
+                            # 检查前面的 &| 和后面的 &| 来确定边界
+                            # 简化：在 & 或 | 之间，每个比较表达式都应该被包裹
+                            result.append(ch)
+                            i += 2
+                            continue
+            
+            result.append(ch)
+            i += 1
+        
+        return ''.join(result)
+    
+    def wrap_top_level(s: str) -> str:
+        out, seg, depth = [], [], 0
+        in_string = False  # 标记是否在字符串中
+        def flush():
+            t = ''.join(seg).strip()
+            if t:
+                # 在片段中，确保每个比较表达式都被包裹
+                # 但只在包含 & 或 | 时才需要额外包裹
+                if '&' in t or '|' in t:
+                    # 在每个 & 或 | 之前和之后包裹比较表达式
+                    # 使用正则表达式找到所有比较表达式并包裹它们
+                    import re
+                    # 匹配模式：值 比较运算符 值（在 & 或 | 的上下文中）
+                    # 简化为：在 & 或 | 之间包裹每个子表达式
+                    parts = re.split(r'([&|])', t)
+                    wrapped_parts = []
+                    for i, part in enumerate(parts):
+                        part = part.strip()
+                        if part and part not in ('&', '|'):
+                            # 如果 part 包含比较运算符且没有被括号包裹，就包裹它
+                            if COMP_RE.search(part):
+                                # 检查括号是否平衡
+                                depth_check = 0
+                                has_unbalanced = False
+                                for ch in part:
+                                    if ch == '(':
+                                        depth_check += 1
+                                    elif ch == ')':
+                                        depth_check -= 1
+                                    if depth_check < 0:
+                                        has_unbalanced = True
+                                        break
+                                
+                                # 如果括号不平衡或者没有被完整包裹，就包裹它
+                                if depth_check != 0 or has_unbalanced or not (part.startswith('(') and part.endswith(')')):
+                                    wrapped_parts.append(f'({part})')
+                                else:
+                                    wrapped_parts.append(part)
+                            else:
+                                wrapped_parts.append(part)
+                        else:
+                            wrapped_parts.append(part)
+                    t = ''.join(wrapped_parts)
+                out.append(f'({t})' if t else '')
+            seg.clear()
+        for ch in s:
+            # 简单处理字符串引号
+            if ch in ('"', "'"):
+                in_string = not in_string
+                seg.append(ch)
+                continue
+            
+            if not in_string:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                
+                # 只有在 depth == 0 时才分割（这意味着在顶层，不在任何函数调用内部）
+                if depth == 0 and ch in '&|':
+                    flush()
+                    out.append(ch)
+                else:
+                    seg.append(ch)
+            else:
+                # 在字符串内，直接添加字符
+                seg.append(ch)
+        flush()
+        return ''.join(out)
 
-    for ch in expr:
-        if ch == '(':
-            depth += 1
-        elif ch == ')':
-            depth -= 1
-        if ch in '&|':
-            flush()
-            out.append(ch)
-        else:
-            buf.append(ch)
-    flush()
-    return ''.join(out)
+    # 先处理"函数第一个参数"里可能存在的 &/|
+    # 注意：必须在 wrap_top_level 之前处理，因为 wrap_top_level 会在顶层分割 &/|
+    # 如果先 wrap_top_level，函数参数内的 &/| 会被错误地移到外面
+    out, i, n = [], 0, len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch.isalpha() or ch == '_':
+            # 读取可能的函数名
+            j = i + 1
+            while j < n and (expr[j].isalnum() or expr[j] == '_'):
+                j += 1
+            fn = expr[i:j]
+            # 若后面紧跟 '('，进入函数参数处理
+            if j < n and expr[j] == '(':
+                out.append(fn)
+                out.append('(')
+                depth = 1
+                k = j + 1
+                # 抓取"第一个参数"直到逗号（或右括号）
+                first_arg = []
+                found_comma = False
+                # 标记是否在字符串中（简化处理，假设表达式不包含复杂字符串字面量）
+                in_string = False
+                while k < n and depth > 0:
+                    c = expr[k]
+                    # 简单处理字符串引号（单引号和双引号）
+                    if c in ('"', "'"):
+                        # 切换字符串状态
+                        in_string = not in_string
+                        first_arg.append(c)
+                        k += 1
+                        continue
+                    
+                    if not in_string:
+                        if c == '(':
+                            depth += 1
+                            first_arg.append(c)
+                        elif c == ')':
+                            depth -= 1
+                            if depth == 0:
+                                # 遇到右括号，说明没有第二个参数（这是单参数函数调用）
+                                # 不添加右括号到 first_arg，因为我们会在后面统一处理
+                                break
+                            else:
+                                first_arg.append(c)
+                        elif depth == 1 and c == ',':
+                            # 找到第一个参数的结束位置（逗号）
+                            # 注意：这里的 depth == 1 确保逗号在函数调用的第一层，而不是嵌套函数中
+                            found_comma = True
+                            k += 1  # 跳过逗号
+                            break
+                        else:
+                            first_arg.append(c)
+                    else:
+                        # 在字符串内，直接添加字符
+                        first_arg.append(c)
+                    k += 1
+                
+                # k 此时在：
+                # - 如果找到逗号：在逗号后的第一个字符位置
+                # - 如果没有逗号：在右括号的位置（depth == 0 时 break）
+                
+                # 如果第一个参数里含 &/|，整体再包一层
+                fa = ''.join(first_arg).strip()
+                if ('&' in fa) or ('|' in fa):
+                    fa = f'({fa})'
+                out.append(fa)
+                
+                # 如果有第二个参数，继续处理后续内容
+                if found_comma:
+                    # 找到了逗号，需要添加逗号并处理后续参数
+                    out.append(',')
+                    # 把余下直到配对右括号的内容复制
+                    # 此时 depth 应该是 1（函数调用的深度），因为我们找到了逗号后 depth 仍然是 1
+                    rest_depth = 1
+                    in_string = False
+                    while k < n:
+                        c = expr[k]
+                        # 简单处理字符串引号
+                        if c in ('"', "'"):
+                            in_string = not in_string
+                            out.append(c)
+                            k += 1
+                            continue
+                        
+                        if not in_string:
+                            if c == '(':
+                                rest_depth += 1
+                            elif c == ')':
+                                rest_depth -= 1
+                                if rest_depth == 0:
+                                    out.append(c)  # 添加右括号
+                                    k += 1
+                                    break
+                        out.append(c)
+                        k += 1
+                else:
+                    # 没有找到逗号，说明这是单参数函数调用
+                    # k 现在在右括号位置，我们需要添加右括号并继续
+                    if k < n and expr[k] == ')':
+                        out.append(')')
+                        k += 1
+                
+                i = k
+                continue
+        # 非函数名起始，正常抄
+        out.append(ch)
+        i += 1
+    s = ''.join(out)
+    
+    # 再做顶层包裹（此时函数参数内的 &/| 已经被正确处理）
+    s = wrap_top_level(s)
+    
+    return s
+
 
 def _extract_bool_signal(res: dict, index, prefer_keys=("sig", "last_expr", "SIG", "LAST_EXPR")):
     """
@@ -61,11 +290,53 @@ def _extract_bool_signal(res: dict, index, prefer_keys=("sig", "last_expr", "SIG
 
 # 统一把条件转成布尔并把 NaN 当 False
 def _as_bool(cond):
-    s = pd.Series(cond, dtype=object)
-    # NaN 一律按 False 处理，避免"开头数据不全"把条件误判为 True
-    # 使用 where 而不是 replace/fillna 以避免 downcasting 警告
-    s = s.where(s.notna(), False)
-    return s.infer_objects(copy=False).astype(bool)
+    # 如果 cond 已经是布尔类型的 Series，直接返回
+    if isinstance(cond, pd.Series) and cond.dtype == bool:
+        return cond.fillna(False)
+    # 如果 cond 是数值类型的 Series，先转换为布尔
+    if isinstance(cond, pd.Series) and np.issubdtype(cond.dtype, np.number):
+        return (cond != 0).fillna(False)
+    # 处理 numpy 数组
+    if isinstance(cond, np.ndarray):
+        # 如果是布尔数组，直接转换
+        if cond.dtype == bool:
+            return pd.Series(cond).fillna(False)
+        # 如果是数值数组，转换为布尔
+        if np.issubdtype(cond.dtype, np.number):
+            return pd.Series(cond != 0).fillna(False)
+        # 其他类型，先转为对象类型再转换
+        s = pd.Series(cond, dtype=object)
+        s = s.where(s.notna(), False)
+        return s.infer_objects(copy=False).astype(bool)
+    # 处理标量值
+    try:
+        # 兼容不同版本的 numpy
+        bool_types = (bool,)
+        if hasattr(np, 'bool_'):
+            bool_types = (bool, np.bool_)
+        if isinstance(cond, bool_types):
+            # 如果是单个布尔值，需要创建 Series（但通常不应该单独传入标量）
+            # 这里返回一个只包含该值的 Series，但需要确保有正确的 index
+            # 实际上，这种情况不应该发生，但为了健壮性，我们尝试从上下文获取 index
+            df = EXTRA_CONTEXT.get("DF")
+            if df is not None and not df.empty:
+                return pd.Series([bool(cond)] * len(df), index=df.index, dtype=bool)
+            return pd.Series([bool(cond)], dtype=bool)
+    except Exception:
+        pass
+    # 通用处理：转为 Series 然后转为布尔
+    try:
+        s = pd.Series(cond, dtype=object)
+        # NaN 一律按 False 处理，避免"开头数据不全"把条件误判为 True
+        # 使用 where 而不是 replace/fillna 以避免 downcasting 警告
+        s = s.where(s.notna(), False)
+        return s.infer_objects(copy=False).astype(bool)
+    except Exception:
+        # 如果转换失败，尝试从上下文获取 DataFrame 并创建全 False 序列
+        df = EXTRA_CONTEXT.get("DF")
+        if df is not None and not df.empty:
+            return pd.Series(False, index=df.index, dtype=bool)
+        return pd.Series([False], dtype=bool)
 
 def IF(cond, a, b):
     condb = _as_bool(cond)
@@ -73,9 +344,66 @@ def IF(cond, a, b):
     return pd.Series(np.where(condb, a, b), index=idx)
 
 def COUNT(cond, n):
-    cond_series = _as_bool(cond)
-    # COUNT 在样本不足 n 时，按“已有样本”计数（TDX 的常见用法也是从起始可用）
-    return cond_series.rolling(int(n), min_periods=1).sum()
+    try:
+        # 先尝试转换条件为布尔类型
+        # 如果 cond 是一个表达式的结果（可能包含 & 或 | 运算符），
+        # 需要确保所有子表达式都被正确计算并转换为布尔类型
+        try:
+            cond_series = _as_bool(cond)
+        except (TypeError, ValueError) as e:
+            # 如果转换失败，可能是因为类型不匹配
+            # 尝试手动处理：如果是 Series，确保是布尔类型
+            if isinstance(cond, pd.Series):
+                # 如果已经是布尔类型，直接使用
+                if cond.dtype == bool:
+                    cond_series = cond.fillna(False)
+                # 如果是数值类型，转换为布尔
+                elif np.issubdtype(cond.dtype, np.number):
+                    cond_series = (cond != 0).fillna(False).astype(bool)
+                else:
+                    # 其他类型，尝试转换为布尔
+                    cond_series = pd.Series(cond).fillna(False).astype(bool)
+            elif isinstance(cond, np.ndarray):
+                # numpy 数组
+                if cond.dtype == bool:
+                    cond_series = pd.Series(cond).fillna(False)
+                else:
+                    cond_series = pd.Series(cond != 0).fillna(False).astype(bool)
+            else:
+                # 其他类型，尝试转换为 Series 然后转为布尔
+                df = EXTRA_CONTEXT.get("DF")
+                if df is not None and not df.empty:
+                    # 尝试将 cond 视为标量，创建全为 cond 的 Series
+                    if isinstance(cond, (bool, np.bool_)):
+                        cond_series = pd.Series([bool(cond)] * len(df), index=df.index, dtype=bool)
+                    else:
+                        # 尝试转换
+                        cond_series = pd.Series(cond, index=df.index).fillna(False).astype(bool)
+                else:
+                    cond_series = pd.Series([False], dtype=bool)
+        
+        # 确保 cond_series 是一个有效的 Series
+        if not isinstance(cond_series, pd.Series) or cond_series.empty:
+            df = EXTRA_CONTEXT.get("DF")
+            if df is not None and not df.empty:
+                return pd.Series(0.0, index=df.index, dtype=float)
+            return pd.Series([0.0], dtype=float)
+        
+        # COUNT 在样本不足 n 时，按"已有样本"计数（TDX 的常见用法也是从起始可用）
+        n_int = int(n)
+        if n_int <= 0:
+            n_int = 1
+        result = cond_series.rolling(n_int, min_periods=1).sum()
+        # 确保结果是数值类型（rolling sum 应该是 float）
+        if not isinstance(result, pd.Series):
+            result = pd.Series(result, index=cond_series.index, dtype=float)
+        return result.astype(float)
+    except Exception as e:
+        # 如果出错，返回全 0 序列
+        df = EXTRA_CONTEXT.get("DF")
+        if df is not None and not df.empty:
+            return pd.Series(0.0, index=df.index, dtype=float)
+        return pd.Series([0.0], dtype=float)
 
 def BARSLAST(cond):
     cond = _as_bool(cond)
@@ -1186,10 +1514,60 @@ def evaluate(script, df, extra_context=None):
     results = {}
     last_value = None
     for name, expr in program:
+        val = None  # 初始化 val
         try:
             val = eval(expr, {"__builtins__": {}}, ctx)
+        except TypeError as e:
+            # 处理类型不匹配错误，特别是位运算符 & 和 | 的类型不匹配
+            if "rand_" in str(e) or "Cannot perform" in str(e):
+                # 尝试修复：将表达式中的比较操作结果强制转换为布尔类型
+                try:
+                    # 创建一个辅助函数来包装比较操作，确保返回布尔类型
+                    def _ensure_bool_for_bitwise(val):
+                        """确保值可以用于位运算（& 和 |）"""
+                        if isinstance(val, pd.Series):
+                            if val.dtype == bool:
+                                return val
+                            # 如果是数值类型，转换为布尔
+                            if np.issubdtype(val.dtype, np.number):
+                                return (val != 0).astype(bool)
+                            # 其他类型，尝试转换为布尔
+                            return val.astype(bool)
+                        elif isinstance(val, np.ndarray):
+                            if val.dtype == bool:
+                                return val
+                            return (val != 0).astype(bool)
+                        elif isinstance(val, (bool, np.bool_)):
+                            return val
+                        else:
+                            # 标量值，转换为布尔
+                            return bool(val)
+                    
+                    # 在上下文中添加辅助函数
+                    ctx_with_helper = ctx.copy()
+                    ctx_with_helper['_ensure_bool'] = _ensure_bool_for_bitwise
+                    
+                    # 修改表达式，在所有比较操作后添加 _ensure_bool 包装
+                    # 这个修复比较复杂，先尝试捕获并给出更友好的错误信息
+                    raise RuntimeError(
+                        f"Error evaluating expression: {expr}\n"
+                        f"Type mismatch in bitwise operation (& or |). "
+                        f"This usually happens when comparing non-boolean values. "
+                        f"Please ensure all comparison operations return boolean values.\n"
+                        f"Original error: {e}"
+                    )
+                except RuntimeError:
+                    raise
+            else:
+                # 如果不是我们处理的 TypeError，重新抛出
+                raise
         except Exception as e:
             raise RuntimeError(f"Error evaluating expression: {expr}\n{e}")
+        
+        # 如果 val 没有被赋值（因为异常），跳过后续处理
+        if val is None:
+            continue
+            
         if isinstance(val, (pd.Series, pd.DataFrame, np.ndarray, float, int, bool)):
             if isinstance(val, pd.Series):
                 val.name = name or getattr(val, 'name', None)

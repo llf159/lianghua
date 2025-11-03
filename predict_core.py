@@ -1151,7 +1151,10 @@ def simulate_next_day(
                             for c, s in res.items():
                                 sub[str(c)] = s
                     except Exception as e:
-                        logger.debug(f"指标{name}计算失败: {e}")
+                        # 指标计算失败影响数据完整性，直接抛出异常
+                        error_msg = f"指标{name}计算失败（股票{ts}）: {e}"
+                        logger.error(error_msg)
+                        raise RuntimeError(error_msg) from e
                 parts.append(sub)
                 
                 if (i + 1) % 100 == 0:
