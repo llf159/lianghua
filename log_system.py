@@ -179,6 +179,8 @@ class PerformanceLogger:
 
 class DebugLogger:
     """增强的调试日志记录器"""
+    # 类级别集合，跟踪已清除日志的logger（每个进程独立）
+    _cleared_loggers = set()
     
     def __init__(self, name: str, log_dir: str = "log"):
         self.name = name
@@ -193,6 +195,11 @@ class DebugLogger:
         # 队列监听器引用（仅主进程使用）
         self._queue_listener: Optional[logging.handlers.QueueListener] = None
         
+        # 在主进程中清除之前的日志文件（每个logger只清除一次）
+        if _is_main_process() and name not in DebugLogger._cleared_loggers:
+            self._clear_old_logs()
+            DebugLogger._cleared_loggers.add(name)
+        
         # 避免重复添加处理器
         if not self.logger.handlers:
             self._setup_handlers()
@@ -204,6 +211,36 @@ class DebugLogger:
         self._error_count = 0
         self._warning_count = 0
         self._lock = threading.Lock()
+    
+    def _clear_old_logs(self):
+        """清除之前的日志文件（包括备份文件）"""
+        try:
+            # 清除所有与该logger相关的日志文件
+            log_patterns = [
+                f"{self.name}_info.log*",
+                f"{self.name}_prep.log*",
+                f"{self.name}_warning.log*",
+                f"{self.name}_error.log*",
+                f"{self.name}_critical.log*",
+                f"{self.name}_performance.log*",
+                f"{self.name}_debug.log*"
+            ]
+            
+            deleted_count = 0
+            for pattern in log_patterns:
+                for log_file in self.log_dir.glob(pattern):
+                    try:
+                        log_file.unlink()
+                        deleted_count += 1
+                    except Exception as e:
+                        # 如果文件被占用或其他错误，忽略继续处理其他文件
+                        pass
+            
+            if deleted_count > 0:
+                print(f"已清除 {deleted_count} 个旧日志文件: {self.name}")
+        except Exception as e:
+            # 清除失败不影响日志系统初始化
+            pass
     
     def _setup_handlers(self):
         """设置日志处理器"""

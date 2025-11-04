@@ -49,26 +49,65 @@ def ui_cleanup_database_connections():
         return False
 
 def check_database_status():
-    """检查数据库状态"""
+    """检查数据库状态（使用状态文件）"""
     try:
-        # 延迟导入 data_reader，避免启动时立即初始化数据库连接
-        try:
-            from database_manager import get_database_manager
-            # get_database_info 已从 database_manager 导入
-        except ImportError as e:
-            st.error(f"无法导入 database_manager 模块: {e}")
+        from database_manager import check_database_status as check_status
+        from database_manager import get_database_manager
+        
+        # 使用状态文件检查数据库状态
+        result = check_status()
+        
+        if not result.get('status_file_exists', False):
+            st.warning("状态文件不存在，建议生成状态文件")
+            # 回退到原来的检查方式
+            try:
+                from database_manager import get_database_info
+                db_info = get_database_info()
+                manager = get_database_manager()
+                enhanced_stats = manager.get_stats()
+                st.info(f"数据库管理器: {enhanced_stats}")
+                st.info(f"数据库信息: {db_info}")
+            except Exception as e:
+                st.error(f"检查数据库状态失败: {e}")
             return False
         
-        # 获取数据库信息
-        db_info = get_database_info()
+        # 显示状态文件信息
+        status_file_generated_at = result.get('status_file_generated_at', '未知')
+        st.info(f"状态文件生成时间: {status_file_generated_at}")
         
-        # 获取数据库管理器统计信息
-        logger.info("[数据库连接] 开始获取数据库管理器实例")
-        manager = get_database_manager()
-        enhanced_stats = manager.get_stats()
+        # 显示当前状态
+        current_status = result.get('current_status', {})
+        stock_data = current_status.get('stock_data', {})
+        details_data = current_status.get('details_data', {})
         
-        st.info(f"数据库管理器: {enhanced_stats}")
-        st.info(f"数据库信息: {db_info}")
+        # 显示股票数据状态
+        if stock_data.get('database_exists', False):
+            st.success(f"股票数据库: 存在")
+            st.info(f"  - 总记录数: {stock_data.get('total_records', 0)}")
+            st.info(f"  - 股票数量: {stock_data.get('total_stocks', 0)}")
+            adj_types = stock_data.get('adj_types', {})
+            for adj_type, adj_status in adj_types.items():
+                st.info(f"  - {adj_type}: {adj_status.get('min_date', 'N/A')} ~ {adj_status.get('max_date', 'N/A')}")
+        else:
+            st.warning("股票数据库: 不存在")
+        
+        # 显示细节数据状态
+        if details_data.get('database_exists', False):
+            st.success(f"细节数据库: 存在")
+            st.info(f"  - 总记录数: {details_data.get('total_records', 0)}")
+            st.info(f"  - 股票数量: {details_data.get('stock_count', 0)}")
+            if details_data.get('min_date') and details_data.get('max_date'):
+                st.info(f"  - 日期范围: {details_data.get('min_date')} ~ {details_data.get('max_date')}")
+        else:
+            st.warning("细节数据库: 不存在")
+        
+        # 显示差异
+        differences = result.get('differences', {})
+        if differences:
+            st.warning("发现状态差异，建议更新状态文件")
+            st.json(differences)
+        else:
+            st.success("状态文件是最新的")
         
         return True
     except Exception as e:

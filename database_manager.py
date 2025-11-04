@@ -140,13 +140,28 @@ class DatabaseConnectionConfigManager:
             
             self._config = self._load_config()
             self._initialized = True
+            
+            # 记录配置信息，确保子进程也使用相同的配置
+            config_info = f"threads={self._config.get('read', {}).get('threads')}, " \
+                         f"memory_limit={self._config.get('read', {}).get('memory_limit')}, " \
+                         f"temp_directory={self._config.get('read', {}).get('temp_directory')}"
+            
             logger.info(
                 f"数据库连接配置管理器初始化完成 "
-                f"(进程: {process_name}, PID: {process_id})"
+                f"(进程: {process_name}, PID: {process_id}) - 配置: {config_info}"
             )
+            
+            # 如果是子进程，额外记录配置信息以便对比验证
+            if process_name != "MainProcess":
+                logger.info(
+                    f"子进程 {process_name} (PID: {process_id}) 配置验证: "
+                    f"只读配置={self._config.get('read', {})}, "
+                    f"读写配置={self._config.get('write', {})}"
+                )
     
     def _load_config(self) -> Dict[str, Dict[str, Any]]:
         """从config.py加载数据库配置，分别管理只读和读写配置"""
+        logger.info("开始加载数据库连接配置...")
         try:
             from config import (
                 DUCKDB_THREADS,
@@ -158,23 +173,41 @@ class DatabaseConnectionConfigManager:
                 DUCKDB_CLEAR_DAILY_BEFORE,
             )
             
-            # 只读连接配置（优化为并发读取）
+            logger.info(
+                f"从config.py成功导入配置项: "
+                f"DUCKDB_THREADS={DUCKDB_THREADS}, "
+                f"DUCKDB_MEMORY_LIMIT={DUCKDB_MEMORY_LIMIT}, "
+                f"DUCKDB_TEMP_DIR={DUCKDB_TEMP_DIR}, "
+                f"DB_QUERY_TIMEOUT={DB_QUERY_TIMEOUT}, "
+                f"DB_ENABLE_INDEXES={DB_ENABLE_INDEXES}, "
+                f"DB_BATCH_SIZE={DB_BATCH_SIZE}, "
+                f"DUCKDB_CLEAR_DAILY_BEFORE={DUCKDB_CLEAR_DAILY_BEFORE}"
+            )
+            
+            # 注意：DuckDB 要求连接到同一个数据库文件的所有连接必须使用相同的配置参数
+            # 因此，所有连接（只读和读写）都使用相同的配置参数
+            # 使用较大的配置值（只读配置），对读写操作也没有坏处
+            unified_threads = DUCKDB_THREADS  # 统一使用完整线程数
+            unified_memory_limit = DUCKDB_MEMORY_LIMIT
+            unified_temp_dir = DUCKDB_TEMP_DIR
+            
+            # 只读连接配置
             read_config = {
-                'threads': DUCKDB_THREADS,  # 只读连接可以使用更多线程
-                'memory_limit': DUCKDB_MEMORY_LIMIT,
-                'temp_directory': DUCKDB_TEMP_DIR,
+                'threads': unified_threads,
+                'memory_limit': unified_memory_limit,
+                'temp_directory': unified_temp_dir,
                 'query_timeout': DB_QUERY_TIMEOUT,
                 'enable_indexes': DB_ENABLE_INDEXES,
                 'batch_size': DB_BATCH_SIZE,
                 # 只读连接不需要清理配置
             }
             
-            # 读写连接配置（优化为写操作）
+            # 读写连接配置（使用相同的配置参数，避免配置冲突）
             write_config = {
-                'threads': max(4, DUCKDB_THREADS // 2),  # 写操作使用较少线程，避免锁冲突
-                'memory_limit': DUCKDB_MEMORY_LIMIT,
-                'temp_directory': DUCKDB_TEMP_DIR,
-                'query_timeout': DB_QUERY_TIMEOUT * 2,  # 写操作可能需要更长时间
+                'threads': unified_threads,  # 使用相同的线程数，避免配置冲突
+                'memory_limit': unified_memory_limit,
+                'temp_directory': unified_temp_dir,
+                'query_timeout': DB_QUERY_TIMEOUT * 2,  # 写操作可能需要更长时间（用于应用层逻辑）
                 'enable_indexes': DB_ENABLE_INDEXES,
                 'batch_size': DB_BATCH_SIZE,
                 'clear_daily_before': DUCKDB_CLEAR_DAILY_BEFORE,
@@ -185,53 +218,94 @@ class DatabaseConnectionConfigManager:
                 'write': write_config,
             }
             
-            logger.debug(f"加载数据库配置 - 只读: {read_config}, 读写: {write_config}")
+            logger.info(
+                f"数据库配置加载成功 - "
+                f"只读配置: threads={read_config['threads']}, "
+                f"memory_limit={read_config['memory_limit']}, "
+                f"temp_directory={read_config['temp_directory']}, "
+                f"query_timeout={read_config['query_timeout']}s, "
+                f"enable_indexes={read_config['enable_indexes']}, "
+                f"batch_size={read_config['batch_size']}; "
+                f"读写配置: threads={write_config['threads']}, "
+                f"memory_limit={write_config['memory_limit']}, "
+                f"temp_directory={write_config['temp_directory']}, "
+                f"query_timeout={write_config['query_timeout']}s, "
+                f"enable_indexes={write_config['enable_indexes']}, "
+                f"batch_size={write_config['batch_size']}, "
+                f"clear_daily_before={write_config['clear_daily_before']}"
+            )
+            logger.debug(f"完整配置字典: {config}")
             return config
             
         except ImportError as e:
-            logger.warning(f"无法从config导入配置，使用默认配置: {e}")
-            # 使用默认配置
+            logger.warning(
+                f"无法从config模块导入配置，使用默认配置。错误详情: {e} (类型: {type(e).__name__})"
+            )
+            import traceback
+            logger.debug(f"ImportError堆栈跟踪:\n{traceback.format_exc()}")
+            # 使用默认配置（所有连接使用相同的配置参数）
+            unified_threads = 16
+            unified_memory_limit = '18GB'
+            unified_temp_dir = None
             read_config = {
-                'threads': 16,
-                'memory_limit': '18GB',
-                'temp_directory': None,
+                'threads': unified_threads,
+                'memory_limit': unified_memory_limit,
+                'temp_directory': unified_temp_dir,
                 'query_timeout': 30,
                 'enable_indexes': True,
                 'batch_size': 1000,
             }
             write_config = {
-                'threads': 8,
-                'memory_limit': '18GB',
-                'temp_directory': None,
+                'threads': unified_threads,  # 使用相同的线程数
+                'memory_limit': unified_memory_limit,
+                'temp_directory': unified_temp_dir,
                 'query_timeout': 60,
                 'enable_indexes': True,
                 'batch_size': 1000,
                 'clear_daily_before': False,
             }
+            logger.info(
+                f"使用默认配置 - "
+                f"只读配置: threads={read_config['threads']}, "
+                f"memory_limit={read_config['memory_limit']}, "
+                f"temp_directory={read_config['temp_directory']}, "
+                f"query_timeout={read_config['query_timeout']}s; "
+                f"读写配置: threads={write_config['threads']}, "
+                f"memory_limit={write_config['memory_limit']}, "
+                f"query_timeout={write_config['query_timeout']}s"
+            )
             return {
                 'read': read_config,
                 'write': write_config,
             }
         except Exception as e:
-            logger.error(f"加载数据库配置时出错: {e}")
-            # 使用安全的默认配置
+            logger.error(
+                f"加载数据库配置时发生异常: {e} (类型: {type(e).__name__})"
+            )
+            import traceback
+            logger.error(f"异常堆栈跟踪:\n{traceback.format_exc()}")
+            # 使用安全的默认配置（所有连接使用相同的配置参数）
+            unified_threads = 16
+            unified_memory_limit = '18GB'
+            unified_temp_dir = None
             read_config = {
-                'threads': 16,
-                'memory_limit': '18GB',
-                'temp_directory': None,
+                'threads': unified_threads,
+                'memory_limit': unified_memory_limit,
+                'temp_directory': unified_temp_dir,
                 'query_timeout': 30,
                 'enable_indexes': True,
                 'batch_size': 1000,
             }
             write_config = {
-                'threads': 8,
-                'memory_limit': '18GB',
-                'temp_directory': None,
+                'threads': unified_threads,  # 使用相同的线程数
+                'memory_limit': unified_memory_limit,
+                'temp_directory': unified_temp_dir,
                 'query_timeout': 60,
                 'enable_indexes': True,
                 'batch_size': 1000,
                 'clear_daily_before': False,
             }
+            logger.warning("回退到安全默认配置")
             return {
                 'read': read_config,
                 'write': write_config,
@@ -264,40 +338,102 @@ class DatabaseConnectionConfigManager:
             read_only: 是否为只读连接
         """
         config = self.get_connection_config(read_only)
+        mode_str = "只读" if read_only else "读写"
+        logger.info(f"开始应用配置到连接 (模式: {mode_str})")
+        logger.debug(f"配置项: {config}")
         
         try:
             # 应用线程配置
             if 'threads' in config and config['threads']:
-                conn.execute(f"SET threads={config['threads']}")
+                threads_value = config['threads']
+                logger.debug(f"设置线程数: SET threads={threads_value}")
+                conn.execute(f"SET threads={threads_value}")
+                logger.debug(f"线程数设置成功: {threads_value}")
+            else:
+                logger.debug("跳过线程配置（配置项为空或不存在）")
             
             # 应用内存限制
             if 'memory_limit' in config and config['memory_limit']:
-                conn.execute(f"SET memory_limit='{config['memory_limit']}'")
+                memory_limit_value = config['memory_limit']
+                # 转义单引号避免SQL注入（虽然这里是配置值，但为了安全也应该处理）
+                memory_limit_sql = str(memory_limit_value).replace("'", "''")
+                sql_cmd = f"SET memory_limit='{memory_limit_sql}'"
+                logger.debug(f"设置内存限制: {sql_cmd} (原始值: {memory_limit_value})")
+                conn.execute(sql_cmd)
+                logger.debug(f"内存限制设置成功: {memory_limit_value}")
+            else:
+                logger.debug("跳过内存限制配置（配置项为空或不存在）")
             
             # 应用临时目录
             if 'temp_directory' in config and config['temp_directory']:
                 temp_dir = config['temp_directory']
+                logger.debug(f"处理临时目录配置: {temp_dir}")
                 # 确保临时目录存在，如果不存在则创建
                 if temp_dir:
                     try:
+                        logger.debug(f"创建临时目录（如果不存在）: {temp_dir}")
                         os.makedirs(temp_dir, exist_ok=True)
-                        conn.execute(f"SET temp_directory='{temp_dir}'")
+                        # 检查目录是否存在且可写
+                        if not os.path.exists(temp_dir):
+                            raise RuntimeError(f"临时目录创建失败: {temp_dir}")
+                        if not os.access(temp_dir, os.W_OK):
+                            raise RuntimeError(f"临时目录不可写: {temp_dir}")
+                        logger.debug(f"临时目录验证成功: {temp_dir}")
+                        
+                        # 将Windows路径的反斜杠转换为正斜杠，并转义单引号避免SQL注入
+                        # DuckDB接受正斜杠路径，即使在Windows上
+                        temp_dir_original = temp_dir
+                        temp_dir_sql = temp_dir.replace('\\', '/').replace("'", "''")
+                        sql_cmd = f"SET temp_directory='{temp_dir_sql}'"
+                        logger.debug(
+                            f"设置临时目录: {sql_cmd} "
+                            f"(原始路径: {temp_dir_original}, SQL路径: {temp_dir_sql})"
+                        )
+                        conn.execute(sql_cmd)
+                        logger.info(f"临时目录设置成功: {temp_dir_original} -> {temp_dir_sql}")
                     except Exception as dir_error:
-                        logger.warning(f"无法创建或使用临时目录 {temp_dir}: {dir_error}")
+                        logger.warning(
+                            f"无法创建或使用临时目录 {temp_dir}: "
+                            f"{dir_error} (类型: {type(dir_error).__name__})"
+                        )
+                        import traceback
+                        logger.debug(f"临时目录错误堆栈跟踪:\n{traceback.format_exc()}")
+                else:
+                    logger.debug("临时目录配置为空，跳过")
+            else:
+                logger.debug("跳过临时目录配置（配置项为空或不存在）")
             
-            # 应用查询超时
-            if 'query_timeout' in config and config['query_timeout']:
-                conn.execute(f"SET query_timeout={config['query_timeout']}")
+            # 注意：DuckDB 不支持 query_timeout 配置参数
+            # 查询超时应该通过应用层的超时机制来控制
+            # 配置字典中的 query_timeout 保留用于应用层逻辑，但不在此处设置
+            if 'query_timeout' in config:
+                logger.debug(
+                    f"query_timeout配置值: {config['query_timeout']}s "
+                    f"(注意: DuckDB不支持此配置，由应用层控制)"
+                )
             
             # 应用索引配置（如果支持）
             if 'enable_indexes' in config:
                 # DuckDB默认启用索引，这里主要用于记录配置状态
-                pass
+                logger.debug(f"索引配置: enable_indexes={config['enable_indexes']} (DuckDB默认启用)")
             
-            logger.debug(f"已应用配置到连接: {config}")
+            if 'batch_size' in config:
+                logger.debug(f"批处理大小配置: batch_size={config['batch_size']} (应用层使用)")
+            
+            logger.info(f"配置应用到连接成功 (模式: {mode_str})")
+            logger.debug(f"完整应用的配置: {config}")
             
         except Exception as e:
-            logger.warning(f"应用配置到连接时出错（部分配置可能未生效）: {e}")
+            # 配置应用失败必须抛出异常，避免配置不一致的连接被使用
+            import traceback
+            error_detail = (
+                f"应用配置到连接时出错 (模式: {mode_str}): "
+                f"{e} (类型: {type(e).__name__})"
+            )
+            logger.error(error_detail)
+            logger.error(f"配置应用错误堆栈跟踪:\n{traceback.format_exc()}")
+            logger.error(f"当前配置: {config}")
+            raise RuntimeError(f"配置应用失败: {e}") from e
     
     def get_config_summary(self, read_only: bool = None) -> str:
         """获取配置摘要（用于日志和调试）
@@ -457,27 +593,59 @@ class DatabaseConnectionPool:
         # 如果连接失败（配置冲突、数据库锁定等），直接抛出异常
         try:
             # 使用连接池的配置管理器（已在初始化时传入或获取单例）
-            # 注意：使用连接池的 read_only 模式，而不是参数中的 read_only
-            # 这样可以确保连接池中所有连接使用相同的配置模式
+            # 注意：DuckDB要求所有连接到同一个数据库的连接必须使用相同的配置
+            # 因此，我们使用统一的配置（基于连接池的模式），确保所有连接配置一致
             pool_read_only = self.read_only
             
-            # 创建连接（先创建基础连接）
+            # 先获取配置，确保配置已加载
+            config = self._config_manager.get_connection_config(read_only=pool_read_only)
+            
+            # 创建连接
             conn = duckdb.connect(self.db_path, read_only=use_read_only)
             
-            # 应用统一配置到连接（使用连接池的模式）
+            # 立即应用统一配置到连接（必须在连接创建后立即应用，确保配置一致性）
+            # 注意：配置应用失败会导致连接配置不一致，必须关闭连接并抛出异常
+            logger.debug(
+                f"准备应用配置到新创建的连接 (进程: {process_name}, PID: {process_id}, "
+                f"连接池模式: {'只读' if pool_read_only else '读写'}, "
+                f"数据库路径: {self.db_path})"
+            )
             try:
                 self._config_manager.apply_config_to_connection(conn, read_only=pool_read_only)
                 # 记录进程信息，确保子进程也使用统一配置
+                config_summary = self._config_manager.get_config_summary(read_only=pool_read_only)
+                logger.info(
+                    f"配置应用成功 (进程: {process_name}, PID: {process_id}, "
+                    f"连接池模式: {'只读' if pool_read_only else '读写'}, "
+                    f"数据库: {self.db_path}): {config_summary}"
+                )
                 logger.debug(
-                    f"已应用统一配置到连接(进程: {process_name}, PID: {process_id}, "
-                    f"连接池模式: {'只读' if pool_read_only else '读写'}): "
-                    f"{self._config_manager.get_config_summary(read_only=pool_read_only)}"
+                    f"完整配置详情 (进程: {process_name}, PID: {process_id}): "
+                    f"{config_summary}"
                 )
             except Exception as config_error:
-                # 配置应用失败不应该阻止连接创建，但需要记录警告
-                logger.warning(
-                    f"应用配置到连接时出错（连接已创建但配置可能未完全生效）: {config_error}"
+                # 配置应用失败必须关闭连接并抛出异常，避免配置不一致的连接被使用
+                import traceback
+                logger.error(
+                    f"配置应用失败，开始关闭连接 (进程: {process_name}, PID: {process_id})"
                 )
+                try:
+                    conn.close()
+                    logger.debug("连接已关闭")
+                except Exception as close_error:
+                    logger.warning(f"关闭连接时出错: {close_error}")
+                error_msg = (
+                    f"应用配置到连接失败 -> {self.db_path}\n"
+                    f"  进程: {process_name} (PID: {process_id})\n"
+                    f"  连接池模式: {'只读' if pool_read_only else '读写'}\n"
+                    f"  连接对象: {conn} (ID: {id(conn)})\n"
+                    f"  错误类型: {type(config_error).__name__}\n"
+                    f"  错误信息: {config_error}\n"
+                    f"  已关闭连接以避免配置不一致"
+                )
+                logger.error(error_msg)
+                logger.error(f"配置应用失败堆栈跟踪:\n{traceback.format_exc()}")
+                raise RuntimeError(f"配置应用失败: {config_error}") from config_error
             
             # 记录连接创建时间和类型
             conn_id = id(conn)
@@ -487,9 +655,15 @@ class DatabaseConnectionPool:
             self._connection_types[conn_id] = read_only
             
             self._stats['total_created'] += 1
+            logger.info(
+                f"数据库连接创建成功: {self.db_path} "
+                f"(连接ID: {conn_id}, 进程: {process_name}, PID: {process_id}, "
+                f"只读: {use_read_only}, 连接池模式: {'只读' if pool_read_only else '读写'})"
+            )
             logger.debug(
-                f"创建新数据库连接成功: {self.db_path} "
-                f"(进程: {process_name}, PID: {process_id}, 只读: {use_read_only})"
+                f"连接统计: 总创建数={self._stats['total_created']}, "
+                f"当前活跃连接数={len(self._active_connections)}, "
+                f"连接池大小={self.max_connections}"
             )
             return conn
             
@@ -799,6 +973,13 @@ class DatabaseManager:
         self._cache_max_size = 100  # 最大缓存条目数
         self._cache_ttl = 300  # 缓存生存时间（秒）
         
+        # 状态文件管理（合并自 database_status）
+        try:
+            from config import DATA_ROOT
+            self._status_file_path = os.path.join(DATA_ROOT, "database_status.json")
+        except ImportError:
+            self._status_file_path = None
+        
         # 启动工作线程
         self._start_workers()
         
@@ -951,20 +1132,19 @@ class DatabaseManager:
         
         # 判断数据库是否需要写入操作
         # details.db 总是需要写入
-        # 在多进程环境下，stock_data.db 也需要写入（子进程下载时会写入），
-        #   为了避免配置冲突（read_only=True vs read_only=False），统一使用 read_only=False
+        # stock_data.db 在下载场景下也需要写入，为了避免配置冲突，统一使用 read_only=False
+        # 注意：下载模块总是需要写入，所以stock_data.db应该识别为写入数据库
         db_path_lower = abs_path.lower().replace('\\', '/')
         is_write_database = 'details' in db_path_lower or 'detail' in db_path_lower
         
-        # 在多进程环境下，stock_data.db 也识别为写入数据库
-        # 这样可以避免主进程创建 read_only=True 连接，子进程创建 read_only=False 连接的配置冲突
-        if self._is_multiprocess:
-            if 'stock_data' in db_path_lower and db_path_lower.endswith('.db'):
-                is_write_database = True
-                logger.debug(
-                    f"多进程环境：数据库 {abs_path} 识别为写入数据库，"
-                    f"所有连接将使用 read_only=False 以避免配置冲突"
-                )
+        # stock_data.db 识别为写入数据库（因为下载场景总是需要写入）
+        # 这样可以避免先创建 read_only=True 连接池，后续需要写入时关闭只读连接池的配置冲突
+        if 'stock_data' in db_path_lower and db_path_lower.endswith('.db'):
+            is_write_database = True
+            logger.debug(
+                f"数据库 {abs_path} 识别为写入数据库（stock_data.db），"
+                f"所有连接将使用 read_only=False 以避免配置冲突"
+            )
         
         with self._lock:
             # DuckDB 限制：同一个数据库文件的所有连接必须使用相同的 read_only 配置
@@ -988,9 +1168,23 @@ class DatabaseManager:
                     try:
                         # 关闭只读连接池中的所有连接
                         read_pool = self._read_pools[abs_path]
+                        # 检查是否有活跃连接
+                        active_count = read_pool._stats.get('active_count', 0)
+                        if active_count > 0:
+                            logger.warning(
+                                f"只读连接池有 {active_count} 个活跃连接，等待释放..."
+                            )
+                            # 等待活跃连接完成（最多等待3秒）
+                            max_wait = 3.0
+                            wait_start = time.time()
+                            while active_count > 0 and (time.time() - wait_start) < max_wait:
+                                time.sleep(0.2)
+                                active_count = read_pool._stats.get('active_count', 0)
+                        
+                        # 关闭连接池
                         read_pool.close_all()
-                        # 等待一小段时间，确保连接真正关闭
-                        time.sleep(0.1)
+                        # 等待更长时间，确保DuckDB连接真正关闭（至少1秒）
+                        time.sleep(1.0)
                         # 移除只读连接池
                         del self._read_pools[abs_path]
                         logger.debug(f"已关闭只读连接池并切换到读写连接池: {abs_path}")
@@ -1001,6 +1195,8 @@ class DatabaseManager:
                             del self._read_pools[abs_path]
                         except:
                             pass
+                        # 等待一段时间，让DuckDB释放连接
+                        time.sleep(1.0)
                 
                 # 对于需要写入的数据库，直接创建读写连接池（即使是只读操作）
                 if abs_path not in self._write_pools:
@@ -1024,18 +1220,55 @@ class DatabaseManager:
             
             # 如果需要读写连接，但已有只读连接池，必须先关闭只读连接池
             if not read_only and abs_path in self._read_pools:
+                read_pool = self._read_pools[abs_path]
+                # 检查只读连接池是否有活跃连接
+                active_count = read_pool._stats.get('active_count', 0)
+                if active_count > 0:
+                    logger.warning(
+                        f"数据库 {abs_path} 已有只读连接池，且有 {active_count} 个活跃连接正在使用，"
+                        f"需要等待这些连接释放后才能切换到读写连接池"
+                    )
+                    # 尝试关闭只读连接池，但如果有活跃连接，关闭可能会失败
+                    # 这里等待一段时间，让活跃连接完成
+                    max_wait = 5.0  # 最多等待5秒
+                    wait_start = time.time()
+                    while active_count > 0 and (time.time() - wait_start) < max_wait:
+                        time.sleep(0.1)
+                        active_count = read_pool._stats.get('active_count', 0)
+                    
+                    if active_count > 0:
+                        logger.error(
+                            f"数据库 {abs_path} 只读连接池仍有 {active_count} 个活跃连接，"
+                            f"无法切换到读写连接池。可能原因：排名操作正在使用只读连接。"
+                            f"请等待排名操作完成后再进行下载。"
+                        )
+                        raise RuntimeError(
+                            f"无法获取读写连接：只读连接池仍有 {active_count} 个活跃连接在使用。"
+                            f"请等待只读操作完成后再尝试写入。"
+                        )
+                
                 logger.warning(
                     f"数据库 {abs_path} 已有只读连接池，需要读写连接，"
                     f"正在关闭只读连接池并创建读写连接池"
                 )
                 try:
                     # 关闭只读连接池中的所有连接
-                    read_pool = self._read_pools[abs_path]
                     read_pool.close_all()
+                    # 等待更长时间，确保DuckDB连接真正关闭（至少1秒）
+                    time.sleep(1.0)
                     # 移除只读连接池
                     del self._read_pools[abs_path]
+                    logger.debug(f"已成功关闭只读连接池并切换到读写连接池: {abs_path}")
                 except Exception as e:
-                    logger.warning(f"关闭只读连接池时出错: {e}")
+                    logger.error(f"关闭只读连接池时出错: {e}")
+                    # 如果关闭失败，尝试强制删除连接池引用，但可能会有问题
+                    try:
+                        del self._read_pools[abs_path]
+                    except:
+                        pass
+                    # 等待一段时间，让DuckDB释放连接
+                    time.sleep(1.0)
+                    raise RuntimeError(f"无法关闭只读连接池以切换到读写模式: {e}")
             
             # 根据 read_only 参数选择相应的连接池
             if read_only:
@@ -1677,24 +1910,47 @@ class DatabaseManager:
                 from config import DATA_ROOT, UNIFIED_DB_PATH
                 db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
             
+            logger.debug(f"[get_latest_trade_date] 开始查询最新交易日，数据库路径: {db_path}")
+            
             if not os.path.exists(db_path):
-                logger.warning(f"数据库文件不存在: {db_path}")
+                logger.warning(f"[get_latest_trade_date] 数据库文件不存在: {db_path}")
                 return None
             
             # 只查询最新日期，避免全表扫描
             sql = "SELECT MAX(trade_date) as max_date FROM stock_data LIMIT 1"
-            df = self.execute_sync_query(db_path, sql, [], timeout=30.0)
+            logger.debug(f"[get_latest_trade_date] 执行SQL查询: {sql}")
             
-            if not df.empty and "max_date" in df.columns and df["max_date"].iloc[0] is not None:
-                latest_date = str(df["max_date"].iloc[0])
-                logger.debug(f"从数据库获取最新交易日: {latest_date}")
-                return latest_date
+            try:
+                df = self.execute_sync_query(db_path, sql, [], timeout=30.0)
+                logger.debug(f"[get_latest_trade_date] 查询返回DataFrame: 行数={len(df)}, 列={list(df.columns) if not df.empty else 'empty'}")
+            except Exception as query_error:
+                logger.error(f"[get_latest_trade_date] SQL查询执行失败: {query_error}")
+                logger.error(f"[get_latest_trade_date] 查询失败详情: {type(query_error).__name__}: {str(query_error)}")
+                import traceback
+                logger.debug(f"[get_latest_trade_date] 查询失败堆栈: {traceback.format_exc()}")
+                return None
             
-            logger.debug("数据库为空或无交易日数据")
+            if not df.empty and "max_date" in df.columns:
+                max_date_value = df["max_date"].iloc[0]
+                if max_date_value is not None and pd.notna(max_date_value):
+                    latest_date = str(max_date_value)
+                    logger.info(f"[get_latest_trade_date] 成功获取最新交易日: {latest_date}")
+                    return latest_date
+                else:
+                    logger.debug(f"[get_latest_trade_date] max_date值为None或NaN: {max_date_value}")
+            else:
+                if df.empty:
+                    logger.debug(f"[get_latest_trade_date] 查询返回空DataFrame")
+                else:
+                    logger.debug(f"[get_latest_trade_date] DataFrame中无'max_date'列，列名: {list(df.columns)}")
+            
+            logger.info("[get_latest_trade_date] 数据库为空或无交易日数据")
             return None
             
         except Exception as e:
-            logger.error(f"从数据库获取最新交易日失败: {e}")
+            logger.error(f"[get_latest_trade_date] 获取最新交易日失败: {e}")
+            import traceback
+            logger.error(f"[get_latest_trade_date] 异常堆栈: {traceback.format_exc()}")
             return None
     
     def get_trade_dates(self, db_path: str = None) -> List[str]:
@@ -1796,7 +2052,12 @@ class DatabaseManager:
                     
                     if today_is_trading:
                         # 今天开盘，根据时间判断
-                        if now.hour < 15:  # 15点前，使用前一个交易日
+                        # 使用15:00作为判断标准（15:00是收盘时间，15:00之前使用前一天，15:00及之后使用今天）
+                        current_time = now.hour * 100 + now.minute  # 转换为HHMM格式便于比较
+                        cutoff_time = 1500  # 15:00
+                        
+                        if current_time < cutoff_time:
+                            # 15点前（即14:59及之前），使用前一个交易日
                             # 找到今天之前的最后一个交易日
                             prev_trading_day = None
                             for day in reversed(trading_days_list):
@@ -1805,13 +2066,14 @@ class DatabaseManager:
                                     break
                             
                             if prev_trading_day:
-                                logger.debug(f"[SMART] 收盘前运行，使用前一个交易日: {prev_trading_day}")
+                                logger.debug(f"[SMART] 收盘前运行 (当前时间: {now.hour:02d}:{now.minute:02d})，使用前一个交易日: {prev_trading_day}")
                                 return prev_trading_day
                             else:
                                 logger.warning(f"[SMART] 未找到前一个交易日，使用今天: {today_str}")
                                 return today_str
                         else:
-                            logger.debug(f"[SMART] 收盘后运行，使用今天: {today_str}")
+                            # 15:00及之后，使用今天
+                            logger.debug(f"[SMART] 收盘后运行 (当前时间: {now.hour:02d}:{now.minute:02d})，使用今天: {today_str}")
                             return today_str
                     else:
                         # 今天不开盘，使用最近的交易日
@@ -2240,8 +2502,8 @@ class DatabaseManager:
         except Exception:
             return False
     
-    def get_database_info(self, db_path: str = None) -> Dict[str, Any]:
-        """获取数据库信息（优化版 - 只查询最新日期，不统计股票数量）"""
+    def get_database_info(self, db_path: str = None, use_cache: bool = True) -> Dict[str, Any]:
+        """获取数据库信息（优先使用状态文件缓存，优化版 - 只查询最新日期，不统计股票数量）"""
         try:
             if db_path is None:
                 from config import DATA_ROOT, UNIFIED_DB_PATH
@@ -2258,6 +2520,46 @@ class DatabaseManager:
             
             if not info["exists"]:
                 return info
+            
+            # 优先从状态文件读取
+            if use_cache:
+                try:
+                    saved_status = self.load_status_file()
+                    
+                    if saved_status and "stock_data" in saved_status:
+                        stock_data_status = saved_status["stock_data"]
+                        # 验证数据库路径是否匹配
+                        if stock_data_status.get("database_path") == db_path:
+                            # 从状态文件获取信息
+                            info["exists"] = stock_data_status.get("database_exists", False)
+                            info["stock_count"] = stock_data_status.get("total_stocks", 0)
+                            
+                            # 获取日期范围（从复权类型中获取最大日期）
+                            adj_types = stock_data_status.get("adj_types", {})
+                            max_date = None
+                            for adj_type, adj_status in adj_types.items():
+                                adj_max_date = adj_status.get("max_date")
+                                if adj_max_date:
+                                    if max_date is None or adj_max_date > max_date:
+                                        max_date = adj_max_date
+                            
+                            if max_date:
+                                info["date_range"]["end"] = max_date
+                            
+                            # 获取文件大小
+                            try:
+                                info["size"] = os.path.getsize(db_path)
+                            except Exception:
+                                pass
+                            
+                            # 从状态文件推断表列表
+                            if stock_data_status.get("database_exists"):
+                                info["tables"] = ["stock_data"]  # 通常都有这个表
+                            
+                            logger.debug("从状态文件缓存获取数据库信息")
+                            return info
+                except Exception as cache_error:
+                    logger.debug(f"从状态文件读取失败，回退到数据库查询: {cache_error}")
             
             # 获取文件大小
             try:
@@ -2306,6 +2608,524 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"获取数据源状态失败: {e}")
             return {"error": str(e)}
+    
+    # ========== 状态管理方法（合并自 DatabaseStatusManager） ==========
+    
+    def get_status_file_path(self) -> Optional[str]:
+        """获取状态文件路径"""
+        return self._status_file_path
+    
+    def set_status_file_path(self, status_file_path: Optional[str] = None):
+        """设置状态文件路径"""
+        if status_file_path is None:
+            try:
+                from config import DATA_ROOT
+                status_file_path = os.path.join(DATA_ROOT, "database_status.json")
+            except ImportError:
+                status_file_path = None
+        self._status_file_path = status_file_path
+    
+    def get_stock_data_status(self, use_cache: bool = True) -> Dict[str, Any]:
+        """
+        获取股票数据状态（优先使用状态文件缓存）
+        
+        Args:
+            use_cache: 是否优先使用状态文件缓存，默认为True
+            
+        Returns:
+            包含股票数据状态的字典
+        """
+        try:
+            from config import DATA_ROOT, UNIFIED_DB_PATH, API_ADJ
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            
+            # 优先从状态文件读取
+            if use_cache and self._status_file_path:
+                saved_status = self.load_status_file()
+                if saved_status and "stock_data" in saved_status:
+                    cached_status = saved_status["stock_data"]
+                    # 验证数据库路径是否匹配
+                    if cached_status.get("database_path") == db_path:
+                        # 检查数据库文件是否存在（如果状态文件显示不存在，但文件实际存在，需要重新查询）
+                        db_exists = os.path.exists(db_path)
+                        if cached_status.get("database_exists") == db_exists:
+                            logger.debug("从状态文件缓存获取股票数据状态")
+                            return cached_status
+            
+            # 状态文件不存在或需要刷新，从数据库读取
+            logger.debug("从数据库读取股票数据状态")
+            status = {
+                "database_path": db_path,
+                "database_exists": os.path.exists(db_path),
+                "adj_types": {},
+                "last_update": None
+            }
+            
+            if not status["database_exists"]:
+                logger.warning(f"股票数据数据库不存在: {db_path}")
+                return status
+            
+            # 获取所有复权类型
+            sql = "SELECT DISTINCT adj_type FROM stock_data ORDER BY adj_type"
+            df = self.execute_sync_query(db_path, sql, [], timeout=30.0)
+            
+            if df.empty:
+                logger.warning("股票数据表中没有数据")
+                return status
+            
+            adj_types = df["adj_type"].tolist()
+            
+            # 为每个复权类型获取详细信息
+            for adj_type in adj_types:
+                adj_status = self._get_adj_type_status(db_path, adj_type)
+                status["adj_types"][adj_type] = adj_status
+            
+            # 获取整体统计信息
+            total_sql = "SELECT COUNT(*) as total FROM stock_data"
+            total_df = self.execute_sync_query(db_path, total_sql, [], timeout=30.0)
+            if not total_df.empty:
+                status["total_records"] = int(total_df["total"].iloc[0])
+            
+            # 获取所有股票代码
+            all_stocks_sql = "SELECT DISTINCT ts_code FROM stock_data"
+            all_stocks_df = self.execute_sync_query(db_path, all_stocks_sql, [], timeout=60.0)
+            if not all_stocks_df.empty:
+                status["total_stocks"] = len(all_stocks_df)
+            
+            status["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            return status
+            
+        except Exception as e:
+            logger.error(f"获取股票数据状态失败: {e}")
+            return {
+                "database_path": None,
+                "database_exists": False,
+                "error": str(e),
+                "adj_types": {},
+                "last_update": None
+            }
+    
+    def _get_adj_type_status(self, db_path: str, adj_type: str) -> Dict[str, Any]:
+        """
+        获取特定复权类型的状态
+        
+        Args:
+            db_path: 数据库路径
+            adj_type: 复权类型
+            
+        Returns:
+            包含该复权类型状态的字典
+        """
+        try:
+            # 获取日期范围
+            date_range_sql = """
+                SELECT 
+                    MIN(trade_date) as min_date,
+                    MAX(trade_date) as max_date,
+                    COUNT(*) as total_records,
+                    COUNT(DISTINCT ts_code) as stock_count
+                FROM stock_data 
+                WHERE adj_type = ?
+            """
+            df = self.execute_sync_query(db_path, date_range_sql, [adj_type], timeout=30.0)
+            
+            if df.empty:
+                return {
+                    "min_date": None,
+                    "max_date": None,
+                    "total_records": 0,
+                    "stock_count": 0
+                }
+            
+            row = df.iloc[0]
+            return {
+                "min_date": str(row["min_date"]) if row["min_date"] else None,
+                "max_date": str(row["max_date"]) if row["max_date"] else None,
+                "total_records": int(row["total_records"]),
+                "stock_count": int(row["stock_count"])
+            }
+            
+        except Exception as e:
+            logger.error(f"获取复权类型 {adj_type} 状态失败: {e}")
+            return {
+                "min_date": None,
+                "max_date": None,
+                "total_records": 0,
+                "stock_count": 0,
+                "error": str(e)
+            }
+    
+    def get_details_data_status(self, use_cache: bool = True) -> Dict[str, Any]:
+        """
+        获取细节数据状态（优先使用状态文件缓存）
+        
+        Args:
+            use_cache: 是否优先使用状态文件缓存，默认为True
+            
+        Returns:
+            包含细节数据状态的字典
+        """
+        try:
+            from config import SC_OUTPUT_DIR, SC_DETAIL_DB_TYPE, SC_DETAIL_DB_PATH
+            
+            if SC_DETAIL_DB_TYPE == "duckdb":
+                db_path = os.path.join(SC_OUTPUT_DIR, 'details', 'details.db')
+            else:
+                db_path = os.path.join(SC_OUTPUT_DIR, SC_DETAIL_DB_PATH)
+            
+            db_path = os.path.abspath(db_path)
+            
+            # 优先从状态文件读取
+            if use_cache and self._status_file_path:
+                saved_status = self.load_status_file()
+                if saved_status and "details_data" in saved_status:
+                    cached_status = saved_status["details_data"]
+                    # 验证数据库路径是否匹配
+                    if cached_status.get("database_path") == db_path:
+                        # 检查数据库文件是否存在（如果状态文件显示不存在，但文件实际存在，需要重新查询）
+                        db_exists = os.path.exists(db_path)
+                        if cached_status.get("database_exists") == db_exists:
+                            logger.debug("从状态文件缓存获取细节数据状态")
+                            return cached_status
+            
+            # 状态文件不存在或需要刷新，从数据库读取
+            logger.debug("从数据库读取细节数据状态")
+            status = {
+                "database_path": db_path,
+                "database_exists": os.path.exists(db_path),
+                "min_date": None,
+                "max_date": None,
+                "total_records": 0,
+                "stock_count": 0,
+                "last_update": None
+            }
+            
+            if not status["database_exists"]:
+                logger.warning(f"细节数据数据库不存在: {db_path}")
+                return status
+            
+            # 获取日期范围和统计信息
+            stats_sql = """
+                SELECT 
+                    MIN(ref_date) as min_date,
+                    MAX(ref_date) as max_date,
+                    COUNT(*) as total_records,
+                    COUNT(DISTINCT ts_code) as stock_count
+                FROM stock_details
+            """
+            df = self.execute_sync_query(db_path, stats_sql, [], timeout=30.0)
+            
+            if not df.empty:
+                row = df.iloc[0]
+                status["min_date"] = str(row["min_date"]) if row["min_date"] else None
+                status["max_date"] = str(row["max_date"]) if row["max_date"] else None
+                status["total_records"] = int(row["total_records"])
+                status["stock_count"] = int(row["stock_count"])
+            
+            status["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            return status
+            
+        except Exception as e:
+            logger.error(f"获取细节数据状态失败: {e}")
+            return {
+                "database_path": None,
+                "database_exists": False,
+                "error": str(e),
+                "min_date": None,
+                "max_date": None,
+                "total_records": 0,
+                "stock_count": 0,
+                "last_update": None
+            }
+    
+    def generate_status_file(self) -> Dict[str, Any]:
+        """
+        生成状态文件（从数据库读取最新状态）
+        
+        Returns:
+            包含完整状态的字典
+        """
+        if not self._status_file_path:
+            raise ValueError("状态文件路径未设置")
+        
+        logger.info("开始生成数据库状态文件...")
+        
+        # 生成状态文件时，不使用缓存，从数据库读取最新状态
+        status = {
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "stock_data": self.get_stock_data_status(use_cache=False),
+            "details_data": self.get_details_data_status(use_cache=False)
+        }
+        
+        # 确保目录存在
+        status_dir = os.path.dirname(self._status_file_path)
+        if status_dir:
+            os.makedirs(status_dir, exist_ok=True)
+        
+        # 写入文件
+        try:
+            with open(self._status_file_path, 'w', encoding='utf-8') as f:
+                json.dump(status, f, ensure_ascii=False, indent=2)
+            
+            logger.info(f"数据库状态文件已生成: {self._status_file_path}")
+            return status
+            
+        except Exception as e:
+            logger.error(f"写入状态文件失败: {e}")
+            raise
+    
+    def load_status_file(self) -> Optional[Dict[str, Any]]:
+        """
+        加载状态文件
+        
+        Returns:
+            状态字典，如果文件不存在则返回None
+        """
+        if not self._status_file_path or not os.path.exists(self._status_file_path):
+            logger.warning(f"状态文件不存在: {self._status_file_path}")
+            return None
+        
+        try:
+            with open(self._status_file_path, 'r', encoding='utf-8') as f:
+                status = json.load(f)
+            
+            logger.info(f"状态文件已加载: {self._status_file_path}")
+            return status
+            
+        except Exception as e:
+            logger.error(f"读取状态文件失败: {e}")
+            return None
+    
+    def check_status(self, use_cache: bool = True) -> Dict[str, Any]:
+        """
+        检查当前数据库状态与状态文件的差异（优先使用状态文件）
+        
+        Args:
+            use_cache: 是否优先使用状态文件缓存，默认为True
+            
+        Returns:
+            包含检查结果的字典
+        """
+        logger.info("开始检查数据库状态...")
+        
+        # 加载已保存的状态
+        saved_status = self.load_status_file()
+        
+        if saved_status is None:
+            # 状态文件不存在，需要从数据库读取当前状态
+            logger.info("状态文件不存在，从数据库读取当前状态")
+            current_status = {
+                "stock_data": self.get_stock_data_status(use_cache=False),
+                "details_data": self.get_details_data_status(use_cache=False)
+            }
+            return {
+                "status_file_exists": False,
+                "current_status": current_status,
+                "differences": {},
+                "recommendation": "生成新的状态文件"
+            }
+        
+        # 如果使用缓存，先尝试从状态文件获取当前状态（避免不必要的数据库查询）
+        if use_cache:
+            # 先使用缓存的状态进行比较
+            cached_current_status = {
+                "stock_data": self.get_stock_data_status(use_cache=True),
+                "details_data": self.get_details_data_status(use_cache=True)
+            }
+            
+            # 比较差异
+            differences = self._compare_status(saved_status, cached_current_status)
+            
+            # 如果没有差异，直接返回缓存的结果
+            if not differences:
+                logger.info("数据库状态与状态文件一致（使用缓存）")
+                return {
+                    "status_file_exists": True,
+                    "status_file_generated_at": saved_status.get("generated_at"),
+                    "current_status": cached_current_status,
+                    "saved_status": {
+                        "stock_data": saved_status.get("stock_data", {}),
+                        "details_data": saved_status.get("details_data", {})
+                    },
+                    "differences": differences,
+                    "has_changes": False,
+                    "recommendation": "状态文件是最新的"
+                }
+            
+            # 有差异，需要从数据库重新读取以确认
+            logger.info(f"发现潜在差异，从数据库重新读取以确认")
+        
+        # 从数据库读取当前状态（用于比较或确认差异）
+        current_status = {
+            "stock_data": self.get_stock_data_status(use_cache=False),
+            "details_data": self.get_details_data_status(use_cache=False)
+        }
+        
+        # 比较差异
+        differences = self._compare_status(saved_status, current_status)
+        
+        result = {
+            "status_file_exists": True,
+            "status_file_generated_at": saved_status.get("generated_at"),
+            "current_status": current_status,
+            "saved_status": {
+                "stock_data": saved_status.get("stock_data", {}),
+                "details_data": saved_status.get("details_data", {})
+            },
+            "differences": differences,
+            "has_changes": len(differences) > 0
+        }
+        
+        if differences:
+            logger.warning(f"发现 {len(differences)} 处差异")
+            result["recommendation"] = "建议更新状态文件"
+        else:
+            logger.info("数据库状态与状态文件一致")
+            result["recommendation"] = "状态文件是最新的"
+        
+        return result
+    
+    def _compare_status(self, saved: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        比较已保存的状态和当前状态
+        
+        Args:
+            saved: 已保存的状态
+            current: 当前状态
+            
+        Returns:
+            包含差异的字典
+        """
+        differences = {}
+        
+        # 比较股票数据
+        saved_stock = saved.get("stock_data", {})
+        current_stock = current.get("stock_data", {})
+        
+        stock_diff = {}
+        
+        # 检查数据库是否存在
+        if saved_stock.get("database_exists") != current_stock.get("database_exists"):
+            stock_diff["database_exists"] = {
+                "saved": saved_stock.get("database_exists"),
+                "current": current_stock.get("database_exists")
+            }
+        
+        # 比较总记录数
+        if saved_stock.get("total_records") != current_stock.get("total_records"):
+            stock_diff["total_records"] = {
+                "saved": saved_stock.get("total_records"),
+                "current": current_stock.get("total_records")
+            }
+        
+        # 比较总股票数
+        if saved_stock.get("total_stocks") != current_stock.get("total_stocks"):
+            stock_diff["total_stocks"] = {
+                "saved": saved_stock.get("total_stocks"),
+                "current": current_stock.get("total_stocks")
+            }
+        
+        # 比较每个复权类型
+        saved_adj_types = saved_stock.get("adj_types", {})
+        current_adj_types = current_stock.get("adj_types", {})
+        
+        all_adj_types = set(saved_adj_types.keys()) | set(current_adj_types.keys())
+        
+        for adj_type in all_adj_types:
+            saved_adj = saved_adj_types.get(adj_type, {})
+            current_adj = current_adj_types.get(adj_type, {})
+            
+            adj_diff = {}
+            
+            # 比较日期范围
+            if saved_adj.get("min_date") != current_adj.get("min_date"):
+                adj_diff["min_date"] = {
+                    "saved": saved_adj.get("min_date"),
+                    "current": current_adj.get("min_date")
+                }
+            
+            if saved_adj.get("max_date") != current_adj.get("max_date"):
+                adj_diff["max_date"] = {
+                    "saved": saved_adj.get("max_date"),
+                    "current": current_adj.get("max_date")
+                }
+            
+            # 比较记录数
+            if saved_adj.get("total_records") != current_adj.get("total_records"):
+                adj_diff["total_records"] = {
+                    "saved": saved_adj.get("total_records"),
+                    "current": current_adj.get("total_records")
+                }
+            
+            # 比较股票数
+            if saved_adj.get("stock_count") != current_adj.get("stock_count"):
+                adj_diff["stock_count"] = {
+                    "saved": saved_adj.get("stock_count"),
+                    "current": current_adj.get("stock_count")
+                }
+            
+            if adj_diff:
+                stock_diff[f"adj_type_{adj_type}"] = adj_diff
+        
+        if stock_diff:
+            differences["stock_data"] = stock_diff
+        
+        # 比较细节数据
+        saved_details = saved.get("details_data", {})
+        current_details = current.get("details_data", {})
+        
+        details_diff = {}
+        
+        # 检查数据库是否存在
+        if saved_details.get("database_exists") != current_details.get("database_exists"):
+            details_diff["database_exists"] = {
+                "saved": saved_details.get("database_exists"),
+                "current": current_details.get("database_exists")
+            }
+        
+        # 比较日期范围
+        if saved_details.get("min_date") != current_details.get("min_date"):
+            details_diff["min_date"] = {
+                "saved": saved_details.get("min_date"),
+                "current": current_details.get("min_date")
+            }
+        
+        if saved_details.get("max_date") != current_details.get("max_date"):
+            details_diff["max_date"] = {
+                "saved": saved_details.get("max_date"),
+                "current": current_details.get("max_date")
+            }
+        
+        # 比较记录数
+        if saved_details.get("total_records") != current_details.get("total_records"):
+            details_diff["total_records"] = {
+                "saved": saved_details.get("total_records"),
+                "current": current_details.get("total_records")
+            }
+        
+        # 比较股票数
+        if saved_details.get("stock_count") != current_details.get("stock_count"):
+            details_diff["stock_count"] = {
+                "saved": saved_details.get("stock_count"),
+                "current": current_details.get("stock_count")
+            }
+        
+        if details_diff:
+            differences["details_data"] = details_diff
+        
+        return differences
+    
+    def update_status_file(self) -> Dict[str, Any]:
+        """
+        更新状态文件
+        
+        Returns:
+            更新后的状态字典
+        """
+        logger.info("更新数据库状态文件...")
+        return self.generate_status_file()
 
 # 全局数据库管理器实例
 _database_manager = None
@@ -2407,10 +3227,10 @@ def is_using_unified_db(db_path: str = None) -> bool:
     manager = get_database_manager()
     return manager.is_using_unified_db(db_path)
 
-def get_database_info(db_path: str = None) -> Dict[str, Any]:
-    """获取数据库信息的便捷函数"""
+def get_database_info(db_path: str = None, use_cache: bool = True) -> Dict[str, Any]:
+    """获取数据库信息的便捷函数（优先使用状态文件缓存）"""
     manager = get_database_manager()
-    return manager.get_database_info(db_path)
+    return manager.get_database_info(db_path, use_cache=use_cache)
 
 def get_data_source_status(db_path: str = None) -> Dict[str, Any]:
     """获取数据源状态的便捷函数"""
@@ -2928,9 +3748,12 @@ class DataReceiver:
         response = None
         
         try:
+            logger.info(f"[数据导入] 开始处理导入请求 {request.request_id} (来源: {request.source_module}, 表: {request.table_name}, 模式: {request.mode})")
+            
             # 验证数据
             validation_result = self._validate_data(request)
             if not validation_result["valid"]:
+                logger.error(f"[数据导入] 数据验证失败 {request.request_id}: {', '.join(validation_result['errors'])}")
                 response = DataImportResponse(
                     request_id=request.request_id,
                     success=False,
@@ -2941,6 +3764,7 @@ class DataReceiver:
             else:
                 # 转换数据格式
                 df = self._convert_to_dataframe(request.data)
+                logger.info(f"[数据导入] 数据验证通过，开始导入 {len(df)} 条记录到表 {request.table_name}...")
                 
                 # 执行导入
                 db_path = request.db_path
@@ -2952,12 +3776,15 @@ class DataReceiver:
                     df, request.table_name, request.mode, db_path
                 )
                 
+                execution_time = time.time() - start_time
+                logger.info(f"[数据导入] 导入完成 {request.request_id}: 导入 {import_result['imported']} 条记录，跳过 {import_result['skipped']} 条，耗时 {execution_time:.2f} 秒")
+                
                 response = DataImportResponse(
                     request_id=request.request_id,
                     success=True,
                     rows_imported=import_result["imported"],
                     rows_skipped=import_result["skipped"],
-                    execution_time=time.time() - start_time
+                    execution_time=execution_time
                 )
                 
         except Exception as e:
@@ -3663,12 +4490,13 @@ def get_details_db_path(db_path: Optional[str] = None) -> str:
         base_dir = os.path.dirname(os.path.abspath(__file__))
         return _abs_norm(os.path.join(base_dir, 'output', 'score', 'details', 'details.db'))
 
-def get_details_table_info(db_path: Optional[str] = None) -> Dict[str, Any]:
+def get_details_table_info(db_path: Optional[str] = None, use_cache: bool = True) -> Dict[str, Any]:
     """
-    获取Details数据库表信息
+    获取Details数据库表信息（优先使用状态文件缓存）
     
     Args:
         db_path: 数据库文件路径，如果为None则使用配置文件中的路径
+        use_cache: 是否优先使用状态文件缓存，默认为True
         
     Returns:
         包含表结构、记录数、日期范围等信息的字典
@@ -3681,36 +4509,76 @@ def get_details_table_info(db_path: Optional[str] = None) -> Dict[str, Any]:
         
         manager = get_database_manager()
         
-        # 获取表结构
-        sql = "DESCRIBE stock_details"
-        df = manager.execute_sync_query(db_path, sql, timeout=30.0)
-        
-        # 获取记录数
-        count_sql = "SELECT COUNT(*) as total FROM stock_details"
-        count_df = manager.execute_sync_query(db_path, count_sql, timeout=30.0)
-        total_count = count_df.iloc[0]['total'] if not count_df.empty else 0
-        
-        # 获取日期范围
-        date_sql = """
-        SELECT 
-            MIN(ref_date) as min_date,
-            MAX(ref_date) as max_date,
-            COUNT(DISTINCT ref_date) as date_count
-        FROM stock_details
-        """
-        date_df = manager.execute_sync_query(db_path, date_sql, timeout=30.0)
-        
-        # 获取股票数量
-        stock_sql = "SELECT COUNT(DISTINCT ts_code) as stock_count FROM stock_details"
-        stock_df = manager.execute_sync_query(db_path, stock_sql, timeout=30.0)
-        
-        return {
-            'table_structure': df.to_dict('records') if not df.empty else [],
-            'total_records': total_count,
-            'date_range': date_df.to_dict('records')[0] if not date_df.empty else {},
-            'stock_count': stock_df.iloc[0]['stock_count'] if not stock_df.empty else 0,
+        # 优先从状态文件读取统计信息
+        result = {
+            'table_structure': [],
+            'total_records': 0,
+            'date_range': {},
+            'stock_count': 0,
             'database_path': db_path
         }
+        
+        if use_cache:
+            try:
+                saved_status = manager.load_status_file()
+                
+                if saved_status and "details_data" in saved_status:
+                    details_status = saved_status["details_data"]
+                    # 验证数据库路径是否匹配
+                    if details_status.get("database_path") == db_path:
+                        # 从状态文件获取统计信息
+                        result['total_records'] = details_status.get("total_records", 0)
+                        result['stock_count'] = details_status.get("stock_count", 0)
+                        
+                        # 获取日期范围
+                        min_date = details_status.get("min_date")
+                        max_date = details_status.get("max_date")
+                        if min_date or max_date:
+                            date_range = {}
+                            if min_date:
+                                date_range['min_date'] = min_date
+                            if max_date:
+                                date_range['max_date'] = max_date
+                            result['date_range'] = date_range
+                        
+                        logger.debug("从状态文件缓存获取Details表统计信息")
+            except Exception as cache_error:
+                logger.debug(f"从状态文件读取失败，回退到数据库查询: {cache_error}")
+        
+        # 表结构需要从数据库读取（状态文件不包含表结构信息）
+        try:
+            sql = "DESCRIBE stock_details"
+            df = manager.execute_sync_query(db_path, sql, timeout=30.0)
+            result['table_structure'] = df.to_dict('records') if not df.empty else []
+        except Exception as e:
+            logger.warning(f"获取表结构失败: {e}")
+        
+        # 如果缓存中没有统计信息，从数据库读取
+        if result['total_records'] == 0 and result['stock_count'] == 0 and not result.get('date_range'):
+            logger.debug("从数据库读取Details表统计信息")
+            # 获取记录数
+            count_sql = "SELECT COUNT(*) as total FROM stock_details"
+            count_df = manager.execute_sync_query(db_path, count_sql, timeout=30.0)
+            result['total_records'] = count_df.iloc[0]['total'] if not count_df.empty else 0
+            
+            # 获取日期范围
+            date_sql = """
+            SELECT 
+                MIN(ref_date) as min_date,
+                MAX(ref_date) as max_date,
+                COUNT(DISTINCT ref_date) as date_count
+            FROM stock_details
+            """
+            date_df = manager.execute_sync_query(db_path, date_sql, timeout=30.0)
+            if not date_df.empty:
+                result['date_range'] = date_df.to_dict('records')[0]
+            
+            # 获取股票数量
+            stock_sql = "SELECT COUNT(DISTINCT ts_code) as stock_count FROM stock_details"
+            stock_df = manager.execute_sync_query(db_path, stock_sql, timeout=30.0)
+            result['stock_count'] = stock_df.iloc[0]['stock_count'] if not stock_df.empty else 0
+        
+        return result
     except Exception as e:
         logger.error(f"get_details_table_info 失败: {e}")
         return {'error': str(e)}
@@ -3888,6 +4756,92 @@ def get_details_stock_summary(ts_code: str, db_path: Optional[str] = None) -> Di
     except Exception as e:
         logger.error(f"get_details_stock_summary 失败: {e}")
         return {}
+
+# ========== 状态管理便捷函数（保持向后兼容，合并自 database_status） ==========
+
+def generate_database_status(status_file_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    生成数据库状态文件（便捷函数）
+    
+    Args:
+        status_file_path: 状态文件路径，如果为None则使用默认路径
+        
+    Returns:
+        包含完整状态的字典
+    """
+    manager = get_database_manager()
+    if status_file_path:
+        manager.set_status_file_path(status_file_path)
+    return manager.generate_status_file()
+
+
+def check_database_status(status_file_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    检查数据库状态（便捷函数）
+    
+    Args:
+        status_file_path: 状态文件路径，如果为None则使用默认路径
+        
+    Returns:
+        包含检查结果的字典
+    """
+    manager = get_database_manager()
+    if status_file_path:
+        manager.set_status_file_path(status_file_path)
+    return manager.check_status()
+
+
+def update_database_status(status_file_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    更新数据库状态文件（便捷函数）
+    
+    Args:
+        status_file_path: 状态文件路径，如果为None则使用默认路径
+        
+    Returns:
+        更新后的状态字典
+    """
+    manager = get_database_manager()
+    if status_file_path:
+        manager.set_status_file_path(status_file_path)
+    return manager.update_status_file()
+
+
+def update_stock_data_status(status_file_path: Optional[str] = None) -> None:
+    """
+    更新股票数据状态（仅更新股票数据部分）
+    
+    Args:
+        status_file_path: 状态文件路径，如果为None则使用默认路径
+    """
+    try:
+        manager = get_database_manager()
+        if status_file_path:
+            manager.set_status_file_path(status_file_path)
+        # 生成完整状态（包含股票数据和细节数据）
+        status = manager.generate_status_file()
+        logger.info("股票数据状态已更新")
+    except Exception as e:
+        logger.error(f"更新股票数据状态失败: {e}")
+
+
+def update_details_data_status(status_file_path: Optional[str] = None) -> None:
+    """
+    更新细节数据状态（仅更新细节数据部分）
+    
+    Args:
+        status_file_path: 状态文件路径，如果为None则使用默认路径
+    """
+    try:
+        manager = get_database_manager()
+        if status_file_path:
+            manager.set_status_file_path(status_file_path)
+        # 生成完整状态（包含股票数据和细节数据）
+        status = manager.generate_status_file()
+        logger.info("细节数据状态已更新")
+    except Exception as e:
+        logger.error(f"更新细节数据状态失败: {e}")
+
 
 # 清理函数
 import atexit

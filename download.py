@@ -393,7 +393,7 @@ class TushareManager:
 class DataProcessor:
     """数据处理器"""
     
-    def __init__(self, db_manager: DatabaseManager):
+    def __init__(self, db_manager: Optional[DatabaseManager]):
         self.db_manager = db_manager
         self.indicator_names = get_all_indicator_names()
     
@@ -433,14 +433,28 @@ class DataProcessor:
         return df
     
     def compute_indicators_with_warmup(self, df: pd.DataFrame, ts_code: str, 
-                                     adj_type: str) -> pd.DataFrame:
-        """计算指标（包含warmup机制）"""
+                                     adj_type: str, warmup_cache: Dict[str, pd.DataFrame] = None) -> pd.DataFrame:
+        """计算指标（包含warmup机制）
+        
+        Args:
+            df: 新下载的数据
+            ts_code: 股票代码
+            adj_type: 复权类型
+            warmup_cache: 预加载的历史数据缓存（增量下载时使用）
+        """
         if df is None or df.empty:
             return df
         
         try:
-            # 获取历史数据用于warmup
-            historical_data = self._get_historical_data_for_warmup(ts_code, adj_type, df)
+            historical_data = None
+            
+            # 优先使用预加载的缓存数据
+            if warmup_cache is not None and ts_code in warmup_cache:
+                historical_data = warmup_cache[ts_code].copy()
+                logger.debug(f"使用预加载的历史数据 {ts_code}: {len(historical_data)} 行")
+            else:
+                # 如果没有缓存，按需从数据库获取（兼容旧逻辑）
+                historical_data = self._get_historical_data_for_warmup(ts_code, adj_type, df)
             
             if historical_data is not None and not historical_data.empty:
                 # 合并历史数据和新增数据
@@ -455,7 +469,7 @@ class DataProcessor:
                     df_with_indicators['trade_date'] >= df['trade_date'].min()
                 ].copy()
             else:
-                # 没有历史数据，直接计算
+                # 没有历史数据，直接计算（首次下载的情况）
                 df_with_indicators = compute(df, self.indicator_names)
             
             # 精度控制
@@ -476,6 +490,10 @@ class DataProcessor:
     def _get_historical_data_for_warmup(self, ts_code: str, adj_type: str, 
                                        new_data: pd.DataFrame) -> Optional[pd.DataFrame]:
         """获取历史数据用于warmup"""
+        # 如果没有db_manager，无法获取历史数据
+        if self.db_manager is None:
+            return None
+            
         try:
             # 计算需要的warmup天数
             warmup_days = warmup_for(self.indicator_names)
@@ -550,10 +568,10 @@ class DataProcessor:
 class StockDownloader:
     """股票数据下载器"""
     
-    def __init__(self, config: DownloadConfig):
+    def __init__(self, config: DownloadConfig, is_first_download: bool = False):
         self.config = config
-        logger.info("[数据库连接] 开始获取数据库管理器实例 (初始化股票下载器)")
-        self.db_manager = get_database_manager()
+        self.is_first_download = is_first_download  # 是否为首次下载
+        # 不在初始化时创建数据库连接，避免子线程创建连接
         
         # 创建限频器
         rate_limiter = RateLimiter(
@@ -564,12 +582,96 @@ class StockDownloader:
         )
         
         self.tushare_manager = TushareManager(rate_limiter=rate_limiter)
-        self.data_processor = DataProcessor(self.db_manager)
+        # 延迟创建data_processor，只在需要时创建（主线程中）
+        self._data_processor = None
+        # 预加载的历史数据缓存（增量下载时使用）
+        self._warmup_cache: Dict[str, pd.DataFrame] = {}  # {ts_code: historical_data}
         self.stats = DownloadStats()
         self._lock = threading.Lock()
     
-    def download_stock_data(self, ts_code: str) -> Tuple[str, str]:
-        """下载单只股票数据"""
+    def _get_data_processor(self):
+        """获取数据处理器（延迟创建，只在主线程中创建）"""
+        if self._data_processor is None:
+            # 只在主线程中创建数据库连接
+            logger.info("[数据库连接] 开始获取数据库管理器实例 (创建数据处理器)")
+            db_manager = get_database_manager()
+            self._data_processor = DataProcessor(db_manager)
+        return self._data_processor
+    
+    def _preload_warmup_data(self, db_manager: DatabaseManager, stock_codes: List[str], 
+                             data_processor: DataProcessor):
+        """批量预加载历史数据到内存（用于增量下载的warmup）"""
+        try:
+            from indicators import warmup_for
+            warmup_days = warmup_for(data_processor.indicator_names)
+            if warmup_days <= 0:
+                logger.info("指标不需要warmup，跳过预加载")
+                return
+            
+            # 计算需要加载的日期范围
+            from datetime import datetime, timedelta
+            start_date_obj = datetime.strptime(self.config.start_date, '%Y%m%d')
+            # 加载warmup_days天前的数据（加上一些缓冲）
+            load_start_obj = start_date_obj - timedelta(days=warmup_days + 10)  # 多加载10天作为缓冲
+            load_start = load_start_obj.strftime('%Y%m%d')
+            load_end_obj = start_date_obj - timedelta(days=1)
+            load_end = load_end_obj.strftime('%Y%m%d')
+            
+            logger.info(f"预加载历史数据范围: {load_start} - {load_end} (warmup天数: {warmup_days})")
+            
+            # 批量查询所有股票的历史数据
+            logger.info(f"开始批量查询 {len(stock_codes)} 只股票的历史数据...")
+            preload_progress = tqdm(
+                total=len(stock_codes),
+                desc="预加载历史数据",
+                unit="只",
+                ncols=100,
+                leave=False
+            )
+            
+            loaded_count = 0
+            for ts_code in stock_codes:
+                try:
+                    # 从数据库查询历史数据
+                    historical_df = db_manager.query_stock_data(
+                        ts_code=ts_code,
+                        start_date=load_start,
+                        end_date=load_end,
+                        adj_type=self.config.adj_type
+                    )
+                    
+                    if not historical_df.empty:
+                        # 清理数据
+                        historical_df = data_processor.clean_stock_data(historical_df, ts_code)
+                        # 存入缓存
+                        self._warmup_cache[ts_code] = historical_df
+                        loaded_count += 1
+                except Exception as e:
+                    logger.debug(f"预加载历史数据失败 {ts_code}: {e}")
+                    # 预加载失败不影响下载，继续处理下一只股票
+                
+                preload_progress.update(1)
+            
+            preload_progress.close()
+            logger.info(f"预加载完成：成功加载 {loaded_count}/{len(stock_codes)} 只股票的历史数据")
+            
+        except Exception as e:
+            logger.warning(f"批量预加载历史数据失败: {e}，将使用按需加载模式")
+            # 预加载失败不影响下载，将使用原来的按需加载模式
+    
+    def download_stock_data(self, ts_code: str, data_processor: DataProcessor = None) -> Tuple[str, str, Optional[pd.DataFrame]]:
+        """下载单只股票数据，边下载边计算指标并返回处理后的数据
+        
+        Args:
+            ts_code: 股票代码
+            data_processor: 数据处理器，用于计算指标和warmup。如果为None，只下载不计算指标
+        
+        Returns:
+            Tuple[ts_code, status, data]:
+                - ts_code: 股票代码
+                - status: 状态 ("success", "empty", "error:xxx")
+                - data: 处理后的数据（包含指标），如果失败则为None
+        """
         try:
             # 下载原始数据
             logger.debug(f"开始下载 {ts_code} 的原始数据...")
@@ -582,55 +684,66 @@ class StockDownloader:
             
             if raw_data is None or raw_data.empty:
                 logger.debug(f"{ts_code} 无数据")
-                return ts_code, "empty"
+                return ts_code, "empty", None
             
             logger.debug(f"{ts_code} 获取到 {len(raw_data)} 条原始数据")
             
-            # 清理数据
+            # 清理数据（不依赖数据库连接）
             logger.debug(f"清理 {ts_code} 数据...")
-            cleaned_data = self.data_processor.clean_stock_data(raw_data, ts_code)
+            # 使用临时的DataProcessor进行清理（不需要数据库连接）
+            temp_processor = DataProcessor(None)  # 传入None，因为清理操作不需要数据库
+            cleaned_data = temp_processor.clean_stock_data(raw_data, ts_code)
             
-            # 计算指标
-            if self.config.enable_warmup:
-                logger.debug(f"计算 {ts_code} 指标（包含warmup）...")
-                data_with_indicators = self.data_processor.compute_indicators_with_warmup(
-                    cleaned_data, ts_code, self.config.adj_type
-                )
+            # 如果提供了data_processor，立即计算指标
+            if data_processor is not None:
+                # 首次下载不需要warmup，增量下载才需要
+                need_warmup = self.config.enable_warmup and not self.is_first_download
+                
+                if need_warmup:
+                    logger.debug(f"计算 {ts_code} 指标（包含warmup）...")
+                    try:
+                        # 计算指标（包含warmup，使用预加载的缓存数据）
+                        data_with_indicators = data_processor.compute_indicators_with_warmup(
+                            cleaned_data,
+                            ts_code,
+                            self.config.adj_type,
+                            warmup_cache=self._warmup_cache
+                        )
+                        # 准备数据用于数据库
+                        final_data = data_processor.prepare_data_for_database(
+                            data_with_indicators, self.config.adj_type
+                        )
+                        logger.debug(f"{ts_code} 指标计算完成，共 {len(final_data)} 条记录，{len(final_data.columns)} 列")
+                        return ts_code, "success", final_data
+                    except Exception as e:
+                        logger.error(f"{ts_code} 指标计算失败: {e}")
+                        raise
+                else:
+                    # 首次下载或未启用warmup，直接计算指标
+                    logger.debug(f"计算 {ts_code} 指标（不包含warmup）...")
+                    try:
+                        from indicators import compute, get_all_indicator_names
+                        data_with_indicators = compute(cleaned_data, get_all_indicator_names())
+                        final_data = data_processor.prepare_data_for_database(
+                            data_with_indicators, self.config.adj_type
+                        )
+                        logger.debug(f"{ts_code} 指标计算完成，共 {len(final_data)} 条记录")
+                        return ts_code, "success", final_data
+                    except Exception as e:
+                        logger.error(f"{ts_code} 指标计算失败: {e}")
+                        raise
             else:
-                logger.debug(f"计算 {ts_code} 指标...")
-                data_with_indicators = compute(cleaned_data, self.data_processor.indicator_names)
-            
-            # 准备数据用于数据库写入
-            logger.debug(f"准备 {ts_code} 数据写入数据库...")
-            final_data = self.data_processor.prepare_data_for_database(
-                data_with_indicators, self.config.adj_type
-            )
-            
-            # 写入数据库
-            logger.debug(f"写入 {ts_code} 数据到数据库...")
-            self.db_manager.receive_stock_data(
-                source_module="download",
-                data=final_data,
-                mode="upsert"  # 使用upsert模式避免重复数据
-            )
-            
-            with self._lock:
-                self.stats.success_count += 1
-            
-            logger.debug(f"{ts_code} 下载完成，共 {len(final_data)} 条记录")
-            return ts_code, "success"
+                # 没有提供data_processor，只返回清理后的原始数据
+                logger.debug(f"{ts_code} 数据清理完成，共 {len(cleaned_data)} 条记录（未计算指标）")
+                return ts_code, "success", cleaned_data
             
         except Exception as e:
             error_msg = str(e)
             error_msg_lower = error_msg.lower()
             
-            # 如果是指标计算或数据库连接/写入错误，影响数据完整性，直接抛出异常
+            # 如果是指标计算错误，影响数据完整性，直接抛出异常
             if any(keyword in error_msg_lower for keyword in [
-                "指标计算失败", "indicator", "计算失败", "compute",
-                "数据库连接", "database connection", "connection", "connect",
-                "数据库写入", "database write", "写入失败", "write",
-                "数据库错误", "database error", "database", "query",
-                "无法获取", "获取失败", "访问失败"
+                "指标计算失败", "indicator", "计算失败", "compute"
             ]):
                 logger.error(f"下载股票数据失败（影响数据完整性）{ts_code}: {error_msg}")
                 raise RuntimeError(f"下载股票数据失败（影响数据完整性）{ts_code}: {error_msg}") from e
@@ -641,48 +754,139 @@ class StockDownloader:
                 self.stats.failed_stocks.append((ts_code, error_msg))
             
             logger.error(f"下载股票数据失败 {ts_code}: {error_msg}")
-            return ts_code, f"error: {error_msg}"
+            return ts_code, f"error: {error_msg}", None
     
     def download_all_stocks(self) -> DownloadStats:
-        """下载所有股票数据"""
+        """下载所有股票数据，由主线程统一写入数据库"""
         logger.info("开始下载股票数据...")
         
         # 获取股票列表
-        stock_list = self.tushare_manager.get_stock_list()
-        stock_codes = stock_list['ts_code'].tolist()
+        try:
+            stock_list = self.tushare_manager.get_stock_list()
+            if stock_list is None or stock_list.empty:
+                logger.error("获取股票列表失败：返回结果为空")
+                return self.stats
+            
+            if 'ts_code' not in stock_list.columns:
+                logger.error(f"股票列表缺少 'ts_code' 列，可用列: {stock_list.columns.tolist()}")
+                return self.stats
+            
+            stock_codes = stock_list['ts_code'].tolist()
+            
+            if not stock_codes:
+                logger.error("股票列表为空，无法下载")
+                return self.stats
+            
+            self.stats.total_stocks = len(stock_codes)
+            logger.info(f"准备下载 {len(stock_codes)} 只股票的数据，日期范围: {self.config.start_date} - {self.config.end_date}")
+        except Exception as e:
+            logger.error(f"获取股票列表时发生异常: {e}")
+            import traceback
+            logger.error(f"异常详情: {traceback.format_exc()}")
+            return self.stats
         
-        self.stats.total_stocks = len(stock_codes)
-        logger.info(f"准备下载 {len(stock_codes)} 只股票的数据")
+        # 在主线程中创建数据库连接和数据处理器
+        logger.info("[数据库连接] 开始获取数据库管理器实例 (主线程统一写入)")
+        db_manager = get_database_manager()
+        data_processor = DataProcessor(db_manager)
+        
+        # 如果是增量下载且启用了warmup，批量预加载历史数据到内存
+        if not self.is_first_download and self.config.enable_warmup:
+            logger.info("增量下载模式：开始批量预加载历史数据用于warmup...")
+            self._preload_warmup_data(db_manager, stock_codes, data_processor)
         
         # 创建进度条
         progress_bar = tqdm(
             total=len(stock_codes),
-            desc="下载股票数据",
+            desc="下载并计算指标",
             unit="只",
             ncols=100,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
         )
         
-        # 并发下载
+        # 用于收集需要批量写入的数据（如果启用批量写入模式）
+        collected_data = []  # 存储所有成功下载并处理的数据
+        
+        # 边下载边计算指标边写入
+        logger.info("开始边下载边计算指标边写入...")
+        
+        # 并发下载（边下载边计算指标）
         with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
-            # 提交所有任务
+            # 提交所有任务（传入data_processor以便计算指标）
             future_to_code = {
-                executor.submit(self.download_stock_data, ts_code): ts_code 
+                executor.submit(self.download_stock_data, ts_code, data_processor): ts_code 
                 for ts_code in stock_codes
             }
+            
+            # 用于批量写入的锁和计数器
+            write_lock = threading.Lock()
+            write_count = 0
             
             # 处理完成的任务
             for future in as_completed(future_to_code):
                 ts_code = future_to_code[future]
                 try:
-                    result_code, status = future.result()
+                    result_code, status, data = future.result()
                     if status == "empty":
                         with self._lock:
                             self.stats.empty_count += 1
-                    elif status == "success":
-                        logger.debug(f"成功下载 {result_code}")
+                    elif status == "success" and data is not None:
+                        # 立即写入数据库（边下载边写入）
+                        try:
+                            logger.debug(f"开始写入 {result_code} 的数据到数据库（{len(data)} 条记录）...")
+                            
+                            # 使用回调函数在写入完成后更新状态
+                            write_completed = threading.Event()
+                            write_result = {"success": False, "error": None}
+                            
+                            def update_status_callback(response):
+                                try:
+                                    if hasattr(response, 'success') and response.success:
+                                        write_result["success"] = True
+                                        logger.debug(f"{result_code} 数据已成功写入数据库，导入 {response.rows_imported} 条记录")
+                                    else:
+                                        write_result["success"] = False
+                                        write_result["error"] = getattr(response, 'error', '未知错误')
+                                        logger.error(f"{result_code} 数据写入数据库失败: {write_result['error']}")
+                                except Exception as e:
+                                    logger.warning(f"更新状态失败 {result_code}: {e}")
+                                finally:
+                                    write_completed.set()
+                            
+                            # 提交写入请求（异步，不阻塞）
+                            request_id = db_manager.receive_stock_data(
+                                source_module="download",
+                                data=data,
+                                mode="upsert",
+                                callback=update_status_callback
+                            )
+                            
+                            # 等待写入完成（最多等待60秒，因为可能需要从数据库获取历史数据进行warmup）
+                            if write_completed.wait(timeout=60):
+                                if not write_result["success"]:
+                                    logger.error(f"{result_code} 写入失败: {write_result['error']}")
+                                    with self._lock:
+                                        self.stats.error_count += 1
+                                    continue
+                            else:
+                                logger.warning(f"{result_code} 写入请求超时（60秒），数据可能仍在后台处理中，继续处理下一只股票")
+                            
+                            # 写入成功，更新统计
+                            with self._lock:
+                                self.stats.success_count += 1
+                                write_count += 1
+                            
+                            logger.debug(f"✓ {result_code} 下载、计算指标、写入完成")
+                            
+                        except Exception as e:
+                            logger.error(f"{result_code} 写入数据库失败: {e}")
+                            with self._lock:
+                                self.stats.error_count += 1
+                                self.stats.failed_stocks.append((result_code, str(e)))
                     else:
                         logger.warning(f"下载失败 {result_code}: {status}")
+                        with self._lock:
+                            self.stats.error_count += 1
                 except Exception as e:
                     logger.error(f"处理任务异常 {ts_code}: {e}")
                     with self._lock:
@@ -700,6 +904,15 @@ class StockDownloader:
         # 关闭进度条
         progress_bar.close()
         
+        # 所有数据已经边下载边写入，更新状态文件
+        if self.stats.success_count > 0:
+            try:
+                from database_manager import update_stock_data_status
+                update_stock_data_status()
+                logger.info("状态文件已更新")
+            except Exception as e:
+                logger.warning(f"更新状态文件失败: {e}")
+        
         # 打印统计信息
         logger.info(f"下载完成 - 成功: {self.stats.success_count}, 空数据: {self.stats.empty_count}, 失败: {self.stats.error_count}")
         
@@ -714,8 +927,7 @@ class IndexDownloader:
     
     def __init__(self, config: DownloadConfig):
         self.config = config
-        logger.info("[数据库连接] 开始获取数据库管理器实例 (初始化指数下载器)")
-        self.db_manager = get_database_manager()
+        # 不在初始化时创建数据库连接，避免子线程创建连接
         
         # 创建限频器
         rate_limiter = RateLimiter(
@@ -729,8 +941,15 @@ class IndexDownloader:
         self.stats = DownloadStats()
         self._lock = threading.Lock()
     
-    def download_index_data(self, ts_code: str) -> Tuple[str, str]:
-        """下载单只指数数据"""
+    def download_index_data(self, ts_code: str) -> Tuple[str, str, Optional[pd.DataFrame]]:
+        """下载单只指数数据，返回数据而不直接写入数据库
+        
+        Returns:
+            Tuple[ts_code, status, data]:
+                - ts_code: 指数代码
+                - status: 状态 ("success", "empty", "error:xxx")
+                - data: 准备好的数据（DataFrame），如果失败则为None
+        """
         try:
             # 下载原始数据
             logger.debug(f"开始下载 {ts_code} 的原始数据...")
@@ -742,7 +961,7 @@ class IndexDownloader:
             
             if raw_data is None or raw_data.empty:
                 logger.debug(f"{ts_code} 无数据")
-                return ts_code, "empty"
+                return ts_code, "empty", None
             
             logger.debug(f"{ts_code} 获取到 {len(raw_data)} 条原始数据")
             
@@ -782,33 +1001,12 @@ class IndexDownloader:
             base_columns = ['ts_code', 'trade_date', 'adj_type', 'open', 'high', 'low', 'close', 'vol', 'amount']
             df = df[base_columns]
             
-            # 写入数据库
-            logger.debug(f"写入 {ts_code} 数据到数据库...")
-            self.db_manager.receive_stock_data(
-                source_module="download",
-                data=df,
-                mode="upsert"
-            )
-            
-            with self._lock:
-                self.stats.success_count += 1
-            
             logger.debug(f"{ts_code} 下载完成，共 {len(df)} 条记录")
-            return ts_code, "success"
+            return ts_code, "success", df
             
         except Exception as e:
             error_msg = str(e)
             error_msg_lower = error_msg.lower()
-            
-            # 如果是数据库连接/写入错误，影响数据完整性，直接抛出异常
-            if any(keyword in error_msg_lower for keyword in [
-                "数据库连接", "database connection", "connection", "connect",
-                "数据库写入", "database write", "写入失败", "write",
-                "数据库错误", "database error", "database", "query",
-                "无法获取", "获取失败", "访问失败"
-            ]):
-                logger.error(f"下载指数数据失败（影响数据完整性）{ts_code}: {error_msg}")
-                raise RuntimeError(f"下载指数数据失败（影响数据完整性）{ts_code}: {error_msg}") from e
             
             # 其他错误（如下载失败等）可以返回错误状态，不影响其他指数下载
             with self._lock:
@@ -816,18 +1014,26 @@ class IndexDownloader:
                 self.stats.failed_stocks.append((ts_code, error_msg))
             
             logger.error(f"下载指数数据失败 {ts_code}: {error_msg}")
-            return ts_code, f"error: {error_msg}"
+            return ts_code, f"error: {error_msg}", None
     
     def download_all_indices(self, whitelist: List[str] = None) -> DownloadStats:
-        """下载所有指数数据"""
+        """下载所有指数数据，由主线程统一写入数据库"""
         logger.info("开始下载指数数据...")
         
         # 使用白名单或默认指数列表
         if whitelist is None:
             whitelist = INDEX_WHITELIST
         
+        if not whitelist:
+            logger.error("指数白名单为空，无法下载")
+            return self.stats
+        
         self.stats.total_stocks = len(whitelist)
-        logger.info(f"准备下载 {len(whitelist)} 只指数的数据")
+        logger.info(f"准备下载 {len(whitelist)} 只指数的数据，日期范围: {self.config.start_date} - {self.config.end_date}")
+        
+        # 在主线程中创建数据库连接
+        logger.info("[数据库连接] 开始获取数据库管理器实例 (主线程统一写入指数)")
+        db_manager = get_database_manager()
         
         # 创建进度条
         progress_bar = tqdm(
@@ -838,7 +1044,10 @@ class IndexDownloader:
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
         )
         
-        # 并发下载
+        # 收集所有下载的数据
+        collected_data = []  # 存储所有成功下载的数据
+        
+        # 并发下载（不写入数据库）
         with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
             # 提交所有任务
             future_to_code = {
@@ -850,11 +1059,13 @@ class IndexDownloader:
             for future in as_completed(future_to_code):
                 ts_code = future_to_code[future]
                 try:
-                    result_code, status = future.result()
+                    result_code, status, data = future.result()
                     if status == "empty":
                         with self._lock:
                             self.stats.empty_count += 1
-                    elif status == "success":
+                    elif status == "success" and data is not None:
+                        # 收集数据，稍后统一写入
+                        collected_data.append(data)
                         logger.debug(f"成功下载 {result_code}")
                     else:
                         logger.warning(f"下载失败 {result_code}: {status}")
@@ -867,13 +1078,68 @@ class IndexDownloader:
                 # 更新进度条
                 progress_bar.update(1)
                 progress_bar.set_postfix({
-                    '成功': self.stats.success_count,
+                    '成功': len(collected_data),
                     '空数据': self.stats.empty_count,
                     '失败': self.stats.error_count
                 })
         
         # 关闭进度条
         progress_bar.close()
+        
+        # 在主线程中统一写入数据库
+        if collected_data:
+            logger.info(f"开始统一写入 {len(collected_data)} 只指数的数据到数据库...")
+            try:
+                # 合并所有数据
+                all_data = pd.concat(collected_data, ignore_index=True)
+                logger.info(f"合并后共 {len(all_data)} 条记录")
+                
+                # 统一写入数据库
+                logger.info(f"提交写入数据库请求，共 {len(all_data)} 条记录...")
+                
+                # 使用回调函数在写入完成后更新状态文件
+                write_completed = threading.Event()
+                write_result = {"success": False, "error": None}
+                
+                def update_status_callback(response):
+                    try:
+                        if hasattr(response, 'success') and response.success:
+                            write_result["success"] = True
+                            logger.info(f"数据已成功写入数据库，导入 {response.rows_imported} 条记录，耗时 {response.execution_time:.2f} 秒")
+                            from database_manager import update_stock_data_status
+                            update_stock_data_status()
+                        else:
+                            write_result["success"] = False
+                            write_result["error"] = getattr(response, 'error', '未知错误')
+                            logger.error(f"数据写入数据库失败: {write_result['error']}")
+                    except Exception as e:
+                        logger.warning(f"更新状态文件失败: {e}")
+                    finally:
+                        write_completed.set()
+                
+                request_id = db_manager.receive_stock_data(
+                    source_module="download",
+                    data=all_data,
+                    mode="upsert",  # 使用upsert模式避免重复数据
+                    callback=update_status_callback
+                )
+                
+                logger.info(f"写入请求已提交 (ID: {request_id})，等待后台线程处理...")
+                
+                # 等待写入完成（最多等待5分钟）
+                if write_completed.wait(timeout=300):
+                    if not write_result["success"]:
+                        raise RuntimeError(f"数据写入失败: {write_result['error']}")
+                else:
+                    logger.warning("写入请求超时（5分钟），数据可能仍在后台处理中")
+                
+                with self._lock:
+                    self.stats.success_count = len(collected_data)
+                
+                logger.info(f"统一写入完成，共 {len(all_data)} 条记录")
+            except Exception as e:
+                logger.error(f"统一写入数据库失败: {e}")
+                raise
         
         # 打印统计信息
         logger.info(f"下载完成 - 成功: {self.stats.success_count}, 空数据: {self.stats.empty_count}, 失败: {self.stats.error_count}")
@@ -900,27 +1166,64 @@ class DownloadManager:
         self._ensure_database_initialized()
     
     def _check_if_first_download(self) -> bool:
-        """检查是否为首次下载（在数据库初始化之前调用）"""
+        """检查是否为首次下载（使用状态文件，不读取数据库）"""
         try:
-            from config import DATA_ROOT, UNIFIED_DB_PATH
-            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            from database_manager import get_database_manager
             
-            # 如果数据库文件不存在，则为首次下载
-            if not os.path.exists(db_path):
-                logger.info("数据库不存在，判断为首次下载")
+            # 检查状态文件（load_status_file内部已经处理了所有异常，返回None或字典）
+            manager = get_database_manager()
+            status = manager.load_status_file()
+            
+            # 状态文件不存在或读取失败，判断为首次下载
+            if status is None:
+                logger.info("状态文件不存在或读取失败，判断为首次下载")
                 return True
             
-            # 使用数据库管理器获取最新日期
-            latest_date = self.db_manager.get_latest_trade_date(db_path)
-            if latest_date:
-                logger.info(f"数据库存在且有数据，最新日期: {latest_date}，判断为增量下载")
-                return False
-            else:
-                logger.info("数据库存在但无数据，判断为首次下载")
+            # 检查状态文件格式是否正确
+            if not isinstance(status, dict):
+                logger.warning(f"状态文件格式错误（不是字典），判断为首次下载")
+                return True
+            
+            # 检查股票数据状态
+            stock_data_status = status.get("stock_data", {})
+            if not isinstance(stock_data_status, dict):
+                logger.warning(f"状态文件中stock_data格式错误，判断为首次下载")
                 return True
                 
+            if not stock_data_status.get("database_exists", False):
+                logger.info("状态文件显示数据库不存在，判断为首次下载")
+                return True
+            
+            # 检查是否有数据
+            total_records = stock_data_status.get("total_records", 0)
+            if total_records == 0:
+                logger.info("状态文件显示数据库无数据，判断为首次下载")
+                return True
+            
+            # 有数据，判断为增量下载
+            max_date = None
+            adj_types = stock_data_status.get("adj_types", {})
+            if isinstance(adj_types, dict):
+                for adj_type, adj_status in adj_types.items():
+                    if isinstance(adj_status, dict):
+                        adj_max_date = adj_status.get("max_date")
+                        if adj_max_date and (max_date is None or adj_max_date > max_date):
+                            max_date = adj_max_date
+            
+            if max_date:
+                logger.info(f"状态文件显示数据库有数据，最新日期: {max_date}，判断为增量下载")
+            else:
+                logger.info("状态文件显示数据库有数据，判断为增量下载")
+            
+            return False
+                
         except Exception as e:
-            logger.warning(f"检查首次下载状态失败: {e}，假设为首次下载")
+            # 只有在获取DatabaseManager失败时才报错，这种情况下不应该读数据库
+            # 因为如果没有db_manager，也无法读数据库
+            logger.error(f"检查首次下载状态失败（获取DatabaseManager失败）: {e}，判断为首次下载")
+            import traceback
+            logger.debug(f"异常详情: {traceback.format_exc()}")
+            # 如果获取DatabaseManager都失败了，无法读数据库，直接判断为首次下载
             return True
     
     def _ensure_database_initialized(self):
@@ -963,13 +1266,33 @@ class DownloadManager:
         latest_date = None
         if not is_first_download:
             try:
-                # 从数据库获取最新日期
-                latest_date = self.db_manager.get_latest_trade_date()
+                # 从数据库获取最新日期（使用与_check_if_first_download相同的路径）
+                from config import DATA_ROOT, UNIFIED_DB_PATH
+                db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                logger.debug(f"[determine_download_strategy] 使用数据库路径: {db_path}")
+                
+                # 从数据库获取最新日期（确保使用相同的路径）
+                latest_date = self.db_manager.get_latest_trade_date(db_path)
+                logger.debug(f"[determine_download_strategy] 获取到最新日期: {latest_date}")
+                
+                # 如果获取不到最新日期，说明数据库可能为空，重新判断为首次下载
+                if not latest_date:
+                    logger.info("数据库存在但无数据，重新判断为首次下载")
+                    is_first_download = True
             except Exception as e:
-                logger.warning(f"获取最新日期失败: {e}")
+                logger.warning(f"获取最新日期失败: {e}，重新判断为首次下载")
+                import traceback
+                logger.debug(f"获取最新日期失败详情: {traceback.format_exc()}")
+                is_first_download = True
         else:
             # 首次下载，不需要查询数据库
             logger.info("首次下载，跳过数据库查询")
+        
+        # 处理结束日期：如果配置为"today"，先获取智能结束日期
+        actual_end_date = self.config.end_date
+        if self.config.end_date.lower() == "today":
+            actual_end_date = self.get_smart_end_date("today")
+            logger.info(f"结束日期配置为'today'，智能判断后实际结束日期: {actual_end_date}")
         
         # 确定实际下载的日期范围
         actual_start_date = self.config.start_date
@@ -982,9 +1305,18 @@ class DownloadManager:
                 actual_start_date = next_date_obj.strftime('%Y%m%d')
                 
                 # 如果计算出的开始日期晚于配置的结束日期，则跳过下载
-                if actual_start_date > self.config.end_date:
-                    logger.info(f"数据已是最新，无需下载 (最新日期: {latest_date}, 配置结束日期: {self.config.end_date})")
-                    return {"skip_download": True}
+                if actual_start_date > actual_end_date:
+                    logger.info(f"数据已是最新，无需下载 (最新日期: {latest_date}, 计算出的开始日期: {actual_start_date}, 实际结束日期: {actual_end_date})")
+                    logger.perf(f"跳过下载原因: 开始日期({actual_start_date}) > 结束日期({actual_end_date})")
+                    return {
+                        "skip_download": True,
+                        "is_first_download": is_first_download,
+                        "latest_date": latest_date,
+                        "start_date": actual_start_date,
+                        "end_date": actual_end_date,
+                        "adj_type": self.config.adj_type,
+                        "asset_type": self.config.asset_type
+                    }
             except Exception as e:
                 logger.warning(f"计算增量下载日期失败: {e}")
         
@@ -992,7 +1324,7 @@ class DownloadManager:
             "is_first_download": is_first_download,
             "latest_date": latest_date,
             "start_date": actual_start_date,
-            "end_date": self.config.end_date,
+            "end_date": actual_end_date,
             "adj_type": self.config.adj_type,
             "asset_type": self.config.asset_type,
             "skip_download": False
@@ -1015,7 +1347,9 @@ class DownloadManager:
             enable_warmup=self.config.enable_warmup
         )
         
-        downloader = StockDownloader(stock_config)
+        # 传递是否为首次下载的信息
+        is_first_download = strategy.get("is_first_download", False)
+        downloader = StockDownloader(stock_config, is_first_download=is_first_download)
         return downloader.download_all_stocks()
     
     def download_indices(self, strategy: Dict[str, Any], whitelist: List[str] = None) -> DownloadStats:
@@ -1044,12 +1378,23 @@ class DownloadManager:
         if index_whitelist is None:
             index_whitelist = INDEX_WHITELIST
         
-        # 确定下载策略
+        # 确定下载策略（内部已经处理了智能结束日期）
         strategy = self.determine_download_strategy()
         
-        # 添加智能日期判断的详细说明
+        # 检查是否需要跳过下载（必须在访问其他键之前检查）
+        if strategy.get("skip_download", False):
+            logger.warning("=" * 60)
+            logger.warning("数据已是最新，跳过下载")
+            logger.warning("=" * 60)
+            logger.warning(f"跳过原因: 最新日期={strategy.get('latest_date', 'N/A')}, 计算出的开始日期={strategy.get('start_date', 'N/A')}, 实际结束日期={strategy.get('end_date', 'N/A')}")
+            logger.warning(f"如果最新日期 >= 结束日期，说明数据已经是最新的，无需下载")
+            logger.warning("=" * 60)
+            return {"stock": DownloadStats(), "index": DownloadStats()}
+        
+        # 添加智能日期判断的详细说明（如果配置为"today"）
         if self.config.end_date.lower() == "today":
-            smart_end_date = self.get_smart_end_date("today")
+            # strategy['end_date'] 已经是智能处理后的日期
+            smart_end_date = strategy['end_date']
             logger.info("=" * 60)
             logger.info("智能日期判断说明")
             logger.info("=" * 60)
@@ -1062,17 +1407,8 @@ class DownloadManager:
             logger.info("  - 如果无法获取交易日历，使用今天")
             logger.info("=" * 60)
         
-        # 显示中文下载策略信息
-        if self.config.end_date.lower() == "today":
-            smart_end_date = self.get_smart_end_date("today")
-            logger.info(f"下载策略: 首次下载={strategy['is_first_download']}, 最新日期={strategy['latest_date']}, 开始日期={strategy['start_date']}, 结束日期={smart_end_date}, 复权类型={strategy['adj_type']}, 资产类型={strategy['asset_type']}, 跳过下载={strategy['skip_download']}")
-        else:
-            logger.info(f"下载策略: 首次下载={strategy['is_first_download']}, 最新日期={strategy['latest_date']}, 开始日期={strategy['start_date']}, 结束日期={strategy['end_date']}, 复权类型={strategy['adj_type']}, 资产类型={strategy['asset_type']}, 跳过下载={strategy['skip_download']}")
-        
-        # 检查是否需要跳过下载
-        if strategy.get("skip_download", False):
-            logger.info("数据已是最新，跳过下载")
-            return {"stock": DownloadStats(), "index": DownloadStats()}
+        # 显示中文下载策略信息（使用strategy中已经智能处理后的结束日期）
+        logger.info(f"下载策略: 首次下载={strategy['is_first_download']}, 最新日期={strategy['latest_date']}, 开始日期={strategy['start_date']}, 结束日期={strategy['end_date']}, 复权类型={strategy['adj_type']}, 资产类型={strategy['asset_type']}, 跳过下载={strategy['skip_download']}")
         
         results = {}
         total_assets = len(assets)

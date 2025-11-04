@@ -14,7 +14,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # ================= 数据源配置 =================
 # Tushare API Token（必填）
 TOKEN = ""
-
 # 数据存储根目录
 DATA_ROOT = os.path.join(BASE_DIR, "stock_data")
 
@@ -78,8 +77,10 @@ UNIFIED_DB_PATH = "stock_data.db"
 KEEP_PARQUET_FILES = True  # 是否保留原有Parquet文件（用于迁移和备份）
 
 # DuckDB连接配置（由数据库连接配置管理器统一管理）
-DUCKDB_THREADS = 16  # DuckDB使用的线程数（只读连接使用完整线程数，读写连接使用一半）
-DUCKDB_MEMORY_LIMIT = "18GB"  # DuckDB内存限制
+# 注意：DuckDB要求连接到同一个数据库文件的所有连接必须使用相同的配置参数
+# 因此，所有连接（只读和读写）都使用相同的配置参数
+DUCKDB_THREADS = 16  # DuckDB使用的线程数（所有连接统一使用此值）
+DUCKDB_MEMORY_LIMIT = "18GB"  # DuckDB内存限制（所有连接统一使用此值）
 DUCKDB_TEMP_DIR = os.path.join(DATA_ROOT, "duckdb_tmp")  # 临时文件目录
 DUCKDB_CLEAR_DAILY_BEFORE = False  # 是否在写入前清理每日数据
 

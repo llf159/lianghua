@@ -771,6 +771,15 @@ def _flush_batch_buffer():
         df = pd.DataFrame(batch_data)
         
         # 使用同步写入确保数据被正确保存
+        # 使用回调函数在写入完成后更新状态文件
+        def update_status_callback(response):
+            try:
+                if hasattr(response, 'success') and response.success:
+                    from database_manager import update_details_data_status
+                    update_details_data_status()
+            except Exception as e:
+                LOGGER.warning(f"[状态文件] 更新细节数据状态失败: {e}")
+        
         request_id = db_manager.receive_data(
             source_module="scoring_core_batch",
             data_type="custom",
@@ -780,7 +789,8 @@ def _flush_batch_buffer():
             db_path=details_db_path,
             validation_rules={
                 "required_columns": ["ts_code", "ref_date"]
-            }
+            },
+            callback=update_status_callback
         )
         
         LOGGER.info(f"[批量写回] 成功提交批量写回请求: {request_id}, 数据量: {_BATCH_BUFFER['current_count']}")
@@ -2576,25 +2586,44 @@ def _eval_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = None) -
 
 def _check_database_health(check_connection_pool: bool = False):
     """
-    检查数据库健康状态，用于诊断问题
+    检查数据库健康状态，用于诊断问题（使用状态文件）
     
     Args:
         check_connection_pool: 是否检查连接池状态（默认False，减少不必要的连接池访问）
     """
     try:
-        from database_manager import get_data_source_status
+        from database_manager import get_database_manager
         from config import DATA_ROOT, UNIFIED_DB_PATH
         import os
         
-        status = get_data_source_status()
+        # 使用状态文件检查数据库状态
+        manager = get_database_manager()
+        status = manager.load_status_file()
+        
         db_path = os.path.abspath(os.path.join(DATA_ROOT, UNIFIED_DB_PATH))
         
         health_info = {
-            'using_unified_db': status.get('use_unified_db', False),
-            'database_exists': os.path.exists(db_path),
+            'using_unified_db': True,  # 统一使用统一数据库
+            'database_exists': os.path.exists(db_path) if status is None else status.get('stock_data', {}).get('database_exists', False),
             'database_locked': False,  # 功能已迁移到database_manager
-            'file_size': os.path.getsize(db_path) if os.path.exists(db_path) else 0
+            'file_size': os.path.getsize(db_path) if os.path.exists(db_path) else 0,
+            'status_file_exists': status is not None
         }
+        
+        # 如果状态文件存在，添加状态信息
+        if status:
+            stock_data = status.get('stock_data', {})
+            health_info['stock_data_status'] = {
+                'total_records': stock_data.get('total_records', 0),
+                'total_stocks': stock_data.get('total_stocks', 0),
+                'last_update': stock_data.get('last_update')
+            }
+            details_data = status.get('details_data', {})
+            health_info['details_data_status'] = {
+                'total_records': details_data.get('total_records', 0),
+                'stock_count': details_data.get('stock_count', 0),
+                'last_update': details_data.get('last_update')
+            }
         
         # 只在需要时检查连接池状态（避免频繁访问连接池）
         if check_connection_pool:
@@ -4295,6 +4324,12 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
                 LOGGER.info(f"[批量写回] 主进程统一写入成功（包含rank和total）: 数据量={len(df)}, 耗时={result.execution_time:.2f}秒")
                 # 标记主进程统一写入成功，后续不需要再单独更新排名
                 all_detail_data_success = True
+                # 更新状态文件
+                try:
+                    from database_manager import update_details_data_status
+                    update_details_data_status()
+                except Exception as e:
+                    LOGGER.warning(f"[状态文件] 更新细节数据状态失败: {e}")
             else:
                 LOGGER.error(f"[批量写回] 主进程统一写入失败: {result.error}")
                 all_detail_data_success = False
