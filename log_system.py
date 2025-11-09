@@ -5,12 +5,19 @@
 统一日志系统模块
 提供完整的debug日志系统，支持多级别日志记录、性能监控和错误追踪
 包含日志初始化、配置管理和便捷函数
+
+特性：
+- 异步文件写入：使用后台线程异步写入日志文件，提高性能，避免阻塞主线程
+- 多进程支持：子进程日志通过进程队列发送到主进程，统一异步写入
+- 多级别日志：支持DEBUG、INFO、PREP、WARNING、ERROR、CRITICAL和性能日志
+- 日志轮转：自动轮转日志文件，防止文件过大
 """
 
 import os
 import sys
 import logging
 import logging.handlers
+import queue
 # 避免logging内部报错打断业务
 logging.raiseExceptions = False
 
@@ -192,8 +199,12 @@ class DebugLogger:
         self.logger.setLevel(logging.INFO)  # 设置最低级别为INFO，不记录DEBUG
         self.logger.propagate = False
         
-        # 队列监听器引用（仅主进程使用）
+        # 队列监听器引用（仅主进程使用，用于多进程日志）
         self._queue_listener: Optional[logging.handlers.QueueListener] = None
+        
+        # 异步写入队列和监听器（用于文件异步写入）
+        self._async_queue: Optional[queue.Queue] = None
+        self._async_listener: Optional[logging.handlers.QueueListener] = None
         
         # 在主进程中清除之前的日志文件（每个logger只清除一次）
         if _is_main_process() and name not in DebugLogger._cleared_loggers:
@@ -382,22 +393,13 @@ class DebugLogger:
         perf_handler.addFilter(_PerfOnly())
         handlers.append(perf_handler)
 
-        # 主进程：直接使用文件处理器（不走队列，提高效率）
+        # 主进程：使用异步写入队列（提高性能，避免阻塞）
         # 子进程：已经通过队列发送，不执行到这里
-        for handler in handlers:
-            self.logger.addHandler(handler)
-        
-        # 所有进程都添加控制台处理器
-        self.logger.addHandler(console_handler)
-        
-        # 主进程：启动监听器处理子进程发送到队列的日志
-        log_queue = _get_log_queue()
-        if is_main and log_queue is not None and self._queue_listener is None:
-            # 为当前logger创建监听器，处理子进程发送的该logger的日志
-            # 注意：每个logger创建自己的监听器，监听同一个队列
-            # QueueListener会从队列中取出日志并发送到handler
-            # handler会根据logger名称自动过滤，所以每个监听器只处理自己的日志
-            # 为了避免日志丢失，我们使用一个过滤器确保只处理当前logger的日志
+        if is_main:
+            # 创建线程队列用于异步写入文件
+            self._async_queue = queue.Queue(-1)  # 无限制队列
+            
+            # 为每个handler添加logger名称过滤器（用于多进程日志）
             class LoggerNameFilter(logging.Filter):
                 def __init__(self, logger_name):
                     super().__init__()
@@ -405,19 +407,55 @@ class DebugLogger:
                 def filter(self, record):
                     return record.name == self.logger_name
             
-            # 为每个handler添加logger名称过滤器
             filtered_handlers = []
             for handler in handlers:
                 handler.addFilter(LoggerNameFilter(self.logger.name))
                 filtered_handlers.append(handler)
             
-            listener = logging.handlers.QueueListener(
-                log_queue, 
-                *filtered_handlers, 
+            # 创建异步写入监听器（后台线程处理文件写入）
+            self._async_listener = logging.handlers.QueueListener(
+                self._async_queue,
+                *filtered_handlers,
                 respect_handler_level=True
             )
-            listener.start()
-            self._queue_listener = listener
+            self._async_listener.start()
+            
+            # 使用QueueHandler将日志放入异步队列
+            async_handler = logging.handlers.QueueHandler(self._async_queue)
+            self.logger.addHandler(async_handler)
+            
+            # 主进程：启动监听器处理子进程发送到进程队列的日志
+            log_queue = _get_log_queue()
+            if log_queue is not None and self._queue_listener is None:
+                # 子进程的日志也需要异步写入，所以也发送到异步队列
+                # 创建一个特殊的handler，将进程队列的日志转发到异步队列
+                class ProcessQueueToAsyncHandler(logging.Handler):
+                    def __init__(self, async_queue):
+                        super().__init__()
+                        self.async_queue = async_queue
+                    def emit(self, record):
+                        try:
+                            self.async_queue.put(record)
+                        except Exception:
+                            self.handleError(record)
+                
+                process_handler = ProcessQueueToAsyncHandler(self._async_queue)
+                process_handler.addFilter(LoggerNameFilter(self.logger.name))
+                
+                listener = logging.handlers.QueueListener(
+                    log_queue,
+                    process_handler,
+                    respect_handler_level=True
+                )
+                listener.start()
+                self._queue_listener = listener
+        else:
+            # 子进程：直接添加文件处理器（虽然不会执行到这里，但保留以防万一）
+            for handler in handlers:
+                self.logger.addHandler(handler)
+        
+        # 所有进程都添加控制台处理器（同步输出，保持实时性）
+        self.logger.addHandler(console_handler)
 
     
     def debug(self, message: str, **kwargs):
@@ -520,6 +558,24 @@ class DebugLogger:
         with self._lock:
             self._error_count = 0
             self._warning_count = 0
+    
+    def stop(self):
+        """停止异步监听器（应在程序退出时调用）"""
+        # 停止异步写入监听器
+        if self._async_listener is not None:
+            try:
+                self._async_listener.stop()
+            except Exception:
+                pass
+            self._async_listener = None
+        
+        # 停止多进程队列监听器
+        if self._queue_listener is not None:
+            try:
+                self._queue_listener.stop()
+            except Exception:
+                pass
+            self._queue_listener = None
 
 def create_logger(name: str, log_dir: str = "log") -> DebugLogger:
     """创建调试日志记录器"""
@@ -586,6 +642,14 @@ def _stop_queue_listener():
         except Exception:
             pass
         _log_listener = None
+
+def stop_all_loggers():
+    """停止所有日志记录器的异步监听器（应在程序退出时调用）"""
+    for logger in _global_loggers.values():
+        try:
+            logger.stop()
+        except Exception:
+            pass
 
 def get_logger(name: str, log_dir: str = "log") -> DebugLogger:
     """获取全局日志记录器"""
@@ -756,6 +820,7 @@ __all__ = [
     'init_all_loggers',
     'cleanup_logs',
     'get_module_logger',
+    'stop_all_loggers',
     'debug_log',
     'info_log',
     'error_log',

@@ -175,6 +175,61 @@ if _SC_RULES_LOADED:
 else:
     LOGGER.warning("[策略预编译] 策略规则加载失败或未找到规则")
 
+# 策略编译时计算最大 window（按 timeframe 分组）
+def _compute_max_windows_by_tf(rules: List[dict]) -> dict:
+    """
+    计算策略规则中每个 timeframe 的最大 window 值。
+    用于在数据获取时统一使用最大 window，确保所有规则都有足够的数据。
+    
+    Returns:
+        dict: {timeframe: max_window}，例如 {"D": 60, "W": 10, "M": 3}
+    """
+    max_wins = {}
+    
+    def _extract_window(rule_or_clause: dict, tf: str) -> int:
+        """从规则或子句中提取 score_windows 值（用于数据获取）"""
+        if rule_or_clause.get("timeframe", "D").upper() == tf:
+            # 优先使用 score_windows，如果没有则使用 window（向后兼容），最后使用默认值
+            # 注意：scope: LAST 的规则没有 score_windows，不参与计算
+            if rule_or_clause.get("scope", "ANY").upper() == "LAST":
+                return 0  # scope: LAST 不需要窗口，不参与计算
+            return int(rule_or_clause.get("score_windows") or rule_or_clause.get("window", SC_LOOKBACK_D))
+        return 0
+    
+    for rule in rules:
+        if "clauses" in rule and rule["clauses"]:
+            # 带子句的规则：检查每个子句
+            for clause in rule["clauses"]:
+                for tf in ["D", "W", "M"]:
+                    win = _extract_window(clause, tf)
+                    if win > 0:
+                        max_wins[tf] = max(max_wins.get(tf, 0), win)
+        else:
+            # 单条规则
+            for tf in ["D", "W", "M"]:
+                win = _extract_window(rule, tf)
+                if win > 0:
+                    max_wins[tf] = max(max_wins.get(tf, 0), win)
+    
+    # 确保至少有一个默认值
+    if "D" not in max_wins:
+        max_wins["D"] = SC_LOOKBACK_D
+    
+    return max_wins
+
+# 在策略编译时计算最大 windows
+_MAX_WINDOWS_BY_TF = {}
+if _SC_RULES_LOADED:
+    try:
+        all_rules = list(SC_RULES) + list(SC_PRESCREEN_RULES)
+        _MAX_WINDOWS_BY_TF = _compute_max_windows_by_tf(all_rules)
+        LOGGER.info(f"[策略预编译] 最大 windows (按 timeframe): {_MAX_WINDOWS_BY_TF}")
+    except Exception as e:
+        LOGGER.warning(f"[策略预编译] 计算最大 windows 失败: {e}")
+        _MAX_WINDOWS_BY_TF = {"D": SC_LOOKBACK_D}
+else:
+    _MAX_WINDOWS_BY_TF = {"D": SC_LOOKBACK_D}
+
 # 尝试启用表达式编译缓存
 try:
     import tdx_compat
@@ -661,11 +716,16 @@ def _get_batch_buffer_data():
     batch_data = []
     for i, summary in enumerate(_BATCH_BUFFER["summaries"]):
         per_rules = _BATCH_BUFFER["per_rules"][i]["rules"]
+        ref_date = summary.get('ref_date', '')
+        
+        # 在返回前过滤per_rules，只保留算分日期（ref_date）的命中信息
+        filtered_per_rules = _filter_rules_by_ref_date(per_rules, ref_date)
+        
         # 对 JSON 字段进行序列化
         highlights_json = json.dumps(summary.get('highlights', []), ensure_ascii=False)
         drawbacks_json = json.dumps(summary.get('drawbacks', []), ensure_ascii=False)
         opportunities_json = json.dumps(summary.get('opportunities', []), ensure_ascii=False)
-        rules_json = json.dumps(per_rules if per_rules else [], ensure_ascii=False)
+        rules_json = json.dumps(filtered_per_rules if filtered_per_rules else [], ensure_ascii=False)
         
         # 正确处理tiebreak的None值
         tiebreak_value = summary.get('tiebreak')
@@ -733,11 +793,16 @@ def _flush_batch_buffer():
         batch_data = []
         for i, summary in enumerate(_BATCH_BUFFER["summaries"]):
             per_rules = _BATCH_BUFFER["per_rules"][i]["rules"]
+            ref_date = summary.get('ref_date', '')
+            
+            # 在写入前过滤per_rules，只保留算分日期（ref_date）的命中信息
+            filtered_per_rules = _filter_rules_by_ref_date(per_rules, ref_date)
+            
             # 对 JSON 字段进行序列化
             highlights_json = json.dumps(summary.get('highlights', []), ensure_ascii=False)
             drawbacks_json = json.dumps(summary.get('drawbacks', []), ensure_ascii=False)
             opportunities_json = json.dumps(summary.get('opportunities', []), ensure_ascii=False)
-            rules_json = json.dumps(per_rules if per_rules else [], ensure_ascii=False)
+            rules_json = json.dumps(filtered_per_rules if filtered_per_rules else [], ensure_ascii=False)
             
             # 正确处理tiebreak的None值
             tiebreak_value = summary.get('tiebreak')
@@ -1071,17 +1136,87 @@ def RANK_RET(N: int | None = None, K: Optional[int] = None, side: str = "up") ->
 def RANK_MATCH_COEF(N: int | None = None, K: Optional[int] = None) -> float:
     """
     量价匹配系数（0~1，越大匹配越强）：
-      - 涨幅榜应与“量大”（活跃）匹配；
-      - 跌幅榜应与“量小”（冷清）匹配。
+      - 涨幅榜应与"量大"（活跃）匹配；
+      - 跌幅榜应与"量小"（冷清）匹配。
     做法：
       - 计算：r_up = RANK_RET(...,'up'), r_dn = RANK_RET(...,'down')
       - 量小名次：rv_small = RANK_VOL(...)
       - 量大名次：rv_large = (Keff + 1 - rv_small)，Keff 为参与排名样本量
       - 匹配度：min(r_up * rv_large, r_dn * rv_small) 的倒数归一（Keff / prod）
+    
+    优化：批量计算up和down的排名，避免重复计算base
     """
-    # 两边名次
-    r_up = RANK_RET(N, K, side="up")
-    r_dn = RANK_RET(N, K, side="down")
+    ref, base, adj, codes = _RANK_G["ref"], _RANK_G["base"], _RANK_G["adj"], _RANK_G["codes"]
+    N = int(N or _RANK_G["default_N"])
+    ts = str(tdx.EXTRA_CONTEXT.get("TS", ""))
+    
+    # 优化：批量计算up和down的排名，复用base计算
+    # 检查up和down的排名缓存
+    key_up = ("RET_up", ref, int(N or 0), int(K or 0), _codes_sig(codes))
+    key_dn = ("RET_down", ref, int(N or 0), int(K or 0), _codes_sig(codes))
+    ranks_up = _RANK_XSEC_CACHE.get(key_up)
+    ranks_dn = _RANK_XSEC_CACHE.get(key_dn)
+    
+    # 如果两个排名都已缓存，直接使用
+    if ranks_up is not None and ranks_dn is not None:
+        _XSEC_STATS["hits"] += 2
+        r_up = float(ranks_up.get(ts, float("inf")))
+        r_dn = float(ranks_dn.get(ts, float("inf")))
+    else:
+        # 需要计算排名，批量获取base
+        df = _get_rank_data_from_cache(ref, 2, codes)
+        if df is None:
+            _CACHE_STATS["fallbacks"] += 1
+            key = ("DF", str(ref), 2, hash(tuple(sorted(codes))))
+            df_local = _RANK_LOCAL_DF_CACHE.get(key)
+            if df_local is not None:
+                _CACHE_STATS["local_hits"] += 1
+                df = df_local
+            else:
+                _CACHE_STATS["local_misses"] += 1
+                df = None
+        
+        # 获取base（涨跌幅向量）
+        base_key = ("RET_BASE", ref)
+        base_series = _XSEC_BASE_CACHE.get(base_key) if SC_ENABLE_BATCH_XSEC else None
+        if base_series is None:
+            base_series = _xsec_ret(df, ref, codes)
+            if SC_ENABLE_BATCH_XSEC and base_series is not None and not base_series.empty:
+                _XSEC_BASE_CACHE[base_key] = base_series
+        
+        if base_series is None or base_series.empty:
+            return float("inf")
+        
+        # 处理K参数：如果指定了K，先筛选
+        if K and K > 0:
+            base_series = base_series.sort_values(ascending=False).head(int(K))
+        
+        # 批量计算up和down的排名
+        if ranks_up is None:
+            ranks_up = _rank_series(base_series, ascending=False)
+            _RANK_XSEC_CACHE.put(key_up, ranks_up)
+            _XSEC_STATS["misses"] += 1
+        else:
+            _XSEC_STATS["hits"] += 1
+        
+        if ranks_dn is None:
+            ranks_dn = _rank_series(-base_series, ascending=False)
+            _RANK_XSEC_CACHE.put(key_dn, ranks_dn)
+            _XSEC_STATS["misses"] += 1
+        else:
+            _XSEC_STATS["hits"] += 1
+        
+        # 获取当前股票的排名
+        r_up = float(ranks_up.get(ts, float("inf")))
+        r_dn = float(ranks_dn.get(ts, float("inf")))
+    
+    # 处理K参数：如果指定了K且排名超出范围，返回inf
+    if K and r_up > int(K):
+        r_up = float("inf")
+    if K and r_dn > int(K):
+        r_dn = float("inf")
+    
+    # 计算成交量排名
     rv_small = RANK_VOL(N, K)
     Keff = int(K or len(_RANK_G["codes"]) or 1)
     rv_large = max(1.0, Keff + 1.0 - rv_small)
@@ -1114,6 +1249,7 @@ def _last_true_date(df: pd.DataFrame, expr: str, *, ref_date: str, timeframe: st
     if not expr:
         return None, None
     
+    # 自动使用策略编译时的最大 window 作为 data_window，score_window 用于计算窗口
     sig = _eval_bool_cached(ctx, df, expr, timeframe, window, ref_date)
     lag = _last_true_lag(sig)
     if lag is None:
@@ -1526,23 +1662,28 @@ def _recent_points(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = Non
     返回 (加分, lag, 错误或None)
     """
     tf = str(rule.get("timeframe", "D")).upper()
-    # 使用 score_windows 用于计分判断，如果不存在则使用 window
-    score_window = _get_score_window(rule, SC_LOOKBACK_D)
+    # window 用于数据获取，score_windows 用于计算窗口
+    window = int(rule.get("window", SC_LOOKBACK_D))  # window 用于数据获取
+    score_window = _get_score_window(rule, window)  # score_windows 用于计算窗口
     when = (rule.get("when") or "").strip()
     if not when:
         return 0.0, None, "空 when 表达式"
 
     if ctx:
-        # 使用缓存版本
+        # 使用缓存版本：自动使用策略编译时的最大 window 作为 data_window，score_window 用于计算窗口
         s_bool = _eval_bool_cached(ctx, dfD, when, tf, score_window, ref_date)
     else:
-        # 原始版本
+        # 原始版本：在完整数据上计算，然后切片窗口范围
         dfTF = dfD if tf == "D" else _resample(dfD, tf)
         win_df = _window_slice(dfTF, ref_date, score_window)
         if win_df.empty:
             return 0.0, None, None
-        with _ctx_df(win_df):
-            s_bool = evaluate_bool(when, win_df).astype(bool)
+        # 在完整数据上计算表达式
+        with _ctx_df(dfTF):
+            result_full = evaluate_bool(when, dfTF)
+        # 切片到窗口范围
+        result_full_series = pd.Series(result_full, index=dfTF.index, dtype=bool)
+        s_bool = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
     
     lag = _last_true_lag(s_bool)
     if lag is None:
@@ -1677,25 +1818,30 @@ def _batch_update_ranks_duckdb_optimized(db_path: str, ref_date: str, scored_sor
         if time.time() - start_wait_time >= max_wait_time:
             LOGGER.warning(f"[detail] 等待队列完成超时，但仍继续更新排名")
         
-        # 准备批量更新数据
-        update_data = []
-        for i, stock in enumerate(scored_sorted, 1):
-            update_data.append({
-                'ts_code': stock.ts_code,
-                'ref_date': ref_date,
-                'rank': i,
-                'total': len(scored_sorted)
-            })
+        # 准备批量更新数据 - 优化：使用列表推导式替代循环append
+        total_count = len(scored_sorted)
+        update_data = [{
+            'ts_code': stock.ts_code,
+            'ref_date': ref_date,
+            'rank': i,
+            'total': total_count
+        } for i, stock in enumerate(scored_sorted, 1)]
         
         df = pd.DataFrame(update_data)
         
         # 去重：按 (ts_code, ref_date, rank) 排序，保留每个 (ts_code, ref_date) 组合的最小 rank
+        # 优化：先检查是否有重复，避免不必要的排序操作
         original_count = len(df)
-        df = df.sort_values(['ts_code', 'ref_date', 'rank']).drop_duplicates(['ts_code', 'ref_date'], keep='first')
-        deduplicated_count = len(df)
-        
-        if deduplicated_count < original_count:
-            LOGGER.warning(f"[detail] 发现重复键，已去重: 原始 {original_count} 行，去重后 {deduplicated_count} 行")
+        if original_count > 0:
+            # 检查是否有重复的 (ts_code, ref_date) 组合
+            duplicates = df.duplicated(subset=['ts_code', 'ref_date'], keep=False)
+            if duplicates.any():
+                # 只有在有重复时才进行排序和去重
+                df = df.sort_values(['ts_code', 'ref_date', 'rank']).drop_duplicates(['ts_code', 'ref_date'], keep='first')
+                deduplicated_count = len(df)
+                if deduplicated_count < original_count:
+                    LOGGER.warning(f"[detail] 发现重复键，已去重: 原始 {original_count} 行，去重后 {deduplicated_count} 行")
+            # 如果没有重复，直接使用原DataFrame，无需排序
         
         # 使用details目录下的数据库文件
         details_db_path = os.path.join(SC_OUTPUT_DIR, SC_DETAIL_DB_PATH)
@@ -1734,12 +1880,70 @@ def _batch_update_ranks_duckdb_optimized(db_path: str, ref_date: str, scored_sor
 
 # 所有数据库操作已统一使用database_manager，不再需要分散的优化函数
 
+def _filter_rules_by_ref_date(rules: list[dict], ref_date: str) -> list[dict]:
+    """过滤规则，只保留与ref_date相关的命中信息
+    
+    对于EACH/PERBAR/EACH_TRUE类型（多次命中，有很多天都算分），保留窗口内所有命中日期（<= ref_date且在窗口内）
+    对于其他所有类型（LAST/ANY/ALL/RECENT/DIST/NEAR/COUNT>=k/CONSEC>=m/ANY_n/ALL_n等单次型规则），
+    如果规则命中了（ok=True），直接用ref_date作为命中日期（因为打分的时候就是基于ref_date的）
+    """
+    import datetime as dt
+    filtered_rules = []
+    ref_date_dt = dt.datetime.strptime(ref_date, "%Y%m%d")
+    
+    for rule in rules:
+        scope = str(rule.get("scope", "ANY")).upper().strip()
+        ok = rule.get("ok", False)  # 规则是否命中
+        hit_dates = rule.get("hit_dates", [])
+        
+        # 对于EACH/PERBAR/EACH_TRUE类型（多次命中，有很多天都算分），保留窗口内所有命中日期
+        if scope in {"EACH", "PERBAR", "EACH_TRUE"}:
+            # 将hit_dates转换为字符串列表，过滤出 <= ref_date 且在窗口内的日期
+            hit_dates_str = [str(d) for d in hit_dates if d]
+            # 窗口范围：从ref_date往前推window天到ref_date
+            # 所以窗口内的日期是：所有 <= ref_date 且在窗口内的日期
+            # 由于hit_dates已经是窗口内的命中日期（_list_true_dates在窗口内查找），
+            # 所以只需要保留所有 <= ref_date 的日期
+            window_hit_dates = []
+            for d_str in hit_dates_str:
+                try:
+                    d_dt = dt.datetime.strptime(d_str, "%Y%m%d")
+                    if d_dt <= ref_date_dt:
+                        window_hit_dates.append(d_str)
+                except (ValueError, TypeError):
+                    # 如果日期格式不正确，跳过
+                    continue
+            
+            # 如果窗口内有命中日期，则保留该规则
+            if window_hit_dates:
+                filtered_rule = rule.copy()
+                filtered_rule["hit_dates"] = window_hit_dates
+                # 使用最后一个命中日期作为hit_date
+                filtered_rule["hit_date"] = window_hit_dates[-1] if window_hit_dates else None
+                filtered_rule["hit_count"] = len(window_hit_dates)
+                filtered_rules.append(filtered_rule)
+            # 如果窗口内没有命中日期，则跳过该规则（不保留）
+        else:
+            # 对于其他所有类型（LAST/ANY/ALL/RECENT/DIST/NEAR/COUNT>=k/CONSEC>=m/ANY_n/ALL_n等单次型规则）
+            # 如果规则命中了（ok=True），直接用ref_date作为命中日期（因为打分的时候就是基于ref_date的）
+            if ok:
+                filtered_rule = rule.copy()
+                filtered_rule["hit_date"] = ref_date
+                filtered_rule["hit_dates"] = [ref_date]
+                filtered_rule["hit_count"] = 1
+                filtered_rules.append(filtered_rule)
+            # 如果规则没命中，则跳过该规则（不保留）
+    
+    return filtered_rules
 
 def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: list[dict]):
     """
     写入个股详情，优先使用数据库存储，失败时回退到JSON文件
     在表达式选股场景下，禁用数据库写入以避免冲突
     """
+
+    # 在写入前过滤per_rules，只保留算分日期（ref_date）的命中信息
+    filtered_per_rules = _filter_rules_by_ref_date(per_rules, ref_date)
 
     # 数据库写入已统一由database_manager管理，无需进程检查
     success = True
@@ -1769,7 +1973,7 @@ def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: li
             highlights_json = json.dumps(summary.get('highlights', []), ensure_ascii=False)
             drawbacks_json = json.dumps(summary.get('drawbacks', []), ensure_ascii=False)
             opportunities_json = json.dumps(summary.get('opportunities', []), ensure_ascii=False)
-            rules_json = json.dumps(per_rules if per_rules else [], ensure_ascii=False)
+            rules_json = json.dumps(filtered_per_rules if filtered_per_rules else [], ensure_ascii=False)
             
             # 正确处理tiebreak的None值
             tiebreak_value = summary.get('tiebreak')
@@ -1836,7 +2040,7 @@ def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: li
                 "ts_code": ts_code,
                 "ref_date": ref_date,
                 "summary": summary,      # {"score": float, "tiebreak": float|None, "highlights": [...], "drawbacks":[...]}
-                "rules": per_rules       # 每条规则的细粒度命中情况（见下）
+                "rules": filtered_per_rules       # 每条规则的细粒度命中情况（见下），已过滤只保留ref_date的命中
             }
             with open(out_path, "w", encoding="utf-8") as f:
                 import json
@@ -1860,14 +2064,18 @@ def _list_true_dates(df: pd.DataFrame, expr: str, *, ref_date: str, window: int,
     """返回窗口内所有命中日期（按 timeframe 重采样后对齐到日线索引）。"""
     try:
         if ctx:
-            # 使用缓存版本
+            # 使用缓存版本：自动使用策略编译时的最大 window 作为 data_window，score_window 用于计算窗口
             sig = _eval_bool_cached(ctx, df, expr, timeframe, window, ref_date)
         else:
-            # 原始版本
+            # 原始版本：在完整数据上计算，然后切片窗口范围
             dfTF = df if timeframe == "D" else _resample(df, timeframe)
             win_df = _window_slice(dfTF, ref_date, window)
-            with _ctx_df(win_df):
-                sig = evaluate_bool(expr, win_df)
+            # 在完整数据上计算表达式
+            with _ctx_df(dfTF):
+                result_full = evaluate_bool(expr, dfTF)
+            # 切片到窗口范围
+            result_full_series = pd.Series(result_full, index=dfTF.index, dtype=bool)
+            sig = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
         
         if sig is None or len(sig) == 0:
             return []
@@ -1876,7 +2084,20 @@ def _list_true_dates(df: pd.DataFrame, expr: str, *, ref_date: str, window: int,
         idx = sig_bool.index
         # 使用布尔索引直接过滤，比zip循环快得多
         hit_indices = idx[sig_bool.values]
-        out = [str(i) for i in hit_indices]
+        # 格式化日期为 YYYYMMDD 格式，只保留年月日，不包含时间
+        out = []
+        for i in hit_indices:
+            if isinstance(i, pd.Timestamp):
+                out.append(i.strftime("%Y%m%d"))
+            elif hasattr(i, 'strftime'):
+                out.append(i.strftime("%Y%m%d"))
+            else:
+                # 如果不是日期类型，尝试转换为日期后再格式化
+                try:
+                    dt = pd.to_datetime(i)
+                    out.append(dt.strftime("%Y%m%d"))
+                except:
+                    out.append(str(i))
         return out
     except Exception:
         return []
@@ -1923,6 +2144,7 @@ def _inject_config_tags(dfD: pd.DataFrame, ref_date: str, ctx: dict = None):
             # 计算 sig（多子句 AND）
             if ctx:
                 # 使用缓存版本，按 D 级别直接把 df_calc 作为 base_df、tf="D" 送进 _eval_bool_cached 统一路径
+                # 这里传入 1 表示只计算当前一天的数据，data_window 和 score_window 都用 1
                 if rule.get("clauses"):
                     s_all = None
                     for e in exprs:
@@ -1973,6 +2195,7 @@ def _ctx_df(win_df):
             tdx.EXTRA_CONTEXT["DF"] = old
 
 
+@lru_cache(maxsize=512)
 def _normalize_expr(expr: str) -> str:
     """标准化表达式字符串，用于缓存键"""
     if not expr:
@@ -1982,18 +2205,46 @@ def _normalize_expr(expr: str) -> str:
     return normalized
 
 
-def _eval_bool_cached(ctx: dict, base_df: pd.DataFrame, expr: str, tf: str, win: int, ref_date: str) -> pd.Series:
+def _eval_bool_cached(ctx: dict, base_df: pd.DataFrame, expr: str, tf: str, score_window: int, ref_date: str, data_window: int = None) -> pd.Series:
     """
     返回窗口期内的布尔序列（索引为窗口期索引）。
-    1) 先根据 (expr_norm, tf, win, ref_date) 在 ctx['bool_lru'] 查询；
+    1) 先根据 (expr_norm, tf, data_window, score_window, ref_date) 在 ctx['bool_lru'] 查询；
     2) 命中则直接返回；
-    3) 未命中则：获取/构建 resampled df -> 按 ref_date 向左切 win 根 -> 注入上下文后调用原有 evaluate 逻辑 -> 回填 LRU -> 返回。
+    3) 未命中则：获取/构建 resampled df -> 使用 data_window 切片数据用于计算 -> 在数据窗口上计算表达式 -> 切片到 score_window 范围 -> 回填 LRU -> 返回。
+    
+    注意：
+    - data_window: 用于数据获取，从 base_df 中切片出足够的数据用于计算（避免数据被切片导致不足）
+      - 如果未提供，会自动从 ctx 中的 max_windows_by_tf 获取策略编译时计算的最大 window
+      - 如果 ctx 中没有，则使用 score_window 作为 data_window
+      - 如果表达式包含COUNT函数，会自动扩展data_window以包含COUNT窗口和内部表达式所需的历史数据
+    - score_window: 用于计算窗口，只计算 score_window 内的数据
+    - 数据获取使用策略编译时的最大 window，确保所有规则都有足够的数据
     """
+    # 自动从 ctx 中获取策略编译时的最大 window 作为 data_window
+    # 如果 ctx 中有 max_windows_by_tf，优先使用；否则使用传入的 data_window 或 score_window
+    if ctx and 'max_windows_by_tf' in ctx:
+        max_windows = ctx.get('max_windows_by_tf', {})
+        data_window = max_windows.get(tf.upper(), data_window or score_window)
+    elif data_window is None:
+        # 如果没有 ctx 或没有 max_windows_by_tf，使用 score_window 作为 data_window
+        data_window = score_window
+    
+    # 修复：如果表达式包含COUNT函数，需要扩展data_window以包含COUNT窗口和内部表达式所需的历史数据
+    count_window = _extract_max_count_window(expr)
+    if count_window > 0:
+        count_inner_exprs = list(_extract_count_inner_expr(expr))
+        inner_window = 0
+        for inner_expr in count_inner_exprs:
+            inner_window = max(inner_window, _calc_nested_window(inner_expr))
+        # data_window需要包含COUNT窗口和内部表达式所需的历史数据
+        required_window = count_window + inner_window
+        if required_window > data_window:
+            data_window = required_window
     # 构建缓存键前需要先标准化表达式
     expr_norm = _normalize_expr(expr)
     
-    # 构建缓存键
-    cache_key = (expr_norm, tf, win, ref_date)
+    # 构建缓存键（使用 score_window，因为结果是根据 score_window 切片的）
+    cache_key = (expr_norm, tf, data_window, score_window, ref_date)
     
     # 尝试从缓存获取
     bool_lru = ctx.get('bool_lru')
@@ -2007,47 +2258,54 @@ def _eval_bool_cached(ctx: dict, base_df: pd.DataFrame, expr: str, tf: str, win:
     # 未命中缓存，需要计算
     ctx['bool_cache_miss'] = ctx.get('bool_cache_miss', 0) + 1
     
-    # 优化：优先复用ctx中已有的win_cache，避免重复切片
-    win_cache_key = (tf, win, ref_date)
-    win_cache = ctx.get('win_cache', {})
-    if win_cache_key in win_cache:
-        # 直接复用已计算的win_df
-        win_df = win_cache[win_cache_key]
-    else:
-        # 获取或构建重采样数据
-        resampled = ctx.get('resampled', {})
-        if tf not in resampled:
-            if tf == "D":
-                resampled[tf] = base_df
-            else:
-                resampled[tf] = _resample(base_df, tf)
-            ctx['resampled'] = resampled
-        
-        df_tf = resampled[tf]
-        
-        # 切窗
-        win_df = _window_slice(df_tf, ref_date, win)
-        
-        # 缓存到win_cache中，供后续复用
-        if win_cache_key not in win_cache:
-            win_cache[win_cache_key] = win_df
-            ctx['win_cache'] = win_cache
+    # 获取或构建重采样数据（完整数据，不切片）
+    resampled = ctx.get('resampled', {})
+    if tf not in resampled:
+        if tf == "D":
+            resampled[tf] = base_df
+        else:
+            resampled[tf] = _resample(base_df, tf)
+        ctx['resampled'] = resampled
     
-    # 空表达式检查移到切窗之后，这样可以用 win_df.index 构造返回值
+    df_tf_full = resampled[tf]
+    
+    # 使用 data_window 切片数据用于计算（避免数据被切片导致不足）
+    data_win_cache_key = (tf, data_window, ref_date)
+    data_win_cache = ctx.get('data_win_cache', {})
+    if data_win_cache_key not in data_win_cache:
+        df_tf_data = _window_slice(df_tf_full, ref_date, data_window)
+        data_win_cache[data_win_cache_key] = df_tf_data
+        ctx['data_win_cache'] = data_win_cache
+    else:
+        df_tf_data = data_win_cache[data_win_cache_key]
+    
+    # 获取 score_window 索引（用于后续切片结果）
+    score_win_cache_key = (tf, score_window, ref_date)
+    score_win_cache = ctx.get('win_cache', {})
+    if score_win_cache_key not in score_win_cache:
+        win_df = _window_slice(df_tf_full, ref_date, score_window)
+        score_win_cache[score_win_cache_key] = win_df
+        ctx['win_cache'] = score_win_cache
+    else:
+        win_df = score_win_cache[score_win_cache_key]
+    
+    # 空表达式检查
     if not expr_norm:
         result = pd.Series(False, index=win_df.index, dtype=bool)
     elif win_df.empty:
         result = pd.Series([], index=win_df.index, dtype=bool)
     else:
-        # 计算布尔序列
-        with _ctx_df(win_df):
-            result = evaluate_bool(expr, win_df)
+        # 在 data_window 切片的数据上计算表达式（这样TS_RANK、TS_PCT等函数可以获取足够的历史数据）
+        with _ctx_df(df_tf_data):
+            result_full = evaluate_bool(expr, df_tf_data)
         
-        if result is None:
+        if result_full is None:
             result = pd.Series(False, index=win_df.index, dtype=bool)
         else:
-            # 确保返回的是布尔类型的Series，索引与窗口对齐
-            result = pd.Series(result, index=win_df.index, dtype=bool)
+            # 将计算结果转换为Series
+            result_full_series = pd.Series(result_full, index=df_tf_data.index, dtype=bool)
+            # 切片到 score_window 范围（只计算 score_window 内的数据）
+            result = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
     
     # 回填缓存
     if bool_lru:
@@ -2129,6 +2387,12 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) ->
                         else:
                             # 理论不应发生；保守返回空，交由 UI 用 hit_dates 或其它信息展示
                             hit_date = None
+                    
+                    # 修复：RECENT规则的ok应该基于lag是否存在，而不是初始值False
+                    ok = bool(lag is not None and err is None)
+                    gate_ok, gate_err, gate_norm = _eval_gate(df, rule, ref_date, ctx)
+                    if not gate_ok:
+                        add = 0.0
 
                     rows.append({
                         "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
@@ -2144,7 +2408,6 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) ->
                 ok_eval, err_eval = _eval_rule(df, rule, ref_date, ctx)
                 ok  = bool(ok_eval and not err_eval)
                 err = err_eval
-                add = (pts if ok else 0.0)
                 when = rule.get("when")
 
 
@@ -2152,6 +2415,8 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) ->
             hit_date = None
             hit_dates = []
             gate_ok, gate_err, gate_norm = _eval_gate(df, rule, ref_date, ctx)
+            # 计算add：只有当ok=True、gate_ok=True且pts!=0时，才设置add
+            add = (pts if (ok and gate_ok and pts) else 0.0)
             try:
                 if when:
                     dfTF2 = df if tf=="D" else _resample(df, tf)
@@ -2414,6 +2679,264 @@ def _get_score_window(rule_or_clause: dict, default_window: int = None) -> int:
     return int(default_window)
 
 
+@lru_cache(maxsize=256)
+def _extract_max_count_window(when_expr: str) -> int:
+    """
+    从 when 表达式中提取 COUNT 函数的最大窗口大小。
+    例如：COUNT(..., 30) 返回 30，COUNT(..., 5) 和 COUNT(..., 8) 返回 8。
+    
+    Args:
+        when_expr: when 表达式字符串
+        
+    Returns:
+        最大的 COUNT 窗口大小，如果没有找到 COUNT 则返回 0
+    """
+    if not when_expr:
+        return 0
+    
+    max_window = 0
+    # 匹配 COUNT(..., n) 的模式，n 是数字
+    # 需要处理嵌套括号的情况，使用更精确的匹配
+    # 匹配 COUNT( 开头，然后找到最后一个逗号后的数字
+    i = 0
+    while i < len(when_expr):
+        # 查找 COUNT( 的位置（不区分大小写）
+        count_pos = when_expr.upper().find('COUNT(', i)
+        if count_pos == -1:
+            break
+        
+        # 从 COUNT( 后开始查找匹配的右括号
+        start = count_pos + 6  # 'COUNT(' 的长度
+        paren_count = 1
+        j = start
+        while j < len(when_expr) and paren_count > 0:
+            if when_expr[j] == '(':
+                paren_count += 1
+            elif when_expr[j] == ')':
+                paren_count -= 1
+            j += 1
+        
+        if paren_count == 0:
+            # 找到了匹配的右括号，提取括号内的内容
+            content = when_expr[start:j-1]
+            # 查找最后一个逗号后的数字
+            # 从后往前找最后一个逗号
+            last_comma = content.rfind(',')
+            if last_comma != -1:
+                # 提取逗号后的部分
+                after_comma = content[last_comma+1:].strip()
+                # 尝试提取数字
+                num_match = re.match(r'(\d+)', after_comma)
+                if num_match:
+                    try:
+                        window = int(num_match.group(1))
+                        max_window = max(max_window, window)
+                    except (ValueError, TypeError):
+                        pass
+        
+        i = count_pos + 1
+    
+    return max_window
+
+
+@lru_cache(maxsize=256)
+def _extract_count_inner_expr(when_expr: str) -> tuple:
+    """
+    从 when 表达式中提取 COUNT 函数内部的表达式。
+    例如：COUNT(TS_RANK(V,20) >= 16 AND TS_PCT(..., 10) >= 0.9, 30) 
+    返回 ('TS_RANK(V,20) >= 16 AND TS_PCT(..., 10) >= 0.9',)
+    
+    注意：返回tuple以便支持lru_cache（list不可哈希）
+    
+    Args:
+        when_expr: when 表达式字符串
+        
+    Returns:
+        COUNT 函数内部表达式的元组（需要调用方转换为list）
+    """
+    if not when_expr:
+        return tuple()
+    
+    inner_exprs = []
+    i = 0
+    while i < len(when_expr):
+        # 查找 COUNT( 的位置（不区分大小写）
+        count_pos = when_expr.upper().find('COUNT(', i)
+        if count_pos == -1:
+            break
+        
+        # 从 COUNT( 后开始查找匹配的右括号
+        start = count_pos + 6  # 'COUNT(' 的长度
+        paren_count = 1
+        j = start
+        while j < len(when_expr) and paren_count > 0:
+            if when_expr[j] == '(':
+                paren_count += 1
+            elif when_expr[j] == ')':
+                paren_count -= 1
+            j += 1
+        
+        if paren_count == 0:
+            # 找到了匹配的右括号，提取括号内的内容
+            content = when_expr[start:j-1]
+            # 查找最后一个逗号，提取逗号前的部分（COUNT内部表达式）
+            last_comma = content.rfind(',')
+            if last_comma != -1:
+                inner_expr = content[:last_comma].strip()
+                if inner_expr:
+                    inner_exprs.append(inner_expr)
+        
+        i = count_pos + 1
+    
+    return tuple(inner_exprs)
+
+
+@lru_cache(maxsize=256)
+def _scan_expr_window(expr: str) -> int:
+    """
+    扫描表达式中函数所需的最大窗口大小。
+    例如：TS_RANK(V,20) 需要 20，MA(C,10) 需要 10，HHV(H,30) 需要 30。
+    
+    Args:
+        expr: 表达式字符串
+        
+    Returns:
+        表达式中函数所需的最大窗口大小，如果没有找到则返回 0
+    """
+    if not expr:
+        return 0
+    
+    max_window = 0
+    # 匹配函数名(..., n) 的模式，n 是数字
+    # 支持的函数：TS_RANK, TS_PCT, MA, EMA, SMA, HHV, LLV, SUM, STD, REF, COUNT等
+    func_patterns = [
+        r'TS_RANK\s*\([^)]*,\s*(\d+)',
+        r'TS_PCT\s*\([^)]*,\s*(\d+)',
+        r'MA\s*\([^)]*,\s*(\d+)',
+        r'EMA\s*\([^)]*,\s*(\d+)',
+        r'SMA\s*\([^)]*,\s*(\d+)',
+        r'HHV\s*\([^)]*,\s*(\d+)',
+        r'LLV\s*\([^)]*,\s*(\d+)',
+        r'SUM\s*\([^)]*,\s*(\d+)',
+        r'STD\s*\([^)]*,\s*(\d+)',
+        r'REF\s*\([^)]*,\s*(\d+)',
+        r'COUNT\s*\([^)]*,\s*(\d+)',
+    ]
+    
+    for pattern in func_patterns:
+        matches = re.finditer(pattern, expr, re.IGNORECASE)
+        for match in matches:
+            try:
+                window = int(match.group(1))
+                max_window = max(max_window, window)
+            except (ValueError, TypeError):
+                pass
+    
+    return max_window
+
+
+@lru_cache(maxsize=256)
+def _calc_nested_window(expr: str) -> int:
+    """
+    递归计算嵌套函数所需的总窗口大小。
+    例如：HHV(REF(H,1), 20) 需要 20 + 1 = 21天
+         HHV(REF(H,2), 30) 需要 30 + 2 = 32天
+         HHV(MA(REF(C,1),5),20) 需要 20 + 5 + 1 = 26天
+    
+    Args:
+        expr: 表达式字符串
+        
+    Returns:
+        嵌套函数所需的总窗口大小，如果没有找到则返回 0
+    """
+    if not expr:
+        return 0
+    
+    max_total_window = 0
+    
+    # 需要嵌套的函数列表（这些函数需要递归计算内部表达式）
+    nested_funcs = ['TS_RANK', 'TS_PCT', 'MA', 'EMA', 'SMA', 'HHV', 'LLV', 'SUM', 'STD', 'COUNT']
+    
+    # 使用递归方法找到所有函数调用
+    # 需要找到所有嵌套的函数，包括外层和内层
+    # 但是要注意：外层函数的窗口应该累加内层函数的窗口
+    # 例如：HHV(MA(REF(C,1),5),20) 需要 20 + 5 + 1 = 26天
+    # 策略：先找到所有函数调用，然后从外层到内层递归计算
+    
+    # 收集所有函数调用的位置和范围
+    # 需要找到所有嵌套的函数，包括外层和内层
+    # 策略：遍历每个字符位置，查找所有函数调用
+    func_calls = []
+    processed_ranges = set()  # 记录已处理的函数调用范围，避免重复
+    
+    for func_name in nested_funcs:
+        func_pattern = func_name + r'\s*\('
+        # 查找所有匹配的函数调用
+        for match in re.finditer(func_pattern, expr, re.IGNORECASE):
+            func_start = match.start()
+            func_end = match.end()
+            
+            # 找到匹配的右括号
+            paren_count = 1
+            j = func_end
+            while j < len(expr) and paren_count > 0:
+                if expr[j] == '(':
+                    paren_count += 1
+                elif expr[j] == ')':
+                    paren_count -= 1
+                j += 1
+            
+            if paren_count == 0:
+                # 检查是否已经处理过这个函数调用
+                if (func_start, j) not in processed_ranges:
+                    func_calls.append((func_start, j, func_name))
+                    processed_ranges.add((func_start, j))
+    
+    # 从外层到内层处理函数调用（按起始位置排序，外层函数在前）
+    # 但是要注意：内层函数可能在外层函数之前（如MA在HHV之前）
+    # 所以需要按嵌套深度排序：外层函数应该先处理
+    # 简单方法：按函数调用的范围大小排序，范围大的（外层）先处理
+    func_calls.sort(key=lambda x: x[1] - x[0], reverse=True)
+    
+    # 处理每个函数调用
+    for func_start, func_end, func_name in func_calls:
+        func_call = expr[func_start:func_end]
+        # 提取函数参数部分
+        func_pattern = func_name + r'\s*\('
+        match = re.search(func_pattern, func_call, re.IGNORECASE)
+        if match:
+            params = func_call[len(match.group(0)):len(func_call)-1]  # 去掉函数名(和最后的)
+            
+            # 查找最后一个逗号后的数字（窗口参数）
+            last_comma = params.rfind(',')
+            if last_comma != -1:
+                after_comma = params[last_comma+1:].strip()
+                num_match = re.match(r'(\d+)', after_comma)
+                if num_match:
+                    try:
+                        window = int(num_match.group(1))
+                        # 递归计算内部表达式所需窗口
+                        inner_expr = params[:last_comma].strip()
+                        inner_window = _calc_nested_window(inner_expr)
+                        total_window = window + inner_window
+                        max_total_window = max(max_total_window, total_window)
+                    except (ValueError, TypeError):
+                        pass
+    
+    # 如果没有找到需要嵌套的函数，再匹配REF等简单函数
+    if max_total_window == 0:
+        ref_pattern = r'REF\s*\([^)]+,\s*(\d+)'
+        matches = re.finditer(ref_pattern, expr, re.IGNORECASE)
+        for match in matches:
+            try:
+                window = int(match.group(1))
+                max_total_window = max(max_total_window, window)
+            except (ValueError, TypeError):
+                pass
+    
+    return max_total_window
+
+
 def _window_slice(dfTF: pd.DataFrame, ref_date: str, window: int) -> pd.DataFrame:
     dfTF = _ensure_datetime_index(dfTF)
     mask = dfTF.index <= dt.datetime.strptime(ref_date, "%Y%m%d")
@@ -2460,11 +2983,27 @@ def _load_attention_codes(_ref: str) -> list[str]:
 
 def _scope_hit(s_bool: pd.Series, scope: str) -> bool:
     """
+    判断布尔序列是否满足某个scope条件。
+    
     支持的 scope：
       - 基本：LAST | ANY | ALL | COUNT>=k | CONSEC>=m
-      - 扩展：ANY_n | ALL_n   （n 为正整数；表示“在外层 window 内存在一个长度为 n 的连续子集”）
-          ANY_n：该子集中 “when” 至少 1 天为 True
-          ALL_n：该子集中 “when” 每天都为 True  （等价于“存在长度 n 的连续 True”）
+      - 扩展：ANY_n | ALL_n   （n 为正整数；表示"在外层 window 内存在一个长度为 n 的连续子集"）
+          ANY_n：该子集中 "when" 至少 1 天为 True
+          ALL_n：该子集中 "when" 每天都为 True  （等价于"存在长度 n 的连续 True"）
+    
+    重要说明：
+      - EACH / PERBAR / EACH_TRUE scope **不使用此函数**
+      - 对于 EACH scope，应使用 _count_hits_perbar() 函数来计算窗口内逐K命中次数
+      - _count_hits_perbar() 会统计窗口内有多少根K线满足条件，返回命中次数
+      - 如果 _count_hits_perbar() 返回的 cnt > 0，说明策略触发（需要结合 gate 判断最终是否加分）
+      - 参考：_eval_single_rule() 函数中对于 EACH scope 的处理逻辑（第3579行）
+    
+    参数：
+      s_bool: 布尔序列（窗口内的布尔值）
+      scope: scope字符串（如 "LAST", "ANY", "EACH" 等）
+    
+    返回：
+      bool: 是否满足scope条件
     """
     s = s_bool.dropna().astype(bool)
     if s.empty:
@@ -2535,24 +3074,29 @@ def _eval_clause(dfD: pd.DataFrame, clause: dict, ref_date: str, ctx: dict = Non
     返回 (是否命中, 错误消息或 None)
     """
     tf = clause.get("timeframe", "D").upper()
-    # 使用 score_windows 用于计分判断，如果不存在则使用 window
-    score_window = _get_score_window(clause, SC_LOOKBACK_D)
+    # window 用于数据获取，score_windows 用于计算窗口
+    window = int(clause.get("window", SC_LOOKBACK_D))  # window 用于数据获取
+    score_window = _get_score_window(clause, window)  # score_windows 用于计算窗口
     scope = clause.get("scope", "ANY")
     when = clause.get("when", "").strip()
     if not when:
         return False, "空 when 表达式"
     try:
         if ctx:
-            # 使用缓存版本
+            # 使用缓存版本：自动使用策略编译时的最大 window 作为 data_window，score_window 用于计算窗口
             s_bool = _eval_bool_cached(ctx, dfD, when, tf, score_window, ref_date)
         else:
-            # 原始版本
+            # 原始版本：在完整数据上计算，然后切片窗口范围
             dfTF = dfD if tf=="D" else _resample(dfD, tf)
             win_df = _window_slice(dfTF, ref_date, score_window)
             if win_df.empty:
                 return False, f"窗口数据为空: tf={tf}, window={score_window}"
-            with _ctx_df(win_df):
-                s_bool = evaluate_bool(when, win_df)
+            # 在完整数据上计算表达式
+            with _ctx_df(dfTF):
+                result_full = evaluate_bool(when, dfTF)
+            # 切片到窗口范围
+            result_full_series = pd.Series(result_full, index=dfTF.index, dtype=bool)
+            s_bool = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
         hit = _scope_hit(s_bool, scope)
         return hit, None
     except Exception as e:
@@ -2897,6 +3441,7 @@ def _read_stock_df(ts_code: str, start: str, end: str, columns: List[str]) -> pd
     raise RuntimeError(error_detail)
 
 
+@lru_cache(maxsize=256)
 def _trade_span(start: Optional[str], end: str) -> List[str]:
     """把自然日区间换成交易日清单（基于现有分区）。"""
     try:
@@ -3035,34 +3580,100 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
     score_window = _get_score_window(rule, win)
     pts  = float(rule.get("points", 0))
     
-    # 优化：复用ctx中的重采样和切片结果，避免重复计算
-    # 注意：数据准备（重采样）仍使用 window，但计分判断使用 score_window
-    if ctx:
-        # 尝试从ctx获取已重采样的数据
-        resampled = ctx.get('resampled', {})
-        if tf not in resampled:
-            if tf == "D":
-                resampled[tf] = dfD
-            else:
-                resampled[tf] = _resample(dfD, tf)
-            ctx['resampled'] = resampled
-        dfTF = resampled[tf]
-        
-        # 尝试从ctx获取已切片的窗口数据（按(tf, score_window, ref_date)缓存，用于计分判断）
-        win_cache_key = (tf, score_window, ref_date)
-        win_cache = ctx.get('win_cache', {})
-        if win_cache_key not in win_cache:
-            win_cache[win_cache_key] = _window_slice(dfTF, ref_date, score_window)
-            ctx['win_cache'] = win_cache
-        win_df = win_cache[win_cache_key]
-    else:
-        # 没有ctx则直接计算
-        dfTF = dfD if tf=="D" else _resample(dfD, tf)
-        win_df = _window_slice(dfTF, ref_date, score_window)
-    
     res = {"add": 0.0, "cnt": None, "lag": None, "hit_date": None, "hit_dates": [], "gate_ok": True, "error": None}
     try:
         scope = str(rule.get("scope","ANY")).upper().strip()
+        
+        # 优化：对于 scope: LAST，只计算最后一天，不需要计算整个窗口
+        # 但是如果 when 条件中包含 COUNT 函数，需要传入足够的历史数据
+        if scope == "LAST":
+            # 检查 when 条件中是否包含 COUNT 函数
+            when = None
+            cand_when = None
+            if "clauses" in rule and rule["clauses"]:
+                for c in rule["clauses"]:
+                    if c.get("when"): 
+                        cand_when = c["when"]; 
+                        break
+            else:
+                cand_when = rule.get("when")
+            when = cand_when
+            
+            # 提取 COUNT 函数的最大窗口大小
+            count_window = _extract_max_count_window(when or "")
+            
+            if ctx:
+                # 获取重采样数据
+                resampled = ctx.get('resampled', {})
+                if tf not in resampled:
+                    if tf == "D":
+                        resampled[tf] = dfD
+                    else:
+                        resampled[tf] = _resample(dfD, tf)
+                    ctx['resampled'] = resampled
+                dfTF = resampled[tf]
+            else:
+                dfTF = dfD if tf=="D" else _resample(dfD, tf)
+            
+            dfTF = _ensure_datetime_index(dfTF)
+            ref_dt = dt.datetime.strptime(ref_date, "%Y%m%d")
+            
+            # 如果包含 COUNT 函数，需要传入足够的历史数据
+            if count_window > 0:
+                # 对于COUNT函数，需要从COUNT窗口的最早一天往前推，计算COUNT内部表达式所需的历史数据
+                # 例如：策略window=5天，COUNT窗口=5天，COUNT内部表达式包含TS_RANK(V,20)
+                # 那么需要：5（COUNT窗口）+ 20（TS_RANK窗口）= 25天
+                count_inner_exprs = list(_extract_count_inner_expr(when or ""))
+                inner_window = 0
+                for inner_expr in count_inner_exprs:
+                    # 使用_calc_nested_window递归计算嵌套函数所需的总窗口大小
+                    # 这样可以正确处理嵌套函数，如TS_RANK(REF(V,1),20)需要20+1=21天
+                    inner_window = max(inner_window, _calc_nested_window(inner_expr))
+                # data_window = count_window + COUNT内部表达式所需的最大窗口
+                data_window = count_window + inner_window
+                win_df = _window_slice(dfTF, ref_date, data_window)
+            else:
+                # 没有 COUNT 函数，但表达式可能包含嵌套函数（如HHV(REF(H,1),20)）
+                # 需要计算嵌套函数所需的总窗口大小
+                nested_window = _calc_nested_window(when or "")
+                if nested_window > 0:
+                    # 使用嵌套函数所需的总窗口大小
+                    data_window = nested_window
+                    win_df = _window_slice(dfTF, ref_date, data_window)
+                else:
+                    # 如果没有嵌套函数，只获取最后一天的数据
+                    last_day_df = dfTF[dfTF.index <= ref_dt].tail(1)
+                    win_df = last_day_df
+            
+            if win_df.empty:
+                res["error"] = f"窗口数据为空: tf={tf}, ref_date={ref_date}, count_window={count_window}"
+                return res
+        else:
+            # 其他 scope 需要计算整个窗口
+            # 优化：复用ctx中的重采样和切片结果，避免重复计算
+            # 注意：数据准备（重采样）仍使用 window，但计分判断使用 score_window
+            if ctx:
+                # 尝试从ctx获取已重采样的数据
+                resampled = ctx.get('resampled', {})
+                if tf not in resampled:
+                    if tf == "D":
+                        resampled[tf] = dfD
+                    else:
+                        resampled[tf] = _resample(dfD, tf)
+                    ctx['resampled'] = resampled
+                dfTF = resampled[tf]
+                
+                # 尝试从ctx获取已切片的窗口数据（按(tf, score_window, ref_date)缓存，用于计分判断）
+                win_cache_key = (tf, score_window, ref_date)
+                win_cache = ctx.get('win_cache', {})
+                if win_cache_key not in win_cache:
+                    win_cache[win_cache_key] = _window_slice(dfTF, ref_date, score_window)
+                    ctx['win_cache'] = win_cache
+                win_df = win_cache[win_cache_key]
+            else:
+                # 没有ctx则直接计算
+                dfTF = dfD if tf=="D" else _resample(dfD, tf)
+                win_df = _window_slice(dfTF, ref_date, score_window)
         when = None
         cand_when = None
         if "clauses" in rule and rule["clauses"]:
@@ -3074,29 +3685,36 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
             cand_when = rule.get("when")
         when = cand_when
         
+        # EACH/PERBAR/EACH_TRUE scope 处理：使用 _count_hits_perbar() 函数
+        # 注意：EACH scope 不使用 _scope_hit() 函数，而是使用 _count_hits_perbar() 统计窗口内逐K命中次数
+        # 参考：_count_hits_perbar() 函数的详细注释（第4284行）
         if scope in {"EACH","PERBAR","EACH_TRUE"}:
+            # 使用 _count_hits_perbar() 计算窗口内逐K命中次数
+            # 该函数会统计窗口内有多少根K线满足when条件，返回命中次数
             cnt, err = _count_hits_perbar(dfD, rule, ref_date, ctx)
             if err: res["error"] = err
             gate_ok, _, _ = _eval_gate(dfD, rule, ref_date, ctx)
             res["gate_ok"] = gate_ok
-            if cnt and pts and gate_ok:
-                res["cnt"] = int(cnt); res["add"] = float(pts * int(cnt))
+            # 即使pts=0或gate_ok=False，只要cnt>0，也应该设置cnt和add（用于记录details）
+            # 加分规则：add = points * count（如果 gate_ok 为 True）
+            if cnt is not None:
+                res["cnt"] = int(cnt)
+                if cnt > 0:
+                    res["add"] = float(pts * int(cnt)) if gate_ok else 0.0
+                else:
+                    res["add"] = 0.0
+            else:
+                res["cnt"] = 0
+                res["add"] = 0.0
             # 命中日
             if when and not win_df.empty:
                 _d, _ = _last_true_date(dfD, when, ref_date=ref_date, timeframe=tf, window=score_window, ctx=ctx); res["hit_date"] = _d
                 # 如果需要完整hit_dates列表，且已计算过布尔序列，则复用缓存结果
-                if compute_hit_dates:
+                # 即使pts=0，只要cnt>0，也应该计算hit_dates（用于记录details）
+                if compute_hit_dates or (cnt and cnt > 0):
                     try:
-                        if ctx:
-                            sig = _eval_bool_cached(ctx, dfD, when, tf, score_window, ref_date)
-                        else:
-                            sig = None
-                        if sig is not None and len(sig) > 0:
-                            # 向量化处理：使用numpy布尔索引替代循环
-                            sig_bool = sig.astype(bool) if isinstance(sig, pd.Series) else pd.Series(sig).astype(bool)
-                            idx = sig_bool.index
-                            hit_indices = idx[sig_bool.values]
-                            res["hit_dates"] = [str(i) for i in hit_indices]
+                        # 使用 _list_true_dates 函数，确保日期格式为 YYYYMMDD
+                        res["hit_dates"] = _list_true_dates(dfD, when, ref_date=ref_date, window=score_window, timeframe=tf, ctx=ctx)
                     except Exception:
                         pass
             return res
@@ -3109,9 +3727,13 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
                     # 优先使用缓存
                     s_bool = _eval_bool_cached(ctx, dfD, when, tf, score_window, ref_date)
                 else:
-                    # 直接使用已计算的win_df
-                    with _ctx_df(win_df):
-                        s_bool = evaluate_bool(when, win_df).astype(bool)
+                    # 在完整数据上计算，然后切片窗口范围
+                    dfTF = dfD if tf=="D" else _resample(dfD, tf)
+                    with _ctx_df(dfTF):
+                        result_full = evaluate_bool(when, dfTF)
+                    # 切片到窗口范围
+                    result_full_series = pd.Series(result_full, index=dfTF.index, dtype=bool)
+                    s_bool = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
                 
                 lag = _last_true_lag(s_bool)
                 if lag is not None:
@@ -3164,12 +3786,72 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
         # 优化：如果when表达式存在且win_df已计算，直接使用win_df计算，避免在_eval_rule中重复切片
         w = (rule.get("when") or "").strip()
         if w and not win_df.empty:
-            # 直接使用已计算的win_df计算布尔序列，避免在_eval_rule中重复切片
-            if ctx:
-                s_bool = _eval_bool_cached(ctx, dfD, w, tf, score_window, ref_date)
+            # 对于 scope: LAST，只计算最后一天，不需要计算整个窗口
+            if scope == "LAST":
+                # 只计算最后一天的数据
+                if ctx:
+                    # 获取重采样数据（用于计算表达式，需要足够的历史数据）
+                    resampled = ctx.get('resampled', {})
+                    if tf not in resampled:
+                        if tf == "D":
+                            resampled[tf] = dfD
+                        else:
+                            resampled[tf] = _resample(dfD, tf)
+                        ctx['resampled'] = resampled
+                    dfTF = resampled[tf]
+                else:
+                    dfTF = dfD if tf=="D" else _resample(dfD, tf)
+                
+                # 使用策略编译时的最大 window 作为 data_window，确保有足够的历史数据
+                if ctx and 'max_windows_by_tf' in ctx:
+                    max_windows = ctx.get('max_windows_by_tf', {})
+                    data_window = max_windows.get(tf.upper(), win)
+                else:
+                    data_window = win
+                
+                # 检查 when 条件中是否包含 COUNT 函数，如果包含，需要确保 data_window 足够大
+                count_window = _extract_max_count_window(w)
+                if count_window > 0:
+                    # 对于COUNT函数，需要从COUNT窗口的最早一天往前推，计算COUNT内部表达式所需的历史数据
+                    # 例如：策略window=5天，COUNT窗口=5天，COUNT内部表达式包含TS_RANK(V,20)
+                    # 那么需要：5（COUNT窗口）+ 20（TS_RANK窗口）= 25天
+                    count_inner_exprs = list(_extract_count_inner_expr(w))
+                    inner_window = 0
+                    for inner_expr in count_inner_exprs:
+                        # 使用_calc_nested_window递归计算嵌套函数所需的总窗口大小
+                        # 这样可以正确处理嵌套函数，如TS_RANK(REF(V,1),20)需要20+1=21天
+                        inner_window = max(inner_window, _calc_nested_window(inner_expr))
+                    # data_window = max(原有data_window, count_window + COUNT内部表达式所需的最大窗口)
+                    data_window = max(data_window, count_window + inner_window)
+                
+                # 切片数据用于计算（需要足够的历史数据）
+                dfTF = _ensure_datetime_index(dfTF)
+                ref_dt = dt.datetime.strptime(ref_date, "%Y%m%d")
+                df_calc = dfTF[dfTF.index <= ref_dt].tail(data_window)
+                
+                # 只计算最后一天
+                with _ctx_df(df_calc):
+                    result_full = evaluate_bool(w, df_calc)
+                
+                if result_full is None:
+                    s_bool = pd.Series([False], index=win_df.index, dtype=bool)
+                else:
+                    result_full_series = pd.Series(result_full, index=df_calc.index, dtype=bool)
+                    # 只取最后一天
+                    s_bool = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
             else:
-                with _ctx_df(win_df):
-                    s_bool = evaluate_bool(w, win_df).astype(bool)
+                # 其他 scope 需要计算整个窗口
+                if ctx:
+                    # 自动使用策略编译时的最大 window 作为 data_window，score_window 用于计算窗口
+                    s_bool = _eval_bool_cached(ctx, dfD, w, tf, score_window, ref_date)
+                else:
+                    # 在完整数据上计算，然后切片窗口范围
+                    dfTF = dfD if tf=="D" else _resample(dfD, tf)
+                    with _ctx_df(dfTF):
+                        result_full = evaluate_bool(w, dfTF)
+                    # 切片到窗口范围
+                    result_full_series = pd.Series(result_full, index=dfTF.index, dtype=bool)
+                    s_bool = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
             
             hit = _scope_hit(s_bool, str(rule.get("scope","ANY")).upper().strip())
             ok = hit
@@ -3185,13 +3867,26 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
             res["add"] = float(pts)
         # 命中日/全集命中
         if w and not win_df.empty:
-            _d, _ = _last_true_date(dfD, w, ref_date=ref_date, timeframe=tf, window=score_window, ctx=ctx); res["hit_date"] = _d
-            # 如果需要完整hit_dates列表，则计算
-            if compute_hit_dates:
-                try:
-                    res["hit_dates"] = _list_true_dates(dfD, w, ref_date=ref_date, window=score_window, timeframe=tf, ctx=ctx)
-                except Exception:
-                    pass
+            # 对于 scope: LAST，如果命中，hit_date 就是 ref_date
+            # 修复：即使ok=False，也应该计算hit_date（记录最近一次满足条件的日期），与方法2一致
+            if scope == "LAST":
+                if ok:
+                    res["hit_date"] = ref_date
+                else:
+                    # 即使ok=False，也计算最近一次满足条件的日期
+                    _d, _ = _last_true_date(dfD, w, ref_date=ref_date, timeframe=tf, window=score_window, ctx=ctx)
+                    res["hit_date"] = _d
+                if compute_hit_dates and ok:
+                    res["hit_dates"] = [ref_date]
+            else:
+                # 其他 scope 需要计算 hit_date
+                _d, _ = _last_true_date(dfD, w, ref_date=ref_date, timeframe=tf, window=score_window, ctx=ctx); res["hit_date"] = _d
+                # 如果需要完整hit_dates列表，则计算
+                if compute_hit_dates:
+                    try:
+                        res["hit_dates"] = _list_true_dates(dfD, w, ref_date=ref_date, window=score_window, timeframe=tf, ctx=ctx)
+                    except Exception:
+                        pass
         return res
     except Exception as e:
         res["error"] = f"eval-exception: {e}"
@@ -3373,6 +4068,8 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
             'bool_lru': _SmallLRU(BOOL_CACHE_SIZE),
             'resampled': {},  # 重采样数据缓存
             'win_cache': {},  # 窗口切片缓存 (tf, win, ref_date) -> win_df
+            'data_win_cache': {},  # 数据窗口缓存 (tf, data_window, ref_date) -> data_df
+            'max_windows_by_tf': _MAX_WINDOWS_BY_TF.copy(),  # 策略编译时计算的最大 windows（按 timeframe）
             'bool_cache_hit': 0,
             'bool_cache_miss': 0
         }
@@ -3497,8 +4194,14 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
             
             # 添加规则详情（可关）
             if SC_ENABLE_RULE_DETAILS:
+                # 对于EACH/PERBAR/EACH_TRUE规则，即使add=0或gate_ok=False，只要cnt>0，也应该记录为ok=True
+                scope = str(rule.get("scope", "ANY")).upper().strip()
+                if scope in {"EACH", "PERBAR", "EACH_TRUE"}:
+                    ok = bool(cnt and cnt > 0)
+                else:
+                    ok = bool(add != 0)
                 _add_rule_detail(
-                    rule, bool(add != 0), cnt=cnt, add=add,
+                    rule, ok, cnt=cnt, add=add,
                     hit_date=hit_date, hit_dates=hit_dates,
                     err=err, gate_ok=gate_ok, gate_when=None
                 )
@@ -3665,11 +4368,11 @@ def _screen_one(ts_code, st, ref, tf, win, when, scope, use_prescreen_first, ctx
         # 不再进行兜底计算，依赖数据完整性
 
         if ctx:
-            # 使用缓存版本
+            # 使用缓存版本：自动使用策略编译时的最大 window 作为 data_window，score_window 用于计算窗口
             s_bool = _eval_bool_cached(ctx, dfD, when, tf, win, ref)
             ok = _scope_hit(s_bool, scope)
         else:
-            # 原始版本
+            # 原始版本：在完整数据上计算，然后切片窗口范围
             dfTF = dfD if tf == "D" else _resample(dfD, tf)
             win_df = _window_slice(dfTF, ref, win)
             if win_df.empty:
@@ -3677,8 +4380,13 @@ def _screen_one(ts_code, st, ref, tf, win, when, scope, use_prescreen_first, ctx
             tdx.EXTRA_CONTEXT.update(get_eval_env(ts_code, ref))
 
             _inject_config_tags(dfD, ref)      # 忽略异常同原逻辑
-            tdx.EXTRA_CONTEXT["DF"] = win_df
-            ok = _scope_hit(evaluate_bool(when, win_df), scope)
+            # 在完整数据上计算表达式
+            tdx.EXTRA_CONTEXT["DF"] = dfTF
+            result_full = evaluate_bool(when, dfTF)
+            # 切片到窗口范围
+            result_full_series = pd.Series(result_full, index=dfTF.index, dtype=bool)
+            s_bool = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
+            ok = _scope_hit(s_bool, scope)
         if ok:
             return (ts_code, True, (ts_code, ref, "pass"), None)
         else:
@@ -3689,23 +4397,63 @@ def _screen_one(ts_code, st, ref, tf, win, when, scope, use_prescreen_first, ctx
 
 def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str, ctx: dict = None) -> Tuple[int, Optional[str]]:
     """
-    统计"窗口内逐K命中次数"（用于 scope=EACH / PERBAR）。
-    - 单条 rule（无 clauses）：在其 timeframe 上按 when 逐K求布尔，再在 score_windows（或 window）内计数 True。
-    - 带 clauses 的 rule：要求所有子句 timeframe/window 一致；逐K按 AND 融合后再计数。
-    - 返回 (count, err)，err=None 表示成功；err 不为空时建议回退为布尔命中。
+    统计"窗口内逐K命中次数"（专门用于 scope=EACH / PERBAR / EACH_TRUE）。
+    
+    重要说明：
+      此函数专门用于处理 EACH 类型的 scope，与 _scope_hit() 函数不同：
+      - _scope_hit() 用于判断布尔序列是否满足某个条件（如 ANY、ALL、LAST 等）
+      - _count_hits_perbar() 用于统计窗口内有多少根K线满足条件，返回命中次数
+      
+      对于 EACH scope 的策略：
+      1. 使用此函数计算窗口内逐K命中次数
+      2. 如果返回的 count > 0，说明策略触发（有命中）
+      3. 最终是否加分还需要结合 gate 判断（在 _eval_single_rule 中处理）
+      4. 加分 = points * count（如果 gate_ok 为 True）
+    
+    处理逻辑：
+      - 单条 rule（无 clauses）：
+        1. 在其 timeframe 上按 when 表达式逐K计算布尔值
+        2. 在 score_windows（或 window）窗口内统计 True 的数量
+        3. 返回命中次数
+      - 带 clauses 的 rule：
+        1. 要求所有子句 timeframe/window/score_windows 一致
+        2. 逐K按 AND 融合所有子句的布尔值
+        3. 统计融合后为 True 的数量
+        4. 返回命中次数
+    
+    参数：
+      dfD: 基础数据DataFrame（日线数据）
+      rule_or_clause: 规则或子句字典，包含 when、timeframe、window、score_windows 等
+      ref_date: 参考日期（YYYYMMDD格式）
+      ctx: 上下文字典（可选，用于缓存优化）
+    
+    返回值：
+      (count, err): 
+        - count: 命中次数（整数），如果 count > 0 说明策略触发
+        - err: 错误消息（字符串），如果 err=None 表示成功；err 不为空时建议回退为布尔命中
+    
+    使用示例：
+      在 _eval_single_rule() 函数中（第3579行）：
+      ```python
+      if scope in {"EACH","PERBAR","EACH_TRUE"}:
+          cnt, err = _count_hits_perbar(dfD, rule, ref_date, ctx)
+          if cnt and cnt > 0:
+              res["cnt"] = int(cnt)
+              res["add"] = float(pts * int(cnt)) if gate_ok else 0.0
+      ```
     """
     try:
         if "clauses" in rule_or_clause and rule_or_clause["clauses"]:
             clauses = rule_or_clause["clauses"]
             tfs = [str(c.get("timeframe","D")).upper() for c in clauses]
-            # 使用 score_windows 用于计分判断，如果不存在则使用 window
+            # window 用于数据获取，score_windows 用于计算窗口
             score_wins = [_get_score_window(c, SC_LOOKBACK_D) for c in clauses]
-            wins = [int(c.get("window", SC_LOOKBACK_D)) for c in clauses]  # 仍用于检查兼容性
-            if len(set(tfs)) != 1 or len(set(score_wins)) != 1:
-                return 0, "EACH 目前不支持多 timeframe/score_windows 子句混用"
+            wins = [int(c.get("window", SC_LOOKBACK_D)) for c in clauses]  # window 用于数据获取
+            if len(set(tfs)) != 1 or len(set(score_wins)) != 1 or len(set(wins)) != 1:
+                return 0, "EACH 目前不支持多 timeframe/window/score_windows 子句混用"
             tf = tfs[0]
-            score_window = score_wins[0]
-            window = score_window  # 用于后续代码的兼容性
+            window = wins[0]  # window 用于数据获取
+            score_window = score_wins[0]  # score_windows 用于计算窗口
             
             # 优化：复用ctx中的win_cache，避免重复切片
             if ctx:
@@ -3741,12 +4489,16 @@ def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str, c
                 if not when:
                     return 0, "空 when 表达式"
                 if ctx:
-                    # 使用缓存版本（使用 score_window）
+                    # 使用缓存版本：自动使用策略编译时的最大 window 作为 data_window，score_window 用于计算窗口
                     s = _eval_bool_cached(ctx, dfD, when, tf, score_window, ref_date)
                 else:
-                    # 原始版本
-                    with _ctx_df(win_df):
-                        s = evaluate_bool(when, win_df).astype(bool)
+                    # 原始版本：在完整数据上计算，然后切片窗口范围
+                    dfTF = dfD if tf=="D" else _resample(dfD, tf)
+                    with _ctx_df(dfTF):
+                        result_full = evaluate_bool(when, dfTF)
+                    # 切片到窗口范围
+                    result_full_series = pd.Series(result_full, index=dfTF.index, dtype=bool)
+                    s = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
                 sigs.append(s)
             
             # 向量化AND操作：一次性对所有序列进行AND操作，比逐个循环快
@@ -3766,22 +4518,27 @@ def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str, c
             return 0, "无有效子句"
         else:
             tf = str(rule_or_clause.get("timeframe", "D")).upper()
-            # 使用 score_windows 用于计分判断，如果不存在则使用 window
-            score_window = _get_score_window(rule_or_clause, SC_LOOKBACK_D)
+            # window 用于数据获取，score_windows 用于计算窗口
+            window = int(rule_or_clause.get("window", SC_LOOKBACK_D))  # window 用于数据获取
+            score_window = _get_score_window(rule_or_clause, window)  # score_windows 用于计算窗口
             when = (rule_or_clause.get("when") or "").strip()
             if not when:
                 return 0, "空 when 表达式"
             if ctx:
-                # 使用缓存版本（会自动复用win_cache）
+                # 使用缓存版本：自动使用策略编译时的最大 window 作为 data_window，score_window 用于计算窗口
                 s_bool = _eval_bool_cached(ctx, dfD, when, tf, score_window, ref_date)
             else:
-                # 原始版本：没有ctx则直接计算
+                # 原始版本：在完整数据上计算，然后切片窗口范围
                 dfTF = dfD if tf=="D" else _resample(dfD, tf)
                 win_df = _window_slice(dfTF, ref_date, score_window)
                 if win_df.empty:
                     return 0, None
-                with _ctx_df(win_df):
-                    s_bool = evaluate_bool(when, win_df).astype(bool)
+                # 在完整数据上计算表达式
+                with _ctx_df(dfTF):
+                    result_full = evaluate_bool(when, dfTF)
+                # 切片到窗口范围
+                result_full_series = pd.Series(result_full, index=dfTF.index, dtype=bool)
+                s_bool = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
             return int(s_bool.fillna(False).sum()), None
     except Exception as e:
         return 0, f"表达式错误: {e}"

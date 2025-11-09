@@ -78,8 +78,8 @@ class StrategyValidator:
     
     # 可选字段
     OPTIONAL_FIELDS = {
-        "ranking": ["name", "timeframe", "window", "score_windows", "scope", "points", "explain", "show_reason", "as", "gate", "clauses", "dist_points"],
-        "filter": ["name", "timeframe", "window", "score_windows", "scope", "reason", "hard_penalty", "gate", "clauses"],
+        "ranking": ["name", "timeframe", "score_windows", "scope", "points", "explain", "show_reason", "as", "gate", "clauses", "dist_points"],
+        "filter": ["name", "timeframe", "score_windows", "scope", "reason", "hard_penalty", "gate", "clauses"],
         "prediction": ["name", "scenario"],
         "position": ["name", "explain"],
         "opportunity": ["name", "explain"]
@@ -183,17 +183,17 @@ class StrategyValidator:
             if not isinstance(tf, str) or tf.upper() not in self.SUPPORTED_TIMEFRAMES:
                 result.add_error(f"不支持的timeframe: {tf}，支持: {', '.join(self.SUPPORTED_TIMEFRAMES)}", "timeframe")
         
-        # 检查window
-        if "window" in rule:
-            window = rule["window"]
-            if not isinstance(window, (int, float)) or window <= 0:
-                result.add_error(f"window必须是正整数: {window}", "window")
-        
-        # 检查score_windows（可选）
+        # 检查score_windows（可选，但推荐使用）
         if "score_windows" in rule:
             score_windows = rule["score_windows"]
             if score_windows is not None and (not isinstance(score_windows, (int, float)) or score_windows <= 0):
                 result.add_error(f"score_windows必须是正整数: {score_windows}", "score_windows")
+        
+        # 检查window（已废弃，但为了向后兼容仍支持）
+        if "window" in rule:
+            window = rule["window"]
+            if not isinstance(window, (int, float)) or window <= 0:
+                result.add_warning(f"window字段已废弃，请使用score_windows。window必须是正整数: {window}", "window")
         
         # 检查scope
         if "scope" in rule:
@@ -326,13 +326,22 @@ class StrategyValidator:
         if "scope" in rule and rule["scope"] == "ANY":
             result.add_suggestion("scope为ANY时建议考虑使用LAST或EACH", "scope")
         
-        # 检查window设置
+        # 检查score_windows设置
+        if "score_windows" in rule:
+            score_windows = rule["score_windows"]
+            if score_windows is not None:
+                if score_windows > 100:
+                    result.add_warning(f"score_windows值较大({score_windows})，可能影响性能", "score_windows")
+                elif score_windows < 5:
+                    result.add_warning(f"score_windows值较小({score_windows})，可能数据不足", "score_windows")
+        
+        # 检查window设置（已废弃，但为了向后兼容仍支持）
         if "window" in rule:
             window = rule["window"]
             if window > 100:
-                result.add_warning(f"window值较大({window})，可能影响性能", "window")
+                result.add_warning(f"window字段已废弃，请使用score_windows。window值较大({window})，可能影响性能", "window")
             elif window < 5:
-                result.add_warning(f"window值较小({window})，可能数据不足", "window")
+                result.add_warning(f"window字段已废弃，请使用score_windows。window值较小({window})，可能数据不足", "window")
         
         # 检查表达式复杂度
         if "when" in rule and rule["when"]:
@@ -537,10 +546,10 @@ def render_rule_editor():
     **策略类型详解：**
     
     - **排名策略 (ranking)**: 用于股票评分排名，使用 `when` 表达式判断条件，通过 `points` 字段加分
-      - 配置项：name, timeframe, window, scope, points, explain, show_reason, as, gate, clauses, dist_points
+      - 配置项：name, timeframe, score_windows, scope, points, explain, show_reason, as, gate, clauses, dist_points
       
     - **筛选策略 (filter)**: 用于股票筛选过滤，使用 `when` 表达式判断条件，可设置 `hard_penalty` 硬性惩罚
-      - 配置项：name, timeframe, window, scope, reason, hard_penalty, gate, clauses
+      - 配置项：name, timeframe, score_windows, scope, reason, hard_penalty, gate, clauses
       
     - **模拟策略 (prediction)**: 用于市场场景模拟，使用 `check` 表达式判断条件，需要 `scenario` 场景名称
       - 配置项：name, scenario
@@ -1172,8 +1181,8 @@ def render_rule_editor():
                 rule_config["name"] = rule_name
             if timeframe != "D":
                 rule_config["timeframe"] = timeframe
-            if window != 60:
-                rule_config["window"] = window
+            if score_windows != 60:
+                rule_config["score_windows"] = score_windows
             if scope != "ANY":
                 rule_config["scope"] = scope
             if points != 0:
@@ -1195,8 +1204,8 @@ def render_rule_editor():
                 rule_config["name"] = rule_name
             if timeframe != "D":
                 rule_config["timeframe"] = timeframe
-            if window != 60:
-                rule_config["window"] = window
+            if score_windows != 60:
+                rule_config["score_windows"] = score_windows
             if scope != "ANY":
                 rule_config["scope"] = scope
             if hard_penalty:

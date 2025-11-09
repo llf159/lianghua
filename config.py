@@ -14,6 +14,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # ================= 数据源配置 =================
 # Tushare API Token（必填）
 TOKEN = ""
+
 # 数据存储根目录
 DATA_ROOT = os.path.join(BASE_DIR, "stock_data")
 
@@ -36,16 +37,16 @@ API_ADJ = "qfq"  # 可选: "qfq" | "hfq" | "raw"
 CALLS_PER_MIN = 500
 # 安全限频：留出安全边距，避免触发限频
 SAFE_CALLS_PER_MIN = 490
-# 令牌桶容量（设置为较小的值，避免初始爆发）
-RATE_BUCKET_CAPACITY = 8
+# 令牌桶容量（设置为覆盖线程数，允许更多突发）
+RATE_BUCKET_CAPACITY = 12
 # 令牌补充速率（次/秒）
 RATE_BUCKET_REFILL_RATE = 8.0
 # 最小等待时间（秒）
-RATE_BUCKET_MIN_WAIT = 0.05
+RATE_BUCKET_MIN_WAIT = 0.02
 # 接近限频阈值时的额外延迟（秒）
-RATE_BUCKET_EXTRA_DELAY = 0.5
+RATE_BUCKET_EXTRA_DELAY = 0.25
 # 触发额外延迟的调用次数阈值
-RATE_BUCKET_EXTRA_DELAY_THRESHOLD = 480
+RATE_BUCKET_EXTRA_DELAY_THRESHOLD = 495
 
 # 重试配置
 RETRY_TIMES = 5

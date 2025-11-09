@@ -1951,6 +1951,195 @@ if _in_streamlit():
                     )
                 else:
                     st.info("无规则明细。")
+                
+                # 显示未触发的规则
+                try:
+                    # 获取所有规则列表
+                    all_rules = getattr(se, "SC_RULES", []) or []
+                    # 获取已触发规则的名称集合
+                    triggered_rule_names = set()
+                    if not rules.empty and "name" in rules.columns:
+                        triggered_rule_names = set(rules["name"].astype(str).unique())
+                    
+                    # 找出未触发的规则
+                    untriggered_rules = []
+                    for r in all_rules:
+                        rule_name = str(r.get("name", ""))
+                        if rule_name and rule_name not in triggered_rule_names:
+                            # 获取时间周期
+                            tf = str(r.get("timeframe", "D")).upper()
+                            # 获取命中口径
+                            scope = str(r.get("scope", "ANY")).upper().strip()
+                            # 对于 scope: LAST，不显示 score_windows
+                            if scope == "LAST":
+                                win = None  # scope: LAST 不需要 score_windows
+                            else:
+                                # 获取回看窗口（优先使用 score_windows，如果没有则使用 window，最后使用默认值）
+                                win = int(r.get("score_windows") or r.get("window", 60))
+                            # 获取分数
+                            points = float(r.get("points", 0))
+                            # 获取前置门槛
+                            gate = r.get("gate")
+                            gate_str = ""
+                            if gate:
+                                if isinstance(gate, dict):
+                                    gate_when = gate.get("when", "")
+                                    if gate_when:
+                                        gate_str = f"gate: {gate_when}"
+                                elif isinstance(gate, str):
+                                    gate_str = f"gate: {gate}"
+                            
+                            # 处理子句信息
+                            clauses_info = ""
+                            if "clauses" in r and r.get("clauses"):
+                                clauses = r.get("clauses", [])
+                                clause_parts = []
+                                for c in clauses:
+                                    c_tf = str(c.get("timeframe", "D")).upper()
+                                    c_scope = str(c.get("scope", "ANY")).upper().strip()
+                                    # 对于 scope: LAST，不显示窗口值
+                                    if c_scope == "LAST":
+                                        clause_parts.append(f"{c_tf}/-/LAST")
+                                    else:
+                                        # 优先使用 score_windows，如果没有则使用 window，最后使用默认值
+                                        c_win = int(c.get("score_windows") or c.get("window", 60))
+                                        clause_parts.append(f"{c_tf}/{c_win}/{c_scope}")
+                                if clause_parts:
+                                    clauses_info = f"子句: {len(clauses)}个 ({', '.join(clause_parts)})"
+                            
+                            rule_data = {
+                                "name": rule_name,
+                                "timeframe": tf,
+                                "scope": scope,
+                                "points": points,
+                                "gate": gate_str if gate_str else "",
+                                "clauses": clauses_info if clauses_info else "",
+                                "when": name_to_when.get(rule_name, ""),
+                                "explain": str(r.get("explain", ""))
+                            }
+                            # 只有非 LAST scope 才添加 score_windows
+                            if scope != "LAST":
+                                rule_data["score_windows"] = win
+                            # scope: LAST 不添加 score_windows 字段
+            
+                            untriggered_rules.append(rule_data)
+                    
+                    if untriggered_rules:
+                        st.markdown("**未触发的规则**")
+                        untriggered_df = pd.DataFrame(untriggered_rules)
+                        
+                        # 创建用于显示的DataFrame副本
+                        untriggered_display = untriggered_df.copy()
+                        
+                        # 如果show_when为False，移除when列
+                        if not show_when and "when" in untriggered_display.columns:
+                            untriggered_display = untriggered_display.drop(columns=["when"])
+                        
+                        # 确保列顺序：name在最前，然后是timeframe, score_windows(仅非LAST), scope, points, gate, clauses, when(可选), explain在最后
+                        col_order = ["name"]
+                        # 添加主要字段
+                        for col in ["timeframe", "scope", "points"]:
+                            if col in untriggered_display.columns:
+                                col_order.append(col)
+                        # score_windows 只在非 LAST scope 时显示
+                        if "score_windows" in untriggered_display.columns:
+                            # 检查是否有非 LAST 的规则
+                            if not untriggered_display.empty and "scope" in untriggered_display.columns:
+                                has_non_last = (untriggered_display["scope"].astype(str).str.upper() != "LAST").any()
+                                if has_non_last:
+                                    col_order.append("score_windows")
+                            else:
+                                col_order.append("score_windows")
+                        # 添加可选字段（总是显示，即使为空）
+                        for col in ["gate", "clauses"]:
+                            if col in untriggered_display.columns:
+                                col_order.append(col)
+                        # 添加when列（如果show_when为True）
+                        if show_when and "when" in untriggered_display.columns:
+                            col_order.append("when")
+                        # explain列放在最后
+                        if "explain" in untriggered_display.columns:
+                            col_order.append("explain")
+                        # 确保只包含存在的列
+                        col_order = [c for c in col_order if c in untriggered_display.columns]
+                        untriggered_display = untriggered_display[col_order]
+                        
+                        # 配置列的显示方式
+                        untriggered_column_config = None
+                        try:
+                            untriggered_column_config = {}
+                            if "name" in untriggered_display.columns:
+                                untriggered_column_config["name"] = st.column_config.TextColumn(
+                                    "策略名称",
+                                    help="策略的简短名称"
+                                )
+                            if "timeframe" in untriggered_display.columns:
+                                untriggered_column_config["timeframe"] = st.column_config.TextColumn(
+                                    "时间周期",
+                                    help="D(日线)/W(周线)/M(月线)",
+                                    width="small"
+                                )
+                            if "score_windows" in untriggered_display.columns:
+                                # 对于 score_windows 列，使用 TextColumn 以便显示空值或 "-"
+                                # 因为 scope: LAST 的规则没有此字段
+                                untriggered_column_config["score_windows"] = st.column_config.TextColumn(
+                                    "计分窗口",
+                                    help="计分窗口条数（用于计分判断的时间窗口）。scope: LAST 的规则不需要此字段，显示为空",
+                                    width="small"
+                                )
+                            if "scope" in untriggered_display.columns:
+                                untriggered_column_config["scope"] = st.column_config.TextColumn(
+                                    "命中口径",
+                                    help="ANY/EACH/PERBAR等",
+                                    width="small"
+                                )
+                            if "points" in untriggered_display.columns:
+                                untriggered_column_config["points"] = st.column_config.NumberColumn(
+                                    "分数",
+                                    help="命中时加/减分",
+                                    width="small"
+                                )
+                            if "gate" in untriggered_display.columns:
+                                untriggered_column_config["gate"] = st.column_config.TextColumn(
+                                    "前置门槛",
+                                    help="前置条件表达式",
+                                    width="medium"
+                                )
+                            if "clauses" in untriggered_display.columns:
+                                untriggered_column_config["clauses"] = st.column_config.TextColumn(
+                                    "子句信息",
+                                    help="多子句组合信息",
+                                    width="medium"
+                                )
+                            if "when" in untriggered_display.columns:
+                                untriggered_column_config["when"] = st.column_config.TextColumn(
+                                    "条件表达式",
+                                    help="TDX风格表达式",
+                                    width="large"
+                                )
+                            if "explain" in untriggered_display.columns:
+                                untriggered_column_config["explain"] = st.column_config.TextColumn(
+                                    "详细说明",
+                                    help="策略的详细说明",
+                                    width="medium"
+                                )
+                        except Exception:
+                            untriggered_column_config = None
+                        
+                        # 显示未触发的规则
+                        st.dataframe(
+                            untriggered_display,
+                            width='stretch',
+                            height=420,
+                            hide_index=True,
+                            column_config=untriggered_column_config
+                        )
+                    else:
+                        st.info("所有规则均已触发。")
+                except Exception as e:
+                    logger.debug(f"显示未触发规则失败: {e}")
+                    # 静默失败，不影响主流程
+                
                 # st.markdown('<div id="rank_rule_anchor"></div>', unsafe_allow_html=True)
                 st.markdown('<div id="detail_rule_anchor_detail"></div>', unsafe_allow_html=True)
 
@@ -3090,6 +3279,7 @@ if _in_streamlit():
                                 rules = data.get("rules", [])
                                 
                                 names_today = set()
+                                hit_dates_map = {}  # 策略名 -> 触发日期列表
                                 for rr in rules:
                                     # 只要策略触发（ok=True），就视为命中，无需检查add字段
                                     # 或者add>0也视为命中（兼容原有逻辑）
@@ -3097,7 +3287,21 @@ if _in_streamlit():
                                     add_val = rr.get("add")
                                     if bool(ok_val) or (add_val is not None and float(add_val) > 0.0):
                                         n = rr.get("name")
-                                        if n: names_today.add(str(n))
+                                        if n: 
+                                            names_today.add(str(n))
+                                            # 收集触发日期列表
+                                            hit_date = rr.get("hit_date")
+                                            hit_dates = rr.get("hit_dates", [])
+                                            # 合并hit_date和hit_dates
+                                            all_dates = []
+                                            if hit_date:
+                                                all_dates.append(str(hit_date))
+                                            if hit_dates:
+                                                all_dates.extend([str(d) for d in hit_dates if d])
+                                            # 去重并排序
+                                            all_dates = sorted(set(all_dates))
+                                            if all_dates:
+                                                hit_dates_map[str(n)] = all_dates
                                 
                                 if names_today:
                                     if agg_mode.startswith("任一"):
@@ -3105,7 +3309,18 @@ if _in_streamlit():
                                     else:
                                         hit = all((n in names_today) for n in picked)
                                     if hit:
-                                        rows.append({"ts_code": ts2, "score": sc})
+                                        # 收集所有选中策略的触发日期列表
+                                        trigger_dates_list = []
+                                        for rule_name in picked:
+                                            if rule_name in hit_dates_map:
+                                                trigger_dates_list.extend(hit_dates_map[rule_name])
+                                        # 去重并排序
+                                        trigger_dates_list = sorted(set(trigger_dates_list))
+                                        rows.append({
+                                            "ts_code": ts2, 
+                                            "score": sc,
+                                            "trigger_dates": trigger_dates_list if trigger_dates_list else []
+                                        })
                     
                     # 回退到JSON文件查询
                     else:
@@ -3125,6 +3340,7 @@ if _in_streamlit():
                                 sm = j.get("summary") or {}
                                 sc = float(sm.get("score", 0.0))
                                 names_today = set()
+                                hit_dates_map = {}  # 策略名 -> 触发日期列表
                                 for rr in (j.get("rules") or []):
                                     # 只要策略触发（ok=True），就视为命中，无需检查add字段
                                     # 或者add>0也视为命中（兼容原有逻辑）
@@ -3132,14 +3348,39 @@ if _in_streamlit():
                                     add_val = rr.get("add")
                                     if bool(ok_val) or (add_val is not None and float(add_val) > 0.0):
                                         n = rr.get("name")
-                                        if n: names_today.add(str(n))
+                                        if n: 
+                                            names_today.add(str(n))
+                                            # 收集触发日期列表
+                                            hit_date = rr.get("hit_date")
+                                            hit_dates = rr.get("hit_dates", [])
+                                            # 合并hit_date和hit_dates
+                                            all_dates = []
+                                            if hit_date:
+                                                all_dates.append(str(hit_date))
+                                            if hit_dates:
+                                                all_dates.extend([str(d) for d in hit_dates if d])
+                                            # 去重并排序
+                                            all_dates = sorted(set(all_dates))
+                                            if all_dates:
+                                                hit_dates_map[str(n)] = all_dates
                                 if names_today:
                                     if agg_mode.startswith("任一"):
                                         hit = any((n in names_today) for n in picked)
                                     else:
                                         hit = all((n in names_today) for n in picked)
                                     if hit:
-                                        rows.append({"ts_code": ts2, "score": sc})
+                                        # 收集所有选中策略的触发日期列表
+                                        trigger_dates_list = []
+                                        for rule_name in picked:
+                                            if rule_name in hit_dates_map:
+                                                trigger_dates_list.extend(hit_dates_map[rule_name])
+                                        # 去重并排序
+                                        trigger_dates_list = sorted(set(trigger_dates_list))
+                                        rows.append({
+                                            "ts_code": ts2, 
+                                            "score": sc,
+                                            "trigger_dates": trigger_dates_list if trigger_dates_list else []
+                                        })
                     
                     df_hit = pd.DataFrame(rows)
                     if df_hit.empty:
@@ -3149,6 +3390,14 @@ if _in_streamlit():
                         df_hit_sorted = _apply_tiebreak_sorting(df_hit, tiebreak_rule)
                         n = int(limit_n)
                         df_show = df_hit_sorted.head(n)
+                        # 调整列顺序：ts_code, score, trigger_dates
+                        if "trigger_dates" in df_show.columns:
+                            col_order = ["ts_code", "score", "trigger_dates"]
+                            # 添加其他列（如果有）
+                            for col in df_show.columns:
+                                if col not in col_order:
+                                    col_order.append(col)
+                            df_show = df_show[[c for c in col_order if c in df_show.columns]]
                         st.caption(f"命中 {len(df_hit_sorted)} 只；显示前 {len(df_show)} 只；参考日：{ref_real}")
                         st.dataframe(df_show, width='stretch', height=420)
                         # 导出 TXT

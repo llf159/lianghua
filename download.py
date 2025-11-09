@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import threading
+import random
 from typing import List, Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 from datetime import datetime
@@ -89,56 +90,164 @@ class DownloadStats:
 
 # ================= 限频器 =================
 
-class RateLimiter:
-    """高级限频器，支持多种限频策略"""
+class TokenBucketRateLimiter:
+    """基于令牌桶的限频器，支持自动优化"""
     
-    def __init__(self, calls_per_min: int = 500, safe_calls_per_min: int = 490, 
-                 adaptive: bool = True, burst_capacity: int = 10):
+    def __init__(self, 
+                 calls_per_min: int = 500,
+                 safe_calls_per_min: int = 490,
+                 bucket_capacity: int = None,
+                 refill_rate: float = None,
+                 min_wait: float = None,
+                 extra_delay: float = None,
+                 extra_delay_threshold: int = None,
+                 adaptive: bool = True):
+        """
+        初始化令牌桶限频器
+        
+        Args:
+            calls_per_min: 每分钟最大调用次数
+            safe_calls_per_min: 安全调用次数（留出安全边距）
+            bucket_capacity: 令牌桶容量（从config读取，默认8）
+            refill_rate: 令牌补充速率（次/秒，从config读取，默认8.0）
+            min_wait: 最小等待时间（秒，从config读取，默认0.05）
+            extra_delay: 接近限频阈值时的额外延迟（秒，从config读取，默认0.5）
+            extra_delay_threshold: 触发额外延迟的调用次数阈值（从config读取，默认480）
+            adaptive: 是否启用自适应优化
+        """
         self.calls_per_min = calls_per_min
         self.safe_calls_per_min = safe_calls_per_min
         self.adaptive = adaptive
-        self.burst_capacity = burst_capacity
         
-        # 调用时间记录
-        self._call_times = []
+        # 从config读取令牌桶参数，如果没有则使用默认值
+        try:
+            from config import (
+                RATE_BUCKET_CAPACITY, RATE_BUCKET_REFILL_RATE,
+                RATE_BUCKET_MIN_WAIT, RATE_BUCKET_EXTRA_DELAY,
+                RATE_BUCKET_EXTRA_DELAY_THRESHOLD
+            )
+            self.bucket_capacity = bucket_capacity or RATE_BUCKET_CAPACITY
+            # 如果没有指定refill_rate，使用最大限频（calls_per_min / 60.0）
+            # 先按照最大限频来，快到限频的时候减速，试探上限
+            if refill_rate is None:
+                self.refill_rate = self.calls_per_min / 60.0  # 使用最大限频
+            else:
+                self.refill_rate = refill_rate
+            self.min_wait = min_wait or RATE_BUCKET_MIN_WAIT
+            self.extra_delay = extra_delay or RATE_BUCKET_EXTRA_DELAY
+            self.extra_delay_threshold = extra_delay_threshold or RATE_BUCKET_EXTRA_DELAY_THRESHOLD
+        except ImportError:
+            # 如果config中没有这些配置，使用默认值
+            self.bucket_capacity = bucket_capacity or 8
+            # 如果没有指定refill_rate，使用最大限频（calls_per_min / 60.0）
+            if refill_rate is None:
+                self.refill_rate = self.calls_per_min / 60.0  # 使用最大限频
+            else:
+                self.refill_rate = refill_rate
+            self.min_wait = min_wait or 0.05
+            self.extra_delay = extra_delay or 0.5
+            self.extra_delay_threshold = extra_delay_threshold or 480
+        
+        # 令牌桶状态
+        self._tokens = float(self.bucket_capacity)  # 当前令牌数
+        self._last_refill = time.time()  # 上次补充令牌的时间
         self._lock = threading.Lock()
         
-        # 自适应参数
-        self._current_limit = safe_calls_per_min
+        # 自适应优化参数
+        self._current_refill_rate = self.refill_rate  # 当前补充速率
+        self._current_capacity = self.bucket_capacity  # 当前容量
         self._error_count = 0
         self._success_count = 0
+        self._rate_limit_errors = 0  # 限频错误次数
         self._last_adjustment = time.time()
+        self._adjustment_interval = 30.0  # 调整间隔（秒）
         
         # 统计信息
         self._total_calls = 0
         self._total_wait_time = 0.0
         self._rate_limit_hits = 0
+        self._recent_calls = []  # 最近1分钟的调用时间记录（用于统计）
+    
+    def _refill_tokens(self, now: float):
+        """补充令牌"""
+        elapsed = now - self._last_refill
+        if elapsed > 0:
+            # 根据当前补充速率补充令牌
+            tokens_to_add = elapsed * self._current_refill_rate
+            self._tokens = min(self._current_capacity, self._tokens + tokens_to_add)
+            self._last_refill = now
     
     def wait_if_needed(self):
-        """检查是否需要等待，如果需要则等待"""
+        """检查是否需要等待，如果需要则等待
+        策略：先按照最大限频来，快到限频的时候减速，试探上限
+        """
         with self._lock:
             now = time.time()
             
-            # 清理1分钟前的调用记录
-            self._call_times = [t for t in self._call_times if now - t < 60]
+            # 补充令牌
+            self._refill_tokens(now)
             
-            # 检查是否需要等待
-            if len(self._call_times) >= self._current_limit:
-                # 计算需要等待的时间
-                oldest_call = self._call_times[0]
-                sleep_time = 60 - (now - oldest_call) + 0.1
+            # 清理1分钟前的调用记录
+            self._recent_calls = [t for t in self._recent_calls if now - t < 60]
+            
+            # 计算需要等待的时间
+            wait_time = 0.0
+            
+            # 如果令牌不足，需要等待
+            if self._tokens < 1.0:
+                # 计算需要等待的时间以获取一个令牌
+                tokens_needed = 1.0 - self._tokens
+                wait_time = tokens_needed / self._current_refill_rate
+                wait_time = max(self.min_wait, wait_time)  # 至少等待最小时间
+            
+            # 动态减速：根据接近限频的程度动态调整等待时间
+            recent_calls_count = len(self._recent_calls)
+            max_calls_per_min = self.calls_per_min
+            
+            # 计算接近限频的比例
+            if recent_calls_count > 0:
+                usage_ratio = recent_calls_count / max_calls_per_min
                 
-                if sleep_time > 0:
-                    self._total_wait_time += sleep_time
-                    self._rate_limit_hits += 1
-                    time.sleep(sleep_time)
+                # 如果接近限频阈值（92%以上），开始减速
+                if usage_ratio >= 0.92:
+                    # 根据接近程度计算额外的减速延迟
+                    # 越接近限频，延迟越大
+                    slowdown_factor = (usage_ratio - 0.92) / 0.08  # 0.92到1.0之间，映射到0到1
+                    extra_wait = self.extra_delay * slowdown_factor
+                    wait_time += extra_wait
                     
-                    # 重新清理
-                    now = time.time()
-                    self._call_times = [t for t in self._call_times if now - t < 60]
+                    # 动态降低当前补充速率（试探上限）
+                    if usage_ratio >= 0.98:
+                        # 非常接近限频，适度降低速率（保持90%以上）
+                        target_rate = max_calls_per_min / 60.0 * 0.92  # 降低到92%
+                        if self._current_refill_rate > target_rate:
+                            self._current_refill_rate = target_rate
+                            logger.debug(f"接近限频阈值 ({recent_calls_count}/{max_calls_per_min})，降低速率到 {self._current_refill_rate:.2f} 次/秒")
+                    elif usage_ratio >= 0.96:
+                        # 接近限频，适度降低速率
+                        target_rate = max_calls_per_min / 60.0 * 0.95  # 降低到95%
+                        if self._current_refill_rate > target_rate:
+                            self._current_refill_rate = target_rate
+                            logger.debug(f"接近限频阈值 ({recent_calls_count}/{max_calls_per_min})，适度降低速率到 {self._current_refill_rate:.2f} 次/秒")
+                    
+                    if extra_wait > 0:
+                        logger.debug(f"接近限频阈值 ({recent_calls_count}/{max_calls_per_min}, {usage_ratio*100:.1f}%)，添加减速延迟 {extra_wait:.2f}秒")
+            
+            # 如果需要等待
+            if wait_time > 0:
+                self._total_wait_time += wait_time
+                self._rate_limit_hits += 1
+                time.sleep(wait_time)
+                
+                # 等待后重新补充令牌
+                now = time.time()
+                self._refill_tokens(now)
+            
+            # 消耗一个令牌
+            self._tokens -= 1.0
             
             # 记录本次调用
-            self._call_times.append(now)
+            self._recent_calls.append(now)
             self._total_calls += 1
     
     def record_success(self):
@@ -146,58 +255,102 @@ class RateLimiter:
         with self._lock:
             self._success_count += 1
             if self.adaptive:
-                self._adjust_limit_after_success()
+                self._adjust_after_success()
     
     def record_error(self, error_type: str = "unknown"):
         """记录错误调用"""
         with self._lock:
             self._error_count += 1
+            if "limit" in error_type.lower() or "quota" in error_type.lower() or "频率" in error_type.lower():
+                self._rate_limit_errors += 1
             if self.adaptive:
-                self._adjust_limit_after_error(error_type)
+                self._adjust_after_error(error_type)
     
-    def _adjust_limit_after_success(self):
-        """成功调用后调整限频"""
+    def _adjust_after_success(self):
+        """成功调用后自适应调整
+        策略：试探上限，如果没有限频错误，逐步提高速率
+        """
         now = time.time()
         
         # 每30秒调整一次
-        if now - self._last_adjustment < 30:
+        if now - self._last_adjustment < self._adjustment_interval:
             return
         
-        # 如果最近成功率很高，可以适当提高限频
-        if self._success_count > 50 and self._error_count < 5:
-            if self._current_limit < self.calls_per_min * 0.95:
-                self._current_limit = min(self._current_limit + 5, int(self.calls_per_min * 0.95))
-                logger.debug(f"限频器自适应调整: 提高限频到 {self._current_limit}")
+        max_rate = self.calls_per_min / 60.0  # 理论最大速率
         
+        # 如果最近成功率很高且没有限频错误，试探上限，逐步提高速率
+        if self._success_count > 25 and self._error_count < 5 and self._rate_limit_errors == 0:
+            # 试探上限：逐步提高补充速率（最多到理论最大值）
+            if self._current_refill_rate < max_rate:
+                old_rate = self._current_refill_rate
+                # 小步试探，每次提高2%
+                self._current_refill_rate = min(self._current_refill_rate * 1.02, max_rate)
+                logger.info(f"令牌桶试探上限: 提高补充速率 {old_rate:.2f} -> {self._current_refill_rate:.2f} 次/秒 (目标: {max_rate:.2f})")
+            
+            # 适当增加容量（允许更多突发）
+            if self._current_capacity < self.bucket_capacity * 1.5:
+                old_capacity = self._current_capacity
+                self._current_capacity = min(self._current_capacity + 1, int(self.bucket_capacity * 1.5))
+                logger.debug(f"令牌桶自适应调整: 增加容量 {old_capacity:.1f} -> {self._current_capacity:.1f}")
+        elif self._rate_limit_errors == 0 and self._current_refill_rate < max_rate * 0.98:
+            # 即使成功率不是特别高，如果没有限频错误，也可以小幅试探
+            old_rate = self._current_refill_rate
+            self._current_refill_rate = min(self._current_refill_rate * 1.02, max_rate * 0.98)
+            logger.debug(f"令牌桶小幅试探: 提高补充速率 {old_rate:.2f} -> {self._current_refill_rate:.2f} 次/秒")
+        
+        # 重置统计
+        self._success_count = 0
+        self._error_count = 0
+        self._rate_limit_errors = 0
         self._last_adjustment = now
     
-    def _adjust_limit_after_error(self, error_type: str):
-        """错误调用后调整限频"""
+    def _adjust_after_error(self, error_type: str):
+        """错误调用后自适应调整
+        策略：遇到限频错误时，适度降低速率，但不要降得太低，以便继续试探上限
+        """
         now = time.time()
         
         # 每30秒调整一次
-        if now - self._last_adjustment < 30:
+        if now - self._last_adjustment < self._adjustment_interval:
             return
         
-        # 如果是限频错误，降低限频
-        if "limit" in error_type.lower() or "quota" in error_type.lower():
-            self._current_limit = max(self._current_limit - 10, int(self.safe_calls_per_min * 0.8))
-            logger.warning(f"限频器自适应调整: 降低限频到 {self._current_limit}")
+        max_rate = self.calls_per_min / 60.0  # 理论最大速率
         
+        # 如果是限频错误，适度降低速率（试探上限）
+        if "limit" in error_type.lower() or "quota" in error_type.lower() or "频率" in error_type.lower():
+            # 降低补充速率，但不要降得太低（降低5%，以便继续试探）
+            old_rate = self._current_refill_rate
+            # 降低到当前速率的95%，但不低于最大速率的85%（继续试探）
+            target_rate = max(self._current_refill_rate * 0.95, max_rate * 0.85)
+            self._current_refill_rate = target_rate
+            logger.warning(f"令牌桶试探上限: 遇到限频错误，降低补充速率 {old_rate:.2f} -> {self._current_refill_rate:.2f} 次/秒（继续试探）")
+            
+            # 适度降低容量
+            old_capacity = self._current_capacity
+            self._current_capacity = max(int(self._current_capacity * 0.95), self.bucket_capacity)
+            logger.debug(f"令牌桶自适应调整: 降低容量 {old_capacity:.1f} -> {self._current_capacity:.1f}（限频错误）")
+        
+        # 重置统计
+        self._success_count = 0
+        self._error_count = 0
+        self._rate_limit_errors = 0
         self._last_adjustment = now
     
     def get_stats(self) -> Dict[str, Any]:
         """获取限频器统计信息"""
         with self._lock:
             now = time.time()
-            recent_calls = len([t for t in self._call_times if now - t < 60])
+            recent_calls = len([t for t in self._recent_calls if now - t < 60])
             
             return {
-                "current_limit": self._current_limit,
+                "current_refill_rate": self._current_refill_rate,
+                "current_capacity": self._current_capacity,
+                "current_tokens": self._tokens,
                 "recent_calls_per_min": recent_calls,
                 "total_calls": self._total_calls,
                 "success_count": self._success_count,
                 "error_count": self._error_count,
+                "rate_limit_errors": self._rate_limit_errors,
                 "total_wait_time": self._total_wait_time,
                 "rate_limit_hits": self._rate_limit_hits,
                 "success_rate": self._success_count / max(self._total_calls, 1) * 100
@@ -209,18 +362,23 @@ class RateLimiter:
             self._total_calls = 0
             self._success_count = 0
             self._error_count = 0
+            self._rate_limit_errors = 0
             self._total_wait_time = 0.0
             self._rate_limit_hits = 0
+            self._recent_calls = []
+
+# 为了向后兼容，保留RateLimiter作为TokenBucketRateLimiter的别名
+RateLimiter = TokenBucketRateLimiter
 
 # ================= Tushare接口管理 =================
 
 class TushareManager:
     """Tushare接口管理器"""
     
-    def __init__(self, token: str = None, rate_limiter: RateLimiter = None):
+    def __init__(self, token: str = None, rate_limiter: TokenBucketRateLimiter = None):
         self.token = token or TOKEN
         self._pro = None
-        self.rate_limiter = rate_limiter or RateLimiter()
+        self.rate_limiter = rate_limiter or TokenBucketRateLimiter()
         
         if not self.token or self.token.startswith("在这里"):
             raise ValueError("Tushare Pro 未配置：请在 config.TOKEN 中设置有效 token")
@@ -268,7 +426,10 @@ class TushareManager:
                     logger.warning(f"API调用频率限制: {error_msg}")
                     # 频率限制错误，等待更长时间
                     if attempt < max_retries - 1:
-                        wait_time = retry_delay * (2 ** attempt)  # 指数退避
+                        base_wait_time = retry_delay * (2 ** attempt)  # 指数退避
+                        # 添加±20%的随机抖动，避免多个请求同时重试
+                        jitter = random.uniform(-0.2, 0.2) * base_wait_time
+                        wait_time = max(0.1, base_wait_time + jitter)  # 确保等待时间至少0.1秒
                         logger.info(f"频率限制，等待 {wait_time:.1f} 秒后重试...")
                         time.sleep(wait_time)
                         continue
@@ -282,7 +443,10 @@ class TushareManager:
                     logger.warning(f"网络连接问题: {error_msg}")
                     # 网络错误可以重试
                     if attempt < max_retries - 1:
-                        wait_time = retry_delay * (attempt + 1)
+                        base_wait_time = retry_delay * (attempt + 1)
+                        # 添加±20%的随机抖动，避免多个请求同时重试
+                        jitter = random.uniform(-0.2, 0.2) * base_wait_time
+                        wait_time = max(0.1, base_wait_time + jitter)  # 确保等待时间至少0.1秒
                         logger.info(f"网络问题，等待 {wait_time:.1f} 秒后重试...")
                         time.sleep(wait_time)
                         continue
@@ -291,7 +455,10 @@ class TushareManager:
                     logger.error(f"API调用失败: {error_msg}")
                     # 其他错误可以重试
                     if attempt < max_retries - 1:
-                        wait_time = retry_delay * (attempt + 1)
+                        base_wait_time = retry_delay * (attempt + 1)
+                        # 添加±20%的随机抖动，避免多个请求同时重试
+                        jitter = random.uniform(-0.2, 0.2) * base_wait_time
+                        wait_time = max(0.1, base_wait_time + jitter)  # 确保等待时间至少0.1秒
                         logger.info(f"API错误，等待 {wait_time:.1f} 秒后重试...")
                         time.sleep(wait_time)
                         continue
@@ -573,12 +740,11 @@ class StockDownloader:
         self.is_first_download = is_first_download  # 是否为首次下载
         # 不在初始化时创建数据库连接，避免子线程创建连接
         
-        # 创建限频器
-        rate_limiter = RateLimiter(
+        # 创建限频器（使用令牌桶算法）
+        rate_limiter = TokenBucketRateLimiter(
             calls_per_min=config.rate_limit_calls_per_min,
             safe_calls_per_min=config.safe_calls_per_min,
-            adaptive=config.enable_adaptive_rate_limit,
-            burst_capacity=config.rate_limit_burst_capacity
+            adaptive=config.enable_adaptive_rate_limit
         )
         
         self.tushare_manager = TushareManager(rate_limiter=rate_limiter)
@@ -672,89 +838,124 @@ class StockDownloader:
                 - status: 状态 ("success", "empty", "error:xxx")
                 - data: 处理后的数据（包含指标），如果失败则为None
         """
-        try:
-            # 下载原始数据
-            logger.debug(f"开始下载 {ts_code} 的原始数据...")
-            raw_data = self.tushare_manager.get_stock_daily(
-                ts_code=ts_code,
-                start_date=self.config.start_date,
-                end_date=self.config.end_date,
-                adj=self.config.adj_type if self.config.adj_type != "raw" else None
-            )
-            
-            if raw_data is None or raw_data.empty:
-                logger.debug(f"{ts_code} 无数据")
-                return ts_code, "empty", None
-            
-            logger.debug(f"{ts_code} 获取到 {len(raw_data)} 条原始数据")
-            
-            # 清理数据（不依赖数据库连接）
-            logger.debug(f"清理 {ts_code} 数据...")
-            # 使用临时的DataProcessor进行清理（不需要数据库连接）
-            temp_processor = DataProcessor(None)  # 传入None，因为清理操作不需要数据库
-            cleaned_data = temp_processor.clean_stock_data(raw_data, ts_code)
-            
-            # 如果提供了data_processor，立即计算指标
-            if data_processor is not None:
-                # 首次下载不需要warmup，增量下载才需要
-                need_warmup = self.config.enable_warmup and not self.is_first_download
+        max_retries = self.config.retry_times
+        retry_delay = 1.0
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                # 下载原始数据
+                logger.debug(f"开始下载 {ts_code} 的原始数据... (尝试 {attempt + 1}/{max_retries})")
+                raw_data = self.tushare_manager.get_stock_daily(
+                    ts_code=ts_code,
+                    start_date=self.config.start_date,
+                    end_date=self.config.end_date,
+                    adj=self.config.adj_type if self.config.adj_type != "raw" else None
+                )
                 
-                if need_warmup:
-                    logger.debug(f"计算 {ts_code} 指标（包含warmup）...")
-                    try:
-                        # 计算指标（包含warmup，使用预加载的缓存数据）
-                        data_with_indicators = data_processor.compute_indicators_with_warmup(
-                            cleaned_data,
-                            ts_code,
-                            self.config.adj_type,
-                            warmup_cache=self._warmup_cache
-                        )
-                        # 准备数据用于数据库
-                        final_data = data_processor.prepare_data_for_database(
-                            data_with_indicators, self.config.adj_type
-                        )
-                        logger.debug(f"{ts_code} 指标计算完成，共 {len(final_data)} 条记录，{len(final_data.columns)} 列")
-                        return ts_code, "success", final_data
-                    except Exception as e:
-                        logger.error(f"{ts_code} 指标计算失败: {e}")
-                        raise
+                if raw_data is None or raw_data.empty:
+                    logger.debug(f"{ts_code} 无数据")
+                    return ts_code, "empty", None
+                
+                logger.debug(f"{ts_code} 获取到 {len(raw_data)} 条原始数据")
+                
+                # 清理数据（不依赖数据库连接）
+                logger.debug(f"清理 {ts_code} 数据...")
+                # 使用临时的DataProcessor进行清理（不需要数据库连接）
+                temp_processor = DataProcessor(None)  # 传入None，因为清理操作不需要数据库
+                cleaned_data = temp_processor.clean_stock_data(raw_data, ts_code)
+                
+                # 如果提供了data_processor，立即计算指标
+                if data_processor is not None:
+                    # 首次下载不需要warmup，增量下载才需要
+                    need_warmup = self.config.enable_warmup and not self.is_first_download
+                    
+                    if need_warmup:
+                        logger.debug(f"计算 {ts_code} 指标（包含warmup）...")
+                        try:
+                            # 计算指标（包含warmup，使用预加载的缓存数据）
+                            data_with_indicators = data_processor.compute_indicators_with_warmup(
+                                cleaned_data,
+                                ts_code,
+                                self.config.adj_type,
+                                warmup_cache=self._warmup_cache
+                            )
+                            # 准备数据用于数据库
+                            final_data = data_processor.prepare_data_for_database(
+                                data_with_indicators, self.config.adj_type
+                            )
+                            logger.debug(f"{ts_code} 指标计算完成，共 {len(final_data)} 条记录，{len(final_data.columns)} 列")
+                            return ts_code, "success", final_data
+                        except Exception as e:
+                            logger.error(f"{ts_code} 指标计算失败: {e}")
+                            raise
+                    else:
+                        # 首次下载或未启用warmup，直接计算指标
+                        logger.debug(f"计算 {ts_code} 指标（不包含warmup）...")
+                        try:
+                            from indicators import compute, get_all_indicator_names
+                            data_with_indicators = compute(cleaned_data, get_all_indicator_names())
+                            final_data = data_processor.prepare_data_for_database(
+                                data_with_indicators, self.config.adj_type
+                            )
+                            logger.debug(f"{ts_code} 指标计算完成，共 {len(final_data)} 条记录")
+                            return ts_code, "success", final_data
+                        except Exception as e:
+                            logger.error(f"{ts_code} 指标计算失败: {e}")
+                            raise
                 else:
-                    # 首次下载或未启用warmup，直接计算指标
-                    logger.debug(f"计算 {ts_code} 指标（不包含warmup）...")
-                    try:
-                        from indicators import compute, get_all_indicator_names
-                        data_with_indicators = compute(cleaned_data, get_all_indicator_names())
-                        final_data = data_processor.prepare_data_for_database(
-                            data_with_indicators, self.config.adj_type
-                        )
-                        logger.debug(f"{ts_code} 指标计算完成，共 {len(final_data)} 条记录")
-                        return ts_code, "success", final_data
-                    except Exception as e:
-                        logger.error(f"{ts_code} 指标计算失败: {e}")
-                        raise
-            else:
-                # 没有提供data_processor，只返回清理后的原始数据
-                logger.debug(f"{ts_code} 数据清理完成，共 {len(cleaned_data)} 条记录（未计算指标）")
-                return ts_code, "success", cleaned_data
-            
-        except Exception as e:
-            error_msg = str(e)
-            error_msg_lower = error_msg.lower()
-            
-            # 如果是指标计算错误，影响数据完整性，直接抛出异常
-            if any(keyword in error_msg_lower for keyword in [
-                "指标计算失败", "indicator", "计算失败", "compute"
-            ]):
-                logger.error(f"下载股票数据失败（影响数据完整性）{ts_code}: {error_msg}")
-                raise RuntimeError(f"下载股票数据失败（影响数据完整性）{ts_code}: {error_msg}") from e
-            
-            # 其他错误（如下载失败等）可以返回错误状态，不影响其他股票下载
+                    # 没有提供data_processor，只返回清理后的原始数据
+                    logger.debug(f"{ts_code} 数据清理完成，共 {len(cleaned_data)} 条记录（未计算指标）")
+                    return ts_code, "success", cleaned_data
+                
+            except Exception as e:
+                error_msg = str(e)
+                error_msg_lower = error_msg.lower()
+                last_error = e
+                
+                # 如果是指标计算错误，影响数据完整性，直接抛出异常，不重试
+                if any(keyword in error_msg_lower for keyword in [
+                    "指标计算失败", "indicator", "计算失败", "compute"
+                ]):
+                    logger.error(f"下载股票数据失败（影响数据完整性）{ts_code}: {error_msg}")
+                    raise RuntimeError(f"下载股票数据失败（影响数据完整性）{ts_code}: {error_msg}") from e
+                
+                # 认证错误不重试
+                if "token" in error_msg_lower or "auth" in error_msg_lower or "1002" in error_msg:
+                    logger.error(f"Token认证失败 {ts_code}: {error_msg}，不重试")
+                    with self._lock:
+                        self.stats.error_count += 1
+                        self.stats.failed_stocks.append((ts_code, error_msg))
+                    return ts_code, f"error: {error_msg}", None
+                
+                # 其他错误可以重试
+                if attempt < max_retries - 1:
+                    base_wait_time = retry_delay * (2 ** attempt)  # 指数退避
+                    # 添加±20%的随机抖动，避免多个请求同时重试
+                    jitter = random.uniform(-0.2, 0.2) * base_wait_time
+                    wait_time = max(0.1, base_wait_time + jitter)  # 确保等待时间至少0.1秒
+                    logger.warning(f"下载股票数据失败 {ts_code} (尝试 {attempt + 1}/{max_retries}): {error_msg}")
+                    logger.info(f"等待 {wait_time:.1f} 秒后重试...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # 所有重试都失败了
+                    logger.error(f"下载股票数据最终失败 {ts_code} (已重试 {max_retries} 次): {error_msg}")
+                    with self._lock:
+                        self.stats.error_count += 1
+                        self.stats.failed_stocks.append((ts_code, error_msg))
+                    return ts_code, f"error: {error_msg}", None
+        
+        # 如果所有重试都失败，返回错误
+        if last_error:
+            error_msg = str(last_error)
+            logger.error(f"下载股票数据失败 {ts_code} (已重试 {max_retries} 次): {error_msg}")
             with self._lock:
                 self.stats.error_count += 1
                 self.stats.failed_stocks.append((ts_code, error_msg))
-            
-            logger.error(f"下载股票数据失败 {ts_code}: {error_msg}")
             return ts_code, f"error: {error_msg}", None
+        
+        return ts_code, "error: 未知错误", None
     
     def download_all_stocks(self) -> DownloadStats:
         """下载所有股票数据，由主线程统一写入数据库"""
@@ -918,7 +1119,10 @@ class StockDownloader:
         
         # 打印限频器统计信息
         rate_stats = self.tushare_manager.rate_limiter.get_stats()
-        logger.info(f"限频器统计 - 总调用: {rate_stats['total_calls']}, 成功率: {rate_stats['success_rate']:.1f}%, 等待时间: {rate_stats['total_wait_time']:.1f}s")
+        logger.info(f"令牌桶限频器统计 - 总调用: {rate_stats['total_calls']}, 成功率: {rate_stats['success_rate']:.1f}%, "
+                   f"补充速率: {rate_stats['current_refill_rate']:.2f}次/秒, 容量: {rate_stats['current_capacity']:.1f}, "
+                   f"当前令牌: {rate_stats['current_tokens']:.1f}, 等待时间: {rate_stats['total_wait_time']:.1f}s, "
+                   f"限频命中: {rate_stats['rate_limit_hits']}")
         
         return self.stats
 
@@ -929,12 +1133,11 @@ class IndexDownloader:
         self.config = config
         # 不在初始化时创建数据库连接，避免子线程创建连接
         
-        # 创建限频器
-        rate_limiter = RateLimiter(
+        # 创建限频器（使用令牌桶算法）
+        rate_limiter = TokenBucketRateLimiter(
             calls_per_min=config.rate_limit_calls_per_min,
             safe_calls_per_min=config.safe_calls_per_min,
-            adaptive=config.enable_adaptive_rate_limit,
-            burst_capacity=config.rate_limit_burst_capacity
+            adaptive=config.enable_adaptive_rate_limit
         )
         
         self.tushare_manager = TushareManager(rate_limiter=rate_limiter)
@@ -950,71 +1153,106 @@ class IndexDownloader:
                 - status: 状态 ("success", "empty", "error:xxx")
                 - data: 准备好的数据（DataFrame），如果失败则为None
         """
-        try:
-            # 下载原始数据
-            logger.debug(f"开始下载 {ts_code} 的原始数据...")
-            raw_data = self.tushare_manager.get_index_daily(
-                ts_code=ts_code,
-                start_date=self.config.start_date,
-                end_date=self.config.end_date
-            )
-            
-            if raw_data is None or raw_data.empty:
-                logger.debug(f"{ts_code} 无数据")
-                return ts_code, "empty", None
-            
-            logger.debug(f"{ts_code} 获取到 {len(raw_data)} 条原始数据")
-            
-            # 清理数据
-            logger.debug(f"清理 {ts_code} 数据...")
-            df = raw_data.copy()
-            
-            # 删除不需要的列
-            columns_to_drop = ["pre_close", "change", "pct_chg"]
-            for col in columns_to_drop:
-                if col in df.columns:
-                    df = df.drop(columns=[col])
-            
-            # 数值化处理
-            numeric_columns = ["open", "high", "low", "close", "vol", "amount"]
-            for col in numeric_columns:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            
-            # 精度控制
-            price_columns = ["open", "high", "low", "close", "vol", "amount"]
-            for col in price_columns:
-                if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
-                    df[col] = df[col].astype(float).round(2)
-            
-            # 排序和去重
-            df = df.sort_values("trade_date")
-            df = df.drop_duplicates("trade_date", keep="last")
-            
-            # 规范化日期
-            df = normalize_trade_date(df)
-            
-            # 添加复权类型（指数使用ind）
-            df['adj_type'] = 'ind'
-            
-            # 确保列顺序正确
-            base_columns = ['ts_code', 'trade_date', 'adj_type', 'open', 'high', 'low', 'close', 'vol', 'amount']
-            df = df[base_columns]
-            
-            logger.debug(f"{ts_code} 下载完成，共 {len(df)} 条记录")
-            return ts_code, "success", df
-            
-        except Exception as e:
-            error_msg = str(e)
-            error_msg_lower = error_msg.lower()
-            
-            # 其他错误（如下载失败等）可以返回错误状态，不影响其他指数下载
+        max_retries = self.config.retry_times
+        retry_delay = 1.0
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                # 下载原始数据
+                logger.debug(f"开始下载 {ts_code} 的原始数据... (尝试 {attempt + 1}/{max_retries})")
+                raw_data = self.tushare_manager.get_index_daily(
+                    ts_code=ts_code,
+                    start_date=self.config.start_date,
+                    end_date=self.config.end_date
+                )
+                
+                if raw_data is None or raw_data.empty:
+                    logger.debug(f"{ts_code} 无数据")
+                    return ts_code, "empty", None
+                
+                logger.debug(f"{ts_code} 获取到 {len(raw_data)} 条原始数据")
+                
+                # 清理数据
+                logger.debug(f"清理 {ts_code} 数据...")
+                df = raw_data.copy()
+                
+                # 删除不需要的列
+                columns_to_drop = ["pre_close", "change", "pct_chg"]
+                for col in columns_to_drop:
+                    if col in df.columns:
+                        df = df.drop(columns=[col])
+                
+                # 数值化处理
+                numeric_columns = ["open", "high", "low", "close", "vol", "amount"]
+                for col in numeric_columns:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                
+                # 精度控制
+                price_columns = ["open", "high", "low", "close", "vol", "amount"]
+                for col in price_columns:
+                    if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                        df[col] = df[col].astype(float).round(2)
+                
+                # 排序和去重
+                df = df.sort_values("trade_date")
+                df = df.drop_duplicates("trade_date", keep="last")
+                
+                # 规范化日期
+                df = normalize_trade_date(df)
+                
+                # 添加复权类型（指数使用ind）
+                df['adj_type'] = 'ind'
+                
+                # 确保列顺序正确
+                base_columns = ['ts_code', 'trade_date', 'adj_type', 'open', 'high', 'low', 'close', 'vol', 'amount']
+                df = df[base_columns]
+                
+                logger.debug(f"{ts_code} 下载完成，共 {len(df)} 条记录")
+                return ts_code, "success", df
+                
+            except Exception as e:
+                error_msg = str(e)
+                error_msg_lower = error_msg.lower()
+                last_error = e
+                
+                # 认证错误不重试
+                if "token" in error_msg_lower or "auth" in error_msg_lower or "1002" in error_msg:
+                    logger.error(f"Token认证失败 {ts_code}: {error_msg}，不重试")
+                    with self._lock:
+                        self.stats.error_count += 1
+                        self.stats.failed_stocks.append((ts_code, error_msg))
+                    return ts_code, f"error: {error_msg}", None
+                
+                # 其他错误可以重试
+                if attempt < max_retries - 1:
+                    base_wait_time = retry_delay * (2 ** attempt)  # 指数退避
+                    # 添加±20%的随机抖动，避免多个请求同时重试
+                    jitter = random.uniform(-0.2, 0.2) * base_wait_time
+                    wait_time = max(0.1, base_wait_time + jitter)  # 确保等待时间至少0.1秒
+                    logger.warning(f"下载指数数据失败 {ts_code} (尝试 {attempt + 1}/{max_retries}): {error_msg}")
+                    logger.info(f"等待 {wait_time:.1f} 秒后重试...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # 所有重试都失败了
+                    logger.error(f"下载指数数据最终失败 {ts_code} (已重试 {max_retries} 次): {error_msg}")
+                    with self._lock:
+                        self.stats.error_count += 1
+                        self.stats.failed_stocks.append((ts_code, error_msg))
+                    return ts_code, f"error: {error_msg}", None
+        
+        # 如果所有重试都失败，返回错误
+        if last_error:
+            error_msg = str(last_error)
+            logger.error(f"下载指数数据失败 {ts_code} (已重试 {max_retries} 次): {error_msg}")
             with self._lock:
                 self.stats.error_count += 1
                 self.stats.failed_stocks.append((ts_code, error_msg))
-            
-            logger.error(f"下载指数数据失败 {ts_code}: {error_msg}")
             return ts_code, f"error: {error_msg}", None
+        
+        return ts_code, "error: 未知错误", None
     
     def download_all_indices(self, whitelist: List[str] = None) -> DownloadStats:
         """下载所有指数数据，由主线程统一写入数据库"""
@@ -1146,7 +1384,10 @@ class IndexDownloader:
         
         # 打印限频器统计信息
         rate_stats = self.tushare_manager.rate_limiter.get_stats()
-        logger.info(f"限频器统计 - 总调用: {rate_stats['total_calls']}, 成功率: {rate_stats['success_rate']:.1f}%, 等待时间: {rate_stats['total_wait_time']:.1f}s")
+        logger.info(f"令牌桶限频器统计 - 总调用: {rate_stats['total_calls']}, 成功率: {rate_stats['success_rate']:.1f}%, "
+                   f"补充速率: {rate_stats['current_refill_rate']:.2f}次/秒, 容量: {rate_stats['current_capacity']:.1f}, "
+                   f"当前令牌: {rate_stats['current_tokens']:.1f}, 等待时间: {rate_stats['total_wait_time']:.1f}s, "
+                   f"限频命中: {rate_stats['rate_limit_hits']}")
         
         return self.stats
 
