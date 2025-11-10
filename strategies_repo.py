@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 strategies_repo.py — Python 版策略仓库
 策略编辑请参考文档
@@ -11,6 +11,69 @@ OPPORTUNITY_TITLE = "买点策略（个股）"
 
 # 排名策略
 RANKING_RULES = [
+    # {
+    #     'name': '10日均线斜率0-10度',
+    #     'timeframe': 'D',
+    #     'when': '''
+    #         MA10_CUR := MA(C, 10);
+    #         MA10_10AGO := REF(MA10_CUR, 10);
+    #         RATIO := SAFE_DIV(MA10_CUR, MA10_10AGO);
+    #         SLOPE := (RATIO - 1) / 0.5;
+    #         ANGLE_RAD := ATAN(SLOPE);
+    #         ANGLE_DEG := ANGLE_RAD * 180 / 3.141592653589793;
+    #         ANGLE_DEG > 0 AND ANGLE_DEG <= 10
+    #     ''',
+    #     'scope': 'LAST',
+    #     'points': 12,
+    #     'explain': '10日均线斜率对应的角度在0-10度之间'
+    # },
+    # {
+    #     'name': '当日机会',
+    #     'timeframe': 'D',
+    #     'window': 2,
+    #     'when': "TAG_HITS('opportunity') > 3",
+    #     'scope': 'LAST',
+    #     'points': 8,
+    #     'explain': '大机会'
+    # },
+    # {
+    #     'name': '前期涨幅温和',
+    #     'timeframe': 'D',
+    #     'window': 60,
+    #     'when': 'SAFE_DIV(HHV(C,60) - LLV(C,60), LLV(C,60)) <= 0.20',
+    #     'scope': 'LAST',
+    #     'points': 5,
+    #     'explain': '过去60日涨幅不大'
+    # },
+    # {
+    #     'name': '前期涨幅强势',
+    #     'timeframe': 'D',
+    #     'window': 60,
+    #     'when': 'SAFE_DIV(HHV(C,60) - LLV(C,60), LLV(C,60)) < 0.40 AND SAFE_DIV(HHV(C,60) - '
+    #             'LLV(C,60), LLV(C,60)) > 0.20',
+    #     'scope': 'LAST',
+    #     'points': 10,
+    #     'explain': '过去60日涨幅过大'
+    # },
+    # {
+    #     'name': '短期过高',
+    #     'timeframe': 'D',
+    #     'window': 10,
+    #     'when': 'SAFE_DIV(HHV(C,8) - LLV(C,8), LLV(C,8)) > 0.3 ',
+    #     'scope': 'LAST',
+    #     'points': -15,
+    #     'explain': '短期过高'
+    # },
+    # {
+    #     'name': 'z-score',
+    #     'timeframe': 'D',
+    #     'window': 20,
+    #     'when': 'z_score >= 1.48',
+    #     'scope': 'EACH',
+    #     'points': 5,
+    #     'explain': 'Z-Score高于1.48',
+    #     'show_reason': False
+    # },
 ]
 
 # 初选策略（硬淘汰）
@@ -55,6 +118,11 @@ PREDICTION_RULES = [
 # 个股持仓检查策略（仅用于个股页签的触发表展示，不生成动作）
 POSITION_POLICIES = [
     
+]
+
+# 自选榜策略组合配置
+# 格式：列表，每个元素包含 name（组合名称）、rules（策略名列表）、agg_mode（聚合方法：OR/AND）、explain（说明）等字段
+CUSTOM_COMBOS = [
 ]
 
 # 个股买点策略（用于给出买点价格来源；可选，不影响持仓检查）

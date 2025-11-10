@@ -1448,8 +1448,8 @@ if _in_streamlit():
         st.session_state["export_pref"] = {"style": "space", "with_suffix": True}
 
     # ===== 顶层页签 =====
-    tab_rank, tab_detail, tab_position, tab_predict, tab_rules, tab_attn, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
-        ["排名", "个股详情", "持仓建议", "明日模拟", "规则编辑", "强度榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
+    tab_rank, tab_detail, tab_position, tab_predict, tab_rules, tab_attn, tab_custom, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
+        ["排名", "个股详情", "持仓建议", "明日模拟", "规则编辑", "强度榜", "自选榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
 
     # ================== 排名 ==================
     with tab_rank:
@@ -1512,7 +1512,8 @@ if _in_streamlit():
 
         # "读取最近一次结果"按钮：仅读取，不计算
         if latest_btn and not run_btn:
-            ref_to_use = _get_latest_date_from_files()
+            # 优先使用用户输入的参考日，如果没有输入则使用最新的文件日期
+            ref_to_use = ref_inp.strip() or _get_latest_date_from_files()
 
         # ---- 统一的 Top 预览区块（无论 run 或 读取最近一次） ----
         if ref_to_use:
@@ -3136,6 +3137,327 @@ if _in_streamlit():
             #     width='stretch',
             #     key=f"dl_attn_{ref_attn}"
             # )
+
+    # ================== 自选榜 ==================
+    with tab_custom:
+        st.subheader("自选榜（策略组合）")
+        
+        # 从 strategies_repo.py 加载策略组合
+        def load_custom_combos():
+            """从 strategies_repo.py 加载策略组合配置，转换为字典格式（name -> combo_data）"""
+            try:
+                from strategies_repo import CUSTOM_COMBOS
+                if isinstance(CUSTOM_COMBOS, list):
+                    # 列表格式转换为字典格式
+                    return {combo.get('name', ''): combo for combo in CUSTOM_COMBOS if combo.get('name')}
+                elif isinstance(CUSTOM_COMBOS, dict):
+                    # 兼容旧格式（字典）
+                    return dict(CUSTOM_COMBOS)
+                return {}
+            except Exception as e:
+                logger.warning(f"加载策略组合失败: {e}")
+                return {}
+        
+        def save_custom_combos(combos: dict):
+            """保存策略组合配置到 strategies_repo.py"""
+            try:
+                import re
+                from pathlib import Path
+                
+                repo_path = Path("strategies_repo.py")
+                if not repo_path.exists():
+                    st.error("找不到 strategies_repo.py 文件")
+                    return False
+                
+                # 读取文件内容
+                content = repo_path.read_text(encoding="utf-8-sig")
+                
+                # 构建新的 CUSTOM_COMBOS 内容（列表格式）
+                new_combos_str = "# 自选榜策略组合配置\n"
+                new_combos_str += "# 格式：列表，每个元素包含 name（组合名称）、rules（策略名列表）、agg_mode（聚合方法：OR/AND）、output_name（落盘名称）、explain（说明）等字段\n"
+                new_combos_str += "CUSTOM_COMBOS = [\n"
+                for combo_name, combo_data in combos.items():
+                    rules = combo_data.get("rules", [])
+                    agg_mode = combo_data.get("agg_mode", "OR")
+                    output_name = combo_data.get("output_name", combo_name)
+                    explain = combo_data.get("explain", "")
+                    new_combos_str += "    {\n"
+                    new_combos_str += f"        'name': '{combo_name}',\n"
+                    new_combos_str += f"        'rules': {repr(rules)},\n"
+                    new_combos_str += f"        'agg_mode': '{agg_mode}',\n"
+                    new_combos_str += f"        'output_name': '{output_name}',\n"
+                    if explain:
+                        new_combos_str += f"        'explain': '{explain}',\n"
+                    new_combos_str += "    },\n"
+                new_combos_str += "]\n"
+                
+                # 使用正则表达式替换 CUSTOM_COMBOS 部分（包括注释）
+                # 匹配从注释开始到 CUSTOM_COMBOS 列表/字典结束的整个块
+                # 使用平衡括号匹配来正确匹配嵌套的结构
+                pattern = r"# 自选榜策略组合配置.*?CUSTOM_COMBOS\s*=\s*[\[{]"
+                match = re.search(pattern, content, re.DOTALL)
+                if match:
+                    # 找到列表/字典开始位置
+                    start_pos = match.end() - 1  # 回退到 [ 或 { 的位置
+                    # 从开始位置找到匹配的结束括号
+                    brace_count = 1
+                    end_pos = start_pos + 1
+                    open_char = content[start_pos]
+                    close_char = ']' if open_char == '[' else '}'
+                    while brace_count > 0 and end_pos < len(content):
+                        if content[end_pos] == open_char:
+                            brace_count += 1
+                        elif content[end_pos] == close_char:
+                            brace_count -= 1
+                        end_pos += 1
+                    # 替换整个块（包括注释）
+                    content = content[:match.start()] + new_combos_str.rstrip() + content[end_pos:]
+                else:
+                    # 如果不存在，在 POSITION_POLICIES 后添加
+                    # 找到 POSITION_POLICIES 的结束位置（包括空行）
+                    pos_pattern = r"(POSITION_POLICIES\s*=\s*\[[^\]]*\]\s*\n)"
+                    if re.search(pos_pattern, content, re.DOTALL):
+                        # 在 POSITION_POLICIES 后添加
+                        content = re.sub(
+                            pos_pattern,
+                            r"\1\n" + new_combos_str,
+                            content,
+                            flags=re.DOTALL
+                        )
+                    else:
+                        # 在文件末尾添加
+                        content += "\n\n" + new_combos_str
+                
+                # 写回文件
+                repo_path.write_text(content, encoding="utf-8-sig")
+                
+                # 重新加载模块
+                import importlib
+                import strategies_repo
+                importlib.reload(strategies_repo)
+                
+                return True
+            except Exception as e:
+                logger.error(f"保存策略组合失败: {e}")
+                st.error(f"保存失败: {e}")
+                return False
+        
+        # 获取所有规则名
+        rule_names = _get_rule_names()
+        
+        # 策略组合管理
+        with st.expander("策略组合管理", expanded=False):
+            combos = load_custom_combos()
+            
+            # 显示现有组合
+            if combos:
+                st.markdown("**现有策略组合：**")
+                for combo_name, combo_data in combos.items():
+                    with st.container(border=True):
+                        col1, col2, col3 = st.columns([3, 1, 1])
+                        with col1:
+                            st.markdown(f"**{combo_name}**")
+                            rules_list = combo_data.get("rules", [])
+                            agg_mode = combo_data.get("agg_mode", "OR")
+                            explain = combo_data.get("explain", "")
+                            st.caption(f"策略组: {', '.join(rules_list[:3])}{'...' if len(rules_list) > 3 else ''} | 聚合方法: {agg_mode}")
+                            if explain:
+                                st.caption(f"说明: {explain}")
+                        with col2:
+                            if st.button("删除", key=f"del_{combo_name}"):
+                                del combos[combo_name]
+                                if save_custom_combos(combos):
+                                    st.success(f"已删除策略组合: {combo_name}")
+                                    st.rerun()
+                        with col3:
+                            if st.button("使用", key=f"use_{combo_name}"):
+                                st.session_state["selected_combo"] = combo_name
+                                st.session_state["selected_rules"] = rules_list
+                                st.session_state["selected_agg_mode"] = agg_mode
+                                st.rerun()
+            
+            st.divider()
+            
+            # 新建/编辑策略组合
+            st.markdown("**新建/编辑策略组合：**")
+            combo_name_input = st.text_input("组合名称（name）", value="", key="combo_name_input", placeholder="例如：突破组合")
+            selected_rules_input = st.multiselect("策略组（rules）", options=rule_names, default=[], key="combo_rules_input")
+            agg_mode_input = st.radio("聚合方法（agg_mode）", ["OR（任一命中）", "AND（全部命中）"], index=0, horizontal=True, key="combo_agg_mode")
+            combo_output_name_input = st.text_input("落盘名称（output_name）", value="", key="combo_output_name_input", placeholder="例如：突破组合（用于生成文件名）")
+            combo_explain_input = st.text_input("说明（explain）", value="", key="combo_explain_input", placeholder="例如：突破相关策略组合")
+            
+            col_save1, col_save2 = st.columns([1, 1])
+            with col_save1:
+                if st.button("保存策略组合", key="save_combo"):
+                    if not combo_name_input.strip():
+                        st.warning("请输入组合名称")
+                    elif not selected_rules_input:
+                        st.warning("请至少选择一个策略")
+                    else:
+                        # 落盘名称默认为组合名称
+                        output_name = combo_output_name_input.strip() if combo_output_name_input.strip() else combo_name_input.strip()
+                        combos[combo_name_input.strip()] = {
+                            "rules": selected_rules_input,
+                            "agg_mode": "OR" if agg_mode_input.startswith("OR") else "AND",
+                            "output_name": output_name,
+                            "explain": combo_explain_input.strip() if combo_explain_input.strip() else ""
+                        }
+                        if save_custom_combos(combos):
+                            st.success(f"已保存策略组合: {combo_name_input.strip()}")
+                            st.rerun()
+            with col_save2:
+                if st.button("清空输入", key="clear_combo"):
+                    st.session_state["combo_name_input"] = ""
+                    st.session_state["combo_rules_input"] = []
+                    st.session_state["combo_output_name_input"] = ""
+                    st.session_state["combo_explain_input"] = ""
+                    st.rerun()
+        
+        st.divider()
+        
+        # 生成自选榜
+        st.markdown("### 生成自选榜")
+        
+        # 加载repo中的策略组合
+        combos_repo = load_custom_combos()
+        
+        # 选择策略组合或手动选择
+        if combos_repo:
+            # 有repo中的策略组合，提供选择
+            combo_options = ["手动选择策略"] + list(combos_repo.keys())
+            selected_combo_key = st.selectbox("选择策略组合", options=combo_options, index=0, key="select_combo_from_repo")
+            
+            if selected_combo_key == "手动选择策略":
+                # 手动选择策略
+                selected_rules = st.multiselect("选择策略（可多选）", options=rule_names, default=[], key="manual_rules")
+                selected_agg_mode = st.radio("聚合模式", ["OR（任一命中）", "AND（全部命中）"], index=0, horizontal=True, key="manual_agg_mode")
+                selected_agg_mode = "OR" if selected_agg_mode.startswith("OR") else "AND"
+                selected_combo_name = None
+                selected_output_name = None
+                selected_combo_data = None
+            else:
+                # 使用repo中的策略组合
+                selected_combo_data = combos_repo.get(selected_combo_key)
+                if selected_combo_data:
+                    selected_rules = selected_combo_data.get("rules", [])
+                    selected_agg_mode = selected_combo_data.get("agg_mode", "OR")
+                    selected_combo_name = selected_combo_key
+                    selected_output_name = selected_combo_data.get("output_name", selected_combo_name)
+                    st.info(f"**策略组合：{selected_combo_name}** | 策略组: {', '.join(selected_rules[:5])}{'...' if len(selected_rules) > 5 else ''} | 聚合方法: {selected_agg_mode}")
+                    st.caption(f"落盘名称: {selected_output_name}")
+                    explain = selected_combo_data.get("explain", "")
+                    if explain:
+                        st.caption(f"说明: {explain}")
+                else:
+                    selected_rules = []
+                    selected_agg_mode = "OR"
+                    selected_combo_name = None
+                    selected_output_name = None
+                    selected_combo_data = None
+        else:
+            # 没有repo中的策略组合，只能手动选择
+            selected_rules = st.multiselect("选择策略（可多选）", options=rule_names, default=[], key="manual_rules")
+            selected_agg_mode = st.radio("聚合模式", ["OR（任一命中）", "AND（全部命中）"], index=0, horizontal=True, key="manual_agg_mode")
+            selected_agg_mode = "OR" if selected_agg_mode.startswith("OR") else "AND"
+            selected_combo_name = None
+            selected_output_name = None
+            selected_combo_data = None
+        
+        # 参数设置
+        with st.form("custom_rank_form"):
+            c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+            with c1:
+                ref_date_custom = st.text_input("参考日（YYYYMMDD；留空=自动最新）", value="", key="custom_ref_date")
+            with c2:
+                universe_custom = st.selectbox("选股范围", ["全市场", "仅白名单", "仅黑名单", "仅强度榜"], index=0, key="custom_universe")
+            with c3:
+                tiebreak_custom = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=1, key="custom_tiebreak")
+            with c4:
+                topN_custom = st.number_input("输出 Top-N（留空=不限制）", min_value=0, max_value=5000, value=200, step=10, key="custom_topN")
+            
+            # 榜单名称：如果使用了repo中的策略组合，使用其落盘名称；手动选择时才需要填写
+            if selected_output_name:
+                # 使用repo中的策略组合，显示落盘名称（只读）
+                st.text_input("落盘名称（用于文件名）", value=selected_output_name, key="custom_combo_name", disabled=True)
+                combo_name_output = selected_output_name
+            else:
+                # 手动选择策略，需要填写榜单名称
+                combo_name_output = st.text_input("榜单名称（用于文件名）", value="custom", key="custom_combo_name", placeholder="例如：突破组合")
+            
+            gen_btn = st.form_submit_button("生成并落盘", width='stretch')
+        
+        if gen_btn:
+            if not selected_rules:
+                st.warning("请至少选择一个策略")
+            elif not combo_name_output.strip():
+                st.warning("请输入榜单名称")
+            else:
+                try:
+                    # 自动启用数据库读取（和选股页面的按触发规则筛选一样）
+                    if not is_details_db_reading_enabled():
+                        st.session_state["details_db_reading_enabled"] = True
+                    
+                    ref_real = ref_date_custom.strip() or _get_latest_date_from_files() or ""
+                    if not ref_real:
+                        st.error("未能确定参考日")
+                    else:
+                        universe_map = {"全市场": "all", "仅白名单": "white", "仅黑名单": "black", "仅强度榜": "strength"}
+                        universe = universe_map.get(universe_custom, "all")
+                        
+                        # 调用生成函数
+                        from scoring_core import build_custom_rank
+                        result = build_custom_rank(
+                            combo_name=combo_name_output.strip(),
+                            rule_names=selected_rules,
+                            agg_mode=selected_agg_mode,
+                            ref_date=ref_real,
+                            universe=universe,
+                            tiebreak=tiebreak_custom,
+                            topN=topN_custom if topN_custom > 0 else None,
+                            write=True
+                        )
+                        
+                        if result:
+                            st.success(f"自选榜已生成并落盘: {result}")
+                            # 读取并显示结果
+                            try:
+                                df_result = pd.read_csv(result)
+                                st.dataframe(df_result, width='stretch', height=480)
+                                
+                                # 导出 TXT
+                                if "ts_code" in df_result.columns:
+                                    codes = df_result["ts_code"].astype(str).tolist()
+                                    txt = _codes_to_txt(codes, st.session_state["export_pref"]["style"], st.session_state["export_pref"]["with_suffix"])
+                                    copy_txt_button(txt, label="📋 复制代码", key=f"copy_custom_{ref_real}")
+                            except Exception as e:
+                                st.warning(f"读取结果失败: {e}")
+                        else:
+                            st.info("未筛到命中标的")
+                except Exception as e:
+                    st.error(f"生成失败: {e}")
+        
+        # 查看历史榜单
+        st.divider()
+        st.markdown("### 查看历史榜单")
+        custom_dir = SC_OUTPUT_DIR / "custom"
+        if custom_dir.exists():
+            csv_files = sorted(custom_dir.glob("custom_*.csv"), key=lambda x: x.stat().st_mtime, reverse=True)
+            if csv_files:
+                selected_file = st.selectbox("选择文件", options=[f.name for f in csv_files[:20]], key="custom_file_select")
+                if selected_file:
+                    try:
+                        df_view = pd.read_csv(custom_dir / selected_file)
+                        st.dataframe(df_view, width='stretch', height=420)
+                        if "ts_code" in df_view.columns:
+                            codes = df_view["ts_code"].astype(str).tolist()
+                            txt = _codes_to_txt(codes, st.session_state["export_pref"]["style"], st.session_state["export_pref"]["with_suffix"])
+                            copy_txt_button(txt, label="📋 复制代码", key=f"copy_custom_file_{selected_file}")
+                    except Exception as e:
+                        st.error(f"读取文件失败: {e}")
+            else:
+                st.info("暂无历史榜单文件")
+        else:
+            st.info("自定义榜单目录不存在")
 
     # ================== 选股 ==================
     with tab_screen:

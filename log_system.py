@@ -523,6 +523,10 @@ class DebugLogger:
             message = message.decode('utf-8', errors='replace')
         self.logger.log(PREP_LEVEL_NUM, message, **kwargs)
     
+    def isEnabledFor(self, level: int) -> bool:
+        """检查是否启用了指定级别的日志"""
+        return self.logger.isEnabledFor(level)
+    
     def log_function_call(self, func_name: str, args: tuple = (), kwargs: dict = None):
         """记录函数调用"""
         kwargs = kwargs or {}

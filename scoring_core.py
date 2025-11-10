@@ -593,28 +593,52 @@ def preload_rank_data(ref_date: str, start_date: str, columns: List[str]):
         sc_rules = globals().get("SC_RULES") or (load_rank_rules_py() or [])
         sc_prescreen_rules = globals().get("SC_PRESCREEN_RULES") or (load_filter_rules_py() or [])
         
-        # 从策略规则中提取最大windows（类似 _compute_read_start 的逻辑）
-        def _max_win(rules: List[dict], tf: str) -> int:
-            wins = []
+        # 收集所有策略规则的 when 表达式，并使用 _calc_nested_window 计算最大所需数据长度
+        def _collect_and_calc_max_window(rules: List[dict], tf: str) -> int:
+            """收集规则中的窗口和表达式，计算最大所需数据长度"""
+            max_window = 0
+            max_expr_window = 0
+            
             for r in rules:
                 if "clauses" in r:
+                    # 带子句的规则：检查每个子句
                     for c in r["clauses"]:
-                        if c.get("timeframe","D").upper()==tf:
-                            wins.append(int(c.get("window", SC_LOOKBACK_D)))
+                        if c.get("timeframe", "D").upper() == tf:
+                            # 获取窗口（优先使用 score_windows，否则使用 window）
+                            window = int(c.get("score_windows") or c.get("window", SC_LOOKBACK_D))
+                            max_window = max(max_window, window)
+                            
+                            # 使用 _calc_nested_window 计算表达式最大所需数据长度
+                            when_expr = (c.get("when") or "").strip()
+                            if when_expr:
+                                expr_window = _calc_nested_window(when_expr)
+                                max_expr_window = max(max_expr_window, expr_window)
                 else:
-                    if r.get("timeframe","D").upper()==tf:
-                        wins.append(int(r.get("window", SC_LOOKBACK_D)))
-            return max(wins or [0])
+                    # 单条规则
+                    if r.get("timeframe", "D").upper() == tf:
+                        # 获取窗口（优先使用 score_windows，否则使用 window）
+                        window = int(r.get("score_windows") or r.get("window", SC_LOOKBACK_D))
+                        max_window = max(max_window, window)
+                        
+                        # 使用 _calc_nested_window 计算表达式最大所需数据长度
+                        when_expr = (r.get("when") or "").strip()
+                        if when_expr:
+                            expr_window = _calc_nested_window(when_expr)
+                            max_expr_window = max(max_expr_window, expr_window)
+            
+            # 返回窗口和表达式所需数据长度的最大值
+            return max(max_window, max_expr_window)
         
-        # 从实际策略规则中提取最大windows，不使用保底值
-        d = max(_max_win(sc_rules, "D"), _max_win(sc_prescreen_rules, "D"))
-        w = max(_max_win(sc_rules, "W"), _max_win(sc_prescreen_rules, "W"))
-        m = max(_max_win(sc_rules, "M"), _max_win(sc_prescreen_rules, "M"))
+        # 从实际策略规则中提取最大windows，使用 _calc_nested_window 计算表达式最大所需数据长度
+        d = max(_collect_and_calc_max_window(sc_rules, "D"), _collect_and_calc_max_window(sc_prescreen_rules, "D"))
+        w = max(_collect_and_calc_max_window(sc_rules, "W"), _collect_and_calc_max_window(sc_prescreen_rules, "W"))
+        m = max(_collect_and_calc_max_window(sc_rules, "M"), _collect_and_calc_max_window(sc_prescreen_rules, "M"))
+        
         # 如果策略中没有配置windows，使用默认值
         if d == 0:
             d = SC_LOOKBACK_D
         days = d + w*6 + m*22
-        LOGGER.info(f"[预加载] 策略最大windows: 日={d}, 周={w}, 月={m}, 总天数={days}")
+        LOGGER.info(f"[预加载] 策略最大windows（含表达式递归计算）: 日={d}, 周={w}, 月={m}, 总天数={days}")
         
         # 按照交易日列表反推准确的交易日起点
         actual_start_date = _compute_start_date_by_trade_dates(ref_date, days)
@@ -775,19 +799,29 @@ def _flush_batch_buffer():
         pass
     
     try:
-        LOGGER.info(f"[批量写回] 开始批量写回 {_BATCH_BUFFER['current_count']} 条明细数据")
+        # 优化日志：使用条件日志，避免不必要的字符串格式化
+        if LOGGER.isEnabledFor(_logging.INFO):
+            LOGGER.info(f"[批量写回] 开始批量写回 {_BATCH_BUFFER['current_count']} 条明细数据")
         
         # 使用database_manager进行批量写回，不直接操作数据库
         from database_manager import get_database_manager
         from config import SC_OUTPUT_DIR
         
-        LOGGER.info("[数据库连接] 开始获取数据库管理器实例 (批量写回明细数据)")
-        db_manager = get_database_manager()
+        # 优化：缓存details_db_path，避免重复计算
         details_db_path = os.path.join(SC_OUTPUT_DIR, SC_DETAIL_DB_PATH)
         os.makedirs(os.path.dirname(details_db_path), exist_ok=True)
         
-        # 确保数据库表存在
-        db_manager.init_stock_details_tables(details_db_path, "duckdb")
+        db_manager = get_database_manager()
+        
+        # 优化：表结构已经在主进程中初始化，子进程不需要再调用
+        # 只在主进程中初始化表结构
+        try:
+            current_process = multiprocessing.current_process()
+            if current_process.name == "MainProcess":
+                db_manager.init_stock_details_tables(details_db_path, "duckdb")
+        except (AttributeError, RuntimeError):
+            # 单进程模式，初始化表结构
+            db_manager.init_stock_details_tables(details_db_path, "duckdb")
         
         # 准备批量数据
         batch_data = []
@@ -858,7 +892,9 @@ def _flush_batch_buffer():
             callback=update_status_callback
         )
         
-        LOGGER.info(f"[批量写回] 成功提交批量写回请求: {request_id}, 数据量: {_BATCH_BUFFER['current_count']}")
+        # 优化日志：使用条件日志，避免不必要的字符串格式化
+        if LOGGER.isEnabledFor(_logging.INFO):
+            LOGGER.info(f"[批量写回] 成功提交批量写回请求: {request_id}, 数据量: {_BATCH_BUFFER['current_count']}")
         
     except Exception as e:
         LOGGER.error(f"[批量写回] 批量写回失败: {e}")
@@ -1936,10 +1972,16 @@ def _filter_rules_by_ref_date(rules: list[dict], ref_date: str) -> list[dict]:
     
     return filtered_rules
 
-def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: list[dict]):
+def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: list[dict], skip_db_write: bool = False):
     """
     写入个股详情，优先使用数据库存储，失败时回退到JSON文件
-    在表达式选股场景下，禁用数据库写入以避免冲突
+    
+    Args:
+        ts_code: 股票代码
+        ref_date: 参考日期
+        summary: 摘要数据
+        per_rules: 规则详情列表
+        skip_db_write: 是否跳过数据库写入（表达式选股场景应设置为True）
     """
 
     # 在写入前过滤per_rules，只保留算分日期（ref_date）的命中信息
@@ -1949,25 +1991,38 @@ def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: li
     success = True
     db_success = False
     
-    # 检查是否在表达式选股场景下（通过调用栈判断）
-    import inspect
-    call_stack = [frame.function for frame in inspect.stack()]
-    is_expression_screening = any(func in call_stack for func in ['apply_rule_across_universe', '_apply_one_stock_for_rule', 'tdx_screen', '_screen_one'])
+    # 优化：移除inspect.stack()调用栈检查，这是性能瓶颈
+    # 表达式选股场景通过skip_db_write参数标识，而不是通过调用栈检查
+    is_expression_screening = skip_db_write  # 通过参数传递，避免调用栈检查
     
     # 1. 优先尝试数据库存储（表达式选股时跳过）
     if (not is_expression_screening) and SC_DETAIL_STORAGE in ["database","both","db"] and SC_USE_DB_STORAGE:
-        LOGGER.info(f"[detail] 尝试数据库存储: {ts_code}_{ref_date}")
+        # 优化日志：减少不必要的日志输出
+        if LOGGER.isEnabledFor(_logging.INFO):
+            LOGGER.info(f"[detail] 尝试数据库存储: {ts_code}_{ref_date}")
         try:
             # 使用database_manager保存股票详情
             from database_manager import get_database_manager
-            LOGGER.info(f"[数据库连接] 开始获取数据库管理器实例 (保存股票详情: {ts_code}, {ref_date})")
-            db_manager = get_database_manager()
-            
-            # 确保数据库表存在
             from config import SC_OUTPUT_DIR
+            
+            # 优化：缓存details_db_path，避免重复计算
             details_db_path = os.path.join(SC_OUTPUT_DIR, SC_DETAIL_DB_PATH)
             os.makedirs(os.path.dirname(details_db_path), exist_ok=True)
-            db_manager.init_stock_details_tables(details_db_path, "duckdb")
+            
+            # 优化：表结构已经在主进程中初始化，子进程不需要再调用
+            # 只在主进程中初始化表结构
+            try:
+                current_process = multiprocessing.current_process()
+                if current_process.name == "MainProcess":
+                    db_manager = get_database_manager()
+                    db_manager.init_stock_details_tables(details_db_path, "duckdb")
+                else:
+                    # 子进程直接获取数据库管理器，不初始化表结构
+                    db_manager = get_database_manager()
+            except (AttributeError, RuntimeError):
+                # 单进程模式，初始化表结构
+                db_manager = get_database_manager()
+                db_manager.init_stock_details_tables(details_db_path, "duckdb")
             
             # 准备股票详情数据 - 对 JSON 字段进行序列化
             highlights_json = json.dumps(summary.get('highlights', []), ensure_ascii=False)
@@ -2006,10 +2061,7 @@ def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: li
             import pandas as pd
             df = pd.DataFrame([detail_data])
             
-            # 使用details目录下的数据库文件
-            details_db_path = os.path.join(SC_OUTPUT_DIR, SC_DETAIL_DB_PATH)
-            
-            # 使用统一接口进行写入
+            # 使用统一接口进行写入（details_db_path已在上面计算）
             request_id = db_manager.receive_data(
                 source_module="scoring_core",
                 data_type="custom",
@@ -2022,17 +2074,23 @@ def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: li
                 }
             )
             
-            LOGGER.info(f"[detail] 数据库存储已提交: {ts_code}_{ref_date}, 请求ID: {request_id}")
+            # 优化日志：使用条件日志，避免不必要的字符串格式化
+            if LOGGER.isEnabledFor(_logging.INFO):
+                LOGGER.info(f"[detail] 数据库存储已提交: {ts_code}_{ref_date}, 请求ID: {request_id}")
             db_success = True
             
         except Exception as e:
             LOGGER.warning(f"[detail] 数据库存储异常: {ts_code}: {e}")
-    elif is_expression_screening:
-        LOGGER.debug(f"[detail] 表达式选股场景，跳过数据库存储: {ts_code}")
+    if is_expression_screening:
+        # 表达式选股场景不需要写入details，直接返回
+        if LOGGER.isEnabledFor(_logging.DEBUG):
+            LOGGER.debug(f"[detail] 表达式选股场景，跳过details写入: {ts_code}")
+        return
     
     # 2. 如果数据库失败且配置了回退，或者配置了JSON存储，则使用JSON文件
     if (not db_success and SC_DB_FALLBACK_TO_JSON) or SC_DETAIL_STORAGE in ["json", "both"]:
         try:
+            from config import SC_OUTPUT_DIR
             base = os.path.join(SC_OUTPUT_DIR, "details", str(ref_date))
             os.makedirs(base, exist_ok=True)
             out_path = os.path.join(base, f"{ts_code}_{ref_date}.json")
@@ -2046,11 +2104,13 @@ def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: li
                 import json
                 json.dump(_json_sanitize(payload), f, ensure_ascii=False, indent=2, allow_nan=False)
             
-            # 如果是从数据库回退到JSON，给出明确提示
+            # 优化日志：使用条件日志，避免不必要的字符串格式化
             if not db_success and SC_DB_FALLBACK_TO_JSON:
-                LOGGER.info(f"[detail] 数据库写入失败，已回退到JSON文件: {ts_code} -> {out_path}")
+                if LOGGER.isEnabledFor(_logging.INFO):
+                    LOGGER.info(f"[detail] 数据库写入失败，已回退到JSON文件: {ts_code} -> {out_path}")
             else:
-                LOGGER.debug(f"[detail] JSON {ts_code} -> {out_path}")
+                if LOGGER.isEnabledFor(_logging.DEBUG):
+                    LOGGER.debug(f"[detail] JSON {ts_code} -> {out_path}")
             success = True
         except Exception as e:
             LOGGER.warning(f"[detail] JSON写明细失败 {ts_code}: {e}")
@@ -2103,14 +2163,20 @@ def _list_true_dates(df: pd.DataFrame, expr: str, *, ref_date: str, window: int,
         return []
 
 
-def _inject_config_tags(dfD: pd.DataFrame, ref_date: str, ctx: dict = None):
-    # 检查是否在表达式选股场景下（通过调用栈判断）
-    import inspect
-    call_stack = [f.function for f in inspect.stack()]
-    is_expression_screening = any(func in call_stack for func in ['apply_rule_across_universe', '_apply_one_stock_for_rule', 'tdx_screen', '_screen_one'])
+def _inject_config_tags(dfD: pd.DataFrame, ref_date: str, ctx: dict = None, skip_tags: bool = False):
+    """
+    注入基于config的自定义标签
     
-    # 表达式选股时不应该加载和编译repo中的策略
-    if is_expression_screening:
+    Args:
+        dfD: 数据DataFrame
+        ref_date: 参考日期
+        ctx: 上下文字典
+        skip_tags: 是否跳过标签注入（表达式选股场景应设置为True）
+    """
+    # 优化：移除inspect.stack()调用栈检查，这是性能瓶颈
+    # 表达式选股场景通过skip_tags参数标识，而不是通过调用栈检查
+    if skip_tags:
+        # 表达式选股时不应该加载和编译repo中的策略
         return
     
     dfD_dt = _ensure_datetime_index(dfD)
@@ -2342,7 +2408,19 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) ->
             except Exception:
                 period = ref_date
             if scope in {"EACH", "PERBAR", "EACH_TRUE"}:
-                cnt, err = _count_hits_perbar(df, rule, ref_date, ctx)
+                # 检查是否有 gate
+                gate_norm = _normalize_gate(rule)
+                if gate_norm:
+                    # 如果有 gate，使用 _count_hits_perbar_with_gate() 函数
+                    # 该函数会对每次命中单独判断 gate，只统计同时满足 when 和 gate 的天数
+                    cnt, err = _count_hits_perbar_with_gate(df, rule, ref_date, ctx)
+                    # 对于带 gate 的 EACH scope，cnt 已经是同时满足 when 和 gate 的天数
+                    # 所以 gate_ok 始终为 True（因为已经过滤过了）
+                    gate_ok = True
+                else:
+                    # 如果没有 gate，使用原来的函数
+                    cnt, err = _count_hits_perbar(df, rule, ref_date, ctx)
+                    gate_ok = True
                 dfTF = df if tf=="D" else _resample(df, tf)
                 win_df = _window_slice(dfTF, ref_date, score_window)
                 cand_when = None
@@ -2357,10 +2435,8 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) ->
                     _d, _ = _last_true_date(df, cand_when, ref_date=ref_date, timeframe=tf, window=score_window, ctx=ctx)
                     hit_date = _d
                 ok = bool(cnt and cnt > 0 and err is None)
+                # 对于 EACH scope，add = points * count（已经过滤过 gate）
                 add = float(pts * int(cnt or 0))
-                gate_ok, gate_err, gate_norm = _eval_gate(df, rule, ref_date, ctx)
-                if not gate_ok:
-                    add = 0.0
                 rows.append({
                     "name": name, "scope": scope, "timeframe": tf, "window": win, "period": period,
                     "points": pts, "ok": ok, "cnt": int(cnt or 0),
@@ -2369,7 +2445,7 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) ->
                     "hit_dates": _list_true_dates(df, (cand_when or rule.get("when") or ""), ref_date=ref_date, window=score_window, timeframe=tf, ctx=ctx),
                     "hit_count": int(cnt or 0),
                     "gate_ok": bool(gate_ok),
-                    "gate_when": (gate_norm.get("when") if isinstance(gate_norm, dict) else None),
+                    "gate_when": (gate_norm.get("when") if isinstance(gate_norm, dict) else None) if gate_norm else None,
                 })
                 continue
             else:
@@ -2943,20 +3019,22 @@ def _window_slice(dfTF: pd.DataFrame, ref_date: str, window: int) -> pd.DataFram
     return dfTF.loc[mask].tail(int(window))
 
 
-def _load_attention_codes(_ref: str) -> list[str]:
+def _load_category_codes(category_type: str, _ref: str, source: Optional[str] = None) -> list[str]:
     """
-    从 SC_OUTPUT_DIR/attention/ 下选择“end<=_ref”的最新一份：
-      attention_{source}_{start}_{end}.csv
-    source 优先用 SC_ATTENTION_SOURCE（如 'top'|'white'|'black'）
+    通用分类榜加载函数：
+    从 SC_OUTPUT_DIR/{category_type}/ 下选择"end<=_ref"的最新一份：
+      {category_type}_{source}_{start}_{end}.csv
+    source 优先用传入的 source，否则用 SC_ATTENTION_SOURCE（如 'top'|'white'|'black'）
     返回 ts_code 列表；异常返回 []。会打 DEBUG 日志说明匹配的文件。
     """
     try:
-        src = str(SC_ATTENTION_SOURCE or "top").lower()
-        attn_dir = os.path.join(SC_OUTPUT_DIR, "attention")
-        if not os.path.isdir(attn_dir):
+        category_type = str(category_type or "strength").lower()
+        src = str((source or SC_ATTENTION_SOURCE) or "top").lower()
+        cat_dir = os.path.join(SC_OUTPUT_DIR, category_type)
+        if not os.path.isdir(cat_dir):
             return []
         # 只匹配当前 source
-        files = sorted(glob.glob(os.path.join(attn_dir, f"attention_{src}_*.csv")))
+        files = sorted(glob.glob(os.path.join(cat_dir, f"{category_type}_{src}_*.csv")))
         if not files:
             return []
         # 选择 end<=_ref 的最新一期；否则退化为按文件名排序的最后一份
@@ -2964,7 +3042,7 @@ def _load_attention_codes(_ref: str) -> list[str]:
         cand = []
         for f in files:
             name = os.path.basename(f)
-            m = _re.match(rf"attention_{src}_(\d{{8}})_(\d{{8}})\.csv$", name)
+            m = _re.match(rf"{category_type}_{src}_(\d{{8}})_(\d{{8}})\.csv$", name)
             if m:
                 start, end = m.group(1), m.group(2)
                 if end <= _ref:
@@ -2974,11 +3052,48 @@ def _load_attention_codes(_ref: str) -> list[str]:
         codes = df["ts_code"].astype(str).tolist() if "ts_code" in df.columns else []
         import logging as _logging
         if LOGGER.isEnabledFor(_logging.DEBUG):
-            LOGGER.debug(f"[screen][范围] attention 源={src} 参考日={_ref} 匹配文件={os.path.basename(pick)} 命中={len(codes)}")
+            category_name = {"strength": "强度榜", "momentum": "动量榜"}.get(category_type, f"{category_type}榜")
+            LOGGER.debug(f"[screen][范围] {category_name} 源={src} 参考日={_ref} 匹配文件={os.path.basename(pick)} 命中={len(codes)}")
         return codes
     except Exception as e:
-        LOGGER.debug(f"[screen][范围] 加载特别关注清单失败：{e}")
+        category_name = {"strength": "强度榜", "momentum": "动量榜"}.get(category_type, f"{category_type}榜")
+        LOGGER.debug(f"[screen][范围] 加载{category_name}清单失败：{e}")
         return []
+
+
+def _load_attention_codes(_ref: str) -> list[str]:
+    """
+    强度榜加载函数（向后兼容的包装函数）：
+    调用 _load_category_codes(category_type="strength", ...)
+    注意：为了向后兼容，仍从 attention 目录加载（如果存在），否则从 strength 目录加载
+    """
+    try:
+        # 优先尝试从旧的 attention 目录加载（向后兼容）
+        src = str(SC_ATTENTION_SOURCE or "top").lower()
+        attn_dir = os.path.join(SC_OUTPUT_DIR, "attention")
+        if os.path.isdir(attn_dir):
+            files = sorted(glob.glob(os.path.join(attn_dir, f"attention_{src}_*.csv")))
+            if files:
+                import re as _re
+                cand = []
+                for f in files:
+                    name = os.path.basename(f)
+                    m = _re.match(rf"attention_{src}_(\d{{8}})_(\d{{8}})\.csv$", name)
+                    if m:
+                        start, end = m.group(1), m.group(2)
+                        if end <= _ref:
+                            cand.append((end, f))
+                pick = (sorted(cand)[-1][1] if cand else files[-1])
+                df = pd.read_csv(pick, dtype=str)
+                codes = df["ts_code"].astype(str).tolist() if "ts_code" in df.columns else []
+                import logging as _logging
+                if LOGGER.isEnabledFor(_logging.DEBUG):
+                    LOGGER.debug(f"[screen][范围] attention(旧) 源={src} 参考日={_ref} 匹配文件={os.path.basename(pick)} 命中={len(codes)}")
+                return codes
+    except Exception:
+        pass
+    # 回退到新的 strength 目录
+    return _load_category_codes("strength", _ref)
 
 
 def _scope_hit(s_bool: pd.Series, scope: str) -> bool:
@@ -3314,19 +3429,9 @@ def _read_stock_df(ts_code: str, start: str, end: str, columns: List[str]) -> pd
     
     for attempt in range(max_retries):
         try:
-            # 只在第一次尝试或发生数据库锁定错误时才进行健康检查，减少不必要的调用
-            # 第一次尝试：快速检查数据库是否存在
-            if attempt == 0:
-                health_info = _check_database_health(check_connection_pool=False)
-                if health_info.get('database_locked', False):
-                    # 注意：移除了 time.sleep(2.0) 等待数据库锁释放的逻辑
-                    # 原因：被动等待无法确保其他进程真正释放数据库锁。
-                    # 数据库锁定问题应该通过连接池管理、适当的重试机制和
-                    # 错误处理来解决，而不是依赖等待释放。如果数据库被锁定，
-                    # 应该立即重试或回退到备用数据源，让重试机制和指数退避来处理。
-                    LOGGER.warning(f"[{ts_code}] 数据库被锁定，将重试或回退到备用数据源...")
-            
             # 直接使用 database_manager 统一接口查询
+            # 移除每次读取时的健康检查，这是性能瓶颈
+            # 健康检查只在真正出错时才执行（见异常处理部分）
             from database_manager import query_stock_data
             df = query_stock_data(
                 ts_code=ts_code,
@@ -3335,14 +3440,24 @@ def _read_stock_df(ts_code: str, start: str, end: str, columns: List[str]) -> pd
                 columns=columns
             )
             
+            # 优化类型转换：只在需要时转换，避免重复转换
             if not df.empty and "trade_date" in df.columns:
-                df["trade_date"] = df["trade_date"].astype(str)
-            LOGGER.debug(f"[{ts_code}] 数据库查询完成: n_cols={len(df.columns)} 前12列={list(df.columns)[:12]}")
+                # 检查类型，避免不必要的转换（如果dtype不是object，或者第一个值不是字符串，才转换）
+                if df["trade_date"].dtype != 'object':
+                    df["trade_date"] = df["trade_date"].astype(str)
+                elif len(df) > 0 and not isinstance(df["trade_date"].iloc[0], str):
+                    df["trade_date"] = df["trade_date"].astype(str)
+            
+            # 优化日志：使用条件日志，避免不必要的字符串格式化
+            if LOGGER.isEnabledFor(_logging.DEBUG):
+                LOGGER.debug(f"[{ts_code}] 数据库查询完成: n_cols={len(df.columns)}")
             return df
                     
         except Exception as e:
             error_msg = str(e).lower()
-            LOGGER.debug(f"[{ts_code}] 数据库访问异常 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
+            # 优化日志：使用条件日志，避免不必要的字符串格式化
+            if LOGGER.isEnabledFor(_logging.DEBUG):
+                LOGGER.debug(f"[{ts_code}] 数据库访问异常 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
             
             # 根据错误类型采用不同的处理策略
             if any(keyword in error_msg for keyword in [
@@ -3508,7 +3623,11 @@ def _inject_benchmark_features(dfD: pd.DataFrame, start: str, end: str) -> pd.Da
         LOGGER.warning("[bench] df 缺列 trade_date/close，跳过注入"); return dfD
 
     base = dfD.copy()
-    base["trade_date"] = base["trade_date"].astype(str)
+    # 优化类型转换：检查类型，避免不必要的转换（如果dtype不是object，或者第一个值不是字符串，才转换）
+    if base["trade_date"].dtype != 'object':
+        base["trade_date"] = base["trade_date"].astype(str)
+    elif len(base) > 0 and not isinstance(base["trade_date"].iloc[0], str):
+        base["trade_date"] = base["trade_date"].astype(str)
     c = pd.to_numeric(base["close"], errors="coerce")
     stock_ret = c.pct_change()
 
@@ -3559,10 +3678,12 @@ def _inject_benchmark_features(dfD: pd.DataFrame, start: str, end: str) -> pd.Da
             if "corr" in SC_BENCH_FEATURES:
                 base[f"CORR_{tag}_{W}"] = stock_ret.rolling(W).corr(ir)
 
-        LOGGER.debug(
-            "[bench] 注入 %s: 窗口=%d 列增量=%s",
-            code, W, [col for col in base.columns if col.endswith(tag)]
-        )
+        # 优化日志：使用条件日志，避免不必要的字符串格式化和列表推导
+        if LOGGER.isEnabledFor(_logging.DEBUG):
+            LOGGER.debug(
+                "[bench] 注入 %s: 窗口=%d 列增量=%s",
+                code, W, [col for col in base.columns if col.endswith(tag)]
+            )
 
     return base
 
@@ -3685,22 +3806,32 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
             cand_when = rule.get("when")
         when = cand_when
         
-        # EACH/PERBAR/EACH_TRUE scope 处理：使用 _count_hits_perbar() 函数
+        # EACH/PERBAR/EACH_TRUE scope 处理：使用 _count_hits_perbar() 或 _count_hits_perbar_with_gate() 函数
         # 注意：EACH scope 不使用 _scope_hit() 函数，而是使用 _count_hits_perbar() 统计窗口内逐K命中次数
+        # 对于带 gate 的 EACH scope 策略，每次命中都单独判断 gate
         # 参考：_count_hits_perbar() 函数的详细注释（第4284行）
         if scope in {"EACH","PERBAR","EACH_TRUE"}:
-            # 使用 _count_hits_perbar() 计算窗口内逐K命中次数
-            # 该函数会统计窗口内有多少根K线满足when条件，返回命中次数
-            cnt, err = _count_hits_perbar(dfD, rule, ref_date, ctx)
-            if err: res["error"] = err
-            gate_ok, _, _ = _eval_gate(dfD, rule, ref_date, ctx)
-            res["gate_ok"] = gate_ok
-            # 即使pts=0或gate_ok=False，只要cnt>0，也应该设置cnt和add（用于记录details）
-            # 加分规则：add = points * count（如果 gate_ok 为 True）
+            # 检查是否有 gate
+            gate_norm = _normalize_gate(rule)
+            if gate_norm:
+                # 如果有 gate，使用 _count_hits_perbar_with_gate() 函数
+                # 该函数会对每次命中单独判断 gate，只统计同时满足 when 和 gate 的天数
+                cnt, err = _count_hits_perbar_with_gate(dfD, rule, ref_date, ctx)
+                if err: res["error"] = err
+                # 对于带 gate 的 EACH scope，cnt 已经是同时满足 when 和 gate 的天数
+                # 所以 gate_ok 始终为 True（因为已经过滤过了）
+                res["gate_ok"] = True
+            else:
+                # 如果没有 gate，使用原来的函数
+                cnt, err = _count_hits_perbar(dfD, rule, ref_date, ctx)
+                if err: res["error"] = err
+                res["gate_ok"] = True
+            # 即使pts=0，只要cnt>0，也应该设置cnt和add（用于记录details）
+            # 加分规则：add = points * count
             if cnt is not None:
                 res["cnt"] = int(cnt)
                 if cnt > 0:
-                    res["add"] = float(pts * int(cnt)) if gate_ok else 0.0
+                    res["add"] = float(pts * int(cnt))
                 else:
                     res["add"] = 0.0
             else:
@@ -4296,6 +4427,15 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
                     "preload_misses": _CACHE_STATS.get("preload_misses", 0),
                     "fallbacks": _CACHE_STATS.get("fallbacks", 0),
                 }
+                # 收集子进程的表达式编译缓存统计信息
+                try:
+                    import tdx_compat
+                    expr_stats = tdx_compat.get_expr_cache_stats()
+                    cache_stats["expr_hits"] = expr_stats.get("hits", 0)
+                    cache_stats["expr_misses"] = expr_stats.get("misses", 0)
+                    cache_stats["expr_cache_size"] = expr_stats.get("cache_size", 0)
+                except Exception:
+                    pass
         except (AttributeError, RuntimeError):
             pass
         
@@ -4379,7 +4519,7 @@ def _screen_one(ts_code, st, ref, tf, win, when, scope, use_prescreen_first, ctx
                 return (ts_code, False, None, None)
             tdx.EXTRA_CONTEXT.update(get_eval_env(ts_code, ref))
 
-            _inject_config_tags(dfD, ref)      # 忽略异常同原逻辑
+            _inject_config_tags(dfD, ref, skip_tags=True)      # 表达式选股场景，跳过标签注入
             # 在完整数据上计算表达式
             tdx.EXTRA_CONTEXT["DF"] = dfTF
             result_full = evaluate_bool(when, dfTF)
@@ -4544,32 +4684,204 @@ def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str, c
         return 0, f"表达式错误: {e}"
 
 
-def build_attention_rank(start: Optional[str] = None,
-                         end: Optional[str] = None,
-                         source: Optional[str] = None,
-                         min_hits: Optional[int] = None,
-                         topN: Optional[int] = None,
-                         write: bool = True,
-                         mode: str = "strength",
-                         weight_mode: Optional[str] = None,
-                         half_life: Optional[float] = None,
-                         linear_min: Optional[float] = None,
-                         topM: Optional[int] = None):
+def _count_hits_perbar_with_gate(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = None) -> Tuple[int, Optional[str]]:
     """
-    特别关注榜（两种口径）：
-      - mode='strength'（默认）：最近窗口内“排名强度”（按每日横截面名次分位值累计）；
-      - mode='hits'           ：旧逻辑，按“上榜次数”统计。
+    统计"窗口内逐K命中次数"（专门用于 scope=EACH / PERBAR / EACH_TRUE，且带 gate）。
+    
+    对于 EACH scope 的策略，每次命中都单独判断 gate：
+    1. 先找出窗口内所有满足 when 条件的日期（或满足所有 clauses 的日期）
+    2. 对于每个满足 when 的日期，单独判断那一天的 gate
+    3. 只有同时满足 when 和 gate 的日期才计入计数
+    
+    参数：
+      dfD: 基础数据DataFrame（日线数据）
+      rule: 规则字典，包含 when、gate、timeframe、window、score_windows 等
+      ref_date: 参考日期（YYYYMMDD格式）
+      ctx: 上下文字典（可选，用于缓存优化）
+    
+    返回值：
+      (count, err): 
+        - count: 命中次数（整数），同时满足 when 和 gate 的天数
+        - err: 错误消息（字符串），如果 err=None 表示成功
+    """
+    try:
+        # 获取 gate 配置
+        gate_norm = _normalize_gate(rule)
+        if not gate_norm:
+            # 如果没有 gate，直接使用原来的函数
+            return _count_hits_perbar(dfD, rule, ref_date, ctx)
+        
+        # 处理带 clauses 的规则
+        if "clauses" in rule and rule["clauses"]:
+            clauses = rule["clauses"]
+            tfs = [str(c.get("timeframe","D")).upper() for c in clauses]
+            score_wins = [_get_score_window(c, SC_LOOKBACK_D) for c in clauses]
+            wins = [int(c.get("window", SC_LOOKBACK_D)) for c in clauses]
+            if len(set(tfs)) != 1 or len(set(score_wins)) != 1 or len(set(wins)) != 1:
+                return 0, "EACH 目前不支持多 timeframe/window/score_windows 子句混用"
+            tf = tfs[0]
+            window = wins[0]
+            score_window = score_wins[0]
+            
+            # 获取窗口内的数据
+            if ctx:
+                win_cache_key = (tf, score_window, ref_date)
+                win_cache = ctx.get('win_cache', {})
+                if win_cache_key in win_cache:
+                    win_df = win_cache[win_cache_key]
+                else:
+                    resampled = ctx.get('resampled', {})
+                    if tf not in resampled:
+                        if tf == "D":
+                            resampled[tf] = dfD
+                        else:
+                            resampled[tf] = _resample(dfD, tf)
+                        ctx['resampled'] = resampled
+                    dfTF = resampled[tf]
+                    win_df = _window_slice(dfTF, ref_date, score_window)
+                    win_cache[win_cache_key] = win_df
+                    ctx['win_cache'] = win_cache
+            else:
+                dfTF = dfD if tf=="D" else _resample(dfD, tf)
+                win_df = _window_slice(dfTF, ref_date, score_window)
+            
+            if win_df.empty:
+                return 0, None
+            
+            # 批量计算所有clauses的布尔序列，然后一次性向量化AND
+            sigs = []
+            for c in clauses:
+                when = (c.get("when") or "").strip()
+                if not when:
+                    return 0, "空 when 表达式"
+                if ctx:
+                    s = _eval_bool_cached(ctx, dfD, when, tf, score_window, ref_date)
+                else:
+                    with _ctx_df(dfTF):
+                        result_full = evaluate_bool(when, dfTF)
+                    result_full_series = pd.Series(result_full, index=dfTF.index, dtype=bool)
+                    s = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
+                sigs.append(s)
+            
+            # 向量化AND操作
+            if not sigs:
+                return 0, "无有效子句"
+            base_idx = sigs[0].index
+            aligned_sigs = []
+            for s in sigs:
+                s_aligned = s.reindex(base_idx, fill_value=False).astype(bool)
+                aligned_sigs.append(s_aligned.values)
+            if aligned_sigs:
+                s_all_array = np.logical_and.reduce(aligned_sigs)
+                s_when = pd.Series(s_all_array, index=base_idx)
+            else:
+                return 0, "无有效子句"
+        else:
+            # 处理单条规则
+            tf = str(rule.get("timeframe", "D")).upper()
+            window = int(rule.get("window", SC_LOOKBACK_D))
+            score_window = _get_score_window(rule, window)
+            when = (rule.get("when") or "").strip()
+            if not when:
+                return 0, "空 when 表达式"
+
+            # 获取窗口内的数据
+            if ctx:
+                win_cache_key = (tf, score_window, ref_date)
+                win_cache = ctx.get('win_cache', {})
+                if win_cache_key in win_cache:
+                    win_df = win_cache[win_cache_key]
+                else:
+                    resampled = ctx.get('resampled', {})
+                    if tf not in resampled:
+                        if tf == "D":
+                            resampled[tf] = dfD
+                        else:
+                            resampled[tf] = _resample(dfD, tf)
+                        ctx['resampled'] = resampled
+                    dfTF = resampled[tf]
+                    win_df = _window_slice(dfTF, ref_date, score_window)
+                    win_cache[win_cache_key] = win_df
+                    ctx['win_cache'] = win_cache
+            else:
+                dfTF = dfD if tf == "D" else _resample(dfD, tf)
+                win_df = _window_slice(dfTF, ref_date, score_window)
+            
+            if win_df.empty:
+                return 0, None
+            
+            # 计算 when 条件的布尔序列
+            if ctx:
+                s_when = _eval_bool_cached(ctx, dfD, when, tf, score_window, ref_date)
+            else:
+                with _ctx_df(dfTF):
+                    result_full = evaluate_bool(when, dfTF)
+                result_full_series = pd.Series(result_full, index=dfTF.index, dtype=bool)
+                s_when = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
+        
+        # 找出所有满足 when 条件的日期
+        when_true_indices = s_when[s_when].index
+        if len(when_true_indices) == 0:
+            return 0, None
+        
+        # 对于每个满足 when 的日期，单独判断那一天的 gate
+        count = 0
+        for idx in when_true_indices:
+            # 将索引转换为日期字符串（YYYYMMDD格式）
+            if isinstance(idx, pd.Timestamp):
+                date_str = idx.strftime("%Y%m%d")
+            elif hasattr(idx, 'strftime'):
+                date_str = idx.strftime("%Y%m%d")
+            else:
+                try:
+                    dt = pd.to_datetime(idx)
+                    date_str = dt.strftime("%Y%m%d")
+                except:
+                    continue
+            
+            # 判断这一天的 gate
+            try:
+                gate_ok, gate_err, _ = _eval_gate(dfD, rule, date_str, ctx)
+                if gate_ok and not gate_err:
+                    count += 1
+            except Exception as e:
+                # 如果判断 gate 出错，跳过这一天
+                continue
+        
+        return count, None
+    except Exception as e:
+        return 0, f"表达式错误: {e}"
+
+
+def build_category_rank(category_type: str = "strength",
+                        start: Optional[str] = None,
+                        end: Optional[str] = None,
+                        source: Optional[str] = None,
+                        min_hits: Optional[int] = None,
+                        topN: Optional[int] = None,
+                        write: bool = True,
+                        mode: str = "strength",
+                        weight_mode: Optional[str] = None,
+                        half_life: Optional[float] = None,
+                        linear_min: Optional[float] = None,
+                        topM: Optional[int] = None):
+    """
+    通用分类榜生成函数（支持强度榜等多种分类榜）：
+      - category_type: 分类榜类型，如 'strength'（强度榜）、'momentum'（动量榜）等
+      - mode='strength'（默认）：最近窗口内"排名强度"（按每日横截面名次分位值累计）；
+      - mode='hits'           ：旧逻辑，按"上榜次数"统计。
     窗口：若未给 start，则取最近 SC_ATTENTION_WINDOW_D 个交易日，以 end/ref_date 为右端点。
-    输出：attention_{source}_{span_start}_{span_end}.csv（会直接覆盖旧文件）。
+    输出：{category_type}_{source}_{span_start}_{span_end}.csv（会直接覆盖旧文件）。
     """
     end = end or _pick_ref_date()
     source = (source or SC_ATTENTION_SOURCE).lower()
     min_hits = int(min_hits or SC_ATTENTION_MIN_HITS)
     topN = int(topN or SC_ATTENTION_TOP_K)
+    category_type = str(category_type or "strength").lower()
 
     span = _trade_span(start, end)
     if not span:
-        LOGGER.warning(f"[attention] 交易日窗口为空，start={start} end={end}")
+        LOGGER.warning(f"[分类榜/{category_type}] 交易日窗口为空，start={start} end={end}")
         return None
 
     mode = (mode or "strength").lower()
@@ -4601,20 +4913,20 @@ def build_attention_rank(start: Optional[str] = None,
                 df = df[df["trade_date"] == date_str]
                 codes = df["ts_code"].astype(str).tolist() if "ts_code" in df.columns else []
             except Exception as e:
-                LOGGER.warning(f"[attention] 读取失败 {f}: {e}");
+                LOGGER.warning(f"[分类榜/{category_type}] 读取失败 {f}: {e}");
                 continue
             for c in codes:
                 hit_cnt[c] = hit_cnt.get(c, 0) + 1
                 first_last[c] = (first_last.get(c, (d, d))[0], d)
         if not hit_cnt:
-            LOGGER.warning(f"[attention] {span[0]}~{span[-1]} 内没有 '{source}' 记录。")
+            LOGGER.warning(f"[分类榜/{category_type}] {span[0]}~{span[-1]} 内没有 '{source}' 记录。")
             return None
         rows = [
             {"ts_code": c, "hits": n, "first": first_last[c][0], "last": first_last[c][1]}
             for c, n in hit_cnt.items() if n >= min_hits
         ]
         if not rows:
-            LOGGER.info("[attention] 命中数 >= %d 的为空。", min_hits); return None
+            LOGGER.info("[分类榜/%s] 命中数 >= %d 的为空。", category_type, min_hits); return None
         out_df = pd.DataFrame(rows).sort_values(["hits", "last", "ts_code"], ascending=[False, False, True]).head(topN)
     else:
         # ===== 新口径：排名强度（带时间权重） =====
@@ -4643,7 +4955,7 @@ def build_attention_rank(start: Optional[str] = None,
                         df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
                         df = df.dropna()
                 except Exception as e:
-                    LOGGER.warning(f"[attention] 读取全量排名失败 {path_all}: {e}")
+                    LOGGER.warning(f"[分类榜/{category_type}] 读取全量排名失败 {path_all}: {e}")
                     df = None
             if df is None:
                 # 回退：仅有 Top-K 文件时，以其相对名次近似
@@ -4653,7 +4965,7 @@ def build_attention_rank(start: Optional[str] = None,
                 try:
                     df_top = pd.read_csv(path_top, dtype={"ts_code": str})
                 except Exception as e:
-                    LOGGER.warning(f"[attention] 读取 Top 失败 {path_top}: {e}"); continue
+                    LOGGER.warning(f"[分类榜/{category_type}] 读取 Top 失败 {path_top}: {e}"); continue
                 total = len(df_top)
                 if total == 0:
                     continue
@@ -4689,7 +5001,7 @@ def build_attention_rank(start: Optional[str] = None,
                 first_last[c] = (fl[0], d) if fl[0] <= d else (d, d)
                 
         if not strength:
-            LOGGER.warning(f"[attention] {span[0]}~{span[-1]} 无可计算的排名强度。"); return None
+            LOGGER.warning(f"[分类榜/{category_type}] {span[0]}~{span[-1]} 无可计算的排名强度。"); return None
         rows = []
         for c, s in strength.items():
             n = hits.get(c, 0)
@@ -4705,23 +5017,92 @@ def build_attention_rank(start: Optional[str] = None,
                     "first": f, "last": l
                 })
         if not rows:
-            LOGGER.info("[attention] 强度口径下，命中数 >= %d 的为空。", min_hits); return None
+            LOGGER.info("[分类榜/%s] 强度口径下，命中数 >= %d 的为空。", category_type, min_hits); return None
         out_df = (pd.DataFrame(rows)
                   .sort_values(["strength", "last", "best_rank", "ts_code"],
                                ascending=[False, False, True, True])
                   .head(topN))
 
-    out_dir = os.path.join(SC_OUTPUT_DIR, "attention")
+    # 输出目录基于 category_type
+    out_dir = os.path.join(SC_OUTPUT_DIR, category_type)
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"attention_{source}_{span[0]}_{span[-1]}.csv")
+    out_path = os.path.join(out_dir, f"{category_type}_{source}_{span[0]}_{span[-1]}.csv")
 
     if write:
         out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-        LOGGER.info(f"[特别关注][{end}|w={len(span)}] source={source} 窗口={span[0]}~{span[-1]} min_hits>={min_hits} Top-{topN} -> {out_path}")
+        category_name = {"strength": "强度榜", "momentum": "动量榜"}.get(category_type, f"{category_type}榜")
+        LOGGER.info(f"[{category_name}][{end}|w={len(span)}] source={source} 窗口={span[0]}~{span[-1]} min_hits>={min_hits} Top-{topN} -> {out_path}")
 
         return out_path
     else:
         return out_df
+
+
+def build_attention_rank(start: Optional[str] = None,
+                         end: Optional[str] = None,
+                         source: Optional[str] = None,
+                         min_hits: Optional[int] = None,
+                         topN: Optional[int] = None,
+                         write: bool = True,
+                         mode: str = "strength",
+                         weight_mode: Optional[str] = None,
+                         half_life: Optional[float] = None,
+                         linear_min: Optional[float] = None,
+                         topM: Optional[int] = None):
+    """
+    强度榜生成函数（向后兼容的包装函数）：
+    调用 build_category_rank(category_type="strength", ...)
+    """
+    return build_category_rank(
+        category_type="strength",
+        start=start, end=end, source=source,
+        min_hits=min_hits, topN=topN, write=write,
+        mode=mode, weight_mode=weight_mode,
+        half_life=half_life, linear_min=linear_min, topM=topM
+    )
+
+
+def backfill_category_rolling(category_type: str = "strength",
+                              start: str = None,
+                              end: Optional[str] = None,
+                              source: Optional[str] = None,
+                              min_hits: Optional[int] = None,
+                              topN: Optional[int] = None,
+                              mode: str = "strength",
+                              weight_mode: Optional[str] = None,
+                              half_life: Optional[float] = None,
+                              linear_min: Optional[float] = None,
+                              topM: Optional[int] = None):
+    """
+    通用分类榜滚动补算函数：
+    从start到end（按交易日）逐日滚动补算分类榜：
+    - 每个 end 日都会生成一份：窗口=最近 SC_ATTENTION_WINDOW_D 个交易日（与 build_category_rank 保持一致）
+    - category_type: 分类榜类型，如 'strength'（强度榜）、'momentum'（动量榜）等
+    - source: 'top' | 'white' | 'black'
+    """
+    if start is None:
+        raise ValueError("start 参数必须提供")
+    end = end or _pick_ref_date()
+    days = _trade_span(start, end)
+    if not days:
+        category_name = {"strength": "强度榜", "momentum": "动量榜"}.get(category_type, f"{category_type}榜")
+        LOGGER.warning(f"[分类榜/{category_type}/backfill] 窗口为空：start={start} end={end}")
+        return
+
+    category_name = {"strength": "强度榜", "momentum": "动量榜"}.get(category_type, f"{category_type}榜")
+    LOGGER.info(f"[{category_name}/backfill] 逐日补算 {days[0]} ~ {days[-1]}，共 {len(days)} 个交易日")
+    ok, fail = 0, 0
+    for e in days:
+        try:
+            build_category_rank(category_type=category_type, start=None, end=e, source=source,
+                                min_hits=min_hits, topN=topN, write=True, mode=mode,
+                                weight_mode=weight_mode, half_life=half_life,
+                                linear_min=linear_min, topM=topM)
+            ok += 1
+        except Exception as ex:
+            fail += 1
+            LOGGER.warning(f"[{category_name}/backfill] 生成 {e} 失败：{ex}")
+    LOGGER.info(f"[{category_name}/backfill] 完成：成功 %d，失败 %d", ok, fail)
 
 
 def backfill_attention_rolling(start: str,
@@ -4735,29 +5116,305 @@ def backfill_attention_rolling(start: str,
                                linear_min: Optional[float] = None,
                                topM: Optional[int] = None):
     """
-    从start到end（按交易日）逐日滚动补算“特别关注榜”：
-    - 每个 end 日都会生成一份：窗口=最近 SC_ATTENTION_WINDOW_D 个交易日（与 build_attention_rank 保持一致）
-    - source: 'top' | 'white' | 'black'
+    强度榜滚动补算函数（向后兼容的包装函数）：
+    调用 backfill_category_rolling(category_type="strength", ...)
     """
-    end = end or _pick_ref_date()
-    days = _trade_span(start, end)
-    if not days:
-        LOGGER.warning(f"[attention/backfill] 窗口为空：start={start} end={end}")
-        return
+    return backfill_category_rolling(
+        category_type="strength",
+        start=start, end=end, source=source,
+        min_hits=min_hits, topN=topN, mode=mode,
+        weight_mode=weight_mode, half_life=half_life,
+        linear_min=linear_min, topM=topM
+    )
 
-    LOGGER.info(f"[attention/backfill] 逐日补算 {days[0]} ~ {days[-1]}，共 {len(days)} 个交易日")
-    ok, fail = 0, 0
-    for e in days:
-        try:
-            build_attention_rank(start=None, end=e, source=source,
-                                min_hits=min_hits, topN=topN, write=True, mode=mode,
-                                weight_mode=weight_mode, half_life=half_life,
-                                linear_min=linear_min, topM=topM)
-            ok += 1
-        except Exception as ex:
-            fail += 1
-            LOGGER.warning(f"[attention/backfill] 生成 {e} 失败：{ex}")
-    LOGGER.info("[attention/backfill] 完成：成功 %d，失败 %d", ok, fail)
+
+# ------------------------- 自选榜（策略组合）相关函数 -------------------------
+def build_custom_rank(combo_name: str,
+                      rule_names: list[str],
+                      agg_mode: str = "OR",
+                      ref_date: Optional[str] = None,
+                      universe: str = "all",
+                      tiebreak: str = "kdj_j_asc",
+                      topN: Optional[int] = None,
+                      write: bool = True) -> Optional[pd.DataFrame]:
+    """
+    生成自选榜（按策略组合筛选）：
+      - combo_name: 策略组合名称（用于文件名）
+      - rule_names: 策略名列表
+      - agg_mode: 聚合模式 'OR'（任一命中）| 'AND'（全部命中）
+      - ref_date: 参考日（留空=自动最新）
+      - universe: 选股范围 'all' | 'white' | 'black' | 'attention' | 'strength'
+      - tiebreak: 同分排序方式
+      - topN: 输出前N名（留空=不限制）
+      - write: 是否落盘
+    返回 DataFrame 或文件路径
+    """
+    from database_manager import get_database_manager
+    import json
+    
+    # 获取 details 数据库路径
+    def _get_details_db_path():
+        """获取 details 数据库路径"""
+        from config import SC_OUTPUT_DIR, SC_DETAIL_DB_PATH
+        db_path = os.path.join(SC_OUTPUT_DIR, SC_DETAIL_DB_PATH)
+        if os.path.isfile(db_path):
+            return db_path
+        return None
+    
+    ref_date = ref_date or _pick_ref_date()
+    if not ref_date:
+        LOGGER.warning(f"[自选榜] 未能确定参考日")
+        return None
+    
+    if not rule_names:
+        LOGGER.warning(f"[自选榜] 策略组合为空")
+        return None
+    
+    # 获取选股范围
+    codes_all = _get_universe_codes(universe, ref_date)
+    if not codes_all:
+        LOGGER.warning(f"[自选榜] 选股范围 {universe} 为空")
+        return None
+    
+    rows = []
+    try:
+        # 优先使用数据库查询
+        manager = get_database_manager()
+        details_db_path = _get_details_db_path()
+        db_available = manager and details_db_path
+        
+        if db_available:
+            if details_db_path:
+                sql = "SELECT * FROM stock_details WHERE ref_date = ? AND ts_code IN ({})".format(
+                    ",".join(["?"] * len(codes_all))
+                )
+                df_all = manager.execute_sync_query(details_db_path, sql, [ref_date] + codes_all, timeout=30.0)
+            else:
+                df_all = pd.DataFrame()
+        else:
+            df_all = pd.DataFrame()
+        
+        # 处理数据
+        if not df_all.empty:
+            LOGGER.debug(f"[自选榜] 从数据库读取到 {len(df_all)} 条记录")
+            for _, row in df_all.iterrows():
+                ts_code = str(row.get("ts_code", "")).strip()
+                if not ts_code or ts_code not in codes_all:
+                    continue
+                
+                # 从数据库行中解析数据
+                try:
+                    # 直接从数据库行获取 score 和 tiebreak（数据库表中有这些列）
+                    score = float(row.get('score', 0.0)) if row.get('score') is not None else 0.0
+                    tiebreak_j = float(row.get('tiebreak', 999999.0)) if row.get('tiebreak') is not None else 999999.0
+                    
+                    # 解析 rules 字段
+                    rules_raw = row.get('rules')
+                    rules = []
+                    if rules_raw:
+                        if isinstance(rules_raw, str):
+                            try:
+                                rules = json.loads(rules_raw)
+                            except Exception:
+                                try:
+                                    import ast
+                                    rules = ast.literal_eval(rules_raw)
+                                except Exception:
+                                    rules = []
+                        elif isinstance(rules_raw, list):
+                            rules = rules_raw
+                    
+                    # 确保 rules 是 list[dict] 格式
+                    if not isinstance(rules, list):
+                        rules = []
+                except Exception as e:
+                    LOGGER.debug(f"[自选榜] 解析数据库数据失败 {ts_code}: {e}")
+                    continue
+                
+                if not rules:
+                    continue
+                
+                # 检查策略触发情况
+                names_triggered = set()
+                hit_dates_map = {}
+                for rr in rules:
+                    ok_val = rr.get("ok")
+                    add_val = rr.get("add")
+                    if bool(ok_val) or (add_val is not None and float(add_val) > 0.0):
+                        n = rr.get("name")
+                        if n and n in rule_names:
+                            names_triggered.add(str(n))
+                            # 收集触发日期
+                            hit_date = rr.get("hit_date")
+                            hit_dates = rr.get("hit_dates", [])
+                            all_dates = []
+                            if hit_date:
+                                all_dates.append(str(hit_date))
+                            if hit_dates:
+                                all_dates.extend([str(d) for d in hit_dates if d])
+                            all_dates = sorted(set(all_dates))
+                            if all_dates:
+                                hit_dates_map[str(n)] = all_dates
+                
+                # 判断是否命中
+                if agg_mode.upper() == "OR":
+                    hit = any((n in names_triggered) for n in rule_names)
+                else:  # AND
+                    hit = all((n in names_triggered) for n in rule_names)
+                
+                if hit:
+                    # 收集所有选中策略的触发日期
+                    trigger_dates_list = []
+                    for rule_name in rule_names:
+                        if rule_name in hit_dates_map:
+                            trigger_dates_list.extend(hit_dates_map[rule_name])
+                    trigger_dates_list = sorted(set(trigger_dates_list))
+                    
+                    rows.append({
+                        "ts_code": ts_code,
+                        "score": score,
+                        "tiebreak_j": tiebreak_j,
+                        "trigger_dates": trigger_dates_list if trigger_dates_list else [],
+                        "triggered_rules": list(names_triggered)
+                    })
+        else:
+            # 回退到JSON文件查询
+            LOGGER.debug(f"[自选榜] 数据库不可用，回退到JSON文件查询")
+            ddir = Path(SC_OUTPUT_DIR) / "details" / str(ref_date)
+            if ddir.exists():
+                json_files = list(ddir.glob("*.json"))
+                LOGGER.debug(f"[自选榜] 找到 {len(json_files)} 个JSON文件")
+                for p in ddir.glob("*.json"):
+                    try:
+                        j = json.loads(p.read_text(encoding="utf-8-sig"))
+                    except Exception:
+                        continue
+                    ts_code = str(j.get("ts_code", "")).strip()
+                    if not ts_code or ts_code not in codes_all:
+                        continue
+                    
+                    summary = j.get("summary") or {}
+                    score = float(summary.get("score", 0.0))
+                    rules = j.get("rules") or []
+                    
+                    # 检查策略触发情况
+                    names_triggered = set()
+                    hit_dates_map = {}
+                    for rr in rules:
+                        ok_val = rr.get("ok")
+                        add_val = rr.get("add")
+                        if bool(ok_val) or (add_val is not None and float(add_val) > 0.0):
+                            n = rr.get("name")
+                            if n and n in rule_names:
+                                names_triggered.add(str(n))
+                                # 收集触发日期
+                                hit_date = rr.get("hit_date")
+                                hit_dates = rr.get("hit_dates", [])
+                                all_dates = []
+                                if hit_date:
+                                    all_dates.append(str(hit_date))
+                                if hit_dates:
+                                    all_dates.extend([str(d) for d in hit_dates if d])
+                                all_dates = sorted(set(all_dates))
+                                if all_dates:
+                                    hit_dates_map[str(n)] = all_dates
+                    
+                    # 判断是否命中
+                    if agg_mode.upper() == "OR":
+                        hit = any((n in names_triggered) for n in rule_names)
+                    else:  # AND
+                        hit = all((n in names_triggered) for n in rule_names)
+                    
+                    if hit:
+                        # 收集所有选中策略的触发日期
+                        trigger_dates_list = []
+                        for rule_name in rule_names:
+                            if rule_name in hit_dates_map:
+                                trigger_dates_list.extend(hit_dates_map[rule_name])
+                        trigger_dates_list = sorted(set(trigger_dates_list))
+                        
+                        rows.append({
+                            "ts_code": ts_code,
+                            "score": score,
+                            "tiebreak_j": tiebreak_j,
+                            "trigger_dates": trigger_dates_list if trigger_dates_list else [],
+                            "triggered_rules": list(names_triggered)
+                        })
+        
+        if not rows:
+            LOGGER.info(f"[自选榜] {combo_name} 未筛到命中标的（参考日={ref_date}，策略={rule_names}，聚合模式={agg_mode}，选股范围={universe}，股票数={len(codes_all) if codes_all else 0}）")
+            return None
+        
+        # 构建DataFrame并排序
+        df_result = pd.DataFrame(rows)
+        
+        # 应用Tie-break排序
+        if tiebreak == "kdj_j_asc":
+            # 如果已经有 tiebreak_j 列，直接使用；否则从JSON文件读取
+            if "tiebreak_j" not in df_result.columns:
+                j_values = []
+                for ts_code in df_result["ts_code"]:
+                    data = None
+                    detail_path = Path(SC_OUTPUT_DIR) / "details" / str(ref_date) / f"{ts_code}_{ref_date}.json"
+                    if detail_path.exists():
+                        try:
+                            data = json.loads(detail_path.read_text(encoding="utf-8-sig"))
+                        except Exception:
+                            pass
+                    
+                    if data:
+                        summary = data.get("summary", {})
+                        j_val = summary.get("tiebreak")
+                        j_values.append(float(j_val) if j_val is not None else 999999.0)
+                    else:
+                        j_values.append(999999.0)
+                df_result["tiebreak_j"] = j_values
+            df_result = df_result.sort_values(["score", "tiebreak_j"], ascending=[False, True])
+        else:
+            df_result = df_result.sort_values("score", ascending=False)
+        
+        # 限制TopN
+        if topN:
+            df_result = df_result.head(int(topN))
+        
+        # 落盘
+        if write:
+            out_dir = os.path.join(SC_OUTPUT_DIR, "custom")
+            os.makedirs(out_dir, exist_ok=True)
+            # 文件名：custom_{combo_name}_{ref_date}.csv
+            safe_name = "".join(c for c in combo_name if c.isalnum() or c in ("_", "-")).strip()
+            out_path = os.path.join(out_dir, f"custom_{safe_name}_{ref_date}.csv")
+            df_result.to_csv(out_path, index=False, encoding="utf-8-sig")
+            LOGGER.info(f"[自选榜] {combo_name} 参考日={ref_date} 命中={len(df_result)} 只 -> {out_path}")
+            return out_path
+        else:
+            return df_result
+            
+    except Exception as e:
+        LOGGER.error(f"[自选榜] 生成失败 {combo_name}: {e}", exc_info=True)
+        return None
+
+
+def _get_universe_codes(universe: str, ref_date: str) -> list[str]:
+    """获取选股范围的股票代码列表"""
+    if universe == "all":
+        # 从全量排名文件读取
+        path_all = os.path.join(SC_OUTPUT_DIR, "all", f"score_all_{ref_date}.csv")
+        if os.path.isfile(path_all):
+            try:
+                df = pd.read_csv(path_all, dtype={"ts_code": str})
+                return df["ts_code"].astype(str).tolist() if "ts_code" in df.columns else []
+            except Exception:
+                pass
+        return []
+    elif universe == "white":
+        return _read_cache_list_codes(ref_date, "whitelist")
+    elif universe == "black":
+        return _read_cache_list_codes(ref_date, "blacklist")
+    elif universe in ("attention", "strength"):
+        return _load_category_codes("strength", ref_date)
+    else:
+        return []
 
 
 # ------------------------- 名单缓存 I/O -------------------------
@@ -4765,6 +5422,7 @@ def _ensure_dirs(ref_date: str):
     os.makedirs(os.path.join(SC_OUTPUT_DIR, "top"), exist_ok=True)
     os.makedirs(os.path.join(SC_OUTPUT_DIR, "details"), exist_ok=True)
     os.makedirs(os.path.join(SC_OUTPUT_DIR, "all"), exist_ok=True)
+    os.makedirs(os.path.join(SC_OUTPUT_DIR, "custom"), exist_ok=True)
     os.makedirs(os.path.join(SC_CACHE_DIR, ref_date), exist_ok=True)
 
 
@@ -4898,6 +5556,7 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     max_workers = SC_MAX_WORKERS or min(os.cpu_count() * 2, 16)  # 最多16个进程
     
     # 无条件"尽力预加载"：成功则极大提升命中，失败直接跳过不影响流程
+    preload_start_time = time.time()
     try:
         LOGGER.info("[预加载] 尝试批量预加载排名数据（无论是否统一库）")
         preload_rank_data(ref_date, start_date, columns)
@@ -4912,9 +5571,11 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
                     start_date = precise_start
         except Exception:
             pass
-        LOGGER.info("[预加载] 批量预加载流程结束")
+        preload_duration = time.time() - preload_start_time
+        LOGGER.info(f"[预加载] 批量预加载流程结束，耗时: {preload_duration:.2f}秒")
     except Exception as e:
-        LOGGER.warning(f"[预加载] 预加载发生异常，已跳过：{e}")
+        preload_duration = time.time() - preload_start_time
+        LOGGER.warning(f"[预加载] 预加载发生异常，已跳过：{e}，耗时: {preload_duration:.2f}秒")
     
     # 6) 并行处理
     # 实验特性：在安全条件下尝试使用进程池（默认关闭）
@@ -4970,6 +5631,11 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     all_detail_data_success = False  # 标记主进程统一写入是否成功
     
     # 收集并合并子进程的缓存统计信息（多进程模式下）
+    # 汇总表达式编译缓存统计信息
+    total_expr_hits = 0
+    total_expr_misses = 0
+    max_expr_cache_size = 0
+    
     for result in results:
         # 兼容旧的返回值格式（3个、4个或5个元素）
         cache_stats = None
@@ -4990,6 +5656,10 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
             _CACHE_STATS["preload_hits"] += cache_stats.get("preload_hits", 0)
             _CACHE_STATS["preload_misses"] += cache_stats.get("preload_misses", 0)
             _CACHE_STATS["fallbacks"] += cache_stats.get("fallbacks", 0)
+            # 汇总子进程的表达式编译缓存统计信息
+            total_expr_hits += cache_stats.get("expr_hits", 0)
+            total_expr_misses += cache_stats.get("expr_misses", 0)
+            max_expr_cache_size = max(max_expr_cache_size, cache_stats.get("expr_cache_size", 0))
         
         if black:
             blacklist_items.append(black)
@@ -5149,6 +5819,12 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
                     _CACHE_STATS["hits"], _CACHE_STATS["misses"], preload_hit_rate,
                     _CACHE_STATS["local_hits"], _CACHE_STATS["local_misses"], local_hit_rate,
                     _CACHE_STATS["fallbacks"])
+        # 预加载读取统计（单票读取阶段直接命中预加载DF的统计）
+        pre_read_total = _CACHE_STATS.get('preload_hits', 0) + _CACHE_STATS.get('preload_misses', 0)
+        if pre_read_total > 0:
+            pre_read_rate = (100.0 * _CACHE_STATS.get('preload_hits', 0) / pre_read_total)
+            LOGGER.info("[统计] 预加载读取：hit=%d miss=%d hit_rate=%.1f%%",
+                        _CACHE_STATS.get('preload_hits', 0), _CACHE_STATS.get('preload_misses', 0), pre_read_rate)
     except Exception:
         pass
     try:
@@ -5228,10 +5904,30 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     # 获取表达式编译缓存统计
     try:
         import tdx_compat
+        # 获取主进程的表达式编译缓存统计
         expr_stats = tdx_compat.get_expr_cache_stats()
-        expr_hit_rate = expr_stats["hit_rate"] * 100
-        LOGGER.info(f"[统计] 表达式编译缓存命中率: {expr_hit_rate:.1f}% ({expr_stats['hits']}/{expr_stats['hits'] + expr_stats['misses']})")
-        LOGGER.info(f"[统计] 表达式编译缓存大小: {expr_stats['cache_size']}/{expr_stats['max_size']}")
+        main_expr_hits = expr_stats.get("hits", 0)
+        main_expr_misses = expr_stats.get("misses", 0)
+        main_expr_cache_size = expr_stats.get("cache_size", 0)
+        max_expr_cache_size = expr_stats.get("max_size", 0)
+        
+        # 汇总主进程和子进程的表达式编译缓存统计（如果之前没有收集子进程统计，则初始化为0）
+        if 'total_expr_hits' not in locals():
+            total_expr_hits = 0
+            total_expr_misses = 0
+            max_expr_cache_size = 0
+        total_expr_hits += main_expr_hits
+        total_expr_misses += main_expr_misses
+        max_expr_cache_size = max(max_expr_cache_size, main_expr_cache_size)
+        
+        # 计算总命中率
+        total_expr_requests = total_expr_hits + total_expr_misses
+        if total_expr_requests > 0:
+            expr_hit_rate = (total_expr_hits / total_expr_requests) * 100
+            LOGGER.info(f"[统计] 表达式编译缓存命中率: {expr_hit_rate:.1f}% (命中={total_expr_hits}, 未命中={total_expr_misses}, 总请求={total_expr_requests})")
+            LOGGER.info(f"[统计] 表达式编译缓存大小: {max_expr_cache_size}/{max_expr_cache_size}")
+        else:
+            LOGGER.info(f"[统计] 表达式编译缓存: 主进程命中={main_expr_hits}, 未命中={main_expr_misses}, 缓存大小={main_expr_cache_size}/{max_expr_cache_size}")
     except Exception as e:
         LOGGER.debug(f"[统计] 获取表达式缓存统计失败: {e}")
     
