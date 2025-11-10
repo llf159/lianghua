@@ -13,7 +13,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ================= 数据源配置 =================
 # Tushare API Token（必填）
-TOKEN = "ea5fe779f40e4b3fd8faf4b83647bfd76b8eb8427784ee2251d0a821"
+TOKEN = ""
 
 # 数据存储根目录
 DATA_ROOT = os.path.join(BASE_DIR, "stock_data")
