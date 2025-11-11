@@ -78,8 +78,8 @@ class StrategyValidator:
     
     # 可选字段
     OPTIONAL_FIELDS = {
-        "ranking": ["name", "timeframe", "score_windows", "scope", "points", "explain", "show_reason", "as", "gate", "clauses", "dist_points"],
-        "filter": ["name", "timeframe", "score_windows", "scope", "reason", "hard_penalty", "gate", "clauses"],
+        "ranking": ["name", "timeframe", "score_windows", "scope", "points", "explain", "show_reason", "as", "gate", "trigger", "require", "clauses", "dist_points"],
+        "filter": ["name", "timeframe", "score_windows", "scope", "reason", "hard_penalty", "gate", "trigger", "require", "clauses"],
         "prediction": ["name", "scenario"],
         "position": ["name", "explain"],
         "opportunity": ["name", "explain"]
@@ -121,8 +121,13 @@ class StrategyValidator:
             return result
         
         # 检查必填字段
+        # 注意：如果使用clauses，则不需要when字段
+        has_clauses = "clauses" in rule and rule["clauses"]
         required_fields = self.REQUIRED_FIELDS.get(category, [])
         for field in required_fields:
+            # 如果使用clauses且必填字段是when，则跳过检查
+            if field == "when" and has_clauses:
+                continue
             if field not in rule or not rule[field]:
                 result.add_error(f"缺少必填字段: {field}", field)
                 result.required_fields.append(field)
@@ -149,12 +154,28 @@ class StrategyValidator:
                 result.missing_columns.extend(expr_result.get("missing_columns", []))
                 result.missing_indicators.extend(expr_result.get("missing_indicators", []))
         
-        # 检查gate表达式
-        if "gate" in rule and rule["gate"]:
-            if isinstance(rule["gate"], str):
-                expr_result = self._validate_expression(rule["gate"], "gate")
-                if not expr_result["valid"]:
-                    result.add_warning(f"gate表达式错误: {expr_result['error']}", "gate")
+        # 检查gate/trigger/require表达式（功能相同，字段名不同）
+        for gate_field in ["gate", "trigger", "require"]:
+            if gate_field in rule and rule[gate_field]:
+                gate_value = rule[gate_field]
+                if isinstance(gate_value, str):
+                    expr_result = self._validate_expression(gate_value, gate_field)
+                    if not expr_result["valid"]:
+                        result.add_warning(f"{gate_field}表达式错误: {expr_result['error']}", gate_field)
+                elif isinstance(gate_value, dict):
+                    # 子规则对象格式
+                    gate_result = self.validate_rule(gate_value, category)
+                    if not gate_result.is_valid:
+                        for error in gate_result.errors:
+                            result.add_warning(f"{gate_field}[{error.get('field', '')}]: {error['message']}", f"{gate_field}.{error.get('field', '')}")
+                elif isinstance(gate_value, list):
+                    # 子句数组格式
+                    for i, gate_clause in enumerate(gate_value):
+                        if isinstance(gate_clause, dict):
+                            gate_clause_result = self.validate_rule(gate_clause, category)
+                            if not gate_clause_result.is_valid:
+                                for error in gate_clause_result.errors:
+                                    result.add_warning(f"{gate_field}[{i}][{error.get('field', '')}]: {error['message']}", f"{gate_field}[{i}].{error.get('field', '')}")
         
         # 检查clauses
         if "clauses" in rule and rule["clauses"]:
@@ -202,9 +223,30 @@ class StrategyValidator:
                 result.add_error(f"scope必须是字符串: {scope}", "scope")
             else:
                 # 检查scope格式
-                scope_upper = scope.upper()
-                if not any(scope_upper.startswith(s) for s in self.SUPPORTED_SCOPES):
-                    result.add_warning(f"scope格式可能不正确: {scope}", "scope")
+                scope_upper = scope.upper().strip()
+                # 支持基本格式：ANY, LAST, ALL, EACH, RECENT, DIST, NEAR
+                # 支持COUNT>=k格式
+                # 支持CONSEC>=m格式
+                scope_valid = False
+                if scope_upper in self.SUPPORTED_SCOPES:
+                    scope_valid = True
+                elif scope_upper.startswith("COUNT>="):
+                    try:
+                        k = int(scope_upper.split(">=")[1])
+                        if k > 0:
+                            scope_valid = True
+                    except (ValueError, IndexError):
+                        pass
+                elif scope_upper.startswith("CONSEC>="):
+                    try:
+                        m = int(scope_upper.split(">=")[1])
+                        if m > 0:
+                            scope_valid = True
+                    except (ValueError, IndexError):
+                        pass
+                
+                if not scope_valid:
+                    result.add_warning(f"scope格式可能不正确: {scope}，支持格式：ANY/LAST/ALL/EACH/RECENT/DIST/NEAR/COUNT>=k/CONSEC>=m", "scope")
         
         # 检查points
         if "points" in rule:
@@ -546,10 +588,12 @@ def render_rule_editor():
     **策略类型详解：**
     
     - **排名策略 (ranking)**: 用于股票评分排名，使用 `when` 表达式判断条件，通过 `points` 字段加分
-      - 配置项：name, timeframe, score_windows, scope, points, explain, show_reason, as, gate, clauses, dist_points
+      - 配置项：name, timeframe, score_windows, scope, points, explain, show_reason, as, gate/trigger/require, clauses, dist_points
+      - 注意：window字段已废弃，请使用score_windows
       
     - **筛选策略 (filter)**: 用于股票筛选过滤，使用 `when` 表达式判断条件，可设置 `hard_penalty` 硬性惩罚
-      - 配置项：name, timeframe, score_windows, scope, reason, hard_penalty, gate, clauses
+      - 配置项：name, timeframe, score_windows, scope, reason, hard_penalty, gate/trigger/require, clauses
+      - 注意：window字段已废弃，请使用score_windows
       
     - **模拟策略 (prediction)**: 用于市场场景模拟，使用 `check` 表达式判断条件，需要 `scenario` 场景名称
       - 配置项：name, scenario
@@ -572,8 +616,9 @@ def render_rule_editor():
     with col_template2:
         if st.button("🔄 清除模板", help="清除当前模板设置，恢复默认值"):
             # 清除所有模板相关的session_state
-            for key in ['template_name', 'template_timeframe', 'template_window', 
-                       'template_scope', 'template_points', 'template_explain', 'template_when',
+            for key in ['template_name', 'template_timeframe', 'template_window', 'template_score_windows',
+                       'template_scope', 'template_scope_count', 'template_scope_consec', 
+                       'template_points', 'template_explain', 'template_when',
                        'template_check', 'template_scenario']:
                 if key in st.session_state:
                     del st.session_state[key]
@@ -588,6 +633,7 @@ def render_rule_editor():
             st.session_state.template_name = "均线突破"
             st.session_state.template_timeframe = "D"
             st.session_state.template_window = 20
+            st.session_state.template_score_windows = 20
             st.session_state.template_scope = "EACH"
             st.session_state.template_points = 2
             st.session_state.template_explain = "价格突破均线，确认上涨趋势"
@@ -596,6 +642,7 @@ def render_rule_editor():
             st.session_state.template_name = "成交量放大"
             st.session_state.template_timeframe = "D"
             st.session_state.template_window = 20
+            st.session_state.template_score_windows = 20
             st.session_state.template_scope = "EACH"
             st.session_state.template_points = 1
             st.session_state.template_explain = "成交量显著放大，显示资金关注"
@@ -604,6 +651,7 @@ def render_rule_editor():
             st.session_state.template_name = "价格回调"
             st.session_state.template_timeframe = "D"
             st.session_state.template_window = 10
+            st.session_state.template_score_windows = 10
             st.session_state.template_scope = "LAST"
             st.session_state.template_points = -5
             st.session_state.template_explain = "短期价格回调，风险提示"
@@ -612,6 +660,7 @@ def render_rule_editor():
             st.session_state.template_name = "趋势确认"
             st.session_state.template_timeframe = "D"
             st.session_state.template_window = 20
+            st.session_state.template_score_windows = 20
             st.session_state.template_scope = "EACH"
             st.session_state.template_points = 3
             st.session_state.template_explain = "多重条件确认趋势"
@@ -620,6 +669,7 @@ def render_rule_editor():
             st.session_state.template_name = "技术指标"
             st.session_state.template_timeframe = "D"
             st.session_state.template_window = 14
+            st.session_state.template_score_windows = 14
             st.session_state.template_scope = "EACH"
             st.session_state.template_points = 2
             st.session_state.template_explain = "基于技术指标的信号"
@@ -652,13 +702,18 @@ def render_rule_editor():
     explain = ""
     rule_name = ""
     timeframe = "D"
-    window = 60
+    score_windows = 60
     scope = "ANY"
+    scope_count_value = 1
+    scope_consec_value = 1
     points = 0
     show_reason = True
     rule_as = "auto"
     gate = ""
-    dist_points = 0
+    trigger = ""
+    require = ""
+    dist_points_config = ""
+    use_dist_points = False
     hard_penalty = False
     reason = ""
     clauses_config = ""
@@ -703,24 +758,46 @@ def render_rule_editor():
                 help="数据的时间周期：D(日线)、W(周线)、M(月线)、60MIN(60分钟)"
             )
             
-            # 回看窗口
-            window = st.number_input(
-                "回看窗口 (window)",
+            # 计分窗口（score_windows）
+            score_windows = st.number_input(
+                "计分窗口 (score_windows)",
                 min_value=1,
                 max_value=500,
-                value=st.session_state.get('template_window', 60),
-                help="回看的历史数据条数，通常设置为5-100"
+                value=st.session_state.get('template_score_windows', st.session_state.get('template_window', 60)),
+                help="用于计分判断的历史数据条数，通常设置为5-100。注意：window字段已废弃，请使用score_windows"
             )
             
             # 命中口径
             scope_options = ["ANY", "LAST", "ALL", "EACH", "RECENT", "DIST", "NEAR", "CONSEC", "COUNT"]
             scope_index = scope_options.index(st.session_state.get('template_scope', 'ANY')) if st.session_state.get('template_scope', 'ANY') in scope_options else 0
-            scope = st.selectbox(
+            scope_base = st.selectbox(
                 "命中口径 (scope)",
                 scope_options,
                 index=scope_index,
                 help="规则命中的判断方式：ANY(任意)、LAST(最近)、ALL(全部)、EACH(每个)等"
             )
+            
+            # 处理COUNT和CONSEC格式
+            if scope_base == "COUNT":
+                scope_count_value = st.number_input(
+                    "COUNT阈值",
+                    min_value=1,
+                    max_value=500,
+                    value=st.session_state.get('template_scope_count', 1),
+                    help="COUNT>=k格式，k的值"
+                )
+                scope = f"COUNT>={scope_count_value}"
+            elif scope_base == "CONSEC":
+                scope_consec_value = st.number_input(
+                    "CONSEC连续天数",
+                    min_value=1,
+                    max_value=500,
+                    value=st.session_state.get('template_scope_consec', 1),
+                    help="CONSEC>=m格式，m的值"
+                )
+                scope = f"CONSEC>={scope_consec_value}"
+            else:
+                scope = scope_base
             
             # 分数
             points = st.number_input(
@@ -756,12 +833,28 @@ def render_rule_editor():
                 help="规则分类：auto(自动)、opportunity(机会)、highlight(高亮)、drawback(缺点)"
             )
             
-            # 前置门槛
-            gate = st.text_input(
-                "前置门槛 (gate)",
-                placeholder="例如：C > MA(C, 5)",
-                help="规则生效的前置条件，必须满足才能执行此规则"
+            # 前置门槛（支持gate/trigger/require）
+            gate_type = st.selectbox(
+                "前置门槛类型",
+                ["gate", "trigger", "require", "不使用"],
+                index=3,
+                help="前置门槛类型：gate/trigger/require功能相同，只是字段名不同"
             )
+            
+            if gate_type != "不使用":
+                gate = st.text_input(
+                    f"前置门槛 ({gate_type})",
+                    placeholder="例如：C > MA(C, 5)",
+                    help="规则生效的前置条件，必须满足才能执行此规则。支持字符串表达式、子规则对象或子句数组（JSON格式）"
+                )
+                trigger = gate if gate_type == "trigger" else ""
+                require = gate if gate_type == "require" else ""
+                if gate_type != "gate":
+                    gate = ""
+            else:
+                gate = ""
+                trigger = ""
+                require = ""
             
             # 多子句组合
             use_clauses = st.checkbox(
@@ -769,13 +862,38 @@ def render_rule_editor():
                 help="使用clauses替代when字段，支持更复杂的逻辑组合"
             )
             
-            # 分布分数
-            dist_points = st.number_input(
-                "分布分数 (dist_points)",
-                value=0,
-                step=1,
-                help="用于分布计算的分数，通常与points配合使用"
-            )
+            # 分布分数（dist_points）- 用于RECENT/DIST/NEAR
+            if scope_base in ["RECENT", "DIST", "NEAR"]:
+                use_dist_points = st.checkbox(
+                    "使用分布分数 (dist_points)",
+                    help="根据最近一次命中的距离分段给分，仅用于RECENT/DIST/NEAR口径"
+                )
+                if use_dist_points:
+                    dist_points_config = st.text_area(
+                        "分布分数配置 (dist_points)",
+                        placeholder='[[0,5,20], [6,10,10], [11,20,5]]\n或\n[{"min":0, "max":5, "points":20}, {"min":6, "max":10, "points":10}]',
+                        help="JSON格式的列表，每个元素为[min, max, points]三元组或{min, max, points}对象"
+                    )
+                    with st.expander("分布分数配置说明", expanded=False):
+                        st.markdown("""
+                        **格式1：区间三元组**
+                        ```json
+                        [[0,5,20], [6,10,10], [11,20,5]]
+                        ```
+                        表示：距离0-5天给20分，6-10天给10分，11-20天给5分
+                        
+                        **格式2：显式对象**
+                        ```json
+                        [
+                          {"min":0, "max":5, "points":20},
+                          {"min":6, "max":10, "points":10},
+                          {"min":11, "max":20, "points":5}
+                        ]
+                        ```
+                        """)
+            else:
+                use_dist_points = False
+                dist_points_config = ""
     
     elif rule_category == "filter":
         # 筛选策略配置
@@ -802,24 +920,46 @@ def render_rule_editor():
                 help="数据的时间周期：D(日线)、W(周线)、M(月线)、60MIN(60分钟)"
             )
             
-            # 回看窗口
-            window = st.number_input(
-                "回看窗口 (window)",
+            # 计分窗口（score_windows）
+            score_windows = st.number_input(
+                "计分窗口 (score_windows)",
                 min_value=1,
                 max_value=500,
-                value=st.session_state.get('template_window', 60),
-                help="回看的历史数据条数，通常设置为5-100"
+                value=st.session_state.get('template_score_windows', st.session_state.get('template_window', 60)),
+                help="用于计分判断的历史数据条数，通常设置为5-100。注意：window字段已废弃，请使用score_windows"
             )
             
             # 命中口径
             scope_options = ["ANY", "LAST", "ALL", "EACH", "RECENT", "DIST", "NEAR", "CONSEC", "COUNT"]
             scope_index = scope_options.index(st.session_state.get('template_scope', 'ANY')) if st.session_state.get('template_scope', 'ANY') in scope_options else 0
-            scope = st.selectbox(
+            scope_base = st.selectbox(
                 "命中口径 (scope)",
                 scope_options,
                 index=scope_index,
                 help="规则命中的判断方式：ANY(任意)、LAST(最近)、ALL(全部)、EACH(每个)等"
             )
+            
+            # 处理COUNT和CONSEC格式
+            if scope_base == "COUNT":
+                scope_count_value = st.number_input(
+                    "COUNT阈值",
+                    min_value=1,
+                    max_value=500,
+                    value=st.session_state.get('template_scope_count', 1),
+                    help="COUNT>=k格式，k的值"
+                )
+                scope = f"COUNT>={scope_count_value}"
+            elif scope_base == "CONSEC":
+                scope_consec_value = st.number_input(
+                    "CONSEC连续天数",
+                    min_value=1,
+                    max_value=500,
+                    value=st.session_state.get('template_scope_consec', 1),
+                    help="CONSEC>=m格式，m的值"
+                )
+                scope = f"CONSEC>={scope_consec_value}"
+            else:
+                scope = scope_base
         
         with col_right:
             st.markdown("#### 筛选配置")
@@ -838,12 +978,28 @@ def render_rule_editor():
                 help="筛选策略的拒绝原因说明"
             )
             
-            # 前置门槛
-            gate = st.text_input(
-                "前置门槛 (gate)",
-                placeholder="例如：C > MA(C, 5)",
-                help="规则生效的前置条件，必须满足才能执行此规则"
+            # 前置门槛（支持gate/trigger/require）
+            gate_type = st.selectbox(
+                "前置门槛类型",
+                ["gate", "trigger", "require", "不使用"],
+                index=3,
+                help="前置门槛类型：gate/trigger/require功能相同，只是字段名不同"
             )
+            
+            if gate_type != "不使用":
+                gate = st.text_input(
+                    f"前置门槛 ({gate_type})",
+                    placeholder="例如：C > MA(C, 5)",
+                    help="规则生效的前置条件，必须满足才能执行此规则。支持字符串表达式、子规则对象或子句数组（JSON格式）"
+                )
+                trigger = gate if gate_type == "trigger" else ""
+                require = gate if gate_type == "require" else ""
+                if gate_type != "gate":
+                    gate = ""
+            else:
+                gate = ""
+                trigger = ""
+                require = ""
             
             # 多子句组合
             use_clauses = st.checkbox(
@@ -1193,10 +1349,21 @@ def render_rule_editor():
                 rule_config["show_reason"] = show_reason
             if rule_as != "auto":
                 rule_config["as"] = rule_as
+            # 前置门槛（gate/trigger/require）
             if gate:
                 rule_config["gate"] = gate
-            if dist_points != 0:
-                rule_config["dist_points"] = dist_points
+            elif trigger:
+                rule_config["trigger"] = trigger
+            elif require:
+                rule_config["require"] = require
+            # 分布分数（dist_points）
+            if use_dist_points and dist_points_config:
+                try:
+                    dist_points_parsed = json.loads(dist_points_config)
+                    if isinstance(dist_points_parsed, list) and len(dist_points_parsed) > 0:
+                        rule_config["dist_points"] = dist_points_parsed
+                except json.JSONDecodeError as e:
+                    st.warning(f"dist_points配置格式错误：{str(e)}，将忽略此配置")
                 
         elif rule_category == "filter":
             # 筛选策略字段
@@ -1212,8 +1379,13 @@ def render_rule_editor():
                 rule_config["hard_penalty"] = hard_penalty
             if reason:
                 rule_config["reason"] = reason
+            # 前置门槛（gate/trigger/require）
             if gate:
                 rule_config["gate"] = gate
+            elif trigger:
+                rule_config["trigger"] = trigger
+            elif require:
+                rule_config["require"] = require
                 
         elif rule_category == "prediction":
             # 模拟策略字段
@@ -1434,4 +1606,101 @@ def render_rule_editor():
             if not validation_result.errors:
                 st.markdown("**配置预览：**")
                 st.code(json.dumps(rule_config, ensure_ascii=False, indent=2), language="json")
+
+
+# =============================================================================
+# 策略文件验证功能
+# =============================================================================
+
+def validate_strategy_file(file_path: str):
+    """
+    验证策略文件的语法和字段有效性
+    
+    Args:
+        file_path: 策略文件路径
+        
+    Returns:
+        StrategyValidationResult: 验证结果对象
+    """
+    import ast
+    import importlib.util
+    from pathlib import Path
+    
+    result = StrategyValidationResult()
+    validator = StrategyValidator()
+    
+    try:
+        # 读取文件内容
+        file_path_obj = Path(file_path)
+        if not file_path_obj.exists():
+            result.add_error(f"文件不存在: {file_path}")
+            return result
+        
+        content = file_path_obj.read_text(encoding='utf-8')
+        
+        # 检查Python语法
+        try:
+            ast.parse(content)
+        except SyntaxError as e:
+            result.add_error(f"Python语法错误: {e.msg} (行 {e.lineno})")
+            return result
+        
+        # 尝试加载模块
+        spec = importlib.util.spec_from_file_location("strategy_module", file_path)
+        if spec is None or spec.loader is None:
+            result.add_error("无法加载策略文件模块")
+            return result
+        
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        
+        # 验证各种策略规则列表
+        rule_lists = {
+            "RANKING_RULES": ("ranking", "排名策略"),
+            "FILTER_RULES": ("filter", "筛选策略"),
+            "PREDICTION_RULES": ("prediction", "模拟策略"),
+            "POSITION_POLICIES": ("position", "持仓策略"),
+            "OPPORTUNITY_POLICIES": ("opportunity", "买点策略")
+        }
+        
+        total_rules = 0
+        for list_name, (category, category_name) in rule_lists.items():
+            if hasattr(module, list_name):
+                rules = getattr(module, list_name)
+                if isinstance(rules, list):
+                    total_rules += len(rules)
+                    for i, rule in enumerate(rules):
+                        if isinstance(rule, dict):
+                            rule_result = validator.validate_rule(rule, category)
+                            if not rule_result.is_valid:
+                                for error in rule_result.errors:
+                                    result.add_error(
+                                        f"{category_name}[{i}]: {error['message']}",
+                                        f"{list_name}[{i}].{error.get('field', '')}"
+                                    )
+                            for warning in rule_result.warnings:
+                                result.add_warning(
+                                    f"{category_name}[{i}]: {warning['message']}",
+                                    f"{list_name}[{i}].{warning.get('field', '')}"
+                                )
+                            for suggestion in rule_result.suggestions:
+                                result.add_suggestion(
+                                    f"{category_name}[{i}]: {suggestion['message']}",
+                                    f"{list_name}[{i}].{suggestion.get('field', '')}"
+                                )
+                            result.missing_columns.extend(rule_result.missing_columns)
+                            result.missing_indicators.extend(rule_result.missing_indicators)
+                            result.syntax_issues.extend(rule_result.syntax_issues)
+                        else:
+                            result.add_error(f"{category_name}[{i}]: 规则必须是字典格式", f"{list_name}[{i}]")
+        
+        if total_rules == 0:
+            result.add_warning("未找到任何策略规则，请检查策略文件是否包含RANKING_RULES、FILTER_RULES等列表")
+        else:
+            result.add_suggestion(f"共验证了 {total_rules} 条策略规则")
+        
+    except Exception as e:
+        result.add_error(f"验证过程发生异常: {str(e)}")
+    
+    return result
 

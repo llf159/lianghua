@@ -5136,7 +5136,8 @@ def build_custom_rank(combo_name: str,
                       universe: str = "all",
                       tiebreak: str = "kdj_j_asc",
                       topN: Optional[int] = None,
-                      write: bool = True) -> Optional[pd.DataFrame]:
+                      write: bool = True,
+                      exclude_rules: Optional[list[str]] = None) -> Optional[pd.DataFrame]:
     """
     生成自选榜（按策略组合筛选）：
       - combo_name: 策略组合名称（用于文件名）
@@ -5147,6 +5148,7 @@ def build_custom_rank(combo_name: str,
       - tiebreak: 同分排序方式
       - topN: 输出前N名（留空=不限制）
       - write: 是否落盘
+      - exclude_rules: 排除策略列表（如果触发这些策略则排除）
     返回 DataFrame 或文件路径
     """
     from database_manager import get_database_manager
@@ -5236,25 +5238,35 @@ def build_custom_rank(combo_name: str,
                 
                 # 检查策略触发情况
                 names_triggered = set()
+                names_excluded = set()
                 hit_dates_map = {}
                 for rr in rules:
                     ok_val = rr.get("ok")
                     add_val = rr.get("add")
                     if bool(ok_val) or (add_val is not None and float(add_val) > 0.0):
                         n = rr.get("name")
-                        if n and n in rule_names:
-                            names_triggered.add(str(n))
-                            # 收集触发日期
-                            hit_date = rr.get("hit_date")
-                            hit_dates = rr.get("hit_dates", [])
-                            all_dates = []
-                            if hit_date:
-                                all_dates.append(str(hit_date))
-                            if hit_dates:
-                                all_dates.extend([str(d) for d in hit_dates if d])
-                            all_dates = sorted(set(all_dates))
-                            if all_dates:
-                                hit_dates_map[str(n)] = all_dates
+                        if n:
+                            # 检查是否在选中的策略中
+                            if n in rule_names:
+                                names_triggered.add(str(n))
+                                # 收集触发日期
+                                hit_date = rr.get("hit_date")
+                                hit_dates = rr.get("hit_dates", [])
+                                all_dates = []
+                                if hit_date:
+                                    all_dates.append(str(hit_date))
+                                if hit_dates:
+                                    all_dates.extend([str(d) for d in hit_dates if d])
+                                all_dates = sorted(set(all_dates))
+                                if all_dates:
+                                    hit_dates_map[str(n)] = all_dates
+                            # 检查是否在排除策略中
+                            if exclude_rules and n in exclude_rules:
+                                names_excluded.add(str(n))
+                
+                # 如果触发了排除策略，则跳过该股票
+                if names_excluded:
+                    continue
                 
                 # 判断是否命中
                 if agg_mode.upper() == "OR":
@@ -5299,25 +5311,35 @@ def build_custom_rank(combo_name: str,
                     
                     # 检查策略触发情况
                     names_triggered = set()
+                    names_excluded = set()
                     hit_dates_map = {}
                     for rr in rules:
                         ok_val = rr.get("ok")
                         add_val = rr.get("add")
                         if bool(ok_val) or (add_val is not None and float(add_val) > 0.0):
                             n = rr.get("name")
-                            if n and n in rule_names:
-                                names_triggered.add(str(n))
-                                # 收集触发日期
-                                hit_date = rr.get("hit_date")
-                                hit_dates = rr.get("hit_dates", [])
-                                all_dates = []
-                                if hit_date:
-                                    all_dates.append(str(hit_date))
-                                if hit_dates:
-                                    all_dates.extend([str(d) for d in hit_dates if d])
-                                all_dates = sorted(set(all_dates))
-                                if all_dates:
-                                    hit_dates_map[str(n)] = all_dates
+                            if n:
+                                # 检查是否在选中的策略中
+                                if n in rule_names:
+                                    names_triggered.add(str(n))
+                                    # 收集触发日期
+                                    hit_date = rr.get("hit_date")
+                                    hit_dates = rr.get("hit_dates", [])
+                                    all_dates = []
+                                    if hit_date:
+                                        all_dates.append(str(hit_date))
+                                    if hit_dates:
+                                        all_dates.extend([str(d) for d in hit_dates if d])
+                                    all_dates = sorted(set(all_dates))
+                                    if all_dates:
+                                        hit_dates_map[str(n)] = all_dates
+                                # 检查是否在排除策略中
+                                if exclude_rules and n in exclude_rules:
+                                    names_excluded.add(str(n))
+                    
+                    # 如果触发了排除策略，则跳过该股票
+                    if names_excluded:
+                        continue
                     
                     # 判断是否命中
                     if agg_mode.upper() == "OR":
@@ -5342,7 +5364,8 @@ def build_custom_rank(combo_name: str,
                         })
         
         if not rows:
-            LOGGER.info(f"[自选榜] {combo_name} 未筛到命中标的（参考日={ref_date}，策略={rule_names}，聚合模式={agg_mode}，选股范围={universe}，股票数={len(codes_all) if codes_all else 0}）")
+            exclude_info = f"，排除策略={exclude_rules}" if exclude_rules else ""
+            LOGGER.info(f"[自选榜] {combo_name} 未筛到命中标的（参考日={ref_date}，策略={rule_names}，聚合模式={agg_mode}，选股范围={universe}，股票数={len(codes_all) if codes_all else 0}{exclude_info}）")
             return None
         
         # 构建DataFrame并排序
@@ -5384,6 +5407,12 @@ def build_custom_rank(combo_name: str,
             # 文件名：custom_{combo_name}_{ref_date}.csv
             safe_name = "".join(c for c in combo_name if c.isalnum() or c in ("_", "-")).strip()
             out_path = os.path.join(out_dir, f"custom_{safe_name}_{ref_date}.csv")
+            # 如果文件已存在，先删除以确保覆盖
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except Exception as e:
+                    LOGGER.warning(f"[自选榜] 删除旧文件失败 {out_path}: {e}")
             df_result.to_csv(out_path, index=False, encoding="utf-8-sig")
             LOGGER.info(f"[自选榜] {combo_name} 参考日={ref_date} 命中={len(df_result)} 只 -> {out_path}")
             return out_path

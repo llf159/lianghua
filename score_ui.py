@@ -1803,6 +1803,59 @@ if _in_streamlit():
                             with st.expander("其他信息", expanded=False):
                                 for key, value in other_fields.items():
                                     st.text(f"{key}: {value}")
+                # 创建explain到name的映射（用于将explain文本转换为策略名字）
+                # 方法1：从策略仓库中获取（最权威）
+                explain_to_name = {}
+                try:
+                    for r in (getattr(se, "SC_RULES", []) or []):
+                        explain_val = r.get("explain")
+                        name_val = r.get("name")
+                        if explain_val and name_val:
+                            explain_str = str(explain_val).strip()
+                            name_str = str(name_val)
+                            # 存储多种格式的映射以提高匹配成功率
+                            explain_to_name[explain_str] = name_str
+                            # 去除所有空白字符后的版本
+                            explain_normalized = re.sub(r'\s+', '', explain_str)
+                            if explain_normalized != explain_str:
+                                explain_to_name[explain_normalized] = name_str
+                except Exception:
+                    pass
+                
+                # 方法2：从rules数据中补充（如果策略仓库中没有）
+                rules_list_for_mapping = data.get("rules", [])
+                if isinstance(rules_list_for_mapping, list):
+                    for r in rules_list_for_mapping:
+                        if isinstance(r, dict):
+                            explain_val = r.get("explain")
+                            name_val = r.get("name")
+                            if explain_val and name_val:
+                                explain_str = str(explain_val).strip()
+                                name_str = str(name_val)
+                                # 如果策略仓库中没有，则添加
+                                if explain_str not in explain_to_name:
+                                    explain_to_name[explain_str] = name_str
+                                # 去除所有空白字符后的版本
+                                explain_normalized = re.sub(r'\s+', '', explain_str)
+                                if explain_normalized not in explain_to_name:
+                                    explain_to_name[explain_normalized] = name_str
+                
+                # 将explain文本转换为策略名字的辅助函数
+                def _get_rule_name(explain_text: str) -> str:
+                    """将explain文本转换为策略名字，如果找不到则返回原文本"""
+                    if not explain_text:
+                        return explain_text
+                    explain_text = str(explain_text).strip()
+                    # 先尝试精确匹配
+                    if explain_text in explain_to_name:
+                        return explain_to_name[explain_text]
+                    # 再尝试去除所有空白字符后匹配
+                    explain_normalized = re.sub(r'\s+', '', explain_text)
+                    if explain_normalized in explain_to_name:
+                        return explain_to_name[explain_normalized]
+                    # 如果都找不到，返回原文本
+                    return explain_text
+                
                 with colB:
                     st.markdown("**高亮 / 缺点**")
                     # 美化显示highlights和drawbacks
@@ -1814,13 +1867,15 @@ if _in_streamlit():
                             st.markdown("**✅ 高亮**")
                             for h in highlights:
                                 if h:
-                                    st.success(f"• {h}")
+                                    rule_name = _get_rule_name(h)
+                                    st.success(f"• {rule_name}")
                         
                         if drawbacks:
                             st.markdown("**⚠️ 缺点**")
                             for d in drawbacks:
                                 if d:
-                                    st.error(f"• {d}")
+                                    rule_name = _get_rule_name(d)
+                                    st.error(f"• {rule_name}")
                         
                         if not highlights and not drawbacks:
                             st.caption("暂无")
@@ -1830,7 +1885,9 @@ if _in_streamlit():
                 with st.expander("交易性机会", expanded=True):
                     if ops:
                         for t in ops:
-                            st.write("• " + str(t))
+                            if t:
+                                rule_name = _get_rule_name(t)
+                                st.write("• " + rule_name)
                     else:
                         st.caption("暂无")
 
@@ -2663,10 +2720,10 @@ if _in_streamlit():
 
         # 导入验证器
         try:
-            from strategies_repo import validate_strategy_file
+            from rule_editor import validate_strategy_file
             validation_available = True
         except ImportError:
-            st.error("策略验证器模块未找到，请确保 strategy_validator.py 文件存在")
+            st.error("策略验证器模块未找到，请确保 rule_editor.py 文件存在")
             validation_available = False
         
         if validation_available:
@@ -3174,13 +3231,14 @@ if _in_streamlit():
                 
                 # 构建新的 CUSTOM_COMBOS 内容（列表格式）
                 new_combos_str = "# 自选榜策略组合配置\n"
-                new_combos_str += "# 格式：列表，每个元素包含 name（组合名称）、rules（策略名列表）、agg_mode（聚合方法：OR/AND）、output_name（落盘名称）、explain（说明）等字段\n"
+                new_combos_str += "# 格式：列表，每个元素包含 name（组合名称）、rules（策略名列表）、agg_mode（聚合方法：OR/AND）、output_name（落盘名称）、explain（说明）、exclude_rules（排除策略列表）等字段\n"
                 new_combos_str += "CUSTOM_COMBOS = [\n"
                 for combo_name, combo_data in combos.items():
                     rules = combo_data.get("rules", [])
                     agg_mode = combo_data.get("agg_mode", "OR")
                     output_name = combo_data.get("output_name", combo_name)
                     explain = combo_data.get("explain", "")
+                    exclude_rules = combo_data.get("exclude_rules", [])
                     new_combos_str += "    {\n"
                     new_combos_str += f"        'name': '{combo_name}',\n"
                     new_combos_str += f"        'rules': {repr(rules)},\n"
@@ -3188,6 +3246,8 @@ if _in_streamlit():
                     new_combos_str += f"        'output_name': '{output_name}',\n"
                     if explain:
                         new_combos_str += f"        'explain': '{explain}',\n"
+                    if exclude_rules:
+                        new_combos_str += f"        'exclude_rules': {repr(exclude_rules)},\n"
                     new_combos_str += "    },\n"
                 new_combos_str += "]\n"
                 
@@ -3260,7 +3320,10 @@ if _in_streamlit():
                             rules_list = combo_data.get("rules", [])
                             agg_mode = combo_data.get("agg_mode", "OR")
                             explain = combo_data.get("explain", "")
+                            exclude_rules_list = combo_data.get("exclude_rules", [])
                             st.caption(f"策略组: {', '.join(rules_list[:3])}{'...' if len(rules_list) > 3 else ''} | 聚合方法: {agg_mode}")
+                            if exclude_rules_list:
+                                st.caption(f"排除策略: {', '.join(exclude_rules_list[:3])}{'...' if len(exclude_rules_list) > 3 else ''}")
                             if explain:
                                 st.caption(f"说明: {explain}")
                         with col2:
@@ -3283,6 +3346,7 @@ if _in_streamlit():
             combo_name_input = st.text_input("组合名称（name）", value="", key="combo_name_input", placeholder="例如：突破组合")
             selected_rules_input = st.multiselect("策略组（rules）", options=rule_names, default=[], key="combo_rules_input")
             agg_mode_input = st.radio("聚合方法（agg_mode）", ["OR（任一命中）", "AND（全部命中）"], index=0, horizontal=True, key="combo_agg_mode")
+            exclude_rules_input = st.multiselect("排除策略（exclude_rules）", options=rule_names, default=[], key="combo_exclude_rules_input", help="如果触发这些策略则排除该股票")
             combo_output_name_input = st.text_input("落盘名称（output_name）", value="", key="combo_output_name_input", placeholder="例如：突破组合（用于生成文件名）")
             combo_explain_input = st.text_input("说明（explain）", value="", key="combo_explain_input", placeholder="例如：突破相关策略组合")
             
@@ -3296,12 +3360,15 @@ if _in_streamlit():
                     else:
                         # 落盘名称默认为组合名称
                         output_name = combo_output_name_input.strip() if combo_output_name_input.strip() else combo_name_input.strip()
-                        combos[combo_name_input.strip()] = {
+                        combo_data = {
                             "rules": selected_rules_input,
                             "agg_mode": "OR" if agg_mode_input.startswith("OR") else "AND",
                             "output_name": output_name,
                             "explain": combo_explain_input.strip() if combo_explain_input.strip() else ""
                         }
+                        if exclude_rules_input:
+                            combo_data["exclude_rules"] = exclude_rules_input
+                        combos[combo_name_input.strip()] = combo_data
                         if save_custom_combos(combos):
                             st.success(f"已保存策略组合: {combo_name_input.strip()}")
                             st.rerun()
@@ -3309,6 +3376,7 @@ if _in_streamlit():
                 if st.button("清空输入", key="clear_combo"):
                     st.session_state["combo_name_input"] = ""
                     st.session_state["combo_rules_input"] = []
+                    st.session_state["combo_exclude_rules_input"] = []
                     st.session_state["combo_output_name_input"] = ""
                     st.session_state["combo_explain_input"] = ""
                     st.rerun()
@@ -3332,6 +3400,7 @@ if _in_streamlit():
                 selected_rules = st.multiselect("选择策略（可多选）", options=rule_names, default=[], key="manual_rules")
                 selected_agg_mode = st.radio("聚合模式", ["OR（任一命中）", "AND（全部命中）"], index=0, horizontal=True, key="manual_agg_mode")
                 selected_agg_mode = "OR" if selected_agg_mode.startswith("OR") else "AND"
+                selected_exclude_rules = st.multiselect("排除策略（可多选）", options=rule_names, default=[], key="manual_exclude_rules", help="如果触发这些策略则排除该股票")
                 selected_combo_name = None
                 selected_output_name = None
                 selected_combo_data = None
@@ -3341,9 +3410,11 @@ if _in_streamlit():
                 if selected_combo_data:
                     selected_rules = selected_combo_data.get("rules", [])
                     selected_agg_mode = selected_combo_data.get("agg_mode", "OR")
+                    selected_exclude_rules = selected_combo_data.get("exclude_rules", [])
                     selected_combo_name = selected_combo_key
                     selected_output_name = selected_combo_data.get("output_name", selected_combo_name)
-                    st.info(f"**策略组合：{selected_combo_name}** | 策略组: {', '.join(selected_rules[:5])}{'...' if len(selected_rules) > 5 else ''} | 聚合方法: {selected_agg_mode}")
+                    exclude_info = f" | 排除策略: {', '.join(selected_exclude_rules[:3])}{'...' if len(selected_exclude_rules) > 3 else ''}" if selected_exclude_rules else ""
+                    st.info(f"**策略组合：{selected_combo_name}** | 策略组: {', '.join(selected_rules[:5])}{'...' if len(selected_rules) > 5 else ''} | 聚合方法: {selected_agg_mode}{exclude_info}")
                     st.caption(f"落盘名称: {selected_output_name}")
                     explain = selected_combo_data.get("explain", "")
                     if explain:
@@ -3351,6 +3422,7 @@ if _in_streamlit():
                 else:
                     selected_rules = []
                     selected_agg_mode = "OR"
+                    selected_exclude_rules = []
                     selected_combo_name = None
                     selected_output_name = None
                     selected_combo_data = None
@@ -3359,6 +3431,7 @@ if _in_streamlit():
             selected_rules = st.multiselect("选择策略（可多选）", options=rule_names, default=[], key="manual_rules")
             selected_agg_mode = st.radio("聚合模式", ["OR（任一命中）", "AND（全部命中）"], index=0, horizontal=True, key="manual_agg_mode")
             selected_agg_mode = "OR" if selected_agg_mode.startswith("OR") else "AND"
+            selected_exclude_rules = st.multiselect("排除策略（可多选）", options=rule_names, default=[], key="manual_exclude_rules", help="如果触发这些策略则排除该股票")
             selected_combo_name = None
             selected_output_name = None
             selected_combo_data = None
@@ -3404,6 +3477,16 @@ if _in_streamlit():
                         universe_map = {"全市场": "all", "仅白名单": "white", "仅黑名单": "black", "仅强度榜": "strength"}
                         universe = universe_map.get(universe_custom, "all")
                         
+                        # 获取排除策略
+                        exclude_rules = None
+                        if selected_combo_data:
+                            exclude_rules = selected_combo_data.get("exclude_rules", [])
+                        else:
+                            # 手动选择策略时，使用已定义的 selected_exclude_rules 变量
+                            exclude_rules = selected_exclude_rules if 'selected_exclude_rules' in locals() else []
+                        if not exclude_rules:
+                            exclude_rules = None
+                        
                         # 调用生成函数
                         from scoring_core import build_custom_rank
                         result = build_custom_rank(
@@ -3414,7 +3497,8 @@ if _in_streamlit():
                             universe=universe,
                             tiebreak=tiebreak_custom,
                             topN=topN_custom if topN_custom > 0 else None,
-                            write=True
+                            write=True,
+                            exclude_rules=exclude_rules
                         )
                         
                         if result:
@@ -4579,7 +4663,9 @@ if _in_streamlit():
                         
                         if ts_code:
                             try:
-                                df = query_details_by_stock(ts_code, limit, db_path)
+                                # 自动补后缀
+                                ts_code_normalized = normalize_ts(ts_code.strip(), asset="stock")
+                                df = query_details_by_stock(ts_code_normalized, limit, db_path)
                                 if not df.empty:
                                     st.dataframe(df, width='stretch')
                                 else:
@@ -4785,9 +4871,11 @@ if _in_streamlit():
                         
                         if st.button("查询", key="btn_query_range"):
                             try:
+                                # 自动补后缀
+                                ts_code_normalized = normalize_ts(ts_code.strip(), asset=asset_type) if ts_code else None
                                 df = query_stock_data(
                                     db_path=db_path,
-                                    ts_code=ts_code if ts_code else None,
+                                    ts_code=ts_code_normalized,
                                     start_date=start_date,
                                     end_date=end_date,
                                     columns=columns,
@@ -4801,7 +4889,7 @@ if _in_streamlit():
                                         from database_manager import count_stock_data as _count_stock_data
                                         total_rows = _count_stock_data(
                                             db_path=db_path,
-                                            ts_code=ts_code if ts_code else None,
+                                            ts_code=ts_code_normalized,
                                             start_date=start_date,
                                             end_date=end_date,
                                             adj_type=adj_type if asset_type != "index" else "ind"
@@ -4842,9 +4930,11 @@ if _in_streamlit():
                             st.error("请输入股票代码")
                         else:
                             try:
+                                # 自动补后缀
+                                ts_code_normalized = normalize_ts(ts_code.strip(), asset=asset_type)
                                 df = query_stock_data(
                                     db_path=db_path,
-                                    ts_code=ts_code,
+                                    ts_code=ts_code_normalized,
                                     start_date=start_date,
                                     end_date=end_date,
                                     columns=columns,
@@ -4867,7 +4957,7 @@ if _in_streamlit():
                                         from database_manager import count_stock_data as _count_stock_data
                                         total_rows = _count_stock_data(
                                             db_path=db_path,
-                                            ts_code=ts_code,
+                                            ts_code=ts_code_normalized,
                                             start_date=start_date,
                                             end_date=end_date,
                                             adj_type=adj_type if asset_type != "index" else "ind"
