@@ -23,9 +23,9 @@ warnings.filterwarnings(
 # 初始化日志记录器
 logger = get_logger("score_ui")
 def ui_cleanup_database_connections():
-    """强制清理所有数据库连接 - 统一使用 data_reader 管理"""
+    """强制清理所有数据库连接 - 统一使用 database_manager 管理"""
     try:
-        # 延迟导入 data_reader，避免启动时立即初始化数据库连接
+        # 延迟导入 database_manager，避免启动时立即初始化数据库连接
         try:
             from database_manager import clear_connections_only
         except ImportError as e:
@@ -128,8 +128,12 @@ import traceback
 # import download as dl
 import scoring_core as se
 import config as cfg
-import stats_core as stats
-from utils import normalize_ts, ensure_datetime_index, normalize_trade_date, market_label
+# stats_core 的功能已移到本文件中
+from utils import (
+    normalize_ts, ensure_datetime_index, normalize_trade_date, market_label,
+    get_latest_date_from_database as _get_latest_date_from_database,
+    get_latest_date_from_daily_partition as _get_latest_date_from_daily_partition
+)
 # 使用 database_manager 替代 data_reader
 from database_manager import (
     get_database_manager, query_stock_data, get_trade_dates, 
@@ -145,7 +149,6 @@ def _lazy_import_download():
         import download as dl
         return dl
     except ImportError as e:
-        logger = get_logger("score_ui")
         logger.error(f"导入 download 失败: {e}")
         return None
 
@@ -153,7 +156,587 @@ def _lazy_import_download():
 import os
 from config import DATA_ROOT, API_ADJ, SC_DETAIL_STORAGE, SC_USE_DB_STORAGE, SC_DB_FALLBACK_TO_JSON
 import tdx_compat as tdx
-from stats_core import _pick_trade_dates, _prev_trade_date
+# 从 stats_core 移过来的工具函数和类
+from dataclasses import dataclass, asdict
+from typing import Sequence, Dict, List, Optional, Literal
+from pathlib import Path
+import json
+
+# 工具函数
+def _pick_trade_dates(ref_date: str, back: int) -> List[str]:
+    """返回 [ref_date-back, ..., ref_date] 范围内的交易日列表，用于价格与回看。"""
+    days = get_trade_dates() or []
+    if ref_date not in days:
+        raise ValueError(f"ref_date 不在交易日历内: {ref_date}")
+    i = days.index(ref_date)
+    j0 = max(0, i - back)
+    return days[j0 : i + 1]
+
+def _prev_trade_date(ref_date: str, d: int) -> str:
+    """返回 ref_date 往前 d 个交易日的日期"""
+    cal = get_trade_dates() or []
+    if ref_date not in cal:
+        raise ValueError(f"ref_date 不在交易日内：{ref_date}")
+    i = cal.index(ref_date)
+    j = max(0, i - int(d))
+    return cal[j]
+
+def _read_stock_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
+    """读取股票价格数据"""
+    cols = ["ts_code", "trade_date", "open", "close"]
+    
+    # 优先使用缓存读取（仅对单只股票）
+    if len(codes) == 1:
+        try:
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            df = query_stock_data(
+                db_path=db_path,
+                ts_code=codes[0],
+                start_date=start,
+                end_date=end,
+                adj_type="qfq"
+            )
+            if not df.empty:
+                df = normalize_trade_date(df, "trade_date")
+                return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+        except:
+            pass
+    
+    # 使用 database_manager 直接查询
+    try:
+        from config import DATA_ROOT, UNIFIED_DB_PATH
+        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+        
+        # 构建查询条件
+        conditions = []
+        params = []
+        
+        if codes:
+            placeholders = ",".join(["?"] * len(codes))
+            conditions.append(f"ts_code IN ({placeholders})")
+            params.extend(codes)
+        
+        if start:
+            conditions.append("trade_date >= ?")
+            params.append(start)
+            
+        if end:
+            conditions.append("trade_date <= ?")
+            params.append(end)
+            
+        conditions.append("adj_type = ?")
+        params.append(API_ADJ)
+        
+        # 构建SQL查询
+        select_cols = "*" if not cols else ", ".join(cols)
+        sql = f"SELECT {select_cols} FROM stock_data"
+        
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        
+        sql += " ORDER BY ts_code, trade_date"
+        
+        # 执行查询
+        logger.info(f"[数据库连接] 开始获取数据库管理器实例 (读取股票价格数据: codes={len(codes) if codes else 'all'}, {start}~{end})")
+        manager = get_database_manager()
+        df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
+    except Exception as e:
+        logger.error(f"读取数据范围失败: {e}")
+        df = pd.DataFrame()
+    
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=cols)
+    df = normalize_trade_date(df, "trade_date")
+    df = df[df["ts_code"].isin(set(codes))].sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+    return df
+
+def _count_strategy_triggers(obs_date: str, codes_sample: Sequence[str], *, weights_map: dict[str, float] | None = None) -> pd.DataFrame:
+    """
+    统计某观察日 obs_date 在样本集合 codes_sample 内每个策略（规则名）的触发次数/覆盖率。
+    触发判定：per_rules 里 ok=True 或 hit_date==obs_date 或 obs_date ∈ hit_dates。
+    可选：weights_map 提供 ts_code -> 权重，用于"加权触发次数"和"加权覆盖率"。
+    返回列：name, trigger_count, n_sample, coverage, trigger_weighted, sample_weight, coverage_weighted
+    """
+    ddir = Path("output/score/details") / str(obs_date)
+    if not ddir.exists():
+        return pd.DataFrame(columns=["name","trigger_count","n_sample","coverage","trigger_weighted","sample_weight","coverage_weighted"])
+    codes_set = set(str(c) for c in (codes_sample or []))
+    weights_map = {str(k): float(v) for k,v in (weights_map or {}).items()}
+    n_sample = len(codes_set) if codes_set else 0
+    sample_weight = sum(weights_map.get(ts, 1.0) for ts in codes_set) if codes_set else 0.0
+
+    # 每个策略名 -> {命中的 ts_code 集合, 加权和}
+    acc_set: dict[str, set] = {}
+    acc_w  : dict[str, float] = {}
+
+    for fp in ddir.glob("*.json"):
+        try:
+            obj = json.loads(fp.read_text(encoding="utf-8-sig"))
+        except Exception:
+            continue
+        ts = str(obj.get("ts_code",""))
+        if codes_set and ts not in codes_set:
+            continue
+        rules = (obj.get("per_rules") or obj.get("rules") or [])
+        for r in rules:
+            name = str(r.get("name") or "")
+            if not name:
+                continue
+            ok = bool(r.get("ok"))
+            hd = str(r.get("hit_date") or "")
+            hds = [str(x) for x in (r.get("hit_dates") or [])]
+            trig = ok or (hd == str(obs_date)) or (str(obs_date) in hds)
+            if trig:
+                acc_set.setdefault(name, set()).add(ts)
+                acc_w[name] = acc_w.get(name, 0.0) + float(weights_map.get(ts, 1.0))
+
+    rows = []
+    for name, st in acc_set.items():
+        cnt = int(len(st))
+        cov = (cnt / n_sample if n_sample else 0.0)
+        wsum = float(acc_w.get(name, 0.0))
+        cov_w = (wsum / sample_weight if sample_weight else 0.0)
+        rows.append({
+            "name": name,
+            "trigger_count": cnt,
+            "n_sample": int(n_sample),
+            "coverage": cov,
+            "trigger_weighted": wsum,
+            "sample_weight": sample_weight,
+            "coverage_weighted": cov_w,
+        })
+
+    df = pd.DataFrame(rows, columns=["name","trigger_count","n_sample","coverage","trigger_weighted","sample_weight","coverage_weighted"])
+    if not df.empty:
+        # 优先按加权命中降序，再按未加权、再按名称升序
+        sort_cols = [c for c in ["trigger_weighted","trigger_count","name"] if c in df.columns]
+        df = df.sort_values(sort_cols, ascending=[False, False, True][:len(sort_cols)]).reset_index(drop=True)
+    return df
+
+# Portfolio 相关数据类和类
+PORT_OUT_BASE = Path("output/portfolio")
+
+@dataclass
+class Portfolio:
+    id: str
+    name: str
+    # 资金：总额与可用（未提供则等于 init_cash）
+    init_cash: float = 1_000_000.0
+    init_available: float | None = None
+    # 成交价口径：'next_open' | 'close'
+    trade_price_mode: Literal["next_open", "close"] = "next_open"
+    # 费率：买/卖分开 + 最低费用（单位：元）
+    fee_bps_buy: float = 0.0
+    fee_bps_sell: float = 0.0
+    min_fee: float = 0.0
+
+@dataclass
+class Trade:
+    portfolio_id: str
+    date: str       # 交易指令日期（成交日依成交模式决定）
+    ts_code: str
+    side: Literal["BUY", "SELL"]
+    qty: int
+    price_mode: Optional[Literal["next_open", "close"]] = None  # None 表示跟随组合默认
+    price: Optional[float] = None    # 若指定则使用该价格（覆盖 price_mode）
+    note: str = "manual"
+
+# Portfolio 辅助函数
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def _out_dir(pid: str) -> Path:
+    d = PORT_OUT_BASE / pid
+    _ensure_dir(d)
+    return d
+
+def _load_portfolios() -> Dict[str, Portfolio]:
+    f = PORT_OUT_BASE / "portfolios.json"
+    if not f.exists():
+        return {}
+    obj = json.loads(f.read_text(encoding="utf-8"))
+    out: Dict[str, Portfolio] = {}
+    for k, v in obj.items():
+        # 兼容旧字段：fee_bps -> fee_bps_buy/sell；缺失 init_available -> = init_cash
+        vv = dict(v)
+        if "init_available" not in vv:
+            vv["init_available"] = vv.get("init_cash", 0.0)
+        if "fee_bps" in vv and ("fee_bps_buy" not in vv and "fee_bps_sell" not in vv):
+            try:
+                bps = float(vv.get("fee_bps", 0.0))
+            except Exception:
+                bps = 0.0
+            vv["fee_bps_buy"] = bps
+            vv["fee_bps_sell"] = bps
+        vv.pop("fee_bps", None)
+        out[k] = Portfolio(**vv)
+    return out
+
+def _save_portfolios(ps: Dict[str, Portfolio]) -> None:
+    _ensure_dir(PORT_OUT_BASE)
+    obj = {k: asdict(v) for k, v in ps.items()}
+    (PORT_OUT_BASE / "portfolios.json").write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _read_trade_dates(asset: str = "stock") -> List[str]:
+    # 使用统一的数据库查询
+    return get_trade_dates() or []
+
+def _read_px(codes, start, end, *, asset="stock", cols=("open","close")) -> pd.DataFrame:
+    sel = ["ts_code", "trade_date", *cols]
+    
+    # 优先使用缓存读取（仅对单只股票）
+    if len(codes) == 1 and asset == "stock":
+        try:
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            df = query_stock_data(
+                db_path=db_path,
+                ts_code=codes[0],
+                start_date=start,
+                end_date=end,
+                adj_type="qfq"
+            )
+            if not df.empty:
+                df = normalize_trade_date(df, "trade_date")
+                return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+        except:
+            pass
+    
+    # 使用 database_manager 直接查询
+    try:
+        from config import DATA_ROOT, UNIFIED_DB_PATH
+        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+        
+        # 构建查询条件
+        conditions = []
+        params = []
+        
+        if codes:
+            placeholders = ",".join(["?"] * len(codes))
+            conditions.append(f"ts_code IN ({placeholders})")
+            params.extend(codes)
+        
+        if start:
+            conditions.append("trade_date >= ?")
+            params.append(start)
+            
+        if end:
+            conditions.append("trade_date <= ?")
+            params.append(end)
+            
+        conditions.append("adj_type = ?")
+        params.append(API_ADJ)
+        
+        # 构建SQL查询
+        select_cols = "*" if not sel else ", ".join(sel)
+        sql = f"SELECT {select_cols} FROM stock_data"
+        
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        
+        sql += " ORDER BY ts_code, trade_date"
+        
+        # 执行查询
+        logger.info(f"[数据库连接] 开始获取数据库管理器实例 (读取价格数据用于回测: codes={len(codes) if codes else 'all'}, {start}~{end})")
+        manager = get_database_manager()
+        df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
+    except Exception as e:
+        logger.error(f"读取数据范围失败: {e}")
+        df = pd.DataFrame()
+    
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=sel)
+    df = normalize_trade_date(df, "trade_date")
+    if codes:
+        df = df[df["ts_code"].isin(set(codes))]
+    return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+
+# PortfolioManager 类
+class PortfolioManager:
+    def __init__(self):
+        self._ports: Dict[str, Portfolio] = _load_portfolios()
+
+    # ---- 组合管理 ----
+    def create_portfolio(self, name: str, *, init_cash: float = 1_000_000.0,
+                         init_available: float | None = None,
+                         trade_price_mode: str = "next_open",
+                         fee_bps_buy: float = 0.0,
+                         fee_bps_sell: float = 0.0,
+                         min_fee: float = 0.0) -> str:
+        pid = f"pf_{abs(hash((name, init_cash, trade_price_mode))) % 10**10}"
+        pf = Portfolio(
+            id=pid, name=name,
+            init_cash=float(init_cash),
+            init_available=float(init_available) if init_available is not None else float(init_cash),
+            trade_price_mode=str(trade_price_mode),
+            fee_bps_buy=float(fee_bps_buy),
+            fee_bps_sell=float(fee_bps_sell),
+            min_fee=float(min_fee),
+        )
+        self._ports[pid] = pf
+        _save_portfolios(self._ports)
+        return pid
+    def list_portfolios(self) -> Dict[str, Portfolio]:
+        return dict(self._ports)
+
+    def get(self, pid: str) -> Portfolio:
+        return self._ports[pid]
+
+    # ---- 交易记录 ----
+    def _trades_path(self, pid: str) -> Path:
+        return _out_dir(pid) / "trades.parquet"
+
+    def _positions_path(self, pid: str) -> Path:
+        return _out_dir(pid) / "positions.parquet"
+
+    def _nav_path(self, pid: str) -> Path:
+        return _out_dir(pid) / "nav.parquet"
+
+    def read_trades(self, pid: str) -> pd.DataFrame:
+        fp = self._trades_path(pid)
+        if fp.exists():
+            try:
+                return pd.read_parquet(fp)
+            except Exception:
+                return pd.read_csv(fp.with_suffix(".csv"))
+        return pd.DataFrame(columns=["portfolio_id","date","ts_code","side","qty","price_mode","price","note"])  
+
+    def write_trades(self, pid: str, df: pd.DataFrame) -> None:
+        _ensure_dir(_out_dir(pid))
+        fp = self._trades_path(pid)
+        try:
+            df.to_parquet(fp, index=False)
+        except Exception:
+            df.to_csv(fp.with_suffix(".csv"), index=False, encoding="utf-8-sig")
+
+    def record_trade(self, pid: str, *, date: str, ts_code: str, side: str, qty: int, price_mode: Optional[str] = None, price: Optional[float] = None, note: str = "manual") -> None:
+        ts_code = normalize_ts(ts_code, asset="stock")
+        t = Trade(portfolio_id=pid, date=str(date), ts_code=ts_code, side=side.upper(), qty=int(qty), price_mode=price_mode, price=price, note=note)
+        df = self.read_trades(pid)
+        df = pd.concat([df, pd.DataFrame([asdict(t)])], ignore_index=True)
+        self.write_trades(pid, df)
+
+    # ---- 批量建仓/调仓 ----
+    def rebalance_to_rank(self, pid: str, *, ref_date: str, df_all_scores: pd.DataFrame, top_n: int = 50, weighting: str = "equal") -> pd.DataFrame:
+        """根据当日排名生成目标等权调仓单（在 next_open 成交）。返回生成的交易簿增量 DataFrame。"""
+        pf = self.get(pid)
+        df = df_all_scores.copy()
+        df = normalize_trade_date(df, "ref_date") if "ref_date" in df.columns else normalize_trade_date(df, "trade_date")
+        # 兼容列名
+        if "trade_date" not in df.columns and "ref_date" in df.columns:
+            df = df.rename(columns={"ref_date": "trade_date"})
+        df = df[df["trade_date"] == ref_date].copy()
+        if "rank" not in df.columns:
+            df = df.sort_values(["score"], ascending=False).reset_index(drop=True)
+            df["rank"] = np.arange(1, len(df) + 1)
+        pick = df.nsmallest(int(top_n), "rank")["ts_code"].astype(str).map(lambda s: normalize_ts(s, asset="stock")).tolist()
+
+        # 目标权重（等权）
+        w = 1.0 / max(1, len(pick))
+        # 估值基准：用 ref_date 当日收盘近似（成交在 next_open，仅用于下单数量估计）
+        px = _read_px(pick, ref_date, ref_date, cols=("close",))
+        px = px[px["trade_date"] == ref_date][["ts_code", "close"]]
+
+        nav_df = self.read_nav(pid)
+        last_nav = float(nav_df["nav"].iloc[-1]) if len(nav_df) else 1.0
+        # 组合资产规模（近似）
+        AUM = self.get(pid).init_cash * last_nav
+        trades = []
+        for _, r in px.iterrows():
+            ts = r.ts_code
+            price = float(r.close)
+            qty = max(0, int((AUM * w) // price))  # 简化：不按手数
+            trades.append(Trade(pid, ref_date, ts, "BUY", qty, price_mode="next_open", price=None, note="rebalance_equal"))
+        # 写入
+        df_old = self.read_trades(pid)
+        df_new = pd.concat([df_old, pd.DataFrame([asdict(t) for t in trades])], ignore_index=True)
+        self.write_trades(pid, df_new)
+        return pd.DataFrame([asdict(t) for t in trades])
+
+    # ---- 估值与净值 ----
+    def read_positions(self, pid: str) -> pd.DataFrame:
+        fp = self._positions_path(pid)
+        if fp.exists():
+            try:
+                return pd.read_parquet(fp)
+            except Exception:
+                return pd.read_csv(fp.with_suffix(".csv"))
+        return pd.DataFrame(columns=["portfolio_id","date","ts_code","qty","cost","mkt_price","mkt_value","unreal_pnl"])  
+
+    def write_positions(self, pid: str, df: pd.DataFrame) -> None:
+        _ensure_dir(_out_dir(pid))
+        fp = self._positions_path(pid)
+        try:
+            df.to_parquet(fp, index=False)
+        except Exception:
+            df.to_csv(fp.with_suffix(".csv"), index=False, encoding="utf-8-sig")
+
+    def read_nav(self, pid: str) -> pd.DataFrame:
+        fp = self._nav_path(pid)
+        if fp.exists():
+            try:
+                return pd.read_parquet(fp)
+            except Exception:
+                return pd.read_csv(fp.with_suffix(".csv"))
+        return pd.DataFrame(columns=["portfolio_id","date","nav","ret_d","max_dd","cash","position_mv"])  
+
+    def write_nav(self, pid: str, df: pd.DataFrame) -> None:
+        _ensure_dir(_out_dir(pid))
+        fp = self._nav_path(pid)
+        try:
+            df.to_parquet(fp, index=False)
+        except Exception:
+            df.to_csv(fp.with_suffix(".csv"), index=False, encoding="utf-8-sig")
+
+    def _exec_date(self, d: str, mode: str, trade_days: List[str]) -> str:
+        if mode == "close":
+            return d
+        # next_open
+        if d not in trade_days:
+            # 找到 >= d 的第一个交易日作为指令日
+            trade_days = [x for x in trade_days if x >= d]
+            if not trade_days:
+                return d
+            d = trade_days[0]
+        i = trade_days.index(d)
+        j = min(i + 1, len(trade_days) - 1)
+        return trade_days[j]
+
+    def reprice_and_nav(self, pid: str, *, date_start: str, date_end: str, benchmarks: Sequence[str] = ()) -> Dict[str, Path]:
+        """根据交易簿重放估值，生成持仓与净值时间序列。
+        - 交易的实际成交日：next_open -> 下一交易日开盘；close -> 当日收盘；若指定 price 则忽略模式直接用。
+        - 当日净值：按收盘价估值（不考虑资金成本/分红）。
+        """
+        pf = self.get(pid)
+        trades = self.read_trades(pid)
+        trades = trades[(trades["date"] >= date_start) & (trades["date"] <= date_end)].copy()
+        trades["ts_code"] = trades["ts_code"].astype(str).map(lambda s: normalize_ts(s, asset="stock"))
+
+        trade_days = _read_trade_dates("stock")
+        # 估算需要的代码集合与区间
+        codes = sorted(set(trades["ts_code"]))
+        if not codes:
+            # 没有交易，则仅输出净值=1的序列
+            cal = [d for d in trade_days if date_start <= d <= date_end]
+            nav = pd.DataFrame({"portfolio_id": pid, "date": cal})
+            nav["nav"] = 1.0
+            nav["ret_d"] = 0.0
+            nav["max_dd"] = 0.0
+            self.write_nav(pid, nav)
+            return {"nav_path": self._nav_path(pid)}
+
+        # 拉取价格
+        px = _read_px(codes, date_start, date_end, cols=("open","close"))
+        if px.empty:
+            raise RuntimeError("价格数据为空")
+        # 成交价视图
+        px_open = px[["ts_code","trade_date","open"]].rename(columns={"open":"exec_price"})
+        px_close = px[["ts_code","trade_date","close"]].rename(columns={"close":"exec_price"})
+
+        # 生成成交流水（实际执行日 + 执行价）
+        recs = []
+        for _, r in trades.iterrows():
+            mode = str(r.price_mode) if pd.notna(r.price_mode) and r.price_mode else pf.trade_price_mode
+            if pd.notna(r.price):
+                exec_d = self._exec_date(str(r.date), mode, trade_days)
+                exec_p = float(r.price)
+            else:
+                exec_d = self._exec_date(str(r.date), mode, trade_days)
+                base = px_open if mode == "next_open" else px_close
+                p = base[(base["ts_code"] == r.ts_code) & (base["trade_date"] == exec_d)]
+                exec_p = float(p["exec_price"].iloc[0]) if len(p) else np.nan
+            recs.append({"portfolio_id": pid, "ts_code": r.ts_code, "side": r.side, "qty": int(r.qty), "exec_date": exec_d, "exec_price": exec_p})
+        deals = pd.DataFrame(recs)
+
+        # 逐日回放持仓
+        cal = sorted({d for d in px["trade_date"].unique() if date_start <= d <= date_end})
+        pos_rows = []
+        cash = float(self.get(pid).init_available or self.get(pid).init_cash)
+        holdings: Dict[str, int] = {}
+        cost_basis: Dict[str, float] = {}
+        fee_buy = float(self.get(pid).fee_bps_buy) / 10000.0
+        fee_sell = float(self.get(pid).fee_bps_sell) / 10000.0
+        min_fee = float(getattr(self.get(pid), 'min_fee', 0.0) or 0.0)
+
+        # 预备当日估值价：使用 close
+        px_close_map = px.set_index(["ts_code","trade_date"]).close.to_dict()
+
+        for d in cal:
+            # 执行今日所有成交
+            todays = deals[deals["exec_date"] == d]
+            for _, t in todays.iterrows():
+                amt = t.qty * t.exec_price
+                fee = max(amt * (fee_buy if t.side == "BUY" else fee_sell), min_fee)
+                if t.side == "BUY":
+                    holdings[t.ts_code] = holdings.get(t.ts_code, 0) + int(t.qty)
+                    # 更新成本（加权）
+                    prev_qty = holdings.get(t.ts_code, 0) - int(t.qty)
+                    prev_cost = cost_basis.get(t.ts_code, 0.0) * prev_qty
+                    new_cost = (prev_cost + amt + fee) / max(1, holdings[t.ts_code])
+                    cost_basis[t.ts_code] = new_cost
+                    cash -= (amt + fee)
+                else:
+                    sell_qty = min(int(t.qty), holdings.get(t.ts_code, 0))
+                    holdings[t.ts_code] = holdings.get(t.ts_code, 0) - sell_qty
+                    cash += (sell_qty * t.exec_price - fee)
+                    # 若清仓则清成本
+                    if holdings[t.ts_code] <= 0:
+                        holdings[t.ts_code] = 0
+                        cost_basis[t.ts_code] = 0.0
+
+            # 估值
+            row_pos = []
+            total = cash
+            for ts, q in holdings.items():
+                price = px_close_map.get((ts, d), np.nan)
+                mkt = float(q) * float(price) if pd.notna(price) else 0.0
+                total += mkt
+                row_pos.append({"portfolio_id": pid, "date": d, "ts_code": ts, "qty": int(q), "cost": float(cost_basis.get(ts, 0.0)), "mkt_price": float(price) if pd.notna(price) else np.nan, "mkt_value": float(mkt), "unreal_pnl": float((price - cost_basis.get(ts, 0.0)) * q) if pd.notna(price) else np.nan})
+            pos_rows.extend(row_pos)
+
+        pos_df = pd.DataFrame(pos_rows)
+        # 汇总 NAV（以初始现金为 1.0 基准）
+        nav_rows = []
+        # 重新按日合计市值
+        total_by_day = pos_df.groupby("date").mkt_value.sum().reindex(cal, fill_value=0.0)
+        cash_series = pd.Series(index=cal, dtype=float)
+        # 重算现金轨迹（简单法：用总资产 - 持仓市值；初值 = init_cash）
+        # 为保持一致性，我们再做一遍逐日现金：
+        cash = float(self.get(pid).init_available or self.get(pid).init_cash)
+        holdings = {}
+        cost_basis = {}
+        deals_by_day = deals.groupby("exec_date")
+        for d in cal:
+            # 执行
+            for _, t in deals_by_day.get_group(d).iterrows() if d in deals_by_day.groups else []:
+                amt = t.qty * t.exec_price
+                fee = max(amt * (fee_buy if t.side == "BUY" else fee_sell), min_fee)
+                if t.side == "BUY":
+                    holdings[t.ts_code] = holdings.get(t.ts_code, 0) + int(t.qty)
+                    cash -= (amt + fee)
+                else:
+                    sell_qty = min(int(t.qty), holdings.get(t.ts_code, 0))
+                    holdings[t.ts_code] = holdings.get(t.ts_code, 0) - sell_qty
+                    amt_exec = sell_qty * t.exec_price
+                    fee_exec = amt_exec * fee_sell
+                    cash += (amt_exec - fee_exec)
+            cash_series.loc[d] = cash
+            nav = (cash + total_by_day.loc[d]) / float(self.get(pid).init_cash)
+            ret_d = nav_rows[-1]["nav"] if nav_rows else 1.0
+            dd = 0.0
+            if nav_rows:
+                prev = nav_rows[-1]["nav"]
+                ret_d = nav / prev - 1.0
+                max_nav = max([r["nav"] for r in nav_rows] + [nav])
+                dd = nav / max_nav - 1.0
+            nav_rows.append({"portfolio_id": pid, "date": d, "nav": float(nav), "ret_d": float(ret_d), "max_dd": float(dd), "cash": float(cash), "position_mv": float(total_by_day.loc[d])})
+
+        nav_df = pd.DataFrame(nav_rows)
+        self.write_positions(pid, pos_df)
+        self.write_nav(pid, nav_df)
+        return {"positions_path": self._positions_path(pid), "nav_path": self._nav_path(pid)}
+
 import indicators as ind
 import predict_core as pr
 from rule_editor import render_rule_editor
@@ -357,12 +940,6 @@ def _cached_trade_dates(base: str, adj: str):
 def se_progress_to_streamlit():
     if not _in_streamlit():
         # bare/子线程下：挂空回调，啥也不画，避免任何 st.* 调用
-        def _noop(*a, **k): 
-            pass
-        # 使用新的日志系统替代废弃的 set_progress_handler
-        from log_system import get_logger
-        logger = get_logger("scoring_core")
-        logger.info("使用新的日志系统进行进度跟踪")
         try:
             yield None, None, None
         finally:
@@ -413,12 +990,7 @@ def se_progress_to_streamlit():
         except _q.Empty:
             pass
 
-    # 使用新的日志系统并设置进度处理器
-    from log_system import get_logger
-    logger = get_logger("scoring_core")
-    logger.info("使用新的日志系统进行进度跟踪")
-    
-    # 关键：设置进度处理器，使评分系统能够发送进度事件
+    # 设置进度处理器，使评分系统能够发送进度事件
     _orig_drain = getattr(se, "drain_progress_events", None)
     se.set_progress_handler(_enqueue_handler)
     se.drain_progress_events = _drain  # 将"抽干"替换成主线程渲染
@@ -568,31 +1140,7 @@ def _get_latest_date_from_files() -> Optional[str]:
     return max(dates) if dates else None
 
 
-def _get_latest_date_from_database() -> Optional[str]:
-    """从数据库获取最新交易日"""
-    try:
-        from database_manager import get_latest_trade_date
-        latest = get_latest_trade_date()
-        if latest:
-            logger.info(f"从数据库获取最新交易日: {latest}")
-            return latest
-    except Exception as e:
-        logger.warning(f"从数据库获取最新交易日失败: {e}")
-    return None
-
-
-def _get_latest_date_from_daily_partition() -> Optional[str]:
-    """从daily分区获取最新交易日"""
-    try:
-        from database_manager import get_trade_dates
-        dates = get_trade_dates()
-        if dates:
-            latest = dates[-1]
-            logger.info(f"从daily分区获取最新交易日: {latest}")
-            return latest
-    except Exception as e:
-        logger.warning(f"从daily分区获取最新交易日失败: {e}")
-    return None
+# 函数已迁移到 utils.py，通过导入别名使用
 
 
 def _pick_smart_ref_date() -> Optional[str]:
@@ -670,7 +1218,7 @@ def _rule_to_screen_args(rule: dict):
     """返回 (when_expr, timeframe, window, scope)"""
     if rule.get("clauses"):
         tfs = {str(c.get("timeframe","D")).upper() for c in rule["clauses"]}
-        wins = {int(c.get("window", 60)) for c in rule["clauses"]}
+        wins = {int(c.get("score_windows", 60)) for c in rule["clauses"]}
         scopes = {str(c.get("scope","ANY")).upper() for c in rule["clauses"]}
         whens = [f"({c.get('when','').strip()})" for c in rule["clauses"] if c.get("when","").strip()]
         if not whens:
@@ -685,7 +1233,7 @@ def _rule_to_screen_args(rule: dict):
         if not when:
             raise ValueError("when 不能为空")
         tf = str(rule.get("timeframe","D")).upper()
-        win = int(rule.get("window", 60))
+        win = int(rule.get("score_windows", 60))
         scope = str(rule.get("scope","ANY")).upper()
         # --- substitute placeholders (K/M/N) for scope ---
         try:
@@ -1133,9 +1681,9 @@ def _resolve_pred_universe(label: str, ref: str) -> list[str]:
 
     elif label == "attention":
         try:
-            codes = se._load_attention_codes(ref) or []
+            codes = se._load_category_codes("strength", ref) or []
         except Exception:
-            # 退回按文件名找 “attention*<ref>.csv”
+            # 退回按文件名找 "attention*<ref>.csv"
             p = _find_attn_file_by_date(ref)  # 这个工具已在文件内定义
             if p:
                 df = _read_df(p, dtype={"ts_code": str})
@@ -1317,11 +1865,6 @@ class Stepper:
 def pred_progress_to_streamlit():
     if not _in_streamlit():
         # 非Streamlit环境回调
-        def _noop(*a, **k): pass
-        # 使用新的日志系统替代废弃的 set_progress_handler
-        from log_system import get_logger
-        logger = get_logger("predict_core")
-        logger.info("使用新的日志系统进行进度跟踪")
         try:
             yield None, None, None
         finally:
@@ -1369,10 +1912,6 @@ def pred_progress_to_streamlit():
         except _q.Empty:
             pass
 
-    # 使用新的日志系统替代废弃的 set_progress_handler
-    from log_system import get_logger
-    logger = get_logger("predict_core")
-    logger.info("使用新的日志系统进行进度跟踪")
     _orig_drain = getattr(pr, "drain_progress_events", None)
     pr.drain_progress_events = _drain  # 关键：把"抽干"替换成主线程渲染
 
@@ -2032,8 +2571,8 @@ if _in_streamlit():
                             if scope == "LAST":
                                 win = None  # scope: LAST 不需要 score_windows
                             else:
-                                # 获取回看窗口（优先使用 score_windows，如果没有则使用 window，最后使用默认值）
-                                win = int(r.get("score_windows") or r.get("window", 60))
+                                # 获取回看窗口
+                                win = int(r.get("score_windows", 60))
                             # 获取分数
                             points = float(r.get("points", 0))
                             # 获取前置门槛
@@ -2059,8 +2598,8 @@ if _in_streamlit():
                                     if c_scope == "LAST":
                                         clause_parts.append(f"{c_tf}/-/LAST")
                                     else:
-                                        # 优先使用 score_windows，如果没有则使用 window，最后使用默认值
-                                        c_win = int(c.get("score_windows") or c.get("window", 60))
+                                        # 获取窗口
+                                        c_win = int(c.get("score_windows", 60))
                                         clause_parts.append(f"{c_tf}/{c_win}/{c_scope}")
                                 if clause_parts:
                                     clauses_info = f"子句: {len(clauses)}个 ({', '.join(clause_parts)})"
@@ -2852,7 +3391,7 @@ if _in_streamlit():
                 days = _cached_trade_dates(DATA_ROOT, API_ADJ)
                 end = (date_end or (days[-1] if days else None))
                 if not end:
-                    st.error("未能确定结束日"); st.stop()
+                    st.error("未能确定结束日");
                 if end in days:
                     j = days.index(end)
                     start = days[max(0, j - int(win_n))]
@@ -2864,7 +3403,8 @@ if _in_streamlit():
                 w_map    = {"不加权": "none", "指数半衰": "exp", "线性最小值": "linear"}
 
                 # 3) 正确调用 scoring_core 接口
-                csv_path = se.build_attention_rank(
+                csv_path = se.build_category_rank(
+                    category_type="strength",
                     start=start, end=end, source=src,
                     min_hits=None, topN=int(out_n), write=True,
                     mode=mode_map[method], weight_mode=w_map[weight],
@@ -3034,7 +3574,7 @@ if _in_streamlit():
                 try:
                     days = _cached_trade_dates(DATA_ROOT, API_ADJ) or []
                     if not days:
-                        st.warning("无法获取交易日历。"); st.stop()
+                        st.warning("无法获取交易日历。");
                     # 观察日处理：若手填不在交易日里，取最近一个交易日
                     if not end_use or end_use not in days:
                         end_idx = len(days) - 1
@@ -3045,7 +3585,7 @@ if _in_streamlit():
                         end_idx = days.index(end_use)
                         end = end_use
                     if end_idx <= 0:
-                        st.info("观察日前没有更早交易日可统计。"); st.stop()
+                        st.info("观察日前没有更早交易日可统计。");
 
                     # 回看窗口（不含今天 end）
                     D = int(lookback_days)
@@ -3114,10 +3654,10 @@ if _in_streamlit():
                     if hit_mode == "与今天Top交集":
                         p_today = _path_top(end)
                         if not p_today.exists() or p_today.stat().st_size == 0:
-                            st.info(f"{end} 的 Top 文件不存在或为空。"); st.stop()
+                            st.info(f"{end} 的 Top 文件不存在或为空。");
                         df_today = _read_df(p_today, dtype={"ts_code": str})
                         if df_today is None or df_today.empty:
-                            st.info(f"{end} 的 Top 文件读取为空。"); st.stop()
+                            st.info(f"{end} 的 Top 文件读取为空。");
                         if "rank" not in df_today.columns:
                             df_today = df_today.reset_index(drop=True)
                             df_today["rank"] = np.arange(1, len(df_today) + 1)
@@ -3949,7 +4489,7 @@ if _in_streamlit():
     # ================== 组合模拟 / 持仓 ==================
     with tab_port:
         st.subheader("组合模拟 / 持仓")
-        from stats_core import PortfolioManager
+        # PortfolioManager 已在本文件中定义
         pm = PortfolioManager()
 
         # —— 全局配置（用于新建组合的默认值） ——
@@ -3988,7 +4528,7 @@ if _in_streamlit():
         with col2:
             st.markdown("**当前组合**")
             ports = pm.list_portfolios()
-                # st.stop()
+                #
             # 以 name 排序
             ports_items = sorted(list(ports.items()), key=lambda kv: kv[1].name) if ports else []
             if not ports_items:
@@ -4127,315 +4667,919 @@ if _in_streamlit():
     # ================== 统计（普通页签） ==================
     with tab_stats:
         st.subheader("统计")
-        sub_tabs = st.tabs(["跟踪（Tracking）", "异动（Surge）", "共性（Commonality）"])
+        sub_tabs = st.tabs(["排名跟踪", "涨幅榜", "策略触发统计"])
 
         # --- Tracking ---
         with sub_tabs[0]:
-            refT = st.text_input("参考日", value="", key="ref_1")
-            # 参考日/回看窗口的提示：告诉用户 t-n 是哪天
-            _back_choices = [1, 3, 5, 10, 20]
-            _hint_text, _n2d = _from_last_hints(_back_choices)
-            if _hint_text:
-                st.caption("按最新交易日回推： " + _hint_text)
+            st.markdown("**使用过去某一天的排名，跟踪至今的涨幅、最大涨幅、最大回撤**")
+            
+            # 获取可用的排名文件日期
+            available_dates = []
+            try:
+                all_files = sorted(ALL_DIR.glob("score_all_*.csv"))
+                if all_files:
+                    available_dates = [p.stem.replace("score_all_", "") for p in all_files]
+                    available_dates = sorted(available_dates, reverse=True)  # 最新的在前
+            except Exception:
+                pass
+            
+            if not available_dates:
+                st.warning("未找到可用的排名文件，请先在\"排名\"页签生成排名数据")
+            
+            
+            # 默认选择最老的日期（列表最后一个）
+            default_idx = len(available_dates) - 1
+            if "ref_tracking_selected" in st.session_state:
+                # 如果之前选择过，尝试保持选择
+                if st.session_state["ref_tracking_selected"] in available_dates:
+                    default_idx = available_dates.index(st.session_state["ref_tracking_selected"])
+            
+            refT = st.selectbox(
+                "参考日（选择要跟踪的排名日期）",
+                options=available_dates,
+                index=default_idx,
+                key="ref_tracking",
+                help=f"共 {len(available_dates)} 个可用日期"
+            )
+            
+            # 保存选择
+            st.session_state["ref_tracking_selected"] = refT
 
-            wins = st.text_input("未来收益窗口N（天，逗号分隔）", value="1,2,3,5,10,20")
-            bench = st.text_input("对比指数基准代码（逗号，可留空）", value="")
-            retrosT = st.text_input("附加回看天数", value="1,3,5")
-            only_detail = st.checkbox("仅导出明细（不显示均值/标准差/胜率/分位数汇总）", value=True)
-            gb_board = st.checkbox("分板块汇总", value=True)
-
-            # === 跟踪增强：前日排行 / 名单 / 指标是否触发 / 后续涨幅 ===
-            with st.expander("可选：选择要打勾的指标（来自打分规则；仅用于打勾，不影响样本）", expanded=True):
-                import scoring_core as se
-                # 规则名列表（去重）
+            if st.button("生成跟踪表", key="btn_run_tracking", width='stretch'):
+                
                 try:
-                    rule_names = [str(r.get("name") or f"RULE_{i}") for i, r in enumerate(getattr(se, "SC_RULES", []) or [])]
-                    rule_names = sorted(list(dict.fromkeys(rule_names)))
-                except Exception:
-                    rule_names = []
-                track_rule_names = st.multiselect("指标（可多选）", options=rule_names, default=[])
-                track_max_json = st.number_input("最多读取明细JSON（按当日排名排序）", min_value=50, max_value=5000, value=300, step=50, key="track_max_json")
-
-
-            if st.button("生成跟踪表（含前日排行/名单/指标勾选/后续涨幅）", key="btn_run_tracking", width='stretch'):
-                try:
-                    from stats_core import run_tracking
-                    import scoring_core as se
-                    # 1) 基础 tracking 明细
-                    wlist = [int(x) for x in wins.split(",") if x.strip().isdigit()]
-                    blist = [s.strip() for s in bench.split(",") if s.strip()] or None
-                    rlist = [int(x) for x in retrosT.split(",") if x.strip().isdigit()]
-                    tr2 = run_tracking(
-                        refT, wlist, benchmarks=blist, score_df=None,
-                        group_by_board=gb_board, save=True,
-                        retro_days=rlist, do_summary=(not only_detail)
+                    # 1) 读取参考日的排名数据
+                    rank_path = _path_all(refT)
+                    if not rank_path.exists():
+                        st.error(f"未找到参考日 {refT} 的排名文件：{rank_path}")
+                    
+                    
+                    df_rank = _read_df(rank_path, dtype={"ts_code": str})
+                    if df_rank.empty:
+                        st.error(f"参考日 {refT} 的排名文件为空")
+                    
+                    
+                    # 确保有 rank 列
+                    if "rank" not in df_rank.columns and "score" in df_rank.columns:
+                        df_rank = df_rank.sort_values(["score"], ascending=False).reset_index(drop=True)
+                        df_rank["rank"] = np.arange(1, len(df_rank) + 1)
+                    
+                    codes = df_rank["ts_code"].astype(str).unique().tolist()
+                    st.info(f"读取到 {len(codes)} 只股票的排名数据（参考日：{refT}）")
+                    
+                    # 2) 获取最新交易日
+                    latest_date = _get_latest_date_from_database()
+                    if not latest_date:
+                        st.error("无法获取最新交易日，请检查数据库连接")
+                    
+                    
+                    if latest_date <= refT:
+                        st.warning(f"最新交易日 {latest_date} 不晚于参考日 {refT}，无法计算跟踪数据")
+                    
+                    
+                    st.info(f"跟踪区间：{refT} → {latest_date}")
+                    
+                    # 3) 读取价格数据
+                    with st.spinner(f"正在读取 {len(codes)} 只股票的价格数据..."):
+                        # _read_stock_prices 已在本文件中定义
+                        df_prices = _read_stock_prices(codes, start=refT, end=latest_date)
+                    
+                    if df_prices.empty:
+                        st.error("无法读取价格数据，请检查数据库")
+                    
+                    
+                    # 4) 计算涨幅和回撤
+                    with st.spinner("正在计算涨幅和回撤..."):
+                        # 确保 ts_code 为字符串类型
+                        df_prices["ts_code"] = df_prices["ts_code"].astype(str)
+                        df_rank["ts_code"] = df_rank["ts_code"].astype(str)
+                        
+                        # 按 ts_code 和 trade_date 排序
+                        df_prices = df_prices.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+                        
+                        results = []
+                        
+                        # 按股票分组处理
+                        for code_str, group in df_prices.groupby("ts_code"):
+                            if group.empty:
+                                continue
+                            
+                            # 参考日收盘价
+                            ref_data = group[group["trade_date"] == refT]
+                            if ref_data.empty:
+                                continue
+                            ref_close = ref_data["close"].iloc[0]
+                            
+                            if pd.isna(ref_close) or ref_close <= 0:
+                                continue
+                            
+                            # 最新收盘价
+                            latest_data = group[group["trade_date"] == latest_date]
+                            if latest_data.empty:
+                                continue
+                            latest_close = latest_data["close"].iloc[0]
+                            
+                            if pd.isna(latest_close):
+                                continue
+                            
+                            # 至今涨幅
+                            ret_to_date = (latest_close / ref_close - 1.0) * 100.0
+                            
+                            # 最大涨幅和最大回撤
+                            # 计算每日相对参考日的收益率
+                            group["ret_vs_ref"] = (group["close"] / ref_close - 1.0) * 100.0
+                            
+                            max_ret = group["ret_vs_ref"].max()
+                            
+                            # 最大回撤：从最高点到最低点的跌幅
+                            # 先计算累计最高收益率
+                            group["cummax_ret"] = group["ret_vs_ref"].cummax()
+                            group["drawdown"] = group["ret_vs_ref"] - group["cummax_ret"]
+                            max_drawdown = group["drawdown"].min()
+                            
+                            # 获取排名信息
+                            rank_info = df_rank[df_rank["ts_code"] == code_str]
+                            rank_val = rank_info["rank"].iloc[0] if not rank_info.empty else None
+                            score_val = rank_info["score"].iloc[0] if not rank_info.empty and "score" in rank_info.columns else None
+                            j_val = rank_info["tiebreak_j"].iloc[0] if not rank_info.empty and "tiebreak_j" in rank_info.columns else None
+                            
+                            results.append({
+                                "ts_code": code_str,
+                                "rank": rank_val,
+                                "score": score_val,
+                                "J值": j_val,
+                                "至今涨幅": ret_to_date,
+                                "最大涨幅": max_ret,
+                                "最大回撤": max_drawdown
+                            })
+                        
+                        df_result = pd.DataFrame(results)
+                    
+                    if df_result.empty:
+                        st.warning("未能计算出任何跟踪数据")
+                    
+                    
+                    # 5) 格式化显示
+                    df_display = df_result.copy()
+                    
+                    # 格式化百分比列
+                    for col in ["至今涨幅", "最大涨幅", "最大回撤"]:
+                        if col in df_display.columns:
+                            df_display[col] = df_display[col].map(
+                                lambda x: f"{x:.2f}%" if pd.notna(x) else None
+                            )
+                    
+                    # 按排名排序
+                    df_display = df_display.sort_values("rank").reset_index(drop=True)
+                    
+                    # 选择要显示的列
+                    display_cols = ["rank", "ts_code", "至今涨幅", "最大涨幅", "最大回撤"]
+                    if "score" in df_display.columns:
+                        display_cols.insert(2, "score")
+                    if "J值" in df_display.columns:
+                        # J值放在score之后
+                        if "score" in display_cols:
+                            score_idx = display_cols.index("score")
+                            display_cols.insert(score_idx + 1, "J值")
+                        else:
+                            display_cols.insert(2, "J值")
+                    
+                    available_cols = [c for c in display_cols if c in df_display.columns]
+                    
+                    # 注意：use_container_width 已废弃，使用 width='stretch' 替代
+                    st.dataframe(
+                        df_display[available_cols],
+                        width='stretch',
+                        height=600
                     )
-                    detail = tr2.detail.copy()
-
-                    # 2) 合并前日 rank
-                    prev = _prev_ref_date(refT)
-                    if prev:
-                        df_prev = _read_df(_path_all(prev), usecols=["ts_code","rank"])
-                        if df_prev is not None and len(df_prev) > 0:
-                            df_prev = df_prev.rename(columns={"rank":"rank_tminus_1"})
-                            detail = detail.merge(df_prev, on="ts_code", how="left")
-
-                    # 3) 合并名单（白/黑/特别关注）
-                    try:
-                        whites = set(se._read_cache_list_codes(refT, "whitelist")) if hasattr(se, "_read_cache_list_codes") else set()
-                        blacks = set(se._read_cache_list_codes(refT, "blacklist")) if hasattr(se, "_read_cache_list_codes") else set()
-                        attns  = set(se._load_attention_codes(refT)) if hasattr(se, "_load_attention_codes") else set()
-                        detail["in_whitelist"] = detail["ts_code"].astype(str).map(lambda c: c in whites)
-                        detail["in_blacklist"] = detail["ts_code"].astype(str).map(lambda c: c in blacks)
-                        detail["in_attention"] = detail["ts_code"].astype(str).map(lambda c: c in attns)
-                    except Exception:
-                        for c in ("in_whitelist","in_blacklist","in_attention"):
-                            detail[c] = False
-
-                    # 4) 指标是否触发（来自排名规则）
-                    try:
-                        import scoring_core as se
-                        sel_rules = track_rule_names if isinstance(track_rule_names, list) else []
-                        hit_cols = [f"hit:{name}" for name in sel_rules]
-                        for col in hit_cols:
-                            detail[col] = False
-                        if sel_rules:
-                            pick_n = int(track_max_json) if "track_max_json" in locals() else 300
-                            head_codes = detail.sort_values(["rank"]).head(pick_n)["ts_code"].astype(str).tolist()
-                            def _read_hits_one(ts):
-                                obj = _load_detail_json(str(refT), str(ts))
-                                res = {}
-                                if not obj:
-                                    return res
-                                rules = obj.get("rules") or []
-                                for rr in rules:
-                                    nm = str(rr.get("name") or "")
-                                    if nm in sel_rules:
-                                        res[nm] = bool(rr.get("ok", False))
-                                return res
-                            for ts in head_codes:
-                                hits_map = _read_hits_one(ts)
-                                for nm in sel_rules:
-                                    col = f"hit:{nm}"
-                                    if nm in hits_map:
-                                        detail.loc[detail["ts_code"].astype(str) == ts, col] = bool(hits_map[nm])
-                    except Exception:
-                        pass
-
-                    # 5) 展示所需列
-                    show_cols = [c for c in [
-                        "ts_code","rank","rank_tminus_1",
-                        "in_whitelist","in_blacklist","in_attention",
-                        *[c for c in detail.columns if str(c).startswith("hit:")],
-                        *[c for c in detail.columns if c.startswith("ret_fwd_")]
-                    ] if c in detail.columns]
-                    detail_fmt2 = _fmt_retcols_percent(detail)
-                    st.dataframe(detail_fmt2[show_cols].sort_values(["rank"]).reset_index(drop=True),
-                                width='stretch', height=460)
-                    st.caption("ret_fwd_N = 未来 N 日涨幅（Tracking 已计算）；名单列来自 cache/attention；hit:<规则名> 为所选排名规则在参考日是否触发。")
+                    
+                    st.caption(f"跟踪结果：参考日 {refT} 的排名，跟踪至 {latest_date}。涨幅和回撤均为百分比。")
+                    
+                    # 显示统计信息
+                    with st.expander("统计摘要", expanded=False):
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            avg_ret = df_result["至今涨幅"].mean()
+                            st.metric("平均至今涨幅", f"{avg_ret:.2f}%")
+                        with col2:
+                            avg_max_ret = df_result["最大涨幅"].mean()
+                            st.metric("平均最大涨幅", f"{avg_max_ret:.2f}%")
+                        with col3:
+                            avg_dd = df_result["最大回撤"].mean()
+                            st.metric("平均最大回撤", f"{avg_dd:.2f}%")
+                        
+                        # 正收益比例
+                        positive_ratio = (df_result["至今涨幅"] > 0).sum() / len(df_result) * 100
+                        st.metric("正收益比例", f"{positive_ratio:.1f}%")
+                    
                 except Exception as e:
                     st.error(f"生成失败：{e}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
         # --- Surge ---
         with sub_tabs[1]:
-            refS = st.text_input("参考日", value=_get_latest_date_from_files() or "", key="surge_ref")
-            mode = st.selectbox("榜单口径", ["today","rolling"], index=1, key="surge_mode")
-            rolling_days = st.number_input("rolling模式统计天数", min_value=2, max_value=20, value=5, key="surge_rolling")
-            sel_type = st.selectbox("选样", ["top_n","top_pct"], index=0, key="surge_sel_type")
-            sel_val = st.number_input("阈值（N或%）", min_value=1, max_value=1000, value=200, key="surge_sel_val")
-            retros = st.text_input("回看天数集合（逗号）", value="1,2,3,4,5", key="surge_retros")
-            split_label = st.selectbox("分组口径", ["600/000/科创北(3组)", "主vs其他", "各板块"], index=0, key="surge_split_label")
-            split = {"600/000/科创北(3组)":"combo3", "主vs其他":"main_vs_others", "各板块":"per_board"}[split_label]
+            st.markdown("**按最近n日涨幅排序，区分不同市场**")
+            
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                refS = st.text_input("参考日（YYYYMMDD，留空=最新交易日）", value="", key="surge_ref",
+                                    help="计算涨幅的截止日期")
+            with col2:
+                n_days = st.number_input("最近N日", min_value=1, max_value=60, value=5, key="surge_n_days",
+                                        help="计算最近N日的累计涨幅")
+            
+            # 显示最新交易日
+            latest_date_hint = _get_latest_date_from_database()
+            if latest_date_hint:
+                st.caption(f"最新交易日：{latest_date_hint}")
 
-            with st.expander("可选：对当日样本按规则打勾（来自排名规则）", expanded=False):
-                import scoring_core as se
+            if st.button("生成涨幅榜", key="btn_run_surge", width='stretch'):
                 try:
-                    rule_names = [str(r.get("name") or f"RULE_{i}") for i, r in enumerate(getattr(se, "SC_RULES", []) or [])]
-                    rule_names = sorted(list(dict.fromkeys(rule_names)))
-                except Exception:
-                    rule_names = []
-                surge_rule_names = st.multiselect("指标（可多选）", options=rule_names, default=[] if rule_names else [], key="surge_rule_names")
-                surge_max_json = st.number_input("最多读取明细JSON（仅对样本内股票）", min_value=50, max_value=5000, value=100, step=50, key="surge_max_json")
-
-            if st.button("运行 Surge", key="btn_run_surge", width='stretch'):
-                with st.spinner("生成 Surge 榜单中…"):
-                    try:
-                        from stats_core import run_surge
-                        rlist = [int(x) for x in (retros or "").split(",") if x.strip().isdigit()]
-                        sr = run_surge(
-                            ref_date=str(refS).strip(),
-                            mode=mode,
-                            rolling_days=int(rolling_days),
-                            selection={"type": sel_type, "value": int(sel_val)},
-                            retro_days=rlist,
-                            split=split,
-                            score_df=None,
-                            save=True,
-                        )
-                        table = sr.table.copy()
-
-                        # 命中打勾（可选）
-                        if surge_rule_names:
-                            codes2 = table["ts_code"].astype(str).unique().tolist()
-                            if mode == "today":
-                                obs_date = _prev_trade_date(str(refS), 1)  # t-1
-                            else:
-                                first_date = _pick_trade_dates(str(refS), int(rolling_days))[0]  # t-K
-                                obs_date = _prev_trade_date(first_date, 1)                      # t-K-1
-                            st.caption(f"命中口径：使用『{obs_date}』的 details 作为“启动前”判断。")
-
-                            # 预创建列
-                            for nm in surge_rule_names:
-                                table[f"hit:{nm}"] = False
-
-                            # 读取 JSON（限额）
-                            for ts in codes2[:int(surge_max_json)]:
-                                obj = _load_detail_json(str(obs_date), str(ts)) or {}
-                                rules = obj.get("rules") or []
-                                hits_map = {
-                                    str(rr.get("name") or ""): (
-                                        # 只要策略触发（ok=True），就视为命中，无需检查add字段
-                                        # 或者add>0也视为命中（兼容原有逻辑）
-                                        bool(rr.get("ok")) 
-                                        or (rr.get("add") is not None and float(rr.get("add", 0.0)) > 0.0)
-                                    )
-                                    for rr in rules
-                                }
-                                for nm in surge_rule_names:
-                                    col = f"hit:{nm}"
-                                    if nm in hits_map:
-                                        table.loc[table["ts_code"].astype(str) == ts, col] = bool(hits_map[nm])
-
-                    except Exception as e:
-                        st.error(f"Surge 失败：{e}")
+                    # 1) 确定参考日
+                    if not refS or not refS.strip():
+                        refS = _get_latest_date_from_database()
+                        if not refS:
+                            st.error("无法获取最新交易日，请手动输入参考日")
+                        
                     else:
-                        table_fmt = _fmt_retcols_percent(table)
-                        st.dataframe(table_fmt, width='stretch', height=420)
-                        st.caption("各分组文件已写入 output/surge_lists/<ref>/ 。")
-
-        
-        # --- Commonality ---
-        with sub_tabs[2]:
-            refC = st.text_input("参考日", value=_get_latest_date_from_files() or "", key="common_ref")
-            retrosC = st.text_input("统计前 n 日集合（观察日前移 d，逗号）", value="1,3,5")
-            modeC = st.selectbox("模式", ["rolling","today"], index=0, key="mode_2")
-            rollingC = st.number_input("rolling 天数", min_value=2, max_value=20, value=5, key="rolling_2")
-            selC = st.number_input("样本 Top-N", min_value=10, max_value=1000, value=200)
-            splitC = st.selectbox("分组口径", ["main_vs_others","per_board"], index=0, key="split_2")
-            bg = st.selectbox("背景集", ["all","same_group"], index=0)
-            countStrat = st.checkbox("统计每个策略的触发次数（策略分析）", value=True)
-            scopeC = st.selectbox("触发统计范围", ["仅样本(大涨)","同组全体","两者对比"], index=0, help="仅样本：只看大涨票；同组全体：样本+同组非样本；两者对比：同时输出两个口径")
-            w_en = st.checkbox("对大涨样本加权（用于“同组全体/两者对比”口径）", value=False)
-            w_pos = st.slider("样本权重", min_value=1.0, max_value=5.0, value=2.0, step=0.5, help="仅在“同组全体/两者对比”下生效")
-
-            if st.button("运行 Commonality", width='stretch'):
-                try:
-                    from stats_core import run_commonality
-                    rlist = [int(x) for x in retrosC.split(",") if x.strip().isdigit()]
-                    cr = run_commonality(
-                        ref_date=refC,
-                        retro_day=(rlist[0] if rlist else 1),
-                        retro_days=rlist,
-                        mode=modeC,
-                        rolling_days=int(rollingC),
-                        selection={"type":"top_n","value":int(selC)},
-                        split=splitC,
-                        background=bg,
-                        save=True,
-                        count_strategy=countStrat,
-                        count_strategy_scope=("pos" if scopeC=="仅样本(大涨)" else ("group" if scopeC=="同组全体" else "both")),
-                        strategy_pos_weight=(float(w_pos) if w_en else 1.0),
+                        refS = refS.strip()
+                    
+                    st.info(f"参考日：{refS}，计算最近 {n_days} 日涨幅")
+                    
+                    # 2) 获取股票列表（优先从最新排名文件读取，否则从数据库获取）
+                    codes = []
+                    try:
+                        # 尝试从最新排名文件读取
+                        latest_rank_file = _get_latest_date_from_files()
+                        if latest_rank_file:
+                            rank_path = _path_all(latest_rank_file)
+                            if rank_path.exists():
+                                df_rank = _read_df(rank_path, dtype={"ts_code": str})
+                                if not df_rank.empty and "ts_code" in df_rank.columns:
+                                    codes = df_rank["ts_code"].astype(str).unique().tolist()
+                                    st.info(f"从排名文件读取到 {len(codes)} 只股票")
+                    except Exception:
+                        pass
+                    
+                    # 如果从排名文件读取失败，从数据库获取
+                    if not codes:
+                        with st.spinner("正在获取全市场股票列表..."):
+                            try:
+                                codes = get_stock_list(adj_type="qfq")
+                                if codes:
+                                    st.info(f"从数据库获取到 {len(codes)} 只股票")
+                            except Exception as e:
+                                st.error(f"获取股票列表失败：{e}")
+                            
+                    
+                    if not codes:
+                        st.error("无法获取股票列表")
+                    
+                    
+                    # 3) 计算起始日期
+                    # _pick_trade_dates 已在本文件中定义
+                    dates = _pick_trade_dates(refS, n_days)
+                    if not dates or len(dates) < 2:
+                        st.error(f"无法获取足够的交易日（需要至少2个交易日）")
+                    
+                    
+                    start_date = dates[0]  # 最早日期
+                    end_date = dates[-1]   # 参考日
+                    
+                    st.info(f"计算区间：{start_date} → {end_date}（共 {len(dates)} 个交易日）")
+                    
+                    # 4) 读取价格数据
+                    with st.spinner(f"正在读取 {len(codes)} 只股票的价格数据..."):
+                        # _read_stock_prices 已在本文件中定义
+                        df_prices = _read_stock_prices(codes, start=start_date, end=end_date)
+                    
+                    if df_prices.empty:
+                        st.error("无法读取价格数据，请检查数据库")
+                    
+                    
+                    # 5) 计算涨幅
+                    with st.spinner("正在计算涨幅..."):
+                        df_prices["ts_code"] = df_prices["ts_code"].astype(str)
+                        df_prices = df_prices.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+                        
+                        results = []
+                        
+                        # 按股票分组计算涨幅
+                        for code_str, group in df_prices.groupby("ts_code"):
+                            if group.empty:
+                                continue
+                            
+                            # 起始日收盘价
+                            start_data = group[group["trade_date"] == start_date]
+                            if start_data.empty:
+                                continue
+                            start_close = start_data["close"].iloc[0]
+                            
+                            if pd.isna(start_close) or start_close <= 0:
+                                continue
+                            
+                            # 结束日收盘价
+                            end_data = group[group["trade_date"] == end_date]
+                            if end_data.empty:
+                                continue
+                            end_close = end_data["close"].iloc[0]
+                            
+                            if pd.isna(end_close):
+                                continue
+                            
+                            # 计算涨幅
+                            ret = (end_close / start_close - 1.0) * 100.0
+                            
+                            # 获取市场标签
+                            market = market_label(code_str)
+                            
+                            results.append({
+                                "ts_code": code_str,
+                                "市场": market,
+                                f"{n_days}日涨幅": ret
+                            })
+                        
+                        df_result = pd.DataFrame(results)
+                    
+                    if df_result.empty:
+                        st.warning("未能计算出任何涨幅数据")
+                    
+                    
+                    # 6) 按市场分组并排序
+                    df_result = df_result.sort_values(["市场", f"{n_days}日涨幅"], ascending=[True, False]).reset_index(drop=True)
+                    
+                    # 添加市场内排名
+                    df_result["市场内排名"] = df_result.groupby("市场")[f"{n_days}日涨幅"].rank(ascending=False, method="min").astype(int)
+                    
+                    # 7) 格式化显示
+                    df_display = df_result.copy()
+                    
+                    # 格式化涨幅列
+                    df_display[f"{n_days}日涨幅"] = df_display[f"{n_days}日涨幅"].map(
+                        lambda x: f"{x:.2f}%" if pd.notna(x) else None
                     )
-
-                    if countStrat:
-                        trig = None
-                        if isinstance(cr.reports, dict):
-                            trig = cr.reports.get("strategy_triggers")
-                            if trig is None:
-                                ks = [k for k in cr.reports if str(k).startswith("strategy_triggers__")]
-                                if ks:
-                                    trig = pd.concat([cr.reports[k] for k in ks if hasattr(cr.reports[k], "copy")], ignore_index=True, sort=False)
-                        if isinstance(trig, pd.DataFrame) and not trig.empty:
-                            if "trigger_count" not in trig.columns:
-                                for alt in ("count","n","num"):
-                                    if alt in trig.columns:
-                                        trig = trig.rename(columns={alt: "trigger_count"})
-                                        break
-                                else:
-                                    trig["trigger_count"] = 0
-                            order_cols = [c for c in ["obs_date","scope","trigger_weighted","trigger_count","name"] if c in trig.columns]
-                            if order_cols:
-                                trig = trig.sort_values(order_cols, ascending=[True, True, False, False, True][:len(order_cols)])
-                            st.dataframe(trig, width='stretch', height=420)
-
-                            # —— 对比视图 ——
-                            show_pivot = st.checkbox("按组/口径对比（透视表）", value=True)
-                            if show_pivot:
-                                
-                                # 指标映射：改成「英文 -> 中文」更稳
-                                _metric_map = {
-                                    "trigger_count": "触发次数",
-                                    "coverage": "覆盖率",
-                                    "trigger_weighted": "加权触发次数",
-                                    "coverage_weighted": "加权覆盖率",
-                                }
-                                options_en = [en for en in _metric_map if en in trig.columns]
-
-                                # —— 持久化当前选择（按英文列名）——
-                                _pref_key = "pivot_metric_en"
-                                default_en = "coverage_weighted" if "coverage_weighted" in options_en else (options_en[0] if options_en else None)
-                                if default_en is not None:
-                                    if _pref_key not in st.session_state or st.session_state[_pref_key] not in options_en:
-                                        st.session_state[_pref_key] = default_en
-
-                                # 选择框：显示中文，值为英文
-                                metric_en = st.selectbox(
-                                    "选择对比指标",
-                                    options_en,
-                                    key=_pref_key,
-                                    format_func=lambda en: _metric_map.get(en, en),
-                                )
-
-                                # 后续用 metric_en 直接做透视；若需要中文名可用：
-                                pick_metric_cn = _metric_map.get(metric_en, metric_en)
-                                pick_metric = metric_en
-
-                                scopes_avail = sorted(trig["scope"].dropna().unique().tolist()) if "scope" in trig.columns else []
-                                scope_pick = st.selectbox("选择口径", options=(scopes_avail or ["pos"]), index=0, key="pivot_scope")
-                                dfp = trig.copy()
-                                if "scope" in dfp.columns and scope_pick in scopes_avail:
-                                    dfp = dfp[dfp["scope"]==scope_pick]
-                                if "group" in dfp.columns:
-                                    pv = dfp.pivot_table(index="name", columns="group", values=pick_metric, aggfunc="max")
-                                    st.dataframe(pv, width='stretch', height=420)
-
-                        # —— 每票命中条数分布 ——
-                        ks_hist_single = [k for k in (cr.reports.keys() if isinstance(cr.reports, dict) else []) if str(k).startswith("hits_histogram_single__")]
-                        ks_hist_each   = [k for k in (cr.reports.keys() if isinstance(cr.reports, dict) else []) if str(k).startswith("hits_histogram_each__")]
-                        if ks_hist_single:
-                            st.markdown("**单次型（ANY/LAST 等）命中条数分布**")
-                            hist_single = pd.concat([cr.reports[k] for k in ks_hist_single], ignore_index=True, sort=False)
-                            scopes_hist = sorted(hist_single["scope"].dropna().unique().tolist()) if "scope" in hist_single.columns else []
-                            scope_show = st.selectbox("选择口径（单次型）", options=(scopes_hist or ["pos"]), index=0, key="hist_scope_single")
-                            show = hist_single[hist_single["scope"]==scope_show] if scopes_hist else hist_single
-                            if not show.empty:
-                                pv2 = show.pivot_table(index="n_single_rules_hit", columns="group", values="ratio", aggfunc="max")
-                                st.dataframe(pv2, width='stretch', height=280)
-                        if ks_hist_each:
-                            st.markdown("**多次型（EACH）命中条数分布**")
-                            hist_each = pd.concat([cr.reports[k] for k in ks_hist_each], ignore_index=True, sort=False)
-                            scopes_hist2 = sorted(hist_each["scope"].dropna().unique().tolist()) if "scope" in hist_each.columns else []
-                            scope_show2 = st.selectbox("选择口径（多次型）", options=(scopes_hist2 or ["pos"]), index=0, key="hist_scope_each")
-                            show2 = hist_each[hist_each["scope"]==scope_show2] if scopes_hist2 else hist_each
-                            if not show2.empty:
-                                pv3 = show2.pivot_table(index="n_each_rules_hit", columns="group", values="ratio", aggfunc="max")
-                                st.dataframe(pv3, width='stretch', height=280)
-
-
-                    st.caption("分析集/报告已写入 output/commonality/<ref>/ （包括 strategy_triggers__*.parquet, hits_by_stock__*.parquet, hits_histogram__*.parquet）。")
-
+                    
+                    # 选择要显示的列
+                    display_cols = ["市场", "市场内排名", "ts_code", f"{n_days}日涨幅"]
+                    available_cols = [c for c in display_cols if c in df_display.columns]
+                    
+                    # 按市场分组展示
+                    markets = df_display["市场"].unique()
+                    # 自定义排序：沪深主板放最前，其他按字母顺序
+                    market_order = ["沪A", "深A", "创业板", "科创板", "北交所", "其他"]
+                    markets_sorted = sorted(markets, key=lambda x: (
+                        market_order.index(x) if x in market_order else len(market_order)
+                    ))
+                    
+                    for market in markets_sorted:
+                        market_df = df_display[df_display["市场"] == market].head(100)  # 每个市场最多显示100只
+                        if not market_df.empty:
+                            st.subheader(f"{market}（共 {len(df_display[df_display['市场'] == market])} 只，显示前100）")
+                            # 注意：use_container_width 已废弃，使用 width='stretch' 替代
+                            st.dataframe(
+                                market_df[available_cols],
+                                width='stretch',
+                                height=400
+                            )
+                    
+                    st.caption(f"涨幅榜：参考日 {refS}，最近 {n_days} 日涨幅。按市场分组，市场内按涨幅降序排列。")
+                    
+                    # 显示统计信息
+                    with st.expander("市场统计摘要", expanded=False):
+                        market_stats = []
+                        for market in markets_sorted:
+                            market_data = df_result[df_result["市场"] == market]
+                            if not market_data.empty:
+                                market_stats.append({
+                                    "市场": market,
+                                    "股票数": len(market_data),
+                                    "平均涨幅": market_data[f"{n_days}日涨幅"].mean(),
+                                    "最大涨幅": market_data[f"{n_days}日涨幅"].max(),
+                                    "最小涨幅": market_data[f"{n_days}日涨幅"].min(),
+                                    "正收益数": (market_data[f"{n_days}日涨幅"] > 0).sum(),
+                                    "正收益比例": (market_data[f"{n_days}日涨幅"] > 0).sum() / len(market_data) * 100
+                                })
+                        
+                        if market_stats:
+                            df_stats = pd.DataFrame(market_stats)
+                            # 格式化百分比
+                            for col in ["平均涨幅", "最大涨幅", "最小涨幅"]:
+                                if col in df_stats.columns:
+                                    df_stats[col] = df_stats[col].map(lambda x: f"{x:.2f}%" if pd.notna(x) else None)
+                            df_stats["正收益比例"] = df_stats["正收益比例"].map(lambda x: f"{x:.1f}%" if pd.notna(x) else None)
+                            
+                            # 注意：use_container_width 已废弃，使用 width='stretch' 替代
+                            st.dataframe(df_stats, width='stretch')
+                    
                 except Exception as e:
-                    st.error(f"Commonality 失败：{e}")
+                    st.error(f"生成失败：{e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+        # --- 策略触发统计 ---
+        with sub_tabs[2]:
+            st.markdown("**统计参考日、区间内的策略触发情况，以及触发的后续跟踪**")
+            
+            # 获取可用的详情日期
+            available_detail_dates = []
+            try:
+                # 尝试从数据库获取
+                from database_manager import query_details_recent_dates
+                db_path = get_details_db_path_with_fallback()
+                if db_path and is_details_db_available():
+                    dates_from_db = query_details_recent_dates(365, db_path)  # 获取最近一年的日期
+                    if dates_from_db:
+                        available_detail_dates = sorted(dates_from_db, reverse=True)
+            except Exception:
+                pass
+            
+            # 如果数据库没有，尝试从文件系统获取
+            if not available_detail_dates:
+                try:
+                    det_dirs = sorted([p for p in DET_DIR.glob("*") if p.is_dir()], reverse=True)
+                    available_detail_dates = [p.name for p in det_dirs if _is_valid_date(p.name)]
+                except Exception:
+                    pass
+            
+            if not available_detail_dates:
+                st.warning("未找到可用的详情数据，请先在\"排名\"页签生成评分数据")
+            else:
+                # 参数设置
+                col1, col2, col3 = st.columns([1, 1, 1])
+                with col1:
+                    # 默认选择最新的日期
+                    default_idx = 0
+                    if "strategy_ref_date_selected" in st.session_state:
+                        if st.session_state["strategy_ref_date_selected"] in available_detail_dates:
+                            default_idx = available_detail_dates.index(st.session_state["strategy_ref_date_selected"])
+                    
+                    ref_date_strategy = st.selectbox(
+                        "参考日（起始日期）",
+                        options=available_detail_dates,
+                        index=default_idx,
+                        key="strategy_ref_date",
+                        help=f"共 {len(available_detail_dates)} 个可用日期"
+                    )
+                    st.session_state["strategy_ref_date_selected"] = ref_date_strategy
+                
+                with col2:
+                    # 区间长度（交易日数）
+                    interval_days = st.number_input(
+                        "区间长度（交易日数）",
+                        min_value=1,
+                        max_value=60,
+                        value=5,
+                        key="strategy_interval_days",
+                        help="统计从参考日开始的N个交易日内的策略触发情况"
+                    )
+                
+                with col3:
+                    # 跟踪天数
+                    track_days = st.number_input(
+                        "后续跟踪天数",
+                        min_value=1,
+                        max_value=30,
+                        value=10,
+                        key="strategy_track_days",
+                        help="跟踪触发策略的股票在后续N个交易日的表现"
+                    )
+                
+                # 样本选择
+                sample_choice = st.selectbox(
+                    "统计样本",
+                    ["全市场", "仅Top-K", "仅白名单", "仅黑名单"],
+                    index=0,
+                    key="strategy_sample_choice",
+                    help="选择要统计的股票范围"
+                )
+                
+                topk_value = None
+                if sample_choice == "仅Top-K":
+                    topk_value = st.number_input(
+                        "Top-K值",
+                        min_value=1,
+                        max_value=500,
+                        value=50,
+                        key="strategy_topk"
+                    )
+                
+                if st.button("生成策略触发统计", key="btn_run_strategy_stats", width='stretch'):
+                    try:
+                        with st.spinner("正在统计策略触发情况..."):
+                            # 1) 获取样本股票列表
+                            codes_sample = []
+                            if sample_choice == "全市场":
+                                codes_sample = get_stock_list(adj_type="qfq")
+                            elif sample_choice == "仅Top-K":
+                                # 从排名文件读取Top-K
+                                rank_path = _path_all(ref_date_strategy)
+                                if rank_path.exists():
+                                    df_rank = _read_df(rank_path, dtype={"ts_code": str})
+                                    if not df_rank.empty:
+                                        df_rank = df_rank.sort_values("score", ascending=False).head(topk_value)
+                                        codes_sample = df_rank["ts_code"].astype(str).tolist()
+                                if not codes_sample:
+                                    st.error(f"无法从排名文件读取Top-{topk_value}股票")
+                            elif sample_choice == "仅白名单":
+                                from config import SC_WHITELIST
+                                codes_sample = SC_WHITELIST if SC_WHITELIST else []
+                            elif sample_choice == "仅黑名单":
+                                from config import SC_BLACKLIST
+                                codes_sample = SC_BLACKLIST if SC_BLACKLIST else []
+                            
+                            if not codes_sample:
+                                st.error("无法获取样本股票列表")
+                            
+                            # 2) 获取区间内的所有交易日（从参考日开始往后推N个交易日）
+                            all_trade_dates_list = get_trade_dates() or []
+                            if not all_trade_dates_list:
+                                st.error("无法获取交易日列表")
+                            else:
+                                # 找到参考日在交易日列表中的位置
+                                try:
+                                    ref_idx = all_trade_dates_list.index(ref_date_strategy)
+                                    # 从参考日开始，往后取 interval_days 个交易日（包含参考日）
+                                    end_idx = min(ref_idx + interval_days, len(all_trade_dates_list))
+                                    interval_dates = all_trade_dates_list[ref_idx:end_idx]
+                                except ValueError:
+                                    st.error(f"参考日 {ref_date_strategy} 不在交易日列表中")
+                                    interval_dates = []
+                            
+                            if not interval_dates or len(interval_dates) < 1:
+                                st.error(f"无法获取足够的交易日（参考日：{ref_date_strategy}）")
+                            else:
+                                st.info(f"统计区间：{interval_dates[0]} 至 {interval_dates[-1]}（共 {len(interval_dates)} 个交易日）")
+                                st.info(f"样本股票数：{len(codes_sample)}")
+                            
+                            # 3) 统计每个交易日的策略触发情况
+                            # _count_strategy_triggers 已在本文件中定义
+                            
+                            all_trigger_stats = []
+                            strategy_stocks_map = {}  # 策略名 -> 触发该策略的股票集合（按日期）
+                            
+                            # 调试信息：检查详情数据来源
+                            debug_info = []
+                            
+                            for obs_date in interval_dates:
+                                # 先尝试从数据库读取
+                                df_triggers = None
+                                db_path = get_details_db_path_with_fallback()
+                                
+                                if db_path and is_details_db_available():
+                                    try:
+                                        from database_manager import get_database_manager
+                                        manager = get_database_manager()
+                                        sql = "SELECT ts_code, rules FROM stock_details WHERE ref_date = ?"
+                                        df_details = manager.execute_sync_query(db_path, sql, [obs_date], timeout=30.0)
+                                        
+                                        if not df_details.empty:
+                                            # 从数据库数据构建触发统计
+                                            codes_set = set(str(c) for c in codes_sample)
+                                            acc_set = {}  # 策略名 -> 触发股票集合
+                                            
+                                            for _, detail_row in df_details.iterrows():
+                                                ts = str(detail_row["ts_code"])
+                                                if codes_set and ts not in codes_set:
+                                                    continue
+                                                try:
+                                                    # 解析 rules 字段：优先 json.loads，失败则 ast.literal_eval，最后保证是 list[dict]
+                                                    rules_raw = detail_row.get("rules")
+                                                    rules = []
+                                                    if rules_raw:
+                                                        if isinstance(rules_raw, str):
+                                                            try:
+                                                                rules = json.loads(rules_raw)
+                                                            except Exception:
+                                                                try:
+                                                                    import ast
+                                                                    rules = ast.literal_eval(rules_raw)
+                                                                except Exception:
+                                                                    rules = []
+                                                        elif isinstance(rules_raw, list):
+                                                            rules = rules_raw
+                                                    
+                                                    # 确保 rules 是 list[dict] 格式
+                                                    if not isinstance(rules, list):
+                                                        rules = []
+                                                    
+                                                    # 处理规则列表（可能是 per_rules 或 rules）
+                                                    for r in rules:
+                                                        if not isinstance(r, dict):
+                                                            continue
+                                                        name = str(r.get("name") or "")
+                                                        if not name:
+                                                            continue
+                                                        ok = bool(r.get("ok"))
+                                                        hd = str(r.get("hit_date") or "")
+                                                        hds = [str(x) for x in (r.get("hit_dates") or [])]
+                                                        trig = ok or (hd == str(obs_date)) or (str(obs_date) in hds)
+                                                        if trig:
+                                                            acc_set.setdefault(name, set()).add(ts)
+                                                except Exception:
+                                                    continue
+                                            
+                                            # 构建DataFrame
+                                            if acc_set:
+                                                rows = []
+                                                n_sample = len(codes_set) if codes_set else 0
+                                                for name, stocks_set in acc_set.items():
+                                                    cnt = int(len(stocks_set))
+                                                    cov = (cnt / n_sample if n_sample else 0.0)
+                                                    rows.append({
+                                                        "name": name,
+                                                        "trigger_count": cnt,
+                                                        "n_sample": int(n_sample),
+                                                        "coverage": cov,
+                                                        "trigger_weighted": float(cnt),
+                                                        "sample_weight": float(n_sample),
+                                                        "coverage_weighted": cov,
+                                                    })
+                                                
+                                                if rows:
+                                                    df_triggers = pd.DataFrame(rows, columns=["name","trigger_count","n_sample","coverage","trigger_weighted","sample_weight","coverage_weighted"])
+                                                    df_triggers = df_triggers.sort_values(["trigger_count", "name"], ascending=[False, True]).reset_index(drop=True)
+                                                    debug_info.append(f"{obs_date}: 从数据库读取，找到 {len(df_details)} 条记录，{len(rows)} 个策略触发")
+                                                else:
+                                                    debug_info.append(f"{obs_date}: 从数据库读取，找到 {len(df_details)} 条记录，但无策略触发")
+                                            else:
+                                                debug_info.append(f"{obs_date}: 从数据库读取，找到 {len(df_details)} 条记录，但无策略触发")
+                                        else:
+                                            debug_info.append(f"{obs_date}: 数据库中没有该日期的详情数据")
+                                    except Exception as e:
+                                        debug_info.append(f"{obs_date}: 数据库读取失败: {e}")
+                                
+                                # 如果数据库读取失败，尝试从文件系统读取
+                                if df_triggers is None or df_triggers.empty:
+                                    df_triggers = _count_strategy_triggers(obs_date, codes_sample)
+                                    if not df_triggers.empty:
+                                        debug_info.append(f"{obs_date}: 从文件系统读取，找到策略触发")
+                                    else:
+                                        # 检查文件是否存在
+                                        ddir = Path("output/score/details") / str(obs_date)
+                                        if ddir.exists():
+                                            file_count = len(list(ddir.glob("*.json")))
+                                            debug_info.append(f"{obs_date}: 文件系统目录存在，有 {file_count} 个JSON文件，但无策略触发")
+                                        else:
+                                            debug_info.append(f"{obs_date}: 文件系统目录不存在")
+                                
+                                if not df_triggers.empty:
+                                    df_triggers["obs_date"] = obs_date
+                                    all_trigger_stats.append(df_triggers)
+                                    
+                                    # 记录每个策略触发的股票（从详情数据中读取）
+                                    for _, row in df_triggers.iterrows():
+                                        strategy_name = row["name"]
+                                        triggered_stocks = set()
+                                        
+                                        # 优先从数据库读取，失败则从文件系统读取
+                                        try:
+                                            # 尝试从数据库读取
+                                            db_path = get_details_db_path_with_fallback()
+                                            if db_path and is_details_db_available():
+                                                from database_manager import get_database_manager
+                                                manager = get_database_manager()
+                                                sql = "SELECT ts_code, rules FROM stock_details WHERE ref_date = ?"
+                                                df_details = manager.execute_sync_query(db_path, sql, [obs_date], timeout=30.0)
+                                                
+                                                if not df_details.empty:
+                                                    for _, detail_row in df_details.iterrows():
+                                                        ts = str(detail_row["ts_code"])
+                                                        if ts not in codes_sample:
+                                                            continue
+                                                        try:
+                                                            # 解析 rules 字段
+                                                            rules_raw = detail_row.get("rules")
+                                                            rules = []
+                                                            if rules_raw:
+                                                                if isinstance(rules_raw, str):
+                                                                    try:
+                                                                        rules = json.loads(rules_raw)
+                                                                    except Exception:
+                                                                        try:
+                                                                            import ast
+                                                                            rules = ast.literal_eval(rules_raw)
+                                                                        except Exception:
+                                                                            rules = []
+                                                                elif isinstance(rules_raw, list):
+                                                                    rules = rules_raw
+                                                            
+                                                            # 确保 rules 是 list[dict] 格式
+                                                            if not isinstance(rules, list):
+                                                                rules = []
+                                                            
+                                                            for r in rules:
+                                                                if not isinstance(r, dict):
+                                                                    continue
+                                                                name = str(r.get("name") or "")
+                                                                if name == strategy_name:
+                                                                    ok = bool(r.get("ok"))
+                                                                    hd = str(r.get("hit_date") or "")
+                                                                    hds = [str(x) for x in (r.get("hit_dates") or [])]
+                                                                    trig = ok or (hd == str(obs_date)) or (str(obs_date) in hds)
+                                                                    if trig:
+                                                                        triggered_stocks.add(ts)
+                                                                        break
+                                                        except Exception:
+                                                            continue
+                                        except Exception:
+                                            pass
+                                        
+                                        # 如果数据库读取失败或没有数据，从文件系统读取
+                                        if not triggered_stocks:
+                                            ddir = Path("output/score/details") / str(obs_date)
+                                            if ddir.exists():
+                                                for fp in ddir.glob("*.json"):
+                                                    try:
+                                                        obj = json.loads(fp.read_text(encoding="utf-8-sig"))
+                                                        ts = str(obj.get("ts_code", ""))
+                                                        if ts not in codes_sample:
+                                                            continue
+                                                        rules = (obj.get("per_rules") or obj.get("rules") or [])
+                                                        for r in rules:
+                                                            name = str(r.get("name") or "")
+                                                            if name == strategy_name:
+                                                                ok = bool(r.get("ok"))
+                                                                hd = str(r.get("hit_date") or "")
+                                                                hds = [str(x) for x in (r.get("hit_dates") or [])]
+                                                                trig = ok or (hd == str(obs_date)) or (str(obs_date) in hds)
+                                                                if trig:
+                                                                    triggered_stocks.add(ts)
+                                                                    break
+                                                    except Exception:
+                                                        continue
+                                        
+                                        if triggered_stocks:
+                                            if strategy_name not in strategy_stocks_map:
+                                                strategy_stocks_map[strategy_name] = {}
+                                            strategy_stocks_map[strategy_name][obs_date] = triggered_stocks
+                            
+                            # 显示调试信息
+                            if debug_info:
+                                with st.expander("调试信息（点击查看数据读取情况）", expanded=False):
+                                    for info in debug_info:
+                                        st.text(info)
+                            
+                            if not all_trigger_stats:
+                                st.warning("未找到任何策略触发数据")
+                                st.info('提示：请确保：\n1. 参考日及区间内的日期都有评分数据\n2. 详情数据已正确存储（数据库或文件系统）\n3. 样本股票列表正确\n4. 展开上方的"调试信息"查看详细情况')
+                            else:
+                                # 4) 汇总统计
+                                df_all = pd.concat(all_trigger_stats, ignore_index=True)
+                                
+                                # 按策略名汇总
+                                strategy_summary = df_all.groupby("name").agg({
+                                    "trigger_count": ["sum", "mean", "max"],
+                                    "coverage": ["mean", "max"],
+                                    "obs_date": "nunique"
+                                }).reset_index()
+                                strategy_summary.columns = ["策略名", "总触发次数", "平均触发次数", "最大单日触发", 
+                                                           "平均覆盖率", "最大覆盖率", "触发天数"]
+                                
+                                # 格式化百分比
+                                strategy_summary["平均覆盖率"] = strategy_summary["平均覆盖率"].map(
+                                    lambda x: f"{x*100:.2f}%" if pd.notna(x) else None
+                                )
+                                strategy_summary["最大覆盖率"] = strategy_summary["最大覆盖率"].map(
+                                    lambda x: f"{x*100:.2f}%" if pd.notna(x) else None
+                                )
+                                
+                                # 按总触发次数降序排序
+                                strategy_summary = strategy_summary.sort_values("总触发次数", ascending=False).reset_index(drop=True)
+                                
+                                st.subheader("策略触发汇总统计")
+                                st.dataframe(strategy_summary, width='stretch', height=400)
+                                
+                                # 5) 详细触发情况（按日期）
+                                st.subheader("每日策略触发详情")
+                                df_detail_display = df_all[["obs_date", "name", "trigger_count", "n_sample", "coverage"]].copy()
+                                df_detail_display.columns = ["日期", "策略名", "触发次数", "样本数", "覆盖率"]
+                                df_detail_display["覆盖率"] = df_detail_display["覆盖率"].map(
+                                    lambda x: f"{x*100:.2f}%" if pd.notna(x) else None
+                                )
+                                df_detail_display = df_detail_display.sort_values(["日期", "触发次数"], ascending=[True, False]).reset_index(drop=True)
+                                st.dataframe(df_detail_display, width='stretch', height=400)
+                                
+                                # 6) 后续跟踪
+                                if track_days > 0 and strategy_stocks_map:
+                                    st.subheader("触发策略的后续跟踪")
+                                    
+                                    # 获取跟踪日期范围
+                                    last_obs_date = interval_dates[-1]
+                                    # 从最后一个观察日的下一个交易日开始跟踪
+                                    # 获取所有交易日列表，找到 last_obs_date 的下一个交易日
+                                    all_trade_dates = get_trade_dates() or []
+                                    if not all_trade_dates:
+                                        st.warning("无法获取交易日列表")
+                                    else:
+                                        # 找到 last_obs_date 在交易日列表中的位置
+                                        try:
+                                            last_idx = all_trade_dates.index(last_obs_date)
+                                            # 从下一个交易日开始，取 track_days 个交易日
+                                            next_idx = last_idx + 1
+                                            if next_idx >= len(all_trade_dates):
+                                                st.warning(f"参考日 {last_obs_date} 是最后一个交易日，无法进行后续跟踪")
+                                            else:
+                                                track_dates = all_trade_dates[next_idx:next_idx + track_days]
+                                                if len(track_dates) < 1:
+                                                    st.warning("无法获取足够的跟踪日期")
+                                                else:
+                                                    track_start = track_dates[0]
+                                                    track_end = track_dates[-1]
+                                                    
+                                                    st.info(f"跟踪区间：{track_start} 至 {track_end}（共 {len(track_dates)} 个交易日）")
+                                                    
+                                                    # 读取价格数据
+                                                    # _read_stock_prices 已在本文件中定义
+                                                    
+                                                    # 收集所有需要跟踪的股票
+                                                    all_track_stocks = set()
+                                                    for strategy_name, date_stocks in strategy_stocks_map.items():
+                                                        for stocks in date_stocks.values():
+                                                            all_track_stocks.update(stocks)
+                                                    
+                                                    if all_track_stocks:
+                                                        with st.spinner(f"正在读取 {len(all_track_stocks)} 只股票的价格数据..."):
+                                                            df_prices = _read_stock_prices(list(all_track_stocks), start=track_start, end=track_end)
+                                                        
+                                                        if df_prices.empty:
+                                                            st.warning("无法读取价格数据")
+                                                        else:
+                                                            # 按策略统计后续表现
+                                                            track_results = []
+                                                            
+                                                            for strategy_name, date_stocks in strategy_stocks_map.items():
+                                                                # 收集该策略在所有日期触发的股票（去重）
+                                                                strategy_stocks = set()
+                                                                for stocks in date_stocks.values():
+                                                                    strategy_stocks.update(stocks)
+                                                                
+                                                                if not strategy_stocks:
+                                                                    continue
+                                                                
+                                                                # 计算这些股票在跟踪区间的表现
+                                                                strategy_prices = df_prices[df_prices["ts_code"].isin(strategy_stocks)]
+                                                                if strategy_prices.empty:
+                                                                    continue
+                                                                
+                                                                # 按股票分组计算涨幅
+                                                                stock_returns = []
+                                                                for ts_code, group in strategy_prices.groupby("ts_code"):
+                                                                    group = group.sort_values("trade_date")
+                                                                    if len(group) < 2:
+                                                                        continue
+                                                                    
+                                                                    start_price = group.iloc[0]["close"]
+                                                                    end_price = group.iloc[-1]["close"]
+                                                                    if pd.notna(start_price) and pd.notna(end_price) and start_price > 0:
+                                                                        ret = (end_price / start_price - 1.0) * 100.0
+                                                                        stock_returns.append(ret)
+                                                                
+                                                                if stock_returns:
+                                                                    track_results.append({
+                                                                        "策略名": strategy_name,
+                                                                        "触发股票数": len(strategy_stocks),
+                                                                        "可跟踪股票数": len(stock_returns),
+                                                                        "平均涨幅": np.mean(stock_returns),
+                                                                        "最大涨幅": np.max(stock_returns),
+                                                                        "最小涨幅": np.min(stock_returns),
+                                                                        "正收益数": sum(1 for r in stock_returns if r > 0),
+                                                                        "正收益比例": sum(1 for r in stock_returns if r > 0) / len(stock_returns) * 100 if stock_returns else 0
+                                                                    })
+                                                            
+                                                            if track_results:
+                                                                df_track = pd.DataFrame(track_results)
+                                                                
+                                                                # 先保存原始数值用于排序
+                                                                df_track["_sort_avg_ret"] = df_track["平均涨幅"]
+                                                                
+                                                                # 格式化百分比
+                                                                for col in ["平均涨幅", "最大涨幅", "最小涨幅"]:
+                                                                    if col in df_track.columns:
+                                                                        df_track[col] = df_track[col].map(
+                                                                            lambda x: f"{x:.2f}%" if pd.notna(x) else None
+                                                                        )
+                                                                df_track["正收益比例"] = df_track["正收益比例"].map(
+                                                                    lambda x: f"{x:.1f}%" if pd.notna(x) else None
+                                                                )
+                                                                
+                                                                # 按平均涨幅降序排序（使用原始数值）
+                                                                df_track = df_track.sort_values("_sort_avg_ret", ascending=False).reset_index(drop=True)
+                                                                # 删除临时排序列
+                                                                df_track = df_track.drop(columns=["_sort_avg_ret"])
+                                                                
+                                                                st.dataframe(df_track, width='stretch', height=400)
+                                                                st.caption(f"跟踪结果：统计在区间内触发各策略的股票，在后续 {track_days} 个交易日的表现")
+                                                            else:
+                                                                st.warning("无法计算后续跟踪数据")
+                                        except ValueError:
+                                            st.warning(f"参考日 {last_obs_date} 不在交易日列表中")
+                                        
+                    except Exception as e:
+                        st.error(f"生成失败：{e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+
 
     # ================== 数据管理 ==================
     with tab_data_view:
@@ -4592,7 +5736,7 @@ if _in_streamlit():
                     # 只有在启用数据库查询后才执行查询操作
                     if not data_view_db_enabled:
                         st.warning("⚠️ 请先点击「启用数据库查询」按钮，然后才能查询数据库数据")
-                        st.stop()
+                    
                     
                     # 以下是所有数据库查询操作，只有在启用后才会执行
                     # 查询类型选择

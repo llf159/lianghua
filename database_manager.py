@@ -502,14 +502,6 @@ def get_config_manager() -> DatabaseConnectionConfigManager:
     return _config_manager
 
 
-def get_duckdb_config(db_path: str | None = None):
-    """获取DuckDB配置（已废弃，保留用于向后兼容）。
-    
-    现在返回配置管理器实例，但建议直接使用get_config_manager()。
-    """
-    return get_config_manager()
-
-
 class DatabaseConnectionPool:
     """数据库连接池"""
     
@@ -972,6 +964,10 @@ class DatabaseManager:
         self._cache_lock = threading.RLock()
         self._cache_max_size = 100  # 最大缓存条目数
         self._cache_ttl = 300  # 缓存生存时间（秒）
+        
+        # 预加载数据缓存（用于存储全市场预加载数据）
+        self._preload_caches: Dict[str, Dict[str, Any]] = {}  # key: cache_name, value: cache_dict
+        self._preload_cache_lock = threading.RLock()
         
         # 状态文件管理（合并自 database_status）
         try:
@@ -2165,9 +2161,148 @@ class DatabaseManager:
             logger.error(f"获取股票代码列表失败: {e}")
             return []
     
+    def register_preload_cache(self, cache_name: str, data: pd.DataFrame, ref_date: str, 
+                               start_date: str, columns: List[str]) -> None:
+        """
+        注册预加载数据缓存
+        
+        Args:
+            cache_name: 缓存名称（如 "rank" 或 "screen"）
+            data: 预加载的全市场数据 DataFrame
+            ref_date: 参考日期（结束日期）
+            start_date: 起始日期
+            columns: 包含的列名列表
+        """
+        with self._preload_cache_lock:
+            self._preload_caches[cache_name] = {
+                "data": data.copy() if data is not None else None,
+                "ref_date": ref_date,
+                "start_date": start_date,
+                "columns": columns.copy() if columns else []
+            }
+            logger.debug(f"注册预加载缓存: {cache_name}, ref_date={ref_date}, start_date={start_date}, columns={len(columns)}")
+    
+    def clear_preload_cache(self, cache_name: str = None) -> None:
+        """
+        清除预加载数据缓存
+        
+        Args:
+            cache_name: 缓存名称，如果为None则清除所有缓存
+        """
+        with self._preload_cache_lock:
+            if cache_name:
+                if cache_name in self._preload_caches:
+                    del self._preload_caches[cache_name]
+                    logger.debug(f"清除预加载缓存: {cache_name}")
+            else:
+                self._preload_caches.clear()
+                logger.debug("清除所有预加载缓存")
+    
+    def _get_data_from_preload_cache(self, ts_code: str, start_date: str, end_date: str, 
+                                     columns: List[str], require_exact_start: bool = True) -> Optional[pd.DataFrame]:
+        """
+        从预加载缓存中获取股票数据
+        
+        Args:
+            ts_code: 股票代码
+            start_date: 起始日期
+            end_date: 结束日期
+            columns: 需要的列
+            require_exact_start: 是否要求起始日期完全匹配
+        
+        Returns:
+            如果命中缓存则返回DataFrame，否则返回None
+        """
+        with self._preload_cache_lock:
+            # 按优先级检查所有缓存（先检查排名缓存，再检查筛选缓存）
+            cache_priority = ["rank", "screen"]  # 排名缓存优先级更高
+            
+            for cache_name in cache_priority:
+                if cache_name not in self._preload_caches:
+                    continue
+                
+                cache_dict = self._preload_caches[cache_name]
+                if cache_dict["data"] is None:
+                    continue
+                
+                # 检查参考日期和列
+                if cache_dict["ref_date"] != end_date:
+                    continue
+                
+                if not all(col in cache_dict["columns"] for col in columns):
+                    continue
+                
+                # 检查起始日期（根据类型决定是否严格匹配）
+                if require_exact_start:
+                    if cache_dict["start_date"] != start_date:
+                        continue
+                else:
+                    # 筛选缓存可能包含更早的数据，只需要确保覆盖所需范围
+                    if cache_dict["start_date"] > start_date:
+                        continue
+                
+                try:
+                    # 从预加载数据中筛选指定股票
+                    stock_df = cache_dict["data"][cache_dict["data"]["ts_code"] == ts_code].copy()
+                    if stock_df.empty:
+                        continue
+                    
+                    # 如果不是严格匹配起始日期，需要筛选时间范围
+                    if not require_exact_start:
+                        mask = (stock_df["trade_date"] >= str(start_date)) & (stock_df["trade_date"] <= str(end_date))
+                        stock_df = stock_df.loc[mask].copy()
+                        if stock_df.empty:
+                            continue
+                    
+                    # 确保包含所需的列
+                    available_cols = [col for col in columns if col in stock_df.columns]
+                    if not available_cols:
+                        continue
+                    
+                    result_df = stock_df[["ts_code", "trade_date"] + available_cols]
+                    logger.debug(f"[{ts_code}] 使用{cache_name}预加载数据: {len(result_df)} 条记录")
+                    return result_df
+                    
+                except Exception as e:
+                    logger.warning(f"[{ts_code}] {cache_name}预加载数据筛选失败: {e}")
+                    continue
+        
+        return None
+    
     def query_stock_data(self, db_path: str = None, ts_code: str = None, start_date: str = None, 
                         end_date: str = None, columns: List[str] = None, adj_type: str = "qfq", limit: Optional[int] = None) -> pd.DataFrame:
-        """查询股票数据 - 统一接口"""
+        """
+        查询股票数据 - 统一接口，优先使用预加载缓存
+        
+        Args:
+            db_path: 数据库路径
+            ts_code: 股票代码（单只股票查询时，会优先检查预加载缓存）
+            start_date: 起始日期
+            end_date: 结束日期
+            columns: 需要的列
+            adj_type: 复权类型
+            limit: 限制返回行数
+        
+        Returns:
+            股票数据 DataFrame
+        """
+        # 如果是单只股票查询，优先检查预加载缓存
+        if ts_code and start_date and end_date and columns and adj_type == "qfq":
+            # 先尝试从排名缓存获取（要求起始日期严格匹配）
+            df = self._get_data_from_preload_cache(
+                ts_code, start_date, end_date, columns, require_exact_start=True
+            )
+            if df is not None:
+                return df
+            
+            # 再尝试从筛选缓存获取（起始日期可以更早）
+            df = self._get_data_from_preload_cache(
+                ts_code, start_date, end_date, columns, require_exact_start=False
+            )
+            if df is not None:
+                return df
+        
+        # 缓存未命中，从数据库查询
         try:
             if db_path is None:
                 from config import DATA_ROOT, UNIFIED_DB_PATH
@@ -2217,6 +2352,14 @@ class DatabaseManager:
             
             # 执行查询
             df = self.execute_sync_query(db_path, sql, params, timeout=120.0)
+            
+            # 优化类型转换：只在需要时转换
+            if not df.empty and "trade_date" in df.columns:
+                if df["trade_date"].dtype != 'object':
+                    df["trade_date"] = df["trade_date"].astype(str)
+                elif len(df) > 0 and not isinstance(df["trade_date"].iloc[0], str):
+                    df["trade_date"] = df["trade_date"].astype(str)
+            
             return df
             
         except Exception as e:
@@ -3208,6 +3351,17 @@ def query_stock_data(db_path: str = None, ts_code: str = None, start_date: str =
     """查询股票数据的便捷函数"""
     manager = get_database_manager()
     return manager.query_stock_data(db_path, ts_code, start_date, end_date, columns, adj_type, limit)
+
+def register_preload_cache(cache_name: str, data: pd.DataFrame, ref_date: str, 
+                           start_date: str, columns: List[str]) -> None:
+    """注册预加载数据缓存的便捷函数"""
+    manager = get_database_manager()
+    return manager.register_preload_cache(cache_name, data, ref_date, start_date, columns)
+
+def clear_preload_cache(cache_name: str = None) -> None:
+    """清除预加载数据缓存的便捷函数"""
+    manager = get_database_manager()
+    return manager.clear_preload_cache(cache_name)
 
 def count_stock_data(db_path: str = None, ts_code: str = None, start_date: str = None,
                     end_date: str = None, adj_type: str = "qfq") -> int:
@@ -4268,117 +4422,6 @@ def receive_score_data(source_module: str, data: Union[pd.DataFrame, List[Dict],
     """接收评分数据的便捷函数"""
     manager = get_database_manager()
     return manager.receive_score_data(source_module, data, table_name, mode, callback, db_path)
-
-# 兼容函数 - 为了保持与现有代码的兼容性
-def pv_asset_root(base: str, asset: str, adj: Optional[str]) -> str:
-    """向后兼容函数：生成资产根目录路径"""
-    if asset == "stock":
-        return os.path.join(base, "stock_data", adj or "qfq")
-    elif asset == "index":
-        return os.path.join(base, "index_data", adj or "daily")
-    else:
-        return os.path.join(base, f"{asset}_data", adj or "raw")
-
-def scan_with_duckdb(root: str, ts_code: Optional[str], start: str, end: str,
-                    columns: Optional[List[str]] = None, limit: Optional[int] = None) -> pd.DataFrame:
-    """向后兼容函数：使用DuckDB扫描数据"""
-    try:
-        from config import DATA_ROOT, UNIFIED_DB_PATH
-        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
-        
-        # 构建查询条件
-        conditions = []
-        params = []
-        
-        if ts_code:
-            conditions.append("ts_code = ?")
-            params.append(ts_code)
-        
-        if start:
-            conditions.append("trade_date >= ?")
-            params.append(start)
-            
-        if end:
-            conditions.append("trade_date <= ?")
-            params.append(end)
-        
-        # 构建SQL查询
-        select_cols = "*" if not columns else ", ".join(columns)
-        sql = f"SELECT {select_cols} FROM stock_data"
-        
-        if conditions:
-            sql += " WHERE " + " AND ".join(conditions)
-        
-        sql += " ORDER BY ts_code, trade_date"
-        
-        if limit:
-            sql += f" LIMIT {limit}"
-        
-        # 执行查询
-        manager = get_database_manager()
-        df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
-        return df
-        
-    except Exception as e:
-        logger.error(f"scan_with_duckdb 失败: {e}")
-        return pd.DataFrame()
-
-def read_range(base: str, asset: str, adj: Optional[str], ts_code: Optional[str], 
-               start: str, end: str, columns: Optional[List[str]] = None, 
-               limit: Optional[int] = None) -> pd.DataFrame:
-    """向后兼容函数：读取指定范围的数据"""
-    try:
-        from config import DATA_ROOT, UNIFIED_DB_PATH
-        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
-        
-        # 构建查询条件
-        conditions = []
-        params = []
-        
-        if ts_code:
-            conditions.append("ts_code = ?")
-            params.append(ts_code)
-        
-        if start:
-            conditions.append("trade_date >= ?")
-            params.append(start)
-            
-        if end:
-            conditions.append("trade_date <= ?")
-            params.append(end)
-            
-        if adj:
-            conditions.append("adj_type = ?")
-            params.append(adj)
-        
-        # 构建SQL查询
-        select_cols = "*" if not columns else ", ".join(columns)
-        sql = f"SELECT {select_cols} FROM stock_data"
-        
-        if conditions:
-            sql += " WHERE " + " AND ".join(conditions)
-        
-        sql += " ORDER BY ts_code, trade_date"
-        
-        if limit:
-            sql += f" LIMIT {limit}"
-        
-        # 执行查询
-        manager = get_database_manager()
-        df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
-        return df
-        
-    except Exception as e:
-        logger.error(f"read_range 失败: {e}")
-        return pd.DataFrame()
-
-def list_trade_dates(root: str) -> List[str]:
-    """向后兼容函数：列出交易日"""
-    try:
-        return get_trade_dates()
-    except Exception as e:
-        logger.error(f"list_trade_dates 失败: {e}")
-        return []
 
 # ==================== Details数据库读取功能 ====================
 

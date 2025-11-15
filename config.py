@@ -228,7 +228,11 @@ SELL_MODE = "other"                 # 可选: "open" | "close" | "strategy" | "o
 FALLBACK_SELL_MODE = "open"         # 超过持有天数后强制卖出的模式
 
 # 数据目录（回测用）
-DATA_DIR = "E://gupiao-hfq"  # 回测数据目录路径
+# Windows示例: "E://gupiao-hfq" 或 r"E:\gupiao-hfq"
+# Linux示例: "/home/user/data/gupiao-hfq" 或 "/data/gupiao-hfq"
+# 相对路径示例: os.path.join(BASE_DIR, "backtest_data")
+# 如果不需要回测功能，可以设置为 None
+DATA_DIR = "E://gupiao-hfq"  # 回测数据目录路径（请根据实际系统修改）
 
 # TDX规则文件路径
 TDX_BUY_PATH = "./buy_rules.txt"  # 买入规则文件路径

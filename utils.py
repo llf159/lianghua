@@ -6,6 +6,8 @@
 import pandas as pd
 import os
 import re
+import glob
+from typing import Optional
 from log_system import get_logger
 
 # 初始化日志记录器
@@ -78,7 +80,7 @@ def normalize_ts(ts_input: str, asset: str = "stock") -> str:
     # 六位纯数字：仅对股票补后缀
     if asset == "stock" and re.fullmatch(r"\d{6}", s):
         code = s
-        if code.startswith("8"):
+        if code.startswith("8") or code.startswith("920"):
             ex = "BJ"
         elif code[0] in {"5", "6", "9"}:
             ex = "SH"
@@ -102,7 +104,8 @@ def market_label(ts_code: str) -> str:
         return "科创板"
     if s.startswith((
         "430","831","832","833","834","835","836","837","838","839",
-        "80","81","82","83","84","85","86","87","88","89"
+        "80","81","82","83","84","85","86","87","88","89",
+        "920","921","922","923","924","925","926","927","928","929"
     )):
         return "北交所"
     return "其他"
@@ -210,3 +213,73 @@ def load_pred_rules_py(py_path: Optional[str] = None) -> List[Dict[str, Any]]:
         if s.category == "prediction":
             out.extend(s.rules)
     return out
+
+
+# ==================== 获取最新交易日相关函数 ====================
+
+def get_latest_date_from_database() -> Optional[str]:
+    """从数据库获取最新交易日期"""
+    try:
+        from database_manager import get_latest_trade_date
+        latest = get_latest_trade_date()
+        if latest:
+            logger.info(f"从数据库获取最新交易日: {latest}")
+            return latest
+    except Exception as e:
+        logger.warning(f"从数据库获取最新交易日失败: {e}")
+    return None
+
+
+def get_latest_date_from_daily_partition() -> Optional[str]:
+    """从daily分区获取最新交易日期"""
+    try:
+        from database_manager import get_trade_dates
+        dates = get_trade_dates()
+        if dates:
+            latest = dates[-1]
+            logger.info(f"从daily分区获取最新交易日: {latest}")
+            return latest
+    except Exception as e:
+        logger.warning(f"从daily分区获取最新交易日失败: {e}")
+    return None
+
+
+def get_latest_date_from_single_dir(single_dir: Optional[str] = None) -> Optional[str]:
+    """
+    从single目录推断最新交易日期
+    
+    Args:
+        single_dir: single目录路径，如果为None则尝试从config获取
+        
+    Returns:
+        最新交易日期字符串（YYYYMMDD格式），如果无法获取则返回None
+    """
+    try:
+        # 如果没有提供路径，尝试从config获取
+        if single_dir is None:
+            try:
+                from config import DATA_ROOT, API_ADJ
+                single_dir = os.path.join(DATA_ROOT, "stock", "single", f"single_{API_ADJ}_indicators")
+            except ImportError:
+                logger.debug("无法从config获取single目录路径")
+                return None
+        
+        if not os.path.isdir(single_dir):
+            return None
+        
+        files = glob.glob(os.path.join(single_dir, "*.parquet"))[:50]  # 取前 50 个采样
+        mx = None
+        for f in files:
+            try:
+                td = pd.read_parquet(f, columns=["trade_date"])["trade_date"]
+                tmax = str(td.astype(str).max())
+                if (mx is None) or (tmax > mx):
+                    mx = tmax
+            except Exception:
+                continue
+        if mx:
+            logger.info(f"从single目录获取最新日期: {mx}")
+            return mx
+    except Exception as e:
+        logger.debug(f"从single目录获取最新日期失败: {e}")
+    return None

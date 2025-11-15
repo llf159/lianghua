@@ -25,8 +25,7 @@ try:
     from indicators import estimate_warmup
     from database_manager import (
         get_database_manager, query_stock_data, get_trade_dates, 
-        get_stock_list, get_latest_trade_date, get_smart_end_date,
-        pv_asset_root, scan_with_duckdb, read_range, list_trade_dates
+        get_stock_list, get_latest_trade_date, get_smart_end_date
     )
     
     # 直接使用 database_manager 函数，不再需要包装器
@@ -41,12 +40,7 @@ except Exception as e:
     # 配置兜底
     cfg = type("Cfg", (), {"DATA_ROOT": ".", "API_ADJ": "qfq"})()
     
-    # 数据读取兜底
-    pv_asset_root = lambda base, asset, adj: base
-    def list_trade_dates(root): 
-        return []
-    read_range = None
-    scan_with_duckdb = None
+    # 数据读取兜底（已移除兼容函数）
     
     # 兜底实现：直接返回空数据
     def query_stock_data(*args, **kwargs):
@@ -686,7 +680,6 @@ def _load_hist_window(
     读取近 warmup_days*3 的 O/H/L/C/V（覆盖停牌/周末），过滤到指定 codes。
     返回列至少包含：ts_code, trade_date, open, high, low, close, vol
     """
-    root = pv_asset_root(base, "stock" if asset=="stock" else "index", adj)
     # 给足冗余：自然日回溯
     start = (dt.datetime.strptime(ref_date, "%Y%m%d") - dt.timedelta(days=warmup_days*3)).strftime("%Y%m%d")
     cols = ["ts_code","trade_date","open","high","low","close","vol"]
@@ -709,53 +702,48 @@ def _load_hist_window(
         except:
             pass
     
-    if scan_with_duckdb:
-        df = scan_with_duckdb(root, None, start, ref_date, columns=cols)
-    else:
-        if read_range is None:
-            raise RuntimeError("缺少 scan_with_duckdb/read_range 任一读取函数")
-        # 使用 database_manager 直接查询
-        try:
-            from config import DATA_ROOT, UNIFIED_DB_PATH
-            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+    # 使用 database_manager 直接查询
+    try:
+        from config import DATA_ROOT, UNIFIED_DB_PATH
+        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+        
+        # 构建查询条件
+        conditions = []
+        params = []
+        
+        if codes:
+            placeholders = ",".join(["?"] * len(codes))
+            conditions.append(f"ts_code IN ({placeholders})")
+            params.extend(codes)
+        
+        if start:
+            conditions.append("trade_date >= ?")
+            params.append(start)
             
-            # 构建查询条件
-            conditions = []
-            params = []
+        if ref_date:
+            conditions.append("trade_date <= ?")
+            params.append(ref_date)
             
-            if codes:
-                placeholders = ",".join(["?"] * len(codes))
-                conditions.append(f"ts_code IN ({placeholders})")
-                params.extend(codes)
-            
-            if start:
-                conditions.append("trade_date >= ?")
-                params.append(start)
-                
-            if ref_date:
-                conditions.append("trade_date <= ?")
-                params.append(ref_date)
-                
-            if adj:
-                conditions.append("adj_type = ?")
-                params.append(adj)
-            
-            # 构建SQL查询
-            select_cols = "*" if not cols else ", ".join(cols)
-            sql = f"SELECT {select_cols} FROM stock_data"
-            
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-            
-            sql += " ORDER BY ts_code, trade_date"
-            
-            # 执行查询
-            logger.info(f"[数据库连接] 开始获取数据库管理器实例 (读取股票数据用于预测: codes={len(codes) if codes else 'all'}, {start}~{ref_date})")
-            manager = get_database_manager()
-            df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
-        except Exception as e:
-            logger.error(f"读取数据范围失败: {e}")
-            df = pd.DataFrame()
+        if adj:
+            conditions.append("adj_type = ?")
+            params.append(adj)
+        
+        # 构建SQL查询
+        select_cols = "*" if not cols else ", ".join(cols)
+        sql = f"SELECT {select_cols} FROM stock_data"
+        
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        
+        sql += " ORDER BY ts_code, trade_date"
+        
+        # 执行查询
+        logger.info(f"[数据库连接] 开始获取数据库管理器实例 (读取股票数据用于预测: codes={len(codes) if codes else 'all'}, {start}~{ref_date})")
+        manager = get_database_manager()
+        df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
+    except Exception as e:
+        logger.error(f"读取数据范围失败: {e}")
+        df = pd.DataFrame()
     if df.empty:
         return df
     df["trade_date"] = df["trade_date"].astype(str)

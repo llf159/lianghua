@@ -700,7 +700,7 @@ def init_all_loggers():
         "predict_core",
         "data_reader",
         "download",
-        "stats_core",
+        # "stats_core",  # 已移除，功能已移到 score_ui.py
         "tdx_compat",
         "indicators",
         "utils"
