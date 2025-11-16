@@ -56,7 +56,6 @@ except ImportError:
     sys.exit(1)
 
 # ================= 配置和常量 =================
-
 @dataclass
 class DownloadConfig:
     """下载配置"""
@@ -371,7 +370,6 @@ class TokenBucketRateLimiter:
 RateLimiter = TokenBucketRateLimiter
 
 # ================= Tushare接口管理 =================
-
 class TushareManager:
     """Tushare接口管理器"""
     
@@ -556,7 +554,6 @@ class TushareManager:
             return end_date_config
 
 # ================= 数据处理器 =================
-
 class DataProcessor:
     """数据处理器"""
     
@@ -731,7 +728,6 @@ class DataProcessor:
         return df
 
 # ================= 下载器 =================
-
 class StockDownloader:
     """股票数据下载器"""
     
@@ -1126,6 +1122,7 @@ class StockDownloader:
         
         return self.stats
 
+
 class IndexDownloader:
     """指数数据下载器"""
     
@@ -1392,7 +1389,6 @@ class IndexDownloader:
         return self.stats
 
 # ================= 主下载器 =================
-
 class DownloadManager:
     """下载管理器"""
     
@@ -1717,7 +1713,6 @@ class DownloadManager:
         return results
 
 # ================= 便捷函数 =================
-
 def download_data(start_date: str, end_date: str, adj_type: str = "qfq", 
                  assets: List[str] = None, threads: int = 8, 
                  enable_warmup: bool = True, enable_adaptive_rate_limit: bool = True) -> Dict[str, DownloadStats]:
@@ -1750,6 +1745,7 @@ def download_data(start_date: str, end_date: str, adj_type: str = "qfq",
     
     manager = DownloadManager(config)
     return manager.run_download(assets)
+
 
 def main():
     """主函数"""
@@ -1791,6 +1787,7 @@ def main():
         logger.error(f"下载任务失败: {e}")
         raise
 
+
 def main_cli():
     """命令行接口"""
     import argparse
@@ -1831,6 +1828,7 @@ def main_cli():
         if stats.failed_stocks:
             print(f"失败股票: {[code for code, _ in stats.failed_stocks[:5]]}")
     print("=" * 60)
+
 
 def main_interactive():
     """交互式模式"""
@@ -1925,7 +1923,6 @@ def main_interactive():
         logger.error(f"交互式下载失败: {e}")
 
 # ================= 交易日相关函数 =================
-
 def list_trade_dates(root: str) -> List[str]:
     """
     兼容现有系统的 list_trade_dates 函数
@@ -1953,6 +1950,7 @@ def list_trade_dates(root: str) -> List[str]:
         logger.error(f"list_trade_dates 失败: {root}, 错误: {e}")
         return []
 
+
 def get_trade_dates_from_tushare(start_date: str, end_date: str) -> List[str]:
     """
     从Tushare获取交易日列表的便捷函数（使用数据库管理器的统一方法）
@@ -1972,6 +1970,7 @@ def get_trade_dates_from_tushare(start_date: str, end_date: str) -> List[str]:
         logger.error(f"获取交易日列表失败: {e}")
         return []
 
+
 def get_trade_dates_from_database(db_path: str = None) -> List[str]:
     """
     从数据库获取交易日列表的便捷函数（使用数据库管理器的统一方法）
@@ -1989,6 +1988,7 @@ def get_trade_dates_from_database(db_path: str = None) -> List[str]:
     except Exception as e:
         logger.error(f"从数据库获取交易日列表失败: {e}")
         return []
+
 
 def get_smart_end_date(end_date_config: str) -> str:
     """
@@ -2010,6 +2010,7 @@ def get_smart_end_date(end_date_config: str) -> str:
         if end_date_config.lower() == "today":
             return datetime.now().strftime("%Y%m%d")
         return end_date_config
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

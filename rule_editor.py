@@ -24,10 +24,6 @@ except ImportError:
     def diagnose_expr(expr): return {"ok": True, "error": None, "missing": [], "need_cols": []}
 
 
-# =============================================================================
-# 策略验证器功能
-# =============================================================================
-
 class StrategyValidationResult:
     """策略验证结果"""
     def __init__(self):
@@ -1608,10 +1604,6 @@ def render_rule_editor():
                 st.code(json.dumps(rule_config, ensure_ascii=False, indent=2), language="json")
 
 
-# =============================================================================
-# 策略文件验证功能
-# =============================================================================
-
 def validate_strategy_file(file_path: str):
     """
     验证策略文件的语法和字段有效性
@@ -1703,4 +1695,3 @@ def validate_strategy_file(file_path: str):
         result.add_error(f"验证过程发生异常: {str(e)}")
     
     return result
-

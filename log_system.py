@@ -136,6 +136,7 @@ class ColoredFormatter(logging.Formatter):
                 # 最后的备用方案
                 return f"{record.levelname} [{record.name}] {record.getMessage()}"
 
+
 class PerformanceLogger:
     """性能监控日志记录器"""
     
@@ -183,6 +184,7 @@ class PerformanceLogger:
             yield
         finally:
             self.end_timer(operation, log_level)
+
 
 class DebugLogger:
     """增强的调试日志记录器"""
@@ -581,9 +583,11 @@ class DebugLogger:
                 pass
             self._queue_listener = None
 
+
 def create_logger(name: str, log_dir: str = "log") -> DebugLogger:
     """创建调试日志记录器"""
     return DebugLogger(name, log_dir)
+
 
 def log_function_calls(logger: DebugLogger):
     """装饰器：记录函数调用"""
@@ -603,6 +607,7 @@ def log_function_calls(logger: DebugLogger):
                 raise
         return wrapper
     return decorator
+
 
 def log_performance(logger: DebugLogger, operation: str, log_level: int = logging.DEBUG):
     """装饰器：记录性能"""
@@ -647,6 +652,7 @@ def _stop_queue_listener():
             pass
         _log_listener = None
 
+
 def stop_all_loggers():
     """停止所有日志记录器的异步监听器（应在程序退出时调用）"""
     for logger in _global_loggers.values():
@@ -655,12 +661,14 @@ def stop_all_loggers():
         except Exception:
             pass
 
+
 def get_logger(name: str, log_dir: str = "log") -> DebugLogger:
     """获取全局日志记录器"""
     # 队列会在创建logger时自动初始化（通过 _get_log_queue()）
     if name not in _global_loggers:
         _global_loggers[name] = create_logger(name, log_dir)
     return _global_loggers[name]
+
 
 def cleanup_old_logs(log_dir: str = "log", days: int = 30):
     """清理旧日志文件"""
@@ -684,7 +692,6 @@ def cleanup_old_logs(log_dir: str = "log", days: int = 30):
         print(f"清理完成，共删除 {deleted_count} 个旧日志文件")
 
 # ==================== 日志初始化功能 ====================
-
 # 确保log目录存在
 log_dir = Path("log")
 log_dir.mkdir(exist_ok=True)
@@ -714,6 +721,7 @@ def init_all_loggers():
     
     return loggers
 
+
 def cleanup_logs():
     """清理超过30天的旧日志文件"""
     try:
@@ -721,46 +729,53 @@ def cleanup_logs():
     except Exception as e:
         print(f"清理旧日志文件失败: {e}")
 
+
 def get_module_logger(module_name: str):
     """获取指定模块的日志记录器"""
     return get_logger(module_name)
 
 # ==================== 便捷函数 ====================
-
 def debug_log(message: str, logger_name: str = "default"):
     """快速调试日志"""
     logger = get_logger(logger_name)
     logger.debug(message)
+
 
 def info_log(message: str, logger_name: str = "default"):
     """快速信息日志"""
     logger = get_logger(logger_name)
     logger.info(message)
 
+
 def error_log(message: str, logger_name: str = "default", exc_info: bool = True):
     """快速错误日志"""
     logger = get_logger(logger_name)
     logger.error(message, exc_info=exc_info)
+
 
 def warning_log(message: str, logger_name: str = "default"):
     """快速警告日志"""
     logger = get_logger(logger_name)
     logger.warning(message)
 
+
 def critical_log(message: str, logger_name: str = "default", exc_info: bool = True):
     """快速严重错误日志"""
     logger = get_logger(logger_name)
     logger.critical(message, exc_info=exc_info)
+
 
 def performance_log(message: str, logger_name: str = "default"):
     """快速性能日志"""
     logger = get_logger(logger_name)
     logger.performance(message)
 
+
 def prep_log(message: str, logger_name: str = "default"):
     """快速 PREP 级别日志"""
     logger = get_logger(logger_name)
     logger.prep(message)
+
 
 def log_data_processing(logger_name: str, operation: str, data_shape: tuple = None, 
                        duration: float = None, success: bool = True):
@@ -770,6 +785,7 @@ def log_data_processing(logger_name: str, operation: str, data_shape: tuple = No
     shape_info = f", 数据形状: {data_shape}" if data_shape else ""
     duration_info = f", 耗时: {duration:.3f}s" if duration else ""
     logger.info(f"[数据处理] {operation} {status}{shape_info}{duration_info}")
+
 
 def log_database_operation(logger_name: str, operation: str, table: str = None, 
                           rows_affected: int = None, duration: float = None, success: bool = True):
@@ -781,6 +797,7 @@ def log_database_operation(logger_name: str, operation: str, table: str = None,
     duration_info = f", 耗时: {duration:.3f}s" if duration else ""
     logger.info(f"[数据库] {operation} {status}{table_info}{rows_info}{duration_info}")
 
+
 def log_file_operation(logger_name: str, operation: str, file_path: str, 
                       file_size: int = None, duration: float = None, success: bool = True):
     """记录文件操作"""
@@ -789,6 +806,7 @@ def log_file_operation(logger_name: str, operation: str, file_path: str,
     size_info = f", 文件大小: {file_size} bytes" if file_size else ""
     duration_info = f", 耗时: {duration:.3f}s" if duration else ""
     logger.info(f"[文件操作] {operation} {status}, 路径: {file_path}{size_info}{duration_info}")
+
 
 def log_algorithm_execution(logger_name: str, algorithm: str, input_params: dict = None, 
                            output_shape: tuple = None, duration: float = None, success: bool = True):
@@ -800,12 +818,14 @@ def log_algorithm_execution(logger_name: str, algorithm: str, input_params: dict
     duration_info = f", 耗时: {duration:.3f}s" if duration else ""
     logger.info(f"[算法执行] {algorithm} {status}{params_info}{output_info}{duration_info}")
 
+
 def get_all_logger_stats() -> Dict[str, Dict[str, int]]:
     """获取所有日志记录器的统计信息"""
     stats = {}
     for name, logger in _global_loggers.items():
         stats[name] = logger.get_stats()
     return stats
+
 
 def reset_all_logger_stats():
     """重置所有日志记录器的统计信息"""

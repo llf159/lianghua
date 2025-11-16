@@ -62,6 +62,7 @@ class _SmallLRU:
         
         self.cache[key] = value
 
+
 from config import (
     DATA_ROOT, API_ADJ, UNIFIED_DB_PATH,
     SC_REF_DATE, SC_LOOKBACK_D, SC_PRESCREEN_LOOKBACK_D, SC_BASE_SCORE, SC_MIN_SCORE,
@@ -95,10 +96,12 @@ def _lazy_import_database_manager():
         LOGGER.error(f"导入 database_manager 失败: {e}")
         return None, None
 
+
 def _get_database_manager_functions():
     """获取 database_manager 函数"""
     from database_manager import get_trade_dates, get_database_manager
     return get_trade_dates, get_database_manager
+
 
 def _read_data_via_dispatcher(ts_code: str, start_date: str, end_date: str, columns: List[str]) -> pd.DataFrame:
     """通过数据库管理器读取股票数据"""
@@ -359,6 +362,7 @@ def _codes_sig(codes: list[str]) -> int:
     except Exception:
         return 0
 
+
 def _get_trade_dates_cached() -> list[str]:
     """获取交易日列表（优先从 _RANK_G 获取，否则从数据库获取）"""
     try:
@@ -389,6 +393,7 @@ def _get_trade_dates_cached() -> list[str]:
         LOGGER.error(f"[缓存] 获取交易日列表失败: {e}")
         return []
 
+
 def _prev_trade_date(ref: str) -> str | None:
     dates = _get_trade_dates_cached()
     if not dates:
@@ -399,6 +404,7 @@ def _prev_trade_date(ref: str) -> str | None:
     except ValueError:
         prior = [d for d in dates if d < ref]
         return prior[-1] if prior else None
+
 
 def _xsec_ret(df_preload: pd.DataFrame | None, ref: str, codes: list[str]) -> pd.Series:
     """计算 ref 日相对前收盘的涨跌幅横截面 Series"""
@@ -447,6 +453,7 @@ def _xsec_ret(df_preload: pd.DataFrame | None, ref: str, codes: list[str]) -> pd
             return ret.reindex(codes) if codes else ret
         except Exception:
             return pd.Series(dtype="float64")
+
 
 def _xsec_latest(df_preload: pd.DataFrame | None, ref: str, codes: list[str], col: str) -> pd.Series:
     """取 ref 日的某一列横截面 Series(index=ts_code)；优先用预加载，否则最小列最小日查询"""
@@ -599,6 +606,7 @@ def _batch_load_and_cache_data(
         cache_dict["data"] = None
         return False
 
+
 def preload_rank_data(ref_date: str, start_date: str, columns: List[str]):
     """预加载排名计算所需的universe数据"""
     global _RANK_DATA_CACHE, _RANK_G
@@ -682,6 +690,7 @@ def preload_rank_data(ref_date: str, start_date: str, columns: List[str]):
         LOGGER.error(f"[预加载] 预加载失败: {e}")
         _RANK_DATA_CACHE["data"] = None
 
+
 def preload_screen_data(ref_date: str, universe_codes: List[str], timeframe: str, window: int, columns: List[str]):
     """预加载表达式筛选所需的universe数据"""
     global _SCREEN_DATA_CACHE
@@ -715,6 +724,7 @@ def preload_screen_data(ref_date: str, universe_codes: List[str], timeframe: str
         LOGGER.error(f"[筛选预加载] 预加载失败: {e}")
         _SCREEN_DATA_CACHE["data"] = None
 
+
 def clear_screen_data_cache():
     """清理表达式筛选数据缓存"""
     global _SCREEN_DATA_CACHE
@@ -725,6 +735,7 @@ def clear_screen_data_cache():
     _SCREEN_DATA_CACHE["timeframe"] = None
     _SCREEN_DATA_CACHE["window"] = None
 
+
 def clear_rank_data_cache():
     """清理排名数据缓存"""
     global _RANK_DATA_CACHE
@@ -732,6 +743,7 @@ def clear_rank_data_cache():
     _RANK_DATA_CACHE["ref_date"] = None
     _RANK_DATA_CACHE["start_date"] = None
     _RANK_DATA_CACHE["columns"] = None
+
 
 def _add_to_batch_buffer(ts_code: str, ref_date: str, summary: dict, per_rules: list[dict]):
     """将单票数据添加到批量缓冲区"""
@@ -753,6 +765,7 @@ def _add_to_batch_buffer(ts_code: str, ref_date: str, summary: dict, per_rules: 
     # 检查是否需要批量写回
     if _BATCH_BUFFER["current_count"] >= _BATCH_BUFFER["batch_size"]:
         _flush_batch_buffer()
+
 
 def _get_batch_buffer_data():
     """获取缓冲区中的数据（用于子进程返回给主进程）"""
@@ -803,6 +816,7 @@ def _get_batch_buffer_data():
         })
     
     return batch_data
+
 
 def _flush_batch_buffer():
     """将缓冲区数据批量写回数据库"""
@@ -940,12 +954,14 @@ def _flush_batch_buffer():
         _BATCH_BUFFER["per_rules"].clear()
         _BATCH_BUFFER["current_count"] = 0
 
+
 def _clear_batch_buffer():
     """清空批量缓冲区"""
     global _BATCH_BUFFER
     _BATCH_BUFFER["summaries"].clear()
     _BATCH_BUFFER["per_rules"].clear()
     _BATCH_BUFFER["current_count"] = 0
+
 
 def _get_rank_data_from_cache(ref_date: str, N: int, codes: List[str]) -> Optional[pd.DataFrame]:
     """
@@ -1411,10 +1427,6 @@ def _eval_gate(df: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = None) ->
         return False, f"gate-exception: {e}", g
 
 
-# _after_scoring 函数已移除（从未被调用）
-# 如需使用 tracking 功能，请在 UI 的"统计"标签页中使用
-
-
 def backfill_prev_n_days(ref_date: str | None = None,
                          n: int = 20,
                          include_today: bool = False,
@@ -1455,9 +1467,6 @@ def backfill_prev_n_days(ref_date: str | None = None,
 
     # 5) 复用旧函数做实际补算
     return backfill_missing_ranks(start, end, force=force)
-
-
-# 函数已迁移到 utils.py，通过导入别名使用
 
 
 def _validate_config_ref_date(config_date: str, latest_date: str) -> str:
@@ -1813,9 +1822,6 @@ def _batch_update_ranks_independent(ref_date: str, scored_sorted: List[Any]) -> 
         return False
 
 
-# 所有数据库操作已统一使用database_manager，不再需要分散的优化函数
-
-
 def _batch_update_ranks_duckdb_optimized(db_path: str, ref_date: str, scored_sorted: List[Any]) -> bool:
     """批量更新排名 - 使用database_manager统一接口（同步方式确保数据已写入）"""
     try:
@@ -1905,8 +1911,6 @@ def _batch_update_ranks_duckdb_optimized(db_path: str, ref_date: str, scored_sor
         return False
 
 
-# 所有数据库操作已统一使用database_manager，不再需要分散的优化函数
-
 def _filter_rules_by_ref_date(rules: list[dict], ref_date: str) -> list[dict]:
     """过滤规则，只保留与ref_date相关的命中信息
     
@@ -1962,6 +1966,7 @@ def _filter_rules_by_ref_date(rules: list[dict], ref_date: str) -> list[dict]:
             # 如果规则没命中，则跳过该规则（不保留）
     
     return filtered_rules
+
 
 def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: list[dict], skip_db_write: bool = False):
     """
@@ -3281,6 +3286,7 @@ def _check_database_health(check_connection_pool: bool = False):
         LOGGER.error(f"数据库健康检查失败: {e}")
         return {'error': str(e)}
 
+
 def _get_data_from_cache(
     ts_code: str,
     start: str,
@@ -3355,6 +3361,7 @@ def _get_data_from_cache(
     except Exception as e:
         LOGGER.warning(f"[{ts_code}] {cache_name}预加载数据筛选失败: {e}")
         return None
+
 
 def _read_stock_df(ts_code: str, start: str, end: str, columns: List[str]) -> pd.DataFrame:
     """
@@ -5563,7 +5570,6 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
         try:
             from database_manager import get_database_manager
             from config import SC_OUTPUT_DIR
-            import pandas as pd
             
             LOGGER.info(f"[数据库连接] 开始获取数据库管理器实例 (主进程统一写入detail数据: {len(all_detail_data)}条)")
             db_manager = get_database_manager()

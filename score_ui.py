@@ -48,6 +48,7 @@ def ui_cleanup_database_connections():
         st.error(f"数据库连接清理失败: {e}")
         return False
 
+
 def check_database_status():
     """检查数据库状态（使用状态文件）"""
     try:
@@ -162,7 +163,7 @@ from typing import Sequence, Dict, List, Optional, Literal
 from pathlib import Path
 import json
 
-# 工具函数
+
 def _pick_trade_dates(ref_date: str, back: int) -> List[str]:
     """返回 [ref_date-back, ..., ref_date] 范围内的交易日列表，用于价格与回看。"""
     days = get_trade_dates() or []
@@ -172,6 +173,7 @@ def _pick_trade_dates(ref_date: str, back: int) -> List[str]:
     j0 = max(0, i - back)
     return days[j0 : i + 1]
 
+
 def _prev_trade_date(ref_date: str, d: int) -> str:
     """返回 ref_date 往前 d 个交易日的日期"""
     cal = get_trade_dates() or []
@@ -180,6 +182,7 @@ def _prev_trade_date(ref_date: str, d: int) -> str:
     i = cal.index(ref_date)
     j = max(0, i - int(d))
     return cal[j]
+
 
 def _read_stock_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     """读取股票价格数据"""
@@ -250,6 +253,7 @@ def _read_stock_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFra
     df = normalize_trade_date(df, "trade_date")
     df = df[df["ts_code"].isin(set(codes))].sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
     return df
+
 
 def _count_strategy_triggers(obs_date: str, codes_sample: Sequence[str], *, weights_map: dict[str, float] | None = None) -> pd.DataFrame:
     """
@@ -346,10 +350,12 @@ class Trade:
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
+
 def _out_dir(pid: str) -> Path:
     d = PORT_OUT_BASE / pid
     _ensure_dir(d)
     return d
+
 
 def _load_portfolios() -> Dict[str, Portfolio]:
     f = PORT_OUT_BASE / "portfolios.json"
@@ -373,14 +379,17 @@ def _load_portfolios() -> Dict[str, Portfolio]:
         out[k] = Portfolio(**vv)
     return out
 
+
 def _save_portfolios(ps: Dict[str, Portfolio]) -> None:
     _ensure_dir(PORT_OUT_BASE)
     obj = {k: asdict(v) for k, v in ps.items()}
     (PORT_OUT_BASE / "portfolios.json").write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
 def _read_trade_dates(asset: str = "stock") -> List[str]:
     # 使用统一的数据库查询
     return get_trade_dates() or []
+
 
 def _read_px(codes, start, end, *, asset="stock", cols=("open","close")) -> pd.DataFrame:
     sel = ["ts_code", "trade_date", *cols]
@@ -775,6 +784,7 @@ def _safe_path_hash(p: Path) -> int:
     except (OSError, FileNotFoundError):
         return hash(str(p))
 
+
 def _is_valid_date(date_str: str) -> bool:
     try:
         datetime.strptime(date_str, "%Y%m%d")
@@ -782,11 +792,13 @@ def _is_valid_date(date_str: str) -> bool:
     except ValueError:
         return False
 
+
 def _safe_int(x, default: int = 60) -> int:
     try:
         return int(x)
     except Exception:
         return int(default)
+
 
 def _init_session_state():
     """统一初始化 Streamlit session_state 的关键字段，避免重复判断散落各处。"""
@@ -820,6 +832,7 @@ def _init_session_state():
             st.session_state["data_view_db_enabled"] = False
     except Exception:
         pass
+
 
 if _in_streamlit():
     st.set_page_config(page_title="ScoreApp", layout="wide")
@@ -1612,6 +1625,7 @@ def _get_rule_names() -> list[str]:
     except Exception:
         return []
 
+
 @cache_data(show_spinner=False, ttl=300)
 def _cached_load_prediction_rules() -> list[dict]:
     """缓存版本的 load_prediction_rules 函数"""
@@ -1619,6 +1633,7 @@ def _cached_load_prediction_rules() -> list[dict]:
         return load_prediction_rules()
     except Exception:
         return []
+
 
 def _apply_tiebreak_sorting(df: pd.DataFrame, tiebreak_mode: str = "none") -> pd.DataFrame:
     """
@@ -2010,11 +2025,7 @@ if _in_streamlit():
                 with_suffix = st.checkbox("导出带交易所后缀（.SZ/.SH）", value=False)
             st.session_state["export_pref"] = {"style": "space" if style=="空格分隔" else "lines",
                                             "with_suffix": with_suffix}
-            run_col1, run_col2 = st.columns([1,1])
-            with run_col1:
-                run_btn = st.button("🚀 运行评分（写入 Top/All/Details）", width='stretch')
-            with run_col2:
-                latest_btn = st.button("📅 读取最近一次结果（不重新计算）", width='stretch')
+            run_btn = st.button("🚀 运行评分（写入 Top/All/Details）", width='stretch')
 
         # 运行
         ref_to_use = ref_inp.strip() or _pick_smart_ref_date()
@@ -2043,73 +2054,136 @@ if _in_streamlit():
                 m = re.search(r"(\d{8})", str(top_path))
                 if m:
                     ref_to_use = m.group(1)
-                    if latest_btn and not ref_to_use:
-                        ref_to_use = _pick_smart_ref_date()
             except Exception as e:
                 st.error(f"评分失败：{e}")
                 ref_to_use = None
 
-        # "读取最近一次结果"按钮：仅读取，不计算
-        if latest_btn and not run_btn:
-            # 优先使用用户输入的参考日，如果没有输入则使用最新的文件日期
-            ref_to_use = ref_inp.strip() or _get_latest_date_from_files()
-
-        # ---- 统一的 Top 预览区块（无论 run 或 读取最近一次） ----
-        if ref_to_use:
-            # 获取最新排名文件日期和数据库最新日期用于对比
-            latest_rank_date = _get_latest_date_from_files()
-            db_latest_date = _get_latest_date_from_database()
-            
-            # 显示三个日期的对比
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                if latest_rank_date:
-                    st.markdown(f"**最新排名文件：{latest_rank_date}**")
-                else:
-                    st.markdown("**最新排名文件：未知**")
-            with col2:
-                st.markdown(f"**当前显示排名：{ref_to_use}**")
-            with col3:
-                if db_latest_date:
-                    st.markdown(f"**数据库最新日期：{db_latest_date}**")
-                else:
-                    st.markdown("**数据库最新日期：未知**")
-            
-            # 如果有日期差异，给出提示
-            if latest_rank_date and latest_rank_date != ref_to_use:
-                st.info(f"当前显示的是 {ref_to_use} 的排名，最新排名文件是 {latest_rank_date}")
-            
-            if db_latest_date and db_latest_date != ref_to_use:
-                if db_latest_date > ref_to_use:
-                    st.warning(f"排名数据日期（{ref_to_use}）早于数据库最新日期（{db_latest_date}），建议重新运行评分获取最新排名")
-                else:
-                    st.info(f"排名数据日期（{ref_to_use}）晚于数据库最新日期（{db_latest_date}），排名数据基于较新的数据")
-            
-            df_all = _read_df(_path_all(ref_to_use))
-        else:
-            st.info("未找到任何 Top 文件，请先运行评分或检查输出目录。")
-
         st.divider()
 
+        # ---- Top 浏览区块 ----
         with st.container(border=True):
-            st.markdown("**Top-K 预览**")
-            show_mode = st.radio("展示方式", ["限制条数", "显示全部"], horizontal=True, key="topk_show_mode")
-            rows_to_show = None
-            if show_mode == "限制条数":
-                rows_to_show = st.number_input("Top-K 显示行数", min_value=5, max_value=1000, value=cfg_int("SC_TOPK_ROWS", 30), key="topk_rows_cfg")
-            if ref_to_use and df_all is not None and not df_all.empty:
-                if show_mode == "显示全部":
-                    rows_eff = len(df_all)
-                    st.caption(f"已选择显示全部（共 {rows_eff} 行）。")
-                else:
-                    rows_eff = int(rows_to_show)
-                st.dataframe(df_all.head(rows_eff), width='stretch', height=420)
-                if "ts_code" in df_all.columns:
-                    codes = df_all["ts_code"].astype(str).head(rows_eff).tolist()
-                    txt = _codes_to_txt(codes, st.session_state["export_pref"]["style"], st.session_state["export_pref"]["with_suffix"])
-                    copy_txt_button(txt, label="📋 复制以上（按当前预览）", key=f"copy_top_{ref_to_use}")
+            st.markdown("**Top 浏览**")
+            
+            # 读取结果按钮和参考日输入
+            browse_col1, browse_col2 = st.columns([2, 1])
+            with browse_col1:
+                browse_ref_inp = st.text_input("参考日（YYYYMMDD；留空=自动取最新）", value="", key="browse_ref_input")
+            with browse_col2:
+                browse_btn = st.button("📅 读取结果", width='stretch', key="browse_read_btn")
+            
+            # 读取结果的逻辑
+            browse_ref_to_use = None
+            
+            # 如果运行了评分，优先使用运行后的参考日
+            if run_btn and ref_to_use:
+                browse_ref_to_use = ref_to_use
+            # 如果点击了读取结果按钮或输入了参考日，使用输入的参考日
+            elif browse_btn or browse_ref_inp.strip():
+                # 优先使用用户输入的参考日，如果没有输入则使用最新的文件日期
+                browse_ref_to_use = browse_ref_inp.strip() or _get_latest_date_from_files()
+            # 如果还没有参考日，尝试使用参数设置中的参考日
+            elif ref_inp.strip():
+                browse_ref_to_use = ref_inp.strip()
+            # 最后尝试使用最新的文件日期
             else:
-                st.caption("暂无 Top-K 数据")
+                browse_ref_to_use = _get_latest_date_from_files()
+            
+            if browse_ref_to_use:
+                # 获取最新排名文件日期和数据库最新日期用于对比
+                latest_rank_date = _get_latest_date_from_files()
+                db_latest_date = _get_latest_date_from_database()
+                
+                # 显示三个日期的对比
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    if latest_rank_date:
+                        st.markdown(f"**最新排名文件：{latest_rank_date}**")
+                    else:
+                        st.markdown("**最新排名文件：未知**")
+                with col2:
+                    st.markdown(f"**当前显示排名：{browse_ref_to_use}**")
+                with col3:
+                    if db_latest_date:
+                        st.markdown(f"**数据库最新日期：{db_latest_date}**")
+                    else:
+                        st.markdown("**数据库最新日期：未知**")
+                
+                # 如果有日期差异，给出提示
+                if latest_rank_date and latest_rank_date != browse_ref_to_use:
+                    st.info(f"当前显示的是 {browse_ref_to_use} 的排名，最新排名文件是 {latest_rank_date}。可点击「读取结果」按钮查看最新排名。")
+                
+                if db_latest_date and db_latest_date != browse_ref_to_use:
+                    if db_latest_date > browse_ref_to_use:
+                        st.warning(f"排名数据日期（{browse_ref_to_use}）早于数据库最新日期（{db_latest_date}），建议重新运行评分获取最新排名")
+                    else:
+                        st.info(f"排名数据日期（{browse_ref_to_use}）晚于数据库最新日期（{db_latest_date}）")
+                
+                df_all = _read_df(_path_all(browse_ref_to_use))
+            else:
+                st.info("请先运行评分或点击「读取结果」按钮加载排名数据。")
+                df_all = None
+            
+            # 板块筛选和展示设置
+            if df_all is not None and not df_all.empty:
+                # 添加板块列
+                if "ts_code" in df_all.columns:
+                    df_all = df_all.copy()
+                    df_all["板块"] = df_all["ts_code"].apply(lambda x: market_label(str(x)))
+                    
+                    # 将板块映射到三个分类：主板、创业/科创、北交所
+                    def get_board_category(market):
+                        if market in ["沪A", "深A"]:
+                            return "主板"
+                        elif market in ["创业板", "科创板"]:
+                            return "创业/科创"
+                        elif market == "北交所":
+                            return "北交所"
+                        else:
+                            return "其他"
+                    
+                    df_all["板块分类"] = df_all["板块"].apply(get_board_category)
+                
+                # 板块筛选
+                board_filter_col1, board_filter_col2 = st.columns([1, 3])
+                with board_filter_col1:
+                    board_filter = st.selectbox("板块筛选", ["全部", "主板", "创业/科创", "北交所"], index=0, key="board_filter")
+                
+                # 应用板块筛选
+                if board_filter != "全部" and "板块分类" in df_all.columns:
+                    df_filtered = df_all[df_all["板块分类"] == board_filter].copy()
+                else:
+                    df_filtered = df_all.copy()
+                
+                # 展示方式设置
+                with board_filter_col2:
+                    show_mode = st.radio("展示方式", ["限制条数", "显示全部"], horizontal=True, key="topk_show_mode")
+                
+                rows_to_show = None
+                if show_mode == "限制条数":
+                    rows_to_show = st.number_input("显示行数", min_value=5, max_value=1000, value=cfg_int("SC_TOPK_ROWS", 30), key="topk_rows_cfg")
+                
+                if not df_filtered.empty:
+                    if show_mode == "显示全部":
+                        rows_eff = len(df_filtered)
+                        st.caption(f"已选择显示全部（共 {rows_eff} 行，板块：{board_filter}）。")
+                    else:
+                        rows_eff = int(rows_to_show)
+                    
+                    # 移除临时添加的列用于显示
+                    display_df = df_filtered.head(rows_eff).copy()
+                    if "板块分类" in display_df.columns:
+                        display_df = display_df.drop(columns=["板块分类"])
+                    
+                    st.dataframe(display_df, width='stretch', height=420)
+                    
+                    if "ts_code" in df_filtered.columns:
+                        codes = df_filtered["ts_code"].astype(str).head(rows_eff).tolist()
+                        txt = _codes_to_txt(codes, st.session_state["export_pref"]["style"], st.session_state["export_pref"]["with_suffix"])
+                        copy_txt_button(txt, label="📋 复制以上（按当前预览）", key=f"copy_top_{browse_ref_to_use}")
+                else:
+                    st.caption(f"板块 {board_filter} 暂无数据")
+            else:
+                st.caption("暂无排名数据，请先读取结果")
 
     # ================== 个股详情 ==================
     with tab_detail:
@@ -5765,7 +5839,7 @@ if _in_streamlit():
                         if "details_date_value" not in st.session_state:
                             st.session_state["details_date_value"] = latest_date if latest_date else ""
                         
-                        limit_param = st.number_input("返回记录数", min_value=1, max_value=1000, value=200, key="details_limit")
+                        limit_param = st.number_input("返回记录数（-1为全部）", min_value=-1, value=200, key="details_limit")
                         
                         col1, col2 = st.columns([3, 1])
                         with col1:

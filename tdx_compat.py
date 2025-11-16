@@ -21,7 +21,6 @@ COMP_RE = re.compile(r'(<=|>=|==|!=|<|>)')
 FUNC_NAME_RE = re.compile(r'[A-Z_][A-Z0-9_]*\s*\(')
 
 
-
 def _wrap_comparisons_for_bitwise(expr: str) -> str:
     """
     目标：

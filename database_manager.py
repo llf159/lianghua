@@ -920,6 +920,7 @@ class DatabaseConnectionPool:
         
         return stats
 
+
 class DatabaseManager:
     """统一数据库管理器"""
     
@@ -3304,6 +3305,7 @@ def execute_query(db_path: str, sql: str, params: Optional[List[Any]] = None,
     manager = get_database_manager()
     return manager.execute_sync_query(db_path, sql, params, timeout)
 
+
 def execute_write(db_path: str, sql: str, params: Optional[List[Any]] = None,
                  timeout: float = 30.0) -> bool:
     """执行写入的便捷函数"""
@@ -3317,6 +3319,7 @@ def get_connection(db_path: str, read_only: bool = True, timeout: float = 30.0):
     # 严格使用统一的连接管理器，避免直接使用duckdb.connect
     with manager.get_connection(db_path, read_only, timeout) as conn:
         yield conn
+
 
 def close_all_connections():
     """关闭所有连接的便捷函数"""
@@ -3336,15 +3339,18 @@ def get_stock_list_from_cache() -> List[str]:
     manager = get_database_manager()
     return manager.get_stock_list_from_cache()
 
+
 def get_trade_dates(db_path: str = None) -> List[str]:
     """获取交易日列表的便捷函数"""
     manager = get_database_manager()
     return manager.get_trade_dates(db_path)
 
+
 def get_stock_list(db_path: str = None, adj_type: str = "raw") -> List[str]:
     """获取股票代码列表的便捷函数"""
     manager = get_database_manager()
     return manager.get_stock_list(db_path, adj_type)
+
 
 def query_stock_data(db_path: str = None, ts_code: str = None, start_date: str = None, 
                     end_date: str = None, columns: List[str] = None, adj_type: str = "qfq", limit: Optional[int] = None) -> pd.DataFrame:
@@ -3352,22 +3358,26 @@ def query_stock_data(db_path: str = None, ts_code: str = None, start_date: str =
     manager = get_database_manager()
     return manager.query_stock_data(db_path, ts_code, start_date, end_date, columns, adj_type, limit)
 
+
 def register_preload_cache(cache_name: str, data: pd.DataFrame, ref_date: str, 
                            start_date: str, columns: List[str]) -> None:
     """注册预加载数据缓存的便捷函数"""
     manager = get_database_manager()
     return manager.register_preload_cache(cache_name, data, ref_date, start_date, columns)
 
+
 def clear_preload_cache(cache_name: str = None) -> None:
     """清除预加载数据缓存的便捷函数"""
     manager = get_database_manager()
     return manager.clear_preload_cache(cache_name)
+
 
 def count_stock_data(db_path: str = None, ts_code: str = None, start_date: str = None,
                     end_date: str = None, adj_type: str = "qfq") -> int:
     """统计股票数据总行数的便捷函数"""
     manager = get_database_manager()
     return manager.count_stock_data(db_path, ts_code, start_date, end_date, adj_type)
+
 
 def batch_query_stock_data(db_path: str = None, ts_codes: List[str] = None, 
                           start_date: str = None, end_date: str = None, 
@@ -3376,25 +3386,30 @@ def batch_query_stock_data(db_path: str = None, ts_codes: List[str] = None,
     manager = get_database_manager()
     return manager.batch_query_stock_data(db_path, ts_codes, start_date, end_date, columns, adj_type)
 
+
 def is_using_unified_db(db_path: str = None) -> bool:
     """检查是否使用统一数据库的便捷函数"""
     manager = get_database_manager()
     return manager.is_using_unified_db(db_path)
+
 
 def get_database_info(db_path: str = None, use_cache: bool = True) -> Dict[str, Any]:
     """获取数据库信息的便捷函数（优先使用状态文件缓存）"""
     manager = get_database_manager()
     return manager.get_database_info(db_path, use_cache=use_cache)
 
+
 def get_data_source_status(db_path: str = None) -> Dict[str, Any]:
     """获取数据源状态的便捷函数"""
     manager = get_database_manager()
     return manager.get_data_source_status(db_path)
 
+
 def get_latest_trade_date(db_path: str = None) -> Optional[str]:
     """获取最新交易日的便捷函数"""
     manager = get_database_manager()
     return manager.get_latest_trade_date(db_path)
+
 
 def get_smart_end_date(end_date_config: str) -> str:
     """获取智能结束日期的便捷函数"""
@@ -3402,7 +3417,6 @@ def get_smart_end_date(end_date_config: str) -> str:
     return manager.get_smart_end_date(end_date_config)
 
 # ================= 数据库表结构初始化功能 =================
-
 class DatabaseSchemaManager:
     """数据库表结构管理器"""
     
@@ -3779,13 +3793,13 @@ def init_stock_data_tables(db_path: str, db_type: str = "duckdb"):
     manager = get_database_manager()
     return manager.init_stock_data_tables(db_path, db_type)
 
+
 def init_stock_details_tables(db_path: str, db_type: str = "duckdb"):
     """初始化股票详情表结构的便捷函数"""
     manager = get_database_manager()
     return manager.init_stock_details_tables(db_path, db_type)
 
 # ================= 数据接收和导入功能 =================
-
 @dataclass
 class DataImportRequest:
     """数据导入请求"""
@@ -3819,6 +3833,7 @@ class DataImportResponse:
     error: Optional[str] = None
     execution_time: float = 0.0
     validation_errors: List[str] = None
+
 
 class DataReceiver:
     """数据接收器 - 负责接收和验证外部模块的数据"""
@@ -4402,6 +4417,7 @@ def receive_data(source_module: str, data_type: str, data: Union[pd.DataFrame, L
     return manager.receive_data(source_module, data_type, data, table_name, mode,
                               validation_rules, callback, timeout, priority, db_path)
 
+
 def receive_stock_data(source_module: str, data: Union[pd.DataFrame, List[Dict], str],
                       mode: str = "append", callback: Optional[Callable] = None,
                       db_path: str = None) -> str:
@@ -4409,12 +4425,14 @@ def receive_stock_data(source_module: str, data: Union[pd.DataFrame, List[Dict],
     manager = get_database_manager()
     return manager.receive_stock_data(source_module, data, mode, callback, db_path)
 
+
 def receive_indicator_data(source_module: str, data: Union[pd.DataFrame, List[Dict], str],
                           table_name: str = "indicator_data", mode: str = "append",
                           callback: Optional[Callable] = None, db_path: str = None) -> str:
     """接收指标数据的便捷函数"""
     manager = get_database_manager()
     return manager.receive_indicator_data(source_module, data, table_name, mode, callback, db_path)
+
 
 def receive_score_data(source_module: str, data: Union[pd.DataFrame, List[Dict], str],
                       table_name: str = "score_data", mode: str = "append",
@@ -4424,7 +4442,6 @@ def receive_score_data(source_module: str, data: Union[pd.DataFrame, List[Dict],
     return manager.receive_score_data(source_module, data, table_name, mode, callback, db_path)
 
 # ==================== Details数据库读取功能 ====================
-
 def is_details_db_reading_enabled() -> bool:
     """
     检查details数据库读取是否启用
@@ -4441,6 +4458,7 @@ def is_details_db_reading_enabled() -> bool:
     except (ImportError, AttributeError, RuntimeError):
         # 如果没有streamlit环境或不在streamlit上下文中，返回False
         return False
+
 
 def get_details_db_path_with_fallback(db_path: Optional[str] = None, fallback_to_unified: bool = True) -> Optional[str]:
     """
@@ -4478,6 +4496,7 @@ def get_details_db_path_with_fallback(db_path: Optional[str] = None, fallback_to
     logger.debug(f"Details数据库文件不存在: {details_db_path}")
     return None
 
+
 def is_details_db_available(check_file_exists: bool = True) -> bool:
     """
     检查details数据库是否可用（配置支持且文件存在）
@@ -4509,6 +4528,7 @@ def is_details_db_available(check_file_exists: bool = True) -> bool:
     except (ImportError, AttributeError):
         return False
 
+
 def get_details_db_path(db_path: Optional[str] = None) -> str:
     """
     获取Details数据库路径
@@ -4532,6 +4552,7 @@ def get_details_db_path(db_path: Optional[str] = None) -> str:
         # 如果无法导入配置，使用默认路径
         base_dir = os.path.dirname(os.path.abspath(__file__))
         return _abs_norm(os.path.join(base_dir, 'output', 'score', 'details', 'details.db'))
+
 
 def get_details_table_info(db_path: Optional[str] = None, use_cache: bool = True) -> Dict[str, Any]:
     """
@@ -4626,6 +4647,7 @@ def get_details_table_info(db_path: Optional[str] = None, use_cache: bool = True
         logger.error(f"get_details_table_info 失败: {e}")
         return {'error': str(e)}
 
+
 def query_details_by_stock(ts_code: str, limit: int = 10, db_path: Optional[str] = None) -> pd.DataFrame:
     """
     根据股票代码查询Details数据
@@ -4653,13 +4675,14 @@ def query_details_by_stock(ts_code: str, limit: int = 10, db_path: Optional[str]
         logger.error(f"query_details_by_stock 失败: {e}")
         return pd.DataFrame()
 
+
 def query_details_by_date(ref_date: str, limit: int = 100, db_path: Optional[str] = None) -> pd.DataFrame:
     """
     根据日期查询Details数据
     
     Args:
         ref_date: 参考日期 (YYYYMMDD)
-        limit: 返回记录数限制
+        limit: 返回记录数限制，-1表示返回全部记录
         db_path: 数据库文件路径，如果为None则使用配置文件中的路径
         
     Returns:
@@ -4669,16 +4692,26 @@ def query_details_by_date(ref_date: str, limit: int = 100, db_path: Optional[str
         db_path = get_details_db_path(db_path)
         manager = get_database_manager()
         
-        sql = """
-        SELECT * FROM stock_details 
-        WHERE ref_date = ? 
-        ORDER BY score DESC, rank ASC
-        LIMIT ?
-        """
-        return manager.execute_sync_query(db_path, sql, [ref_date, limit], timeout=30.0)
+        if limit == -1:
+            # -1表示返回全部记录，不使用LIMIT
+            sql = """
+            SELECT * FROM stock_details 
+            WHERE ref_date = ? 
+            ORDER BY score DESC, rank ASC
+            """
+            return manager.execute_sync_query(db_path, sql, [ref_date], timeout=30.0)
+        else:
+            sql = """
+            SELECT * FROM stock_details 
+            WHERE ref_date = ? 
+            ORDER BY score DESC, rank ASC
+            LIMIT ?
+            """
+            return manager.execute_sync_query(db_path, sql, [ref_date, limit], timeout=30.0)
     except Exception as e:
         logger.error(f"query_details_by_date 失败: {e}")
         return pd.DataFrame()
+
 
 def query_details_top_stocks(ref_date: str, top_k: int = 50, db_path: Optional[str] = None) -> pd.DataFrame:
     """
@@ -4706,6 +4739,7 @@ def query_details_top_stocks(ref_date: str, top_k: int = 50, db_path: Optional[s
     except Exception as e:
         logger.error(f"query_details_top_stocks 失败: {e}")
         return pd.DataFrame()
+
 
 def query_details_score_range(ref_date: str, min_score: float, max_score: float, 
                               db_path: Optional[str] = None) -> pd.DataFrame:
@@ -4735,6 +4769,7 @@ def query_details_score_range(ref_date: str, min_score: float, max_score: float,
         logger.error(f"query_details_score_range 失败: {e}")
         return pd.DataFrame()
 
+
 def query_details_recent_dates(days: int = 7, db_path: Optional[str] = None) -> List[str]:
     """
     查询最近的N个交易日
@@ -4762,6 +4797,7 @@ def query_details_recent_dates(days: int = 7, db_path: Optional[str] = None) -> 
     except Exception as e:
         logger.error(f"query_details_recent_dates 失败: {e}")
         return []
+
 
 def get_details_stock_summary(ts_code: str, db_path: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -4801,7 +4837,6 @@ def get_details_stock_summary(ts_code: str, db_path: Optional[str] = None) -> Di
         return {}
 
 # ========== 状态管理便捷函数（保持向后兼容，合并自 database_status） ==========
-
 def generate_database_status(status_file_path: Optional[str] = None) -> Dict[str, Any]:
     """
     生成数据库状态文件（便捷函数）
