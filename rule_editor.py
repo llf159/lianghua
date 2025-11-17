@@ -65,8 +65,8 @@ class StrategyValidator:
     
     # 必填字段
     REQUIRED_FIELDS = {
-        "ranking": ["when"],  # 排名策略
-        "filter": ["when"],   # 筛选策略
+        "ranking": ["when", "score_windows", "scope"],  # 排名策略
+        "filter": ["when", "score_windows", "scope"],   # 筛选策略
         "prediction": ["check"],  # 模拟策略
         "position": ["when"],     # 持仓策略
         "opportunity": ["when"]   # 买点策略
@@ -74,8 +74,8 @@ class StrategyValidator:
     
     # 可选字段
     OPTIONAL_FIELDS = {
-        "ranking": ["name", "timeframe", "score_windows", "scope", "points", "explain", "show_reason", "as", "gate", "trigger", "require", "clauses", "dist_points"],
-        "filter": ["name", "timeframe", "score_windows", "scope", "reason", "hard_penalty", "gate", "trigger", "require", "clauses"],
+        "ranking": ["name", "timeframe", "points", "explain", "show_reason", "as", "gate", "trigger", "require", "clauses", "dist_points"],
+        "filter": ["name", "timeframe", "reason", "hard_penalty", "gate", "trigger", "require", "clauses"],
         "prediction": ["name", "scenario"],
         "position": ["name", "explain"],
         "opportunity": ["name", "explain"]
@@ -103,6 +103,9 @@ class StrategyValidator:
         # 从指标注册表获取可用指标
         if REGISTRY:
             for indicator_name, meta in REGISTRY.items():
+                # 添加指标名本身（names_in_expr 返回的是指标名）
+                self.available_indicators.add(indicator_name.lower())
+                # 添加输出列名
                 if hasattr(meta, 'out') and meta.out:
                     for col in meta.out.keys():
                         self.available_indicators.add(col.lower())
@@ -120,11 +123,32 @@ class StrategyValidator:
         # 注意：如果使用clauses，则不需要when字段
         has_clauses = "clauses" in rule and rule["clauses"]
         required_fields = self.REQUIRED_FIELDS.get(category, [])
+        # 检查 scope，对于某些 scope，score_windows 不是必填的
+        scope = rule.get("scope", "ANY")
+        scope_upper = str(scope).upper().strip() if scope else "ANY"
+        is_last_scope = scope_upper == "LAST"
+        
+        # 对于 RECENT/DIST/NEAR scope，如果有 dist_points，则 score_windows 不是必填的（从 dist_points 中提取最大日期）
+        is_recent_scope = scope_upper in {"RECENT", "DIST", "NEAR"}
+        has_dist_points = bool(rule.get("dist_points") or rule.get("distance_points"))
+        is_recent_with_dist = is_recent_scope and has_dist_points
+        
         for field in required_fields:
             # 如果使用clauses且必填字段是when，则跳过检查
             if field == "when" and has_clauses:
                 continue
-            if field not in rule or not rule[field]:
+            # 对于 scope: LAST，score_windows 不是必填的（默认为1）
+            if field == "score_windows" and is_last_scope:
+                continue  # scope: LAST 不需要 score_windows
+            # 对于 RECENT/DIST/NEAR scope，如果有 dist_points，score_windows 不是必填的（从 dist_points 中提取）
+            if field == "score_windows" and is_recent_with_dist:
+                continue  # RECENT/DIST/NEAR 有 dist_points 时不需要 score_windows
+            # 对于 score_windows，0 也是有效值，需要特殊处理
+            if field == "score_windows":
+                if field not in rule or rule[field] is None:
+                    result.add_error(f"缺少必填字段: {field}", field)
+                    result.required_fields.append(field)
+            elif field not in rule or not rule[field]:
                 result.add_error(f"缺少必填字段: {field}", field)
                 result.required_fields.append(field)
         
@@ -307,8 +331,12 @@ class StrategyValidator:
                 indicators = names_in_expr(expr)
                 missing_indicators = []
                 for ind in indicators:
-                    if ind not in self.available_indicators:
-                        missing_indicators.append(ind)
+                    # 检查指标名（不区分大小写）
+                    ind_lower = ind.lower()
+                    if ind_lower not in self.available_indicators:
+                        # 检查是否在 REGISTRY 中（可能是新注册的指标）
+                        if REGISTRY and ind_lower not in [k.lower() for k in REGISTRY.keys()]:
+                            missing_indicators.append(ind)
                 result["missing_indicators"] = missing_indicators
             
             result["valid"] = True
@@ -352,49 +380,56 @@ class StrategyValidator:
     
     def _provide_suggestions(self, rule: Dict[str, Any], category: str, result: StrategyValidationResult):
         """提供改进建议"""
-        # 检查是否有name字段
+        # 只提供真正有用的建议，避免噪音
+        
+        # 检查是否有name字段（仅对未命名规则提示）
         if "name" not in rule or not rule["name"]:
-            result.add_suggestion("建议添加name字段以便识别规则", "name")
+            # 只在规则比较复杂时才建议添加name
+            if "when" in rule and rule["when"] and len(rule["when"]) > 50:
+                result.add_suggestion("建议添加name字段以便识别规则", "name")
         
-        # 检查是否有explain字段
+        # 检查是否有explain字段（仅对复杂规则提示）
         if "explain" not in rule or not rule["explain"]:
-            result.add_suggestion("建议添加explain字段说明规则用途", "explain")
+            # 只在规则比较复杂时才建议添加explain
+            if "when" in rule and rule["when"] and len(rule["when"]) > 100:
+                result.add_suggestion("建议添加explain字段说明规则用途", "explain")
         
-        # 检查scope设置
-        if "scope" in rule and rule["scope"] == "ANY":
-            result.add_suggestion("scope为ANY时建议考虑使用LAST或EACH", "scope")
+        # 不再建议scope从ANY改为LAST或EACH（ANY是合理的scope选择）
         
-        # 检查score_windows设置
+        # 检查score_windows设置（只对极端值警告）
         if "score_windows" in rule:
             score_windows = rule["score_windows"]
             if score_windows is not None:
-                if score_windows > 100:
+                if score_windows > 200:
                     result.add_warning(f"score_windows值较大({score_windows})，可能影响性能", "score_windows")
-                elif score_windows < 5:
+                elif score_windows < 3:
                     result.add_warning(f"score_windows值较小({score_windows})，可能数据不足", "score_windows")
         
         # 检查window设置（已废弃，但为了向后兼容仍支持）
         if "window" in rule:
             window = rule["window"]
-            if window > 100:
-                result.add_warning(f"window字段已废弃，请使用score_windows。window值较大({window})，可能影响性能", "window")
-            elif window < 5:
-                result.add_warning(f"window字段已废弃，请使用score_windows。window值较小({window})，可能数据不足", "window")
+            result.add_warning(f"window字段已废弃，请使用score_windows", "window")
+            if window > 200:
+                result.add_warning(f"window值较大({window})，可能影响性能", "window")
+            elif window < 3:
+                result.add_warning(f"window值较小({window})，可能数据不足", "window")
         
-        # 检查表达式复杂度
+        # 检查表达式复杂度（只对非常长的表达式提示）
         if "when" in rule and rule["when"]:
             expr = rule["when"]
-            if len(expr) > 200:
-                result.add_suggestion("表达式较长，建议拆分为多个简单规则", "when")
+            if len(expr) > 300:
+                result.add_suggestion("表达式较长，建议拆分为多个简单规则以提高可读性", "when")
             
-            # 检查是否使用了安全除法
-            if "/" in expr and "SAFE_DIV" not in expr:
-                result.add_suggestion("建议使用SAFE_DIV避免除零错误", "when")
+            # 检查是否使用了安全除法（只对明显有除法的表达式提示）
+            if "/" in expr and "SAFE_DIV" not in expr and "//" not in expr:
+                # 检查是否可能是除法运算（不是注释）
+                if re.search(r'[0-9a-zA-Z_]\s*/\s*[0-9a-zA-Z_]', expr):
+                    result.add_suggestion("建议使用SAFE_DIV避免除零错误", "when")
         
-        # 检查points设置
+        # 检查points设置（只对极端值警告）
         if "points" in rule:
             points = rule["points"]
-            if isinstance(points, (int, float)) and abs(points) > 50:
+            if isinstance(points, (int, float)) and abs(points) > 100:
                 result.add_warning(f"points值较大({points})，可能影响评分平衡", "points")
 
 
@@ -754,23 +789,23 @@ def render_rule_editor():
                 help="数据的时间周期：D(日线)、W(周线)、M(月线)、60MIN(60分钟)"
             )
             
-            # 计分窗口（score_windows）
+            # 计分窗口（score_windows）- 必填字段
             score_windows = st.number_input(
-                "计分窗口 (score_windows)",
+                "计分窗口 (score_windows) *",
                 min_value=1,
                 max_value=500,
                 value=st.session_state.get('template_score_windows', st.session_state.get('template_window', 60)),
-                help="用于计分判断的历史数据条数，通常设置为5-100。注意：window字段已废弃，请使用score_windows"
+                help="[必填] 用于计分判断的历史数据条数，通常设置为5-100。注意：window字段已废弃，请使用score_windows"
             )
             
-            # 命中口径
+            # 命中口径 - 必填字段
             scope_options = ["ANY", "LAST", "ALL", "EACH", "RECENT", "DIST", "NEAR", "CONSEC", "COUNT"]
             scope_index = scope_options.index(st.session_state.get('template_scope', 'ANY')) if st.session_state.get('template_scope', 'ANY') in scope_options else 0
             scope_base = st.selectbox(
-                "命中口径 (scope)",
+                "命中口径 (scope) *",
                 scope_options,
                 index=scope_index,
-                help="规则命中的判断方式：ANY(任意)、LAST(最近)、ALL(全部)、EACH(每个)等"
+                help="[必填] 规则命中的判断方式：ANY(任意)、LAST(最近)、ALL(全部)、EACH(每个)等"
             )
             
             # 处理COUNT和CONSEC格式
@@ -916,23 +951,23 @@ def render_rule_editor():
                 help="数据的时间周期：D(日线)、W(周线)、M(月线)、60MIN(60分钟)"
             )
             
-            # 计分窗口（score_windows）
+            # 计分窗口（score_windows）- 必填字段
             score_windows = st.number_input(
-                "计分窗口 (score_windows)",
+                "计分窗口 (score_windows) *",
                 min_value=1,
                 max_value=500,
                 value=st.session_state.get('template_score_windows', st.session_state.get('template_window', 60)),
-                help="用于计分判断的历史数据条数，通常设置为5-100。注意：window字段已废弃，请使用score_windows"
+                help="[必填] 用于计分判断的历史数据条数，通常设置为5-100。注意：window字段已废弃，请使用score_windows"
             )
             
-            # 命中口径
+            # 命中口径 - 必填字段
             scope_options = ["ANY", "LAST", "ALL", "EACH", "RECENT", "DIST", "NEAR", "CONSEC", "COUNT"]
             scope_index = scope_options.index(st.session_state.get('template_scope', 'ANY')) if st.session_state.get('template_scope', 'ANY') in scope_options else 0
             scope_base = st.selectbox(
-                "命中口径 (scope)",
+                "命中口径 (scope) *",
                 scope_options,
                 index=scope_index,
-                help="规则命中的判断方式：ANY(任意)、LAST(最近)、ALL(全部)、EACH(每个)等"
+                help="[必填] 规则命中的判断方式：ANY(任意)、LAST(最近)、ALL(全部)、EACH(每个)等"
             )
             
             # 处理COUNT和CONSEC格式
@@ -1333,10 +1368,24 @@ def render_rule_editor():
                 rule_config["name"] = rule_name
             if timeframe != "D":
                 rule_config["timeframe"] = timeframe
-            if score_windows != 60:
+            # scope 是必填字段，必须包含
+            rule_config["scope"] = scope
+            scope_upper = scope.upper().strip()
+            
+            # score_windows 是必填字段，但某些 scope 可以省略
+            # 1. scope: LAST 可以省略（默认为1）
+            # 2. scope: RECENT/DIST/NEAR 且有 dist_points 时可以省略（从 dist_points 中提取最大日期）
+            if scope_upper == "LAST":
+                # scope: LAST 时，如果用户明确设置了 score_windows，也包含它
+                if score_windows != 60:  # 如果用户修改了默认值，也包含
+                    rule_config["score_windows"] = score_windows
+            elif scope_upper in {"RECENT", "DIST", "NEAR"} and use_dist_points and dist_points_config:
+                # RECENT/DIST/NEAR 且有 dist_points 时，忽略 score_windows（使用 dist_points 的最大值）
+                # 不包含 score_windows 字段
+                pass
+            else:
+                # 其他 scope 必须包含 score_windows
                 rule_config["score_windows"] = score_windows
-            if scope != "ANY":
-                rule_config["scope"] = scope
             if points != 0:
                 rule_config["points"] = points
             if explain:
@@ -1367,10 +1416,25 @@ def render_rule_editor():
                 rule_config["name"] = rule_name
             if timeframe != "D":
                 rule_config["timeframe"] = timeframe
-            if score_windows != 60:
+            # scope 是必填字段，必须包含
+            rule_config["scope"] = scope
+            scope_upper = scope.upper().strip()
+            
+            # score_windows 是必填字段，但某些 scope 可以省略
+            # 1. scope: LAST 可以省略（默认为1）
+            # 2. scope: RECENT/DIST/NEAR 且有 dist_points 时可以省略（从 dist_points 中提取最大日期）
+            if scope_upper == "LAST":
+                # scope: LAST 时，如果用户明确设置了 score_windows，也包含它
+                if score_windows != 60:  # 如果用户修改了默认值，也包含
+                    rule_config["score_windows"] = score_windows
+            elif scope_upper in {"RECENT", "DIST", "NEAR"}:
+                # 筛选策略通常不使用 dist_points，所以这里暂时不处理
+                # 但如果用户明确设置了 score_windows，也包含它
+                if score_windows != 60:  # 如果用户修改了默认值，也包含
+                    rule_config["score_windows"] = score_windows
+            else:
+                # 其他 scope 必须包含 score_windows
                 rule_config["score_windows"] = score_windows
-            if scope != "ANY":
-                rule_config["scope"] = scope
             if hard_penalty:
                 rule_config["hard_penalty"] = hard_penalty
             if reason:
@@ -1628,13 +1692,28 @@ def validate_strategy_file(file_path: str):
             result.add_error(f"文件不存在: {file_path}")
             return result
         
-        content = file_path_obj.read_text(encoding='utf-8')
+        # 读取文件内容，处理 BOM 字符
+        try:
+            content = file_path_obj.read_text(encoding='utf-8-sig')  # utf-8-sig 会自动去除 BOM
+        except UnicodeDecodeError:
+            # 如果 utf-8-sig 失败，尝试 utf-8
+            try:
+                content = file_path_obj.read_text(encoding='utf-8')
+                # 手动去除 BOM
+                if content.startswith('\ufeff'):
+                    content = content[1:]
+            except Exception as e:
+                result.add_error(f"文件读取失败: {str(e)}")
+                return result
         
         # 检查Python语法
         try:
             ast.parse(content)
         except SyntaxError as e:
             result.add_error(f"Python语法错误: {e.msg} (行 {e.lineno})")
+            return result
+        except Exception as e:
+            result.add_error(f"Python语法解析失败: {str(e)}")
             return result
         
         # 尝试加载模块
@@ -1692,6 +1771,15 @@ def validate_strategy_file(file_path: str):
             result.add_suggestion(f"共验证了 {total_rules} 条策略规则")
         
     except Exception as e:
-        result.add_error(f"验证过程发生异常: {str(e)}")
+        import traceback
+        error_msg = f"验证过程发生异常: {str(e)}"
+        # 包含简化的堆栈跟踪信息
+        tb_str = traceback.format_exc()
+        # 只保留最后几行堆栈信息，避免过长
+        tb_lines = tb_str.split('\n')
+        if len(tb_lines) > 10:
+            tb_str = '\n'.join(tb_lines[-10:])
+        error_msg += f"\n详细信息: {tb_str}"
+        result.add_error(error_msg)
     
     return result

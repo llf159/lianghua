@@ -1229,6 +1229,25 @@ def _from_last_hints(days: list[int] | None = None,
 
 def _rule_to_screen_args(rule: dict):
     """返回 (when_expr, timeframe, window, scope)"""
+    # 验证必填字段
+    if "when" in rule or "clauses" in rule:
+        category = "filter" if "hard_penalty" in rule or "reason" in rule else "ranking"
+        try:
+            from rule_editor import StrategyValidator
+            validator = StrategyValidator()
+            result = validator.validate_rule(rule, category)
+            if not result.is_valid and result.errors:
+                missing_fields = [e.get("field", "") for e in result.errors if "缺少必填字段" in e.get("message", "")]
+                if missing_fields:
+                    import warnings
+                    warnings.warn(
+                        f"规则 '{rule.get('name', '<unnamed>')}' 缺少必填字段: {', '.join(missing_fields)}. "
+                        f"将使用默认值，但建议显式指定这些字段。",
+                        UserWarning
+                    )
+        except Exception:
+            pass  # 如果验证器不可用，继续执行
+    
     if rule.get("clauses"):
         tfs = {str(c.get("timeframe","D")).upper() for c in rule["clauses"]}
         wins = {int(c.get("score_windows", 60)) for c in rule["clauses"]}
@@ -1236,7 +1255,7 @@ def _rule_to_screen_args(rule: dict):
         whens = [f"({c.get('when','').strip()})" for c in rule["clauses"] if c.get("when","").strip()]
         if not whens:
             raise ValueError("复合规则缺少 when")
-        # 目前仅支持“相同 tf/window/scope”的复合规则；否则就无法一次性屏全市场
+        # 目前仅支持"相同 tf/window/scope"的复合规则；否则就无法一次性屏全市场
         if len(tfs)==len(wins)==len(scopes)==1:
             return " AND ".join(whens), list(tfs)[0], list(wins)[0], list(scopes)[0]
         else:
@@ -3437,7 +3456,11 @@ if _in_streamlit():
                                     st.warning(f"• {issue}")
                             
                         except Exception as e:
+                            import traceback
                             st.error(f"文件验证出错: {e}")
+                            # 显示详细的错误信息
+                            with st.expander("查看详细错误信息", expanded=False):
+                                st.code(traceback.format_exc(), language="text")
             else:
                 st.warning("未找到策略文件，请确保 strategies_repo.py 文件存在")
 

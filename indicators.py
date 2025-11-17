@@ -341,3 +341,29 @@ def bbi(df):
     ma24 = df['close'].rolling(24).mean()
 
     return (ma3 + ma6 + ma12 + ma24) / 4
+
+def z_score(df, n=60, ema_n=5, vr_n=20, cap=2):
+    """
+    Z优化 = 2*EMA( Zscore( (C-O)/O *100, 窗口=n ), ema_n )  ×  min( V/MA(V,vr_n), cap )
+    """
+    oc = (df["close"] - df["open"]) / (df["open"] + EPS) * 100.0
+    mean = oc.rolling(n, min_periods=n).mean()
+    std  = oc.rolling(n, min_periods=n).std(ddof=0).replace(0, EPS)
+    z0 = (oc - mean) / std
+    z  = z0.ewm(span=ema_n, adjust=False).mean() * 2.0
+    vr = df["vol"] / (df["vol"].rolling(vr_n, min_periods=vr_n).mean() + EPS)
+    w  = vr.clip(upper=cap)
+    return (z * w).fillna(0.0)
+
+def duokong(df):
+    """知行中期多空线"""
+    ema1 = ema(df['close'], span=10)
+    ema2 = ema(ema1, span=10)
+    return ema2
+
+def duokong_long(df):
+    c = df["close"]
+    return (c.rolling(14).mean()
+          + c.rolling(28).mean()
+          + c.rolling(57).mean()
+          + c.rolling(114).mean()) / 4

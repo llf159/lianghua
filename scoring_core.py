@@ -177,9 +177,84 @@ from log_system import get_logger, log_data_processing, log_database_operation, 
 # 初始化统一日志记录器
 LOGGER = get_logger("scoring_core")
 
+def _validate_required_fields(rule_or_clause: dict, category: str = "ranking", rule_name: str = None) -> list:
+    """
+    验证规则或子句的必填字段
+    
+    Args:
+        rule_or_clause: 规则或子句字典
+        category: 策略类型 ("ranking" 或 "filter")
+        rule_name: 规则名称（用于日志）
+    
+    Returns:
+        list: 缺失的必填字段列表，如果都齐全则返回空列表
+    """
+    missing_fields = []
+    
+    # 排名策略和筛选策略的必填字段
+    if category in ("ranking", "filter"):
+        required_fields = ["when", "score_windows", "scope"]
+        
+        # 如果使用clauses，则when不是必填的
+        has_clauses = "clauses" in rule_or_clause and rule_or_clause["clauses"]
+        
+        # 检查 scope，对于某些 scope，score_windows 不是必填的
+        scope = rule_or_clause.get("scope", "ANY")
+        scope_upper = str(scope).upper().strip() if scope else "ANY"
+        is_last_scope = scope_upper == "LAST"
+        
+        # 对于 RECENT/DIST/NEAR scope，如果有 dist_points，则 score_windows 不是必填的（从 dist_points 中提取最大日期）
+        is_recent_scope = scope_upper in {"RECENT", "DIST", "NEAR"}
+        has_dist_points = bool(rule_or_clause.get("dist_points") or rule_or_clause.get("distance_points"))
+        is_recent_with_dist = is_recent_scope and has_dist_points
+        
+        for field in required_fields:
+            if field == "when" and has_clauses:
+                continue  # 使用clauses时，when不是必填的
+            
+            # 对于 scope: LAST，score_windows 不是必填的（默认为1）
+            if field == "score_windows" and is_last_scope:
+                continue  # scope: LAST 不需要 score_windows
+            
+            # 对于 RECENT/DIST/NEAR scope，如果有 dist_points，score_windows 不是必填的（从 dist_points 中提取）
+            if field == "score_windows" and is_recent_with_dist:
+                continue  # RECENT/DIST/NEAR 有 dist_points 时不需要 score_windows
+            
+            # 对于 score_windows，需要检查是否为 None（0 是有效值）
+            if field == "score_windows":
+                if field not in rule_or_clause or rule_or_clause[field] is None:
+                    missing_fields.append(field)
+            elif field not in rule_or_clause or not rule_or_clause[field]:
+                missing_fields.append(field)
+    
+    # 如果缺少必填字段，记录警告
+    if missing_fields:
+        name = rule_name or rule_or_clause.get("name", "<unnamed>")
+        LOGGER.warning(
+            f"[规则验证] {category}策略 '{name}' 缺少必填字段: {', '.join(missing_fields)}. "
+            f"将使用默认值，但建议显式指定这些字段。"
+        )
+    
+    return missing_fields
+
 # 记录策略规则加载状态
 if _SC_RULES_LOADED:
     LOGGER.info(f"[策略预编译] 策略规则加载成功 - 排名规则: {len(SC_RULES)} 条, 筛选规则: {len(SC_PRESCREEN_RULES)} 条")
+    
+    # 验证加载的规则必填字段
+    missing_count = 0
+    for rule in SC_RULES:
+        missing = _validate_required_fields(rule, "ranking", rule.get("name"))
+        if missing:
+            missing_count += 1
+    
+    for rule in SC_PRESCREEN_RULES:
+        missing = _validate_required_fields(rule, "filter", rule.get("name"))
+        if missing:
+            missing_count += 1
+    
+    if missing_count > 0:
+        LOGGER.warning(f"[策略预编译] 发现 {missing_count} 条规则缺少必填字段 (score_windows/scope)，建议更新规则配置")
 else:
     LOGGER.warning("[策略预编译] 策略规则加载失败或未找到规则")
 
@@ -198,9 +273,30 @@ def _compute_max_windows_by_tf(rules: List[dict]) -> dict:
         """从规则或子句中提取 score_windows 值（用于计算最大 data_window）"""
         if rule_or_clause.get("timeframe", "D").upper() == tf:
             # 注意：scope: LAST 的规则没有 score_windows，不参与计算
-            if rule_or_clause.get("scope", "ANY").upper() == "LAST":
+            scope = rule_or_clause.get("scope", "ANY")
+            scope_upper = str(scope).upper().strip() if scope else "ANY"
+            if scope_upper == "LAST":
                 return 0  # scope: LAST 不需要窗口，不参与计算
-            return int(rule_or_clause.get("score_windows", SC_LOOKBACK_D))
+            
+            # 对于 RECENT/DIST/NEAR scope，如果有 dist_points，从 dist_points 中提取最大日期
+            if scope_upper in {"RECENT", "DIST", "NEAR"}:
+                bins = rule_or_clause.get("dist_points") or rule_or_clause.get("distance_points") or []
+                if bins:
+                    max_range = 0
+                    for b in bins:
+                        if isinstance(b, dict):
+                            hi = int(b.get("max", b.get("lag", 0)))
+                        else:
+                            hi = int(b[1]) if len(b) > 1 else 0
+                        max_range = max(max_range, hi)
+                    if max_range > 0:
+                        return max_range + 1  # 返回最大区间+1
+            
+            # score_windows 现在是必填字段，但为了向后兼容，如果没有则使用默认值
+            score_windows = rule_or_clause.get("score_windows")
+            if score_windows is None:
+                return SC_LOOKBACK_D  # 使用默认值
+            return int(score_windows)
         return 0
     
     for rule in rules:
@@ -628,8 +724,7 @@ def preload_rank_data(ref_date: str, start_date: str, columns: List[str]):
         # 收集所有策略规则的 when 表达式，并使用 _calc_nested_window 计算最大所需数据长度
         def _collect_and_calc_max_window(rules: List[dict], tf: str) -> int:
             """收集规则中的窗口和表达式，计算最大所需数据长度"""
-            max_window = 0
-            max_expr_window = 0
+            max_total_window = 0
             
             for r in rules:
                 if "clauses" in r:
@@ -638,28 +733,36 @@ def preload_rank_data(ref_date: str, start_date: str, columns: List[str]):
                         if c.get("timeframe", "D").upper() == tf:
                             # 获取窗口
                             window = int(c.get("score_windows", SC_LOOKBACK_D))
-                            max_window = max(max_window, window)
                             
                             # 使用 _calc_nested_window 计算表达式最大所需数据长度
                             when_expr = (c.get("when") or "").strip()
+                            expr_window = 0
                             if when_expr:
                                 expr_window = _calc_nested_window(when_expr)
-                                max_expr_window = max(max_expr_window, expr_window)
+                            
+                            # 总数据长度 = score_windows + expr_data_length
+                            # 因为要在score_windows窗口内的每一天计算表达式，最早的那一天需要expr_data_length的历史数据
+                            total_window = window + expr_window
+                            max_total_window = max(max_total_window, total_window)
                 else:
                     # 单条规则
                     if r.get("timeframe", "D").upper() == tf:
                         # 获取窗口
                         window = int(r.get("score_windows", SC_LOOKBACK_D))
-                        max_window = max(max_window, window)
                         
                         # 使用 _calc_nested_window 计算表达式最大所需数据长度
                         when_expr = (r.get("when") or "").strip()
+                        expr_window = 0
                         if when_expr:
                             expr_window = _calc_nested_window(when_expr)
-                            max_expr_window = max(max_expr_window, expr_window)
+                        
+                        # 总数据长度 = score_windows + expr_data_length
+                        # 因为要在score_windows窗口内的每一天计算表达式，最早的那一天需要expr_data_length的历史数据
+                        total_window = window + expr_window
+                        max_total_window = max(max_total_window, total_window)
             
-            # 返回窗口和表达式所需数据长度的最大值
-            return max(max_window, max_expr_window)
+            # 返回所有规则中最大的总数据长度（score_windows + expr_data_length）
+            return max_total_window
         
         # 从实际策略规则中提取最大windows，使用 _calc_nested_window 计算表达式最大所需数据长度
         d = max(_collect_and_calc_max_window(sc_rules, "D"), _collect_and_calc_max_window(sc_prescreen_rules, "D"))
@@ -1684,22 +1787,9 @@ def _recent_points(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = Non
     返回 (加分, lag, 错误或None)
     """
     tf = str(rule.get("timeframe", "D")).upper()
-    # score_windows 用于计算窗口和数据获取
+    # 对于 RECENT/DIST/NEAR scope，score_windows 会被忽略，直接使用 dist_points 的最大值
+    # _get_score_window 已经处理了这个逻辑
     score_window = _get_score_window(rule, SC_LOOKBACK_D)
-    
-    # 根据 dist_points 中的最大区间调整 score_window，避免窗口太小
-    bins = rule.get("dist_points") or rule.get("distance_points") or []
-    if bins:
-        max_range = 0
-        for b in bins:
-            if isinstance(b, dict):
-                hi = int(b.get("max", b.get("lag", 0)))
-            else:
-                hi = int(b[1]) if len(b) > 1 else 0
-            max_range = max(max_range, hi)
-        # 确保 score_window 至少覆盖最大区间（+1 因为 lag 从 0 开始）
-        if score_window <= max_range:
-            score_window = max_range + 1
     
     when = (rule.get("when") or "").strip()
     if not when:
@@ -2388,22 +2478,9 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) ->
         scope = str(rule.get("scope", "ANY")).upper().strip()
         pts   = float(rule.get("points", 0))
         tf    = str(rule.get("timeframe", "D")).upper()
+        # 对于 RECENT/DIST/NEAR scope，score_windows 会被忽略，直接使用 dist_points 的最大值
+        # _get_score_window 已经处理了这个逻辑
         score_window = _get_score_window(rule, SC_LOOKBACK_D)
-        
-        # 对于 RECENT/DIST/NEAR scope，根据 dist_points 中的最大区间调整 score_window，避免窗口太小
-        if scope in {"RECENT", "DIST", "NEAR"}:
-            bins = rule.get("dist_points") or rule.get("distance_points") or []
-            if bins:
-                max_range = 0
-                for b in bins:
-                    if isinstance(b, dict):
-                        hi = int(b.get("max", b.get("lag", 0)))
-                    else:
-                        hi = int(b[1]) if len(b) > 1 else 0
-                    max_range = max(max_range, hi)
-                # 确保 score_window 至少覆盖最大区间（+1 因为 lag 从 0 开始）
-                if score_window <= max_range:
-                    score_window = max_range + 1
         
         expl  = rule.get("explain")
         when  = None
@@ -2752,7 +2829,32 @@ def _get_score_window(rule_or_clause: dict, default_window: int = None) -> int:
     if default_window is None:
         default_window = SC_LOOKBACK_D
     
-    # 使用 score_windows
+    # 检查 scope
+    scope = rule_or_clause.get("scope", "ANY")
+    scope_upper = str(scope).upper().strip() if scope else "ANY"
+    is_last_scope = scope_upper == "LAST"
+    is_recent_scope = scope_upper in {"RECENT", "DIST", "NEAR"}
+    
+    # 对于 scope: LAST，默认返回 1（只需要最后一天的数据）
+    if is_last_scope:
+        return 1
+    
+    # 对于 RECENT/DIST/NEAR scope，如果有 dist_points，优先使用 dist_points 的最大值，忽略 score_windows
+    if is_recent_scope:
+        bins = rule_or_clause.get("dist_points") or rule_or_clause.get("distance_points") or []
+        if bins:
+            max_range = 0
+            for b in bins:
+                if isinstance(b, dict):
+                    hi = int(b.get("max", b.get("lag", 0)))
+                else:
+                    hi = int(b[1]) if len(b) > 1 else 0
+                max_range = max(max_range, hi)
+            # 返回最大区间+1（因为 lag 从 0 开始）
+            if max_range > 0:
+                return max_range + 1
+    
+    # 使用 score_windows（如果明确指定）
     if "score_windows" in rule_or_clause and rule_or_clause["score_windows"] is not None:
         return int(rule_or_clause["score_windows"])
     
@@ -3158,6 +3260,11 @@ def _eval_clause(dfD: pd.DataFrame, clause: dict, ref_date: str, ctx: dict = Non
     """
     返回 (是否命中, 错误消息或 None)
     """
+    # 验证子句的必填字段（子句通常属于排名或筛选策略）
+    if "when" in clause:
+        # 判断是排名策略还是筛选策略（子句本身没有hard_penalty，需要从外层判断，这里默认按ranking处理）
+        _validate_required_fields(clause, "ranking", clause.get("name"))
+    
     tf = clause.get("timeframe", "D").upper()
     # score_windows 用于计算窗口
     score_window = _get_score_window(clause, SC_LOOKBACK_D)
@@ -3528,24 +3635,18 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
         compute_hit_dates: 是否计算完整的hit_dates列表（仅在需要详情时启用，避免重复计算）
     """
     
-    tf   = str(rule.get("timeframe","D")).upper()
-    score_window = _get_score_window(rule, SC_LOOKBACK_D)
+    # 验证必填字段（仅对排名和筛选策略）
+    rule_name = rule.get("name", "<unnamed>")
+    if "when" in rule or "clauses" in rule:
+        # 判断是排名策略还是筛选策略
+        category = "filter" if "hard_penalty" in rule or "reason" in rule else "ranking"
+        _validate_required_fields(rule, category, rule_name)
     
-    # 对于 RECENT/DIST/NEAR scope，根据 dist_points 中的最大区间调整 score_window，避免窗口太小
-    scope = str(rule.get("scope","ANY")).upper().strip()
-    if scope in {"RECENT", "DIST", "NEAR"}:
-        bins = rule.get("dist_points") or rule.get("distance_points") or []
-        if bins:
-            max_range = 0
-            for b in bins:
-                if isinstance(b, dict):
-                    hi = int(b.get("max", b.get("lag", 0)))
-                else:
-                    hi = int(b[1]) if len(b) > 1 else 0
-                max_range = max(max_range, hi)
-            # 确保 score_window 至少覆盖最大区间（+1 因为 lag 从 0 开始）
-            if score_window <= max_range:
-                score_window = max_range + 1
+    tf   = str(rule.get("timeframe","D")).upper()
+    scope = str(rule.get("scope", "ANY")).upper().strip()
+    # 对于 RECENT/DIST/NEAR scope，score_windows 会被忽略，直接使用 dist_points 的最大值
+    # _get_score_window 已经处理了这个逻辑
+    score_window = _get_score_window(rule, SC_LOOKBACK_D)
     
     pts  = float(rule.get("points", 0))
     
