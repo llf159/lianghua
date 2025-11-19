@@ -30,7 +30,7 @@ try:
     
     # 直接使用 database_manager 函数，不再需要包装器
     
-    logger.info("成功导入所有依赖模块")
+    logger.debug("成功导入所有依赖模块")
 except Exception as e:
     logger.warning(f"部分依赖模块导入失败，使用兜底实现: {e}")
     
@@ -216,11 +216,12 @@ class PriceSolver:
             SolveResult: 求解结果
         """
         logger.debug(f"开始价格求解: 条件={condition}, 目标值={target_value}, 方法={method}")
-        log_algorithm_execution("predict_core", "价格求解", {
-            "condition": condition, 
-            "target_value": target_value, 
-            "method": method
-        }, None, None, True)
+        # 移除算法执行日志，减少日志噪音
+        # log_algorithm_execution("predict_core", "价格求解", {
+        #     "condition": condition, 
+        #     "target_value": target_value, 
+        #     "method": method
+        # }, None, None, True)
         if price_bounds is None:
             price_bounds = PriceBounds()
             
@@ -738,7 +739,7 @@ def _load_hist_window(
         sql += " ORDER BY ts_code, trade_date"
         
         # 执行查询
-        logger.info(f"[数据库连接] 开始获取数据库管理器实例 (读取股票数据用于预测: codes={len(codes) if codes else 'all'}, {start}~{ref_date})")
+        logger.debug(f"[数据库连接] 读取股票数据用于预测: codes={len(codes) if codes else 'all'}, {start}~{ref_date}")
         manager = get_database_manager()
         df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
     except Exception as e:
@@ -1036,8 +1037,9 @@ def simulate_next_day(
     
     cache_key = _make_cache_key(ref_date, sim_date, scen_hash, uni_hash, ind_flag)
     
-    logger.info(f"开始明日模拟: 参考日={ref_date}, 股票数={len(universe_codes)}, 情景={scenario.mode}")
-    log_data_processing("predict_core", "明日模拟", (len(universe_codes),), None, True)
+    logger.debug(f"开始明日模拟: 参考日={ref_date}, 股票数={len(universe_codes)}, 情景={scenario.mode}")
+    # 移除数据处理日志，减少日志噪音
+    # log_data_processing("predict_core", "明日模拟", (len(universe_codes),), None, True)
 
     # 尝试读取缓存
     if cache is not None:
@@ -1046,13 +1048,13 @@ def simulate_next_day(
             if cached is not None and not cached.empty:
                 df_all = cached.copy()
                 df_sim = df_all[df_all["trade_date"].astype(str) == str(sim_date)].copy()
-                logger.info(f"从缓存加载模拟结果: 行数={len(df_sim)}")
+                logger.debug(f"从缓存加载模拟结果: 行数={len(df_sim)}")
                 return SimResult(ref_date=ref_date, sim_date=sim_date, df_sim=df_sim, df_concat=df_all)
         except Exception as e:
             logger.debug(f"缓存读取失败: {e}")
 
     # 加载历史数据
-    logger.info(f"加载历史数据: 参考日={ref_date}, 预热天数={scenario.warmup_days}")
+    logger.debug(f"加载历史数据: 参考日={ref_date}, 预热天数={scenario.warmup_days}")
     df_hist = _load_hist_window(base, adj, asset, universe_codes, ref_date, scenario.warmup_days)
     
     if df_hist.empty:
@@ -1065,7 +1067,7 @@ def simulate_next_day(
     total_stocks = len(last_rows)
     recs: List[Dict[str, Any]] = []
     
-    logger.info(f"开始生成模拟数据: 股票数={total_stocks}")
+    logger.debug(f"开始生成模拟数据: 股票数={total_stocks}")
     
     for i, (_, row) in enumerate(last_rows.iterrows()):
         ts = str(row["ts_code"])
@@ -1101,7 +1103,7 @@ def simulate_next_day(
             })
     
     df_sim = pd.DataFrame.from_records(recs, columns=["ts_code","trade_date","open","high","low","close","vol"])
-    logger.info(f"模拟数据生成完成: 行数={len(df_sim)}")
+    logger.debug(f"模拟数据生成完成: 行数={len(df_sim)}")
 
     # 拼接历史数据和模拟数据
     df_all = pd.concat([df_hist, df_sim], ignore_index=True)
@@ -1110,7 +1112,7 @@ def simulate_next_day(
 
     # 重算技术指标
     if indicator_runner is not None:
-        logger.info("使用自定义指标计算器")
+        logger.debug("使用自定义指标计算器")
         df_all = indicator_runner(df_all.copy(), recompute_indicators)
     elif recompute_indicators != "none" and hasattr(ind, "REGISTRY"):
         if recompute_indicators == "all":
@@ -1119,7 +1121,7 @@ def simulate_next_day(
             names = [n for n in recompute_indicators if n in getattr(ind, "REGISTRY", {}) and getattr(ind.REGISTRY[n], "py_func", None)]
         
         if names:
-            logger.info(f"开始重算指标: {', '.join(names)}")
+            logger.debug(f"开始重算指标: {', '.join(names)}")
             parts: List[pd.DataFrame] = []
             stock_groups = list(df_all.groupby("ts_code"))
             total_stocks = len(stock_groups)
@@ -1149,7 +1151,7 @@ def simulate_next_day(
                     logger.debug(f"指标计算进度: {i+1}/{total_stocks} ({ts})")
             
             df_all = pd.concat(parts, ignore_index=True).sort_values(["ts_code","trade_date"]).reset_index(drop=True)
-            logger.info(f"指标重算完成: 总行数={len(df_all)}")
+            logger.debug(f"指标重算完成: 总行数={len(df_all)}")
 
     # 保存结果文件
     if out_dir:
@@ -1158,7 +1160,7 @@ def simulate_next_day(
         fpath = out_base / f"sim_{sim_date}.csv"
         try:
             df_all.to_csv(fpath, index=False, encoding="utf-8-sig")
-            logger.info(f"结果已保存: {fpath}")
+            logger.debug(f"结果已保存: {fpath}")
         except Exception as e:
             logger.error(f"保存结果失败: {e}", exc_info=True)
 
@@ -1170,7 +1172,7 @@ def simulate_next_day(
         except Exception as e:
             logger.debug(f"缓存写入失败: {e}")
 
-    logger.info(f"明日模拟完成: 模拟日={sim_date}, 股票数={len(df_sim)}")
+    logger.debug(f"明日模拟完成: 模拟日={sim_date}, 股票数={len(df_sim)}")
     return SimResult(ref_date=ref_date, sim_date=sim_date, df_sim=df_sim, df_concat=df_all)
 
 # ---------------- 规则判定接口 ----------------
@@ -1357,7 +1359,7 @@ def run_prediction(inp: PredictionInput) -> pd.DataFrame:
     results = []
     
     if inp.rules:
-        logger.info(f"开始规则预测: 规则数={len(inp.rules)}")
+        logger.debug(f"开始规则预测: 规则数={len(inp.rules)}")
         for rule in inp.rules:
             name = str(rule.get("name", "") or "").strip() or "<unnamed>"
             chk  = str(rule.get("check", "") or "").strip()
@@ -1411,7 +1413,7 @@ def run_prediction(inp: PredictionInput) -> pd.DataFrame:
                 
             logger.debug(f"规则{name}处理完成")
     else:
-        logger.info("开始表达式预测")
+        logger.debug("开始表达式预测")
         try:
             w = int(estimate_warmup([inp.expr] if inp.expr else None, inp.recompute_indicators))
         except Exception:
@@ -1475,7 +1477,7 @@ def run_prediction(inp: PredictionInput) -> pd.DataFrame:
         df["tiebreak_j"] = None
         df["rank"] = None
     
-    logger.info(f"预测完成: 结果行数={len(df)}")
+    logger.debug(f"预测完成: 结果行数={len(df)}")
     return df
 
 # ---------------- 主入口：个股持仓检查 ----------------
@@ -1724,16 +1726,17 @@ def set_progress_handler(fn):
 def _emit(phase, current=None, total=None, message=None, **kw):
     """发送进度事件（已废弃）"""
     # 使用新的日志系统替代废弃的进度处理器
+    # 降级为 debug，减少日志噪音
     if message:
         if total and current is not None:
-            logger.info(f"[{phase}] {message} ({current}/{total})")
+            logger.debug(f"[{phase}] {message} ({current}/{total})")
         else:
-            logger.info(f"[{phase}] {message}")
+            logger.debug(f"[{phase}] {message}")
     else:
         if total and current is not None:
-            logger.info(f"[{phase}] 进度: {current}/{total}")
+            logger.debug(f"[{phase}] 进度: {current}/{total}")
         else:
-            logger.info(f"[{phase}] 执行中...")
+            logger.debug(f"[{phase}] 执行中...")
 
 
 def drain_progress_events():

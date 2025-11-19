@@ -36,8 +36,8 @@ except ImportError:
 
 # 配置日志 - 使用统一的日志系统
 try:
-    from log_system import get_logger as get_module_logger
-    logger = get_module_logger("database_manager")
+    from log_system import get_logger
+    logger = get_logger("database_manager")
 except ImportError:
     # 回退到标准logging
     logger = logging.getLogger(__name__)
@@ -242,7 +242,14 @@ class DatabaseConnectionConfigManager:
                 f"无法从config模块导入配置，使用默认配置。错误详情: {e} (类型: {type(e).__name__})"
             )
             import traceback
-            logger.debug(f"ImportError堆栈跟踪:\n{traceback.format_exc()}")
+            try:
+                exc_str = traceback.format_exc()
+                # 确保异常堆栈跟踪正确编码
+                if isinstance(exc_str, bytes):
+                    exc_str = exc_str.decode('utf-8', errors='replace')
+                logger.debug(f"ImportError堆栈跟踪:\n{exc_str}")
+            except Exception:
+                logger.debug("ImportError堆栈跟踪: (无法格式化异常信息)")
             # 使用默认配置（所有连接使用相同的配置参数）
             unified_threads = 16
             unified_memory_limit = '18GB'
@@ -283,7 +290,14 @@ class DatabaseConnectionConfigManager:
                 f"加载数据库配置时发生异常: {e} (类型: {type(e).__name__})"
             )
             import traceback
-            logger.error(f"异常堆栈跟踪:\n{traceback.format_exc()}")
+            try:
+                exc_str = traceback.format_exc()
+                # 确保异常堆栈跟踪正确编码
+                if isinstance(exc_str, bytes):
+                    exc_str = exc_str.decode('utf-8', errors='replace')
+                logger.error(f"异常堆栈跟踪:\n{exc_str}")
+            except Exception:
+                logger.error("异常堆栈跟踪: (无法格式化异常信息)")
             # 使用安全的默认配置（所有连接使用相同的配置参数）
             unified_threads = 16
             unified_memory_limit = '18GB'
@@ -397,7 +411,14 @@ class DatabaseConnectionConfigManager:
                             f"{dir_error} (类型: {type(dir_error).__name__})"
                         )
                         import traceback
-                        logger.debug(f"临时目录错误堆栈跟踪:\n{traceback.format_exc()}")
+                        try:
+                            exc_str = traceback.format_exc()
+                            # 确保异常堆栈跟踪正确编码
+                            if isinstance(exc_str, bytes):
+                                exc_str = exc_str.decode('utf-8', errors='replace')
+                            logger.debug(f"临时目录错误堆栈跟踪:\n{exc_str}")
+                        except Exception:
+                            logger.debug("临时目录错误堆栈跟踪: (无法格式化异常信息)")
                 else:
                     logger.debug("临时目录配置为空，跳过")
             else:
@@ -431,7 +452,14 @@ class DatabaseConnectionConfigManager:
                 f"{e} (类型: {type(e).__name__})"
             )
             logger.error(error_detail)
-            logger.error(f"配置应用错误堆栈跟踪:\n{traceback.format_exc()}")
+            try:
+                exc_str = traceback.format_exc()
+                # 确保异常堆栈跟踪正确编码
+                if isinstance(exc_str, bytes):
+                    exc_str = exc_str.decode('utf-8', errors='replace')
+                logger.error(f"配置应用错误堆栈跟踪:\n{exc_str}")
+            except Exception:
+                logger.error("配置应用错误堆栈跟踪: (无法格式化异常信息)")
             logger.error(f"当前配置: {config}")
             raise RuntimeError(f"配置应用失败: {e}") from e
     
@@ -636,7 +664,14 @@ class DatabaseConnectionPool:
                     f"  已关闭连接以避免配置不一致"
                 )
                 logger.error(error_msg)
-                logger.error(f"配置应用失败堆栈跟踪:\n{traceback.format_exc()}")
+                try:
+                    exc_str = traceback.format_exc()
+                    # 确保异常堆栈跟踪正确编码
+                    if isinstance(exc_str, bytes):
+                        exc_str = exc_str.decode('utf-8', errors='replace')
+                    logger.error(f"配置应用失败堆栈跟踪:\n{exc_str}")
+                except Exception:
+                    logger.error("配置应用失败堆栈跟踪: (无法格式化异常信息)")
                 raise RuntimeError(f"配置应用失败: {config_error}") from config_error
             
             # 记录连接创建时间和类型
@@ -1924,7 +1959,14 @@ class DatabaseManager:
                 logger.error(f"[get_latest_trade_date] SQL查询执行失败: {query_error}")
                 logger.error(f"[get_latest_trade_date] 查询失败详情: {type(query_error).__name__}: {str(query_error)}")
                 import traceback
-                logger.debug(f"[get_latest_trade_date] 查询失败堆栈: {traceback.format_exc()}")
+                try:
+                    exc_str = traceback.format_exc()
+                    # 确保异常堆栈跟踪正确编码
+                    if isinstance(exc_str, bytes):
+                        exc_str = exc_str.decode('utf-8', errors='replace')
+                    logger.debug(f"[get_latest_trade_date] 查询失败堆栈: {exc_str}")
+                except Exception:
+                    logger.debug("[get_latest_trade_date] 查询失败堆栈: (无法格式化异常信息)")
                 return None
             
             if not df.empty and "max_date" in df.columns:
@@ -1947,7 +1989,14 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"[get_latest_trade_date] 获取最新交易日失败: {e}")
             import traceback
-            logger.error(f"[get_latest_trade_date] 异常堆栈: {traceback.format_exc()}")
+            try:
+                exc_str = traceback.format_exc()
+                # 确保异常堆栈跟踪正确编码
+                if isinstance(exc_str, bytes):
+                    exc_str = exc_str.decode('utf-8', errors='replace')
+                logger.error(f"[get_latest_trade_date] 异常堆栈: {exc_str}")
+            except Exception:
+                logger.error("[get_latest_trade_date] 异常堆栈: (无法格式化异常信息)")
             return None
     
     def get_trade_dates(self, db_path: str = None) -> List[str]:

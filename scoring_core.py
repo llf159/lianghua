@@ -258,6 +258,181 @@ if _SC_RULES_LOADED:
 else:
     LOGGER.warning("[策略预编译] 策略规则加载失败或未找到规则")
 
+# 归一化 gate/trigger/require 字段（需要在 _calc_rule_total_window 之前定义）
+def _normalize_gate(rule: dict) -> dict | None:
+    """把 trigger/gate/require 归一成：{'clauses': [...]} 或 单子句 dict。"""
+    g = rule.get("trigger") or rule.get("gate") or rule.get("require")
+    if not g:
+        return None
+    if isinstance(g, str):
+        # 默认使用当前规则的时间框架和窗口
+        return {
+            "timeframe": str(rule.get("timeframe","D")).upper(),
+            "score_windows": int(rule.get("score_windows", SC_LOOKBACK_D)),
+            "scope": "LAST",
+            "when": g
+        }
+    if isinstance(g, dict):
+        return g
+    if isinstance(g, (list, tuple)):
+        return {"clauses": list(g)}
+    return None
+
+
+# 需要先定义 _calc_nested_window，因为 _calc_rule_total_window 会用到它
+# 将 _calc_nested_window 的定义移到这里（在策略编译之前）
+@lru_cache(maxsize=256)
+def _calc_nested_window(expr: str) -> int:
+    """
+    递归计算嵌套函数所需的总窗口大小。
+    例如：HHV(REF(H,1), 20) 需要 20 + 1 = 21天
+         HHV(REF(H,2), 30) 需要 30 + 2 = 32天
+         HHV(MA(REF(C,1),5),20) 需要 20 + 5 + 1 = 26天
+    
+    Args:
+        expr: 表达式字符串
+        
+    Returns:
+        嵌套函数所需的总窗口大小，如果没有找到则返回 0
+    """
+    if not expr:
+        return 0
+    
+    max_total_window = 0
+    
+    # 需要嵌套的函数列表（这些函数需要递归计算内部表达式）
+    nested_funcs = ['TS_RANK', 'TS_PCT', 'MA', 'EMA', 'SMA', 'HHV', 'LLV', 'SUM', 'STD', 'COUNT']
+    
+    # 使用递归方法找到所有函数调用
+    func_calls = []
+    processed_ranges = set()
+    
+    for func_name in nested_funcs:
+        func_pattern = func_name + r'\s*\('
+        for match in re.finditer(func_pattern, expr, re.IGNORECASE):
+            func_start = match.start()
+            func_end = match.end()
+            
+            # 找到匹配的右括号
+            paren_count = 1
+            j = func_end
+            while j < len(expr) and paren_count > 0:
+                if expr[j] == '(':
+                    paren_count += 1
+                elif expr[j] == ')':
+                    paren_count -= 1
+                j += 1
+            
+            if paren_count == 0:
+                if (func_start, j) not in processed_ranges:
+                    func_calls.append((func_start, j, func_name))
+                    processed_ranges.add((func_start, j))
+    
+    # 从外层到内层处理函数调用（按范围大小排序）
+    func_calls.sort(key=lambda x: x[1] - x[0], reverse=True)
+    
+    # 处理每个函数调用
+    for func_start, func_end, func_name in func_calls:
+        func_call = expr[func_start:func_end]
+        func_pattern = func_name + r'\s*\('
+        match = re.search(func_pattern, func_call, re.IGNORECASE)
+        if match:
+            params = func_call[len(match.group(0)):len(func_call)-1]
+            
+            # 查找最后一个逗号后的数字（窗口参数）
+            last_comma = params.rfind(',')
+            if last_comma != -1:
+                after_comma = params[last_comma+1:].strip()
+                num_match = re.match(r'(\d+)', after_comma)
+                if num_match:
+                    try:
+                        window = int(num_match.group(1))
+                        # 递归计算内部表达式所需窗口
+                        inner_expr = params[:last_comma].strip()
+                        inner_window = _calc_nested_window(inner_expr)
+                        total_window = window + inner_window
+                        max_total_window = max(max_total_window, total_window)
+                    except (ValueError, TypeError):
+                        pass
+    
+    # 如果没有找到需要嵌套的函数，再匹配REF等简单函数
+    if max_total_window == 0:
+        ref_pattern = r'REF\s*\([^)]+,\s*(\d+)'
+        matches = re.finditer(ref_pattern, expr, re.IGNORECASE)
+        for match in matches:
+            try:
+                window = int(match.group(1))
+                max_total_window = max(max_total_window, window)
+            except (ValueError, TypeError):
+                pass
+    
+    return max_total_window
+
+
+# 计算单个规则或子句的总窗口（包括表达式窗口）
+def _calc_rule_total_window(rule_or_clause: dict, tf: str) -> int:
+    """
+    计算单个规则或子句的总窗口（score_windows + 表达式窗口）
+    结果会缓存到规则对象的 _cached_total_window_by_tf 字段中
+    
+    Args:
+        rule_or_clause: 规则或子句字典
+        tf: 时间框架（D/W/M）
+    
+    Returns:
+        总窗口大小（score_windows + max(when_window, gate_window)）
+    """
+    if rule_or_clause.get("timeframe", "D").upper() != tf:
+        return 0
+    
+    # 检查是否已有缓存
+    cache_key = f"_cached_total_window_{tf}"
+    if cache_key in rule_or_clause:
+        return rule_or_clause[cache_key]
+    
+    # 获取 score_windows
+    window = int(rule_or_clause.get("score_windows", SC_LOOKBACK_D))
+    
+    # 计算 when 表达式窗口
+    when_expr = (rule_or_clause.get("when") or "").strip()
+    expr_window = 0
+    if when_expr:
+        expr_window = _calc_nested_window(when_expr)
+    
+    # 计算 gate 表达式窗口
+    gate_raw = rule_or_clause.get("gate") or rule_or_clause.get("trigger") or rule_or_clause.get("require")
+    gate_window = 0
+    if gate_raw:
+        gate_norm = _normalize_gate(rule_or_clause)
+        if gate_norm:
+            if isinstance(gate_norm, dict) and "when" in gate_norm:
+                gate_expr = (gate_norm.get("when") or "").strip()
+                if gate_expr:
+                    gate_window = _calc_nested_window(gate_expr)
+            elif isinstance(gate_norm, dict) and "clauses" in gate_norm:
+                # gate 包含多个子句，需要计算每个子句的窗口
+                for clause in gate_norm["clauses"]:
+                    if isinstance(clause, dict) and "when" in clause:
+                        clause_expr = (clause.get("when") or "").strip()
+                        if clause_expr:
+                            clause_window = _calc_nested_window(clause_expr)
+                            gate_window = max(gate_window, clause_window)
+        elif isinstance(gate_raw, str):
+            # gate 是字符串表达式
+            gate_expr = gate_raw.strip()
+            if gate_expr:
+                gate_window = _calc_nested_window(gate_expr)
+    
+    # 总窗口 = score_windows + max(when_window, gate_window)
+    expr_window = max(expr_window, gate_window)
+    total_window = window + expr_window
+    
+    # 缓存结果
+    rule_or_clause[cache_key] = total_window
+    
+    return total_window
+
+
 # 策略编译时计算最大 score_windows（按 timeframe 分组）
 def _compute_max_windows_by_tf(rules: List[dict]) -> dict:
     """
@@ -320,13 +495,27 @@ def _compute_max_windows_by_tf(rules: List[dict]) -> dict:
     
     return max_wins
 
-# 在策略编译时计算最大 windows
+# 在策略编译时计算最大 windows 并缓存每个规则的窗口
 _MAX_WINDOWS_BY_TF = {}
 if _SC_RULES_LOADED:
     try:
         all_rules = list(SC_RULES) + list(SC_PRESCREEN_RULES)
+        
+        # 预计算并缓存每个规则的窗口（按时间框架）
+        for rule in all_rules:
+            if "clauses" in rule:
+                # 带子句的规则：为每个子句缓存窗口
+                for clause in rule.get("clauses", []):
+                    for tf in ["D", "W", "M"]:
+                        _calc_rule_total_window(clause, tf)
+            else:
+                # 单条规则：直接缓存窗口
+                for tf in ["D", "W", "M"]:
+                    _calc_rule_total_window(rule, tf)
+        
         _MAX_WINDOWS_BY_TF = _compute_max_windows_by_tf(all_rules)
         LOGGER.info(f"[策略预编译] 最大 windows (按 timeframe): {_MAX_WINDOWS_BY_TF}")
+        LOGGER.info(f"[策略预编译] 已缓存所有规则的窗口计算结果")
     except Exception as e:
         LOGGER.warning(f"[策略预编译] 计算最大 windows 失败: {e}")
         _MAX_WINDOWS_BY_TF = {"D": SC_LOOKBACK_D}
@@ -721,45 +910,22 @@ def preload_rank_data(ref_date: str, start_date: str, columns: List[str]):
         sc_rules = globals().get("SC_RULES") or (load_rank_rules_py() or [])
         sc_prescreen_rules = globals().get("SC_PRESCREEN_RULES") or (load_filter_rules_py() or [])
         
-        # 收集所有策略规则的 when 表达式，并使用 _calc_nested_window 计算最大所需数据长度
+        # 收集所有策略规则的最大窗口（优先使用编译时缓存的窗口值）
         def _collect_and_calc_max_window(rules: List[dict], tf: str) -> int:
-            """收集规则中的窗口和表达式，计算最大所需数据长度"""
+            """收集规则中的最大窗口（优先使用编译时缓存的窗口值）"""
             max_total_window = 0
             
             for r in rules:
                 if "clauses" in r:
                     # 带子句的规则：检查每个子句
                     for c in r["clauses"]:
-                        if c.get("timeframe", "D").upper() == tf:
-                            # 获取窗口
-                            window = int(c.get("score_windows", SC_LOOKBACK_D))
-                            
-                            # 使用 _calc_nested_window 计算表达式最大所需数据长度
-                            when_expr = (c.get("when") or "").strip()
-                            expr_window = 0
-                            if when_expr:
-                                expr_window = _calc_nested_window(when_expr)
-                            
-                            # 总数据长度 = score_windows + expr_data_length
-                            # 因为要在score_windows窗口内的每一天计算表达式，最早的那一天需要expr_data_length的历史数据
-                            total_window = window + expr_window
-                            max_total_window = max(max_total_window, total_window)
-                else:
-                    # 单条规则
-                    if r.get("timeframe", "D").upper() == tf:
-                        # 获取窗口
-                        window = int(r.get("score_windows", SC_LOOKBACK_D))
-                        
-                        # 使用 _calc_nested_window 计算表达式最大所需数据长度
-                        when_expr = (r.get("when") or "").strip()
-                        expr_window = 0
-                        if when_expr:
-                            expr_window = _calc_nested_window(when_expr)
-                        
-                        # 总数据长度 = score_windows + expr_data_length
-                        # 因为要在score_windows窗口内的每一天计算表达式，最早的那一天需要expr_data_length的历史数据
-                        total_window = window + expr_window
+                        # 优先使用缓存的窗口值，如果没有则计算（兼容动态加载的规则）
+                        total_window = _calc_rule_total_window(c, tf)
                         max_total_window = max(max_total_window, total_window)
+                else:
+                    # 单条规则：优先使用缓存的窗口值
+                    total_window = _calc_rule_total_window(r, tf)
+                    max_total_window = max(max_total_window, total_window)
             
             # 返回所有规则中最大的总数据长度（score_windows + expr_data_length）
             return max_total_window
@@ -1485,26 +1651,6 @@ def _make_time_weights(n: int,
         if s > 0:
             w = w / s
     return w.tolist()
-
-
-def _normalize_gate(rule: dict) -> dict | None:
-    """把 trigger/gate/require 归一成：{'clauses': [...]} 或 单子句 dict。"""
-    g = rule.get("trigger") or rule.get("gate") or rule.get("require")
-    if not g:
-        return None
-    if isinstance(g, str):
-        # 默认使用当前规则的时间框架和窗口
-        return {
-            "timeframe": str(rule.get("timeframe","D")).upper(),
-            "score_windows": int(rule.get("score_windows", SC_LOOKBACK_D)),
-            "scope": "LAST",
-            "when": g
-        }
-    if isinstance(g, dict):
-        return g
-    if isinstance(g, (list, tuple)):
-        return {"clauses": list(g)}
-    return None
 
 
 def _eval_gate(df: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = None) -> tuple[bool, str | None, dict | None]:
@@ -3016,108 +3162,6 @@ def _scan_expr_window(expr: str) -> int:
                 pass
     
     return max_window
-
-
-@lru_cache(maxsize=256)
-def _calc_nested_window(expr: str) -> int:
-    """
-    递归计算嵌套函数所需的总窗口大小。
-    例如：HHV(REF(H,1), 20) 需要 20 + 1 = 21天
-         HHV(REF(H,2), 30) 需要 30 + 2 = 32天
-         HHV(MA(REF(C,1),5),20) 需要 20 + 5 + 1 = 26天
-    
-    Args:
-        expr: 表达式字符串
-        
-    Returns:
-        嵌套函数所需的总窗口大小，如果没有找到则返回 0
-    """
-    if not expr:
-        return 0
-    
-    max_total_window = 0
-    
-    # 需要嵌套的函数列表（这些函数需要递归计算内部表达式）
-    nested_funcs = ['TS_RANK', 'TS_PCT', 'MA', 'EMA', 'SMA', 'HHV', 'LLV', 'SUM', 'STD', 'COUNT']
-    
-    # 使用递归方法找到所有函数调用
-    # 需要找到所有嵌套的函数，包括外层和内层
-    # 但是要注意：外层函数的窗口应该累加内层函数的窗口
-    # 例如：HHV(MA(REF(C,1),5),20) 需要 20 + 5 + 1 = 26天
-    # 策略：先找到所有函数调用，然后从外层到内层递归计算
-    
-    # 收集所有函数调用的位置和范围
-    # 需要找到所有嵌套的函数，包括外层和内层
-    # 策略：遍历每个字符位置，查找所有函数调用
-    func_calls = []
-    processed_ranges = set()  # 记录已处理的函数调用范围，避免重复
-    
-    for func_name in nested_funcs:
-        func_pattern = func_name + r'\s*\('
-        # 查找所有匹配的函数调用
-        for match in re.finditer(func_pattern, expr, re.IGNORECASE):
-            func_start = match.start()
-            func_end = match.end()
-            
-            # 找到匹配的右括号
-            paren_count = 1
-            j = func_end
-            while j < len(expr) and paren_count > 0:
-                if expr[j] == '(':
-                    paren_count += 1
-                elif expr[j] == ')':
-                    paren_count -= 1
-                j += 1
-            
-            if paren_count == 0:
-                # 检查是否已经处理过这个函数调用
-                if (func_start, j) not in processed_ranges:
-                    func_calls.append((func_start, j, func_name))
-                    processed_ranges.add((func_start, j))
-    
-    # 从外层到内层处理函数调用（按起始位置排序，外层函数在前）
-    # 但是要注意：内层函数可能在外层函数之前（如MA在HHV之前）
-    # 所以需要按嵌套深度排序：外层函数应该先处理
-    # 简单方法：按函数调用的范围大小排序，范围大的（外层）先处理
-    func_calls.sort(key=lambda x: x[1] - x[0], reverse=True)
-    
-    # 处理每个函数调用
-    for func_start, func_end, func_name in func_calls:
-        func_call = expr[func_start:func_end]
-        # 提取函数参数部分
-        func_pattern = func_name + r'\s*\('
-        match = re.search(func_pattern, func_call, re.IGNORECASE)
-        if match:
-            params = func_call[len(match.group(0)):len(func_call)-1]  # 去掉函数名(和最后的)
-            
-            # 查找最后一个逗号后的数字（窗口参数）
-            last_comma = params.rfind(',')
-            if last_comma != -1:
-                after_comma = params[last_comma+1:].strip()
-                num_match = re.match(r'(\d+)', after_comma)
-                if num_match:
-                    try:
-                        window = int(num_match.group(1))
-                        # 递归计算内部表达式所需窗口
-                        inner_expr = params[:last_comma].strip()
-                        inner_window = _calc_nested_window(inner_expr)
-                        total_window = window + inner_window
-                        max_total_window = max(max_total_window, total_window)
-                    except (ValueError, TypeError):
-                        pass
-    
-    # 如果没有找到需要嵌套的函数，再匹配REF等简单函数
-    if max_total_window == 0:
-        ref_pattern = r'REF\s*\([^)]+,\s*(\d+)'
-        matches = re.finditer(ref_pattern, expr, re.IGNORECASE)
-        for match in matches:
-            try:
-                window = int(match.group(1))
-                max_total_window = max(max_total_window, window)
-            except (ValueError, TypeError):
-                pass
-    
-    return max_total_window
 
 
 def _window_slice(dfTF: pd.DataFrame, ref_date: str, window: int) -> pd.DataFrame:
