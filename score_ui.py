@@ -4200,7 +4200,9 @@ if _in_streamlit():
             with c1:
                 level = st.selectbox("时间级别", ["D","W","M"], index=0, key="screen_level")
             with c2:
-                window = st.number_input("窗口长度", min_value=1, max_value=500, value=30, key="screen_window")
+                window = st.number_input("计分窗口 (score_windows)", min_value=1, max_value=500, value=30, 
+                                         help="用于计分判断的历史数据条数。系统会自动根据表达式中的函数（如REF、MA、TS_RANK等）计算所需的历史数据窗口，总数据窗口 = score_windows + 表达式窗口", 
+                                         key="screen_window")
             with c3:
                 scope_logic = st.selectbox("命中范围(scope)", ["LAST","ANY","ALL","COUNT>=k","CONSEC>=m","ANY_n","ALL_n"], index=0, key="screen_scope_logic")
             with c4:

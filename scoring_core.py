@@ -4475,7 +4475,7 @@ def _score_one(ts_code: str, ref_date: str, start_date: str, columns: List[str])
         return (ts_code, None, (ts_code, ref_date, f"评分失败:{e}"), detail_data, cache_stats)
 
 
-def _screen_one(ts_code, st, ref, tf, win, when, scope, use_prescreen_first, ctx: dict = None, precomputed_cols: list[str] | None = None):
+def _screen_one(ts_code, st, ref, tf, score_windows, when, scope, use_prescreen_first, ctx: dict = None, precomputed_cols: list[str] | None = None, data_window: int = None):
     try:
         # 单票筛选同样并入规则/标签所需列，避免 'j'、'duokong_*' 等缺列
         # 优化：如果提供了预计算的列，直接使用，避免每个股票都重复扫描表达式
@@ -4500,22 +4500,36 @@ def _screen_one(ts_code, st, ref, tf, win, when, scope, use_prescreen_first, ctx
 
         if ctx:
             # 使用缓存版本：自动使用策略编译时的最大 window 作为 data_window，score_window 用于计算窗口
-            s_bool = _eval_bool_cached(ctx, dfD, when, tf, win, ref)
+            s_bool = _eval_bool_cached(ctx, dfD, when, tf, score_windows, ref)
             ok = _scope_hit(s_bool, scope)
         else:
             # 原始版本：在完整数据上计算，然后切片窗口范围
             dfTF = dfD if tf == "D" else _resample(dfD, tf)
-            win_df = _window_slice(dfTF, ref, win)
+            
+            # 如果提供了 data_window，使用它来切片数据用于计算（确保有足够的历史数据）
+            # 否则使用 score_windows（向后兼容）
+            if data_window is not None and data_window > score_windows:
+                # 使用 data_window 切片数据用于计算表达式（确保有足够的历史数据）
+                data_df = _window_slice(dfTF, ref, data_window)
+                if data_df.empty:
+                    return (ts_code, False, None, None)
+                # 使用 score_windows 切片计分窗口（对于 LAST scope，score_windows=1，只取最后一天）
+                win_df = _window_slice(dfTF, ref, score_windows)
+            else:
+                # 向后兼容：如果没有提供 data_window，使用 score_windows
+                win_df = _window_slice(dfTF, ref, score_windows)
+                data_df = win_df
+            
             if win_df.empty:
                 return (ts_code, False, None, None)
             tdx.EXTRA_CONTEXT.update(get_eval_env(ts_code, ref))
 
             _inject_config_tags(dfD, ref, skip_tags=True)      # 表达式选股场景，跳过标签注入
-            # 在完整数据上计算表达式
-            tdx.EXTRA_CONTEXT["DF"] = dfTF
-            result_full = evaluate_bool(when, dfTF)
-            # 切片到窗口范围
-            result_full_series = pd.Series(result_full, index=dfTF.index, dtype=bool)
+            # 在完整数据上计算表达式（使用 data_df 确保有足够的历史数据）
+            tdx.EXTRA_CONTEXT["DF"] = data_df
+            result_full = evaluate_bool(when, data_df)
+            # 切片到计分窗口范围（score_windows）
+            result_full_series = pd.Series(result_full, index=data_df.index, dtype=bool)
             s_bool = result_full_series.reindex(win_df.index, fill_value=False).astype(bool)
             ok = _scope_hit(s_bool, scope)
         if ok:
@@ -6051,8 +6065,32 @@ def tdx_screen(
 
     ref = ref_date or _pick_ref_date()
     tf  = (timeframe or "D").upper()
-    win = int(window or 30)  # 默认30
-    st  = _start_for_tf_window(ref, tf, win)
+    user_score_windows = int(window or 30)  # 用户输入的 window 参数理解为 score_windows（计分窗口）
+    
+    # 使用现有的 _get_score_window 函数来处理所有 scope 的情况（LAST、RECENT、DIST、NEAR 等）
+    # 构造一个临时规则字典，包含 scope 和 score_windows
+    temp_rule = {
+        "scope": scope,
+        "score_windows": user_score_windows
+    }
+    score_windows = _get_score_window(temp_rule, default_window=user_score_windows)
+    
+    if score_windows != user_score_windows:
+        LOGGER.debug(f"[screen] scope={scope}，将 score_windows 从 {user_score_windows} 调整为 {score_windows}")
+    
+    # 自动计算表达式所需的数据窗口（递归计算嵌套函数所需的历史数据）
+    expr_data_window = _calc_nested_window(when)
+    
+    # 总数据窗口 = score_windows（计分窗口）+ 表达式所需的历史数据窗口
+    # 注意：即使 scope 是 LAST（score_windows=1），仍然需要足够的历史数据来计算表达式
+    # 例如：REF(C,1) > MA(C,20) 需要至少 20 天的历史数据来计算 MA，但只需要判断最后一天是否满足条件
+    data_window = score_windows + expr_data_window
+    
+    # 如果表达式需要更多历史数据，使用更大的窗口
+    if expr_data_window > 0:
+        LOGGER.info(f"[screen] 表达式自动计算窗口: score_windows={score_windows}, 表达式窗口={expr_data_window}, 总数据窗口={data_window}")
+    
+    st  = _start_for_tf_window(ref, tf, data_window)  # 使用总数据窗口来获取历史数据
 
     # 选范围 + 只读必要列（J/VR 会在 _screen_one 里兜底）
     codes0 = _list_codes_for_day(ref)
@@ -6062,6 +6100,10 @@ def tdx_screen(
         LOGGER.warning(f"[screen] {ref} 无可用标的。")
         return pd.DataFrame() if return_df else None
 
+    # 初始化排名上下文（用于表达式中的 RANK_VOL、RANK_RET 等排名函数）
+    init_rank_env(ref, codes, DATA_ROOT, API_ADJ, default_N=60)
+    LOGGER.debug(f"[screen] 排名上下文已初始化: ref={ref}, codes={len(codes)}")
+
     # 读取列：表达式涉及列 ∪ 全部规则/预筛/机会标签可能用到的列（如 j、duokong_*、vr 等）
     # 优化：预先扫描表达式所需列（只扫描一次），然后传递给所有 _screen_one 调用
     try:
@@ -6069,7 +6111,7 @@ def tdx_screen(
     except Exception:
         _rule_cols = []
     cols = sorted(set(_scan_cols_from_expr(when)) | set(_rule_cols))
-    LOGGER.debug(f"[screen] 参考日={ref} tf={tf} window={win} scope={scope} 宇宙={len(codes)}")
+    LOGGER.debug(f"[screen] 参考日={ref} tf={tf} score_windows={score_windows} data_window={data_window} scope={scope} 宇宙={len(codes)}")
     LOGGER.debug(f"[screen] 读取列={cols} 起始={st}")
     
     # 预加载表达式筛选所需的数据（性能优化）
@@ -6119,7 +6161,7 @@ def tdx_screen(
     
     # 预加载表达式筛选所需的数据（性能优化）
     try:
-        preload_screen_data(ref, codes, tf, win, cols)
+        preload_screen_data(ref, codes, tf, data_window, cols)
         # 若预加载成功，使用其交易日精确起点，避免与缓存不一致
         try:
             if (_SCREEN_DATA_CACHE.get("data") is not None and 
@@ -6177,9 +6219,10 @@ def tdx_screen(
     with ExecutorCls(max_workers=max_workers) as executor:
         # 提交所有任务
         # 优化：传递预计算的列列表，避免每个股票都重复扫描表达式
+        # 传递 score_windows 和 data_window 两个参数
         futures = []
         for c in codes:
-            futures.append(executor.submit(_screen_one, c, st, ref, tf, win, when, scope, use_prescreen_first, None, cols))
+            futures.append(executor.submit(_screen_one, c, st, ref, tf, score_windows, when, scope, use_prescreen_first, None, cols, data_window))
         
         # 收集结果并更新进度（同时显示在控制台和UI）
         for fut in tqdm(as_completed(futures), total=len(futures), desc=f"选股 {ref}"):
@@ -6192,14 +6235,14 @@ def tdx_screen(
             if ok:
                 hits.append(ts_code)
                 if write_white:
-                    whitelist_items.append((ts_code, ref, f"screen:{tf}{win}:{scope}::{when}"))
+                    whitelist_items.append((ts_code, ref, f"screen:{tf}{score_windows}:{scope}::{when}"))
             else:
                 # 预筛淘汰会带 period/reason；常规未命中则写一个统一 reason
                 if write_black_rest:
                     if list_item:  # 预筛失败时 _screen_one 已给出 (ts_code, period, reason)
                         blacklist_items.append(list_item)
                     else:
-                        blacklist_items.append((ts_code, ref, f"screen_fail:{tf}{win}:{scope}::{when}"))
+                        blacklist_items.append((ts_code, ref, f"screen_fail:{tf}{score_windows}:{scope}::{when}"))
     _progress("screen_done", total=len(codes), current=done, message=f"hits={len(hits)}")
     # 写缓存名单（沿用原语义）
     if write_white or write_black_rest:
@@ -6215,7 +6258,7 @@ def tdx_screen(
     if return_df:
         out = pd.DataFrame({"ts_code": sorted(hits)})
         out["ref_date"] = ref
-        out["rule"] = f"{tf}{win}:{scope}::{when}"
+        out["rule"] = f"{tf}{score_windows}:{scope}::{when}"
         
         # 读取当日得分数据并合并，然后按得分排序
         try:
