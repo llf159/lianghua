@@ -155,7 +155,7 @@ def _lazy_import_download():
 
 # 直接使用 database_manager 函数，不再需要包装器
 import os
-from config import DATA_ROOT, API_ADJ, SC_DETAIL_STORAGE, SC_USE_DB_STORAGE, SC_DB_FALLBACK_TO_JSON
+from config import DATA_ROOT, API_ADJ, SC_DETAIL_STORAGE, SC_USE_DB_STORAGE, SC_DB_FALLBACK_TO_JSON, SC_TRACKING_TOP_N
 import tdx_compat as tdx
 # 从 stats_core 移过来的工具函数和类
 from dataclasses import dataclass, asdict
@@ -1287,7 +1287,7 @@ def _rule_to_screen_args(rule: dict):
 
 def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
     """
-    加载个股详情，优先从数据库读取，失败时回退到JSON文件
+    加载个股详情，优先从数据库读取，如果数据库不可用则从JSON文件读取
     注意：只有当 details_db_reading_enabled 为 True 时才会读取数据库，避免与写入操作冲突
     """
     # 检查是否允许读取数据库（使用统一的函数）
@@ -1295,19 +1295,21 @@ def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
     
     # 1. 优先从数据库读取（只有当db_reading_enabled为True且数据库可用时才读取）
     if db_reading_enabled and is_details_db_available():
-        db_success = False
         try:
             # 使用统一的函数获取details数据库路径（包含回退逻辑）
             details_db_path = get_details_db_path_with_fallback()
             if not details_db_path:
-                # 数据库文件不存在，回退到JSON
-                logger.debug(f"数据库文件不存在，回退到JSON: {ts}_{ref}")
-                db_success = False
-                raise FileNotFoundError("Details数据库文件不存在")
+                # 数据库文件不存在，直接返回None
+                logger.debug(f"数据库文件不存在: {ts}_{ref}")
+                return None
             
             # 查询股票详情表
             logger.info(f"[数据库连接] 开始获取数据库管理器实例 (查询股票详情: {ts}, {ref})")
             manager = get_database_manager()
+            if not manager:
+                logger.debug(f"无法获取数据库管理器: {ts}_{ref}")
+                return None
+            
             sql = "SELECT * FROM stock_details WHERE ts_code = ? AND ref_date = ?"
             df = manager.execute_sync_query(details_db_path, sql, [ts, ref], timeout=30.0)
             
@@ -1381,27 +1383,26 @@ def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
                     'rank': summary['rank'],   # 兼容旧调用
                     'total': summary['total'],
                 }
-                db_success = True
                 return result
             else:
-                # 数据库查询成功但无数据，回退到JSON
-                logger.debug(f"数据库查询为空，回退到JSON: {ts}_{ref}")
-                db_success = False
+                # 数据库查询成功但无数据，直接返回None
+                logger.debug(f"数据库查询为空: {ts}_{ref}")
+                return None
+        except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+            # 数据库文件不存在或管理器获取失败，直接返回None
+            logger.debug(f"数据库访问失败 {ts}_{ref}: {e}")
+            return None
         except Exception as e:
-            # 数据库读取失败，回退到JSON
-            logger.debug(f"数据库读取失败，回退到JSON {ts}_{ref}: {e}")
-            db_success = False
-        
-        # 如果数据库读取失败（异常或查询为空），回退到JSON
-        if not db_success:
-            # 继续下面的JSON回退逻辑
-            pass
-        else:
-            # 数据库读取成功，已返回结果，不应该到达这里
-            pass
+            # 数据库读取失败（可能是表不存在、连接错误等），直接返回None
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                logger.debug(f"Details数据库表不存在: {ts}_{ref}")
+            else:
+                logger.debug(f"数据库读取失败 {ts}_{ref}: {e}")
+            return None
     
-    # 2. 如果数据库失败且配置了回退，或者配置了JSON存储，或者未启用数据库读取，则使用JSON文件
-    if (not db_reading_enabled) or (SC_DB_FALLBACK_TO_JSON) or SC_DETAIL_STORAGE in ["json", "both"]:
+    # 2. 如果未启用数据库读取，或者配置了JSON存储，则使用JSON文件
+    if (not db_reading_enabled) or SC_DETAIL_STORAGE in ["json", "both"]:
         try:
             p = _path_detail(ref, ts)
             if not p.exists(): 
@@ -2024,6 +2025,9 @@ if _in_streamlit():
     tab_rank, tab_detail, tab_position, tab_predict, tab_rules, tab_attn, tab_custom, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
         ["排名", "个股详情", "持仓建议", "明日模拟", "规则编辑", "强度榜", "自选榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
 
+    # tab_rank, tab_detail, tab_position, tab_predict, tab_predict_rank, tab_rules, tab_attn, tab_custom, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
+    #     ["排名", "个股详情", "持仓建议", "明日模拟", "预测排名", "规则编辑", "强度榜", "自选榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
+
     # ================== 排名 ==================
     with tab_rank:
         st.subheader("排名")
@@ -2345,16 +2349,29 @@ if _in_streamlit():
                             # 查询股票详情表
                             logger.info(f"[数据库连接] 开始获取数据库管理器实例 (查询股票详情: {code_norm}, {ref_real})")
                             manager = get_database_manager()
-                            sql = "SELECT * FROM stock_details WHERE ts_code = ? AND ref_date = ?"
-                            df = manager.execute_sync_query(details_db_path, sql, [code_norm, ref_real], timeout=30.0)
-                            
-                            if not df.empty:
-                                st.info("数据来源：数据库")
+                            if manager:
+                                sql = "SELECT * FROM stock_details WHERE ts_code = ? AND ref_date = ?"
+                                df = manager.execute_sync_query(details_db_path, sql, [code_norm, ref_real], timeout=30.0)
+                                
+                                if not df.empty:
+                                    st.info("数据来源：数据库")
+                                else:
+                                    st.info("数据来源：JSON文件")
                             else:
                                 st.info("数据来源：JSON文件")
                         else:
                             st.info("数据来源：JSON文件")
-                    except:
+                    except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                        # 数据库文件不存在或管理器获取失败
+                        logger.debug(f"数据库访问失败: {code_norm}_{ref_real}: {e}")
+                        st.info("数据来源：JSON文件")
+                    except Exception as e:
+                        # 数据库读取失败（可能是表不存在、连接错误等）
+                        error_msg = str(e).lower()
+                        if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                            logger.debug(f"Details数据库表不存在: {code_norm}_{ref_real}")
+                        else:
+                            logger.debug(f"数据库读取失败: {code_norm}_{ref_real}: {e}")
                         st.info("数据来源：JSON文件")
                 else:
                     st.info("数据来源：JSON文件（数据库读取未启用）")
@@ -3311,6 +3328,282 @@ if _in_streamlit():
                         """)
             else:
                 st.warning("请检查参数设置，确保参考日和选股范围都有效")
+
+    # ================== 预测排名 ==================
+    # with tab_predict_rank:
+    #     st.subheader("预测排名")
+    #     st.info("💡 使用模拟数据运行排名策略，得到预测的排名结果")
+        
+    #     # 使用 st.form 防止参数变化时立即刷新UI
+    #     with st.form("predict_rank_form"):
+    #         with st.expander("输入参数", expanded=True):
+    #             c1, c2 = st.columns([1,1])
+    #             with c1:
+    #                 pred_rank_ref = st.text_input("参考日（YYYYMMDD；留空=自动取最新交易日）", value="", key="pred_rank_ref_input")
+    #                 if not pred_rank_ref.strip():
+    #                     # 显示当前会自动使用的参考日
+    #                     auto_ref = _pick_smart_ref_date()
+    #                     if auto_ref:
+    #                         st.caption(f"💡 将自动使用最新交易日: {auto_ref}")
+    #                     else:
+    #                         st.caption("⚠️ 无法自动获取最新交易日，请手动输入")
+    #                 recalc_mode_rank = st.radio("指标重算", ["自选", "全部(all)", "不重算(none)"],
+    #                                             index=0, horizontal=True, key="pred_rank_recalc_mode")
+    #                 if recalc_mode_rank == "自选":
+    #                     recompute_opts_rank = st.multiselect("仅重算需要的指标",
+    #                                                     _indicator_options(),
+    #                                                     default=["kdj"],
+    #                                                     key="pred_rank_recompute_pick")
+    #                     recompute_to_pass_rank = tuple(recompute_opts_rank) if recompute_opts_rank else ("kdj",)
+    #                 elif recalc_mode_rank == "全部(all)":
+    #                     recompute_to_pass_rank = "all"
+    #                 else:
+    #                     recompute_to_pass_rank = "none"
+    #             with c2:
+    #                 uni_choice_rank = st.selectbox(
+    #                     "选股范围",
+    #                     ["自定义（下方文本）","全市场","仅白名单","仅黑名单","仅特别关注榜"],
+    #                     index=0, key="pred_rank_uni_choice")
+    #                 # 文本框仅在"自定义"时使用
+    #                 pasted_rank = st.text_area("选股范围（支持多种分隔符：空格、换行、逗号、分号、竖线等；可混合 ts_code / 简写）", height=120, placeholder="例：\n000001.SZ 600000.SH 000001\n或：\n000001.SZ,600000.SH;000001|300001", disabled=(not uni_choice_rank.startswith("自定义")), key="pred_rank_pasted")
+            
+    #         # 全局场景设置
+    #         with st.container(border=True):
+    #             st.markdown("**全局场景设置**")
+    #             cc1, cc2, cc3 = st.columns([1,1,1])
+    #             with cc1:
+    #                 scen_mode_rank = st.selectbox("价格模式", ["close_pct","open_pct","gap_then_close_pct","flat","limit_up","limit_down"], index=0, key="pred_rank_scen_mode")
+    #                 pct_rank = st.number_input("涨跌幅 pct（%）", value=2.0, step=0.5, format="%.2f", key="pred_rank_pct")
+    #                 gap_pct_rank = st.number_input("跳空 gap_pct（%）", value=0.0, step=0.5, format="%.2f", key="pred_rank_gap_pct")
+    #             with cc2:
+    #                 vol_mode_rank = st.selectbox("量能模式", ["same","pct","mult"], index=2, key="pred_rank_vol_mode")
+    #                 vol_arg_rank = st.number_input("量能参数（% 或 倍数）", value=1.2, step=0.1, format="%.2f", key="pred_rank_vol_arg")
+    #                 hl_mode_rank = st.selectbox("高低生成", ["follow","atr_like","range_pct"], index=0, key="pred_rank_hl_mode")
+    #             with cc3:
+    #                 range_pct_rank = st.number_input("range_pct（%）", value=2.0, step=0.5, format="%.2f", key="pred_rank_range_pct")
+    #                 atr_mult_rank = st.number_input("atr_mult", value=1.0, step=0.1, format="%.2f", key="pred_rank_atr_mult")
+    #                 lock_hi_open_rank = st.checkbox("锁定收盘高于开盘", value=False, key="pred_rank_lock_hi_open")
+            
+    #         # 排名参数
+    #         with st.container(border=True):
+    #             st.markdown("**排名参数**")
+    #             rank_c1, rank_c2 = st.columns([1,1])
+    #             with rank_c1:
+    #                 topk_rank = st.number_input("Top-K", min_value=1, max_value=2000, value=50, key="pred_rank_topk")
+    #                 tie_rank = st.selectbox("同分排序（Tie-break）", ["none", "kdj_j_asc"], index=1, key="pred_rank_tie")
+    #             with rank_c2:
+    #                 maxw_rank = st.number_input("最大并行数", min_value=1, max_value=64, value=8, key="pred_rank_maxw")
+            
+    #         # 提交按钮
+    #         submitted_rank = st.form_submit_button("🚀 运行预测排名", width='stretch')
+        
+    #     # 只有在表单提交时才执行计算
+    #     if submitted_rank:
+    #         # 参考日与代码集
+    #         ref_use_rank = pred_rank_ref.strip() or _pick_smart_ref_date() or ""
+            
+    #         # 解析粘贴的文本范围
+    #         def _parse_codes_rank(txt: str):
+    #             out = []
+    #             if not txt:
+    #                 return out
+    #             import re
+    #             separators = r'[\s\n\r\t,;|]+'
+    #             codes = re.split(separators, txt)
+    #             for code in codes:
+    #                 s = code.strip()
+    #                 if not s:
+    #                     continue
+    #                 try:
+    #                     out.append(normalize_ts(s))
+    #                 except Exception:
+    #                     continue
+    #             return sorted(set([x for x in out if x]))
+    #         uni_rank = _parse_codes_rank(pasted_rank)
+            
+    #         # 创建Scenario对象
+    #         scen_rank = Scenario(
+    #             mode=scen_mode_rank, 
+    #             pct=pct_rank, 
+    #             gap_pct=gap_pct_rank, 
+    #             vol_mode=vol_mode_rank, 
+    #             vol_arg=vol_arg_rank,
+    #             hl_mode=hl_mode_rank, 
+    #             range_pct=range_pct_rank, 
+    #             atr_mult=atr_mult_rank,
+    #             lock_higher_than_open=lock_hi_open_rank
+    #         )
+            
+    #         _uni_map_rank = {"全市场": "all", "仅白名单": "white", "仅黑名单": "black", "仅特别关注榜": "attention"}
+    #         use_codes_rank = uni_choice_rank.startswith("自定义")
+    #         if use_codes_rank:
+    #             uni_arg_rank = uni_rank
+    #         else:
+    #             uni_label_rank = _uni_map_rank.get(uni_choice_rank, "all")
+    #             uni_arg_rank = _resolve_pred_universe(uni_label_rank, ref_use_rank)
+            
+    #         # 只有当 ref 有效且范围"非空"时才允许运行
+    #         can_run_rank = bool(ref_use_rank) and bool(uni_arg_rank)
+            
+    #         if not use_codes_rank and not uni_arg_rank:
+    #             st.info(f"【{uni_choice_rank}】在 {ref_use_rank} 无可用代码源，请先在\"排名\"页签生成当日 all/top 文件或检查名单缓存。")
+            
+    #         if use_codes_rank:
+    #             if uni_arg_rank:
+    #                 st.success(f"✅ 自定义名单解析成功：共 {len(uni_arg_rank)} 只股票")
+    #                 preview_codes_rank = uni_arg_rank[:5]
+    #                 st.caption(f"预览：{', '.join(preview_codes_rank)}{'...' if len(uni_arg_rank) > 5 else ''}")
+    #             else:
+    #                 st.warning("⚠️ 自定义名单为空，请检查输入的股票代码格式")
+            
+    #         if can_run_rank:
+    #             try:
+    #                 with st.spinner("正在生成模拟数据并运行排名..."):
+    #                     # 1. 生成模拟数据
+    #                     from predict_core import simulate_next_day, FileCache
+    #                     cache_rank = FileCache("cache/sim_pred")
+                        
+    #                     sim_result = simulate_next_day(
+    #                         ref_use_rank, 
+    #                         uni_arg_rank, 
+    #                         scen_rank,
+    #                         recompute_indicators=recompute_to_pass_rank,
+    #                         cache=cache_rank
+    #                     )
+                        
+    #                     st.success(f"✅ 模拟数据生成完成：共 {len(sim_result.df_sim)} 只股票")
+                        
+    #                     # 2. 对模拟数据运行排名策略
+    #                     # 需要创建一个临时函数来对模拟数据运行排名
+    #                     # 这里我们需要将模拟数据传递给排名系统
+    #                     # 由于排名系统从数据库读取数据，我们需要一个变通方法
+    #                     # 方案：创建一个临时函数，直接对模拟数据运行排名策略
+                        
+    #                     st.info("正在对模拟数据运行排名策略...")
+                        
+    #                     # 使用模拟数据运行排名
+    #                     # 这里我们需要修改排名逻辑，使其能够接受模拟数据
+    #                     # 暂时使用一个简化的方法：直接对模拟日期的数据进行评分
+                        
+    #                     # 创建一个临时的评分函数，使用模拟数据
+    #                     def _score_with_sim_data(sim_result, ref_date, topk, tie, maxw):
+    #                         """使用模拟数据运行排名"""
+    #                         from predict_core import _build_eval_ctx
+    #                         import tdx_compat as tdx
+    #                         from scoring_core import _iter_unique_rules, SC_MIN_SCORE, _eval_single_rule
+                            
+    #                         results = []
+    #                         sim_date = sim_result.sim_date
+                            
+    #                         # 对每只股票进行评分
+    #                         for ts_code in sim_result.df_sim["ts_code"].unique():
+    #                             try:
+    #                                 # 获取该股票的历史+模拟数据
+    #                                 stock_data = sim_result.df_concat[
+    #                                     sim_result.df_concat["ts_code"].astype(str) == str(ts_code)
+    #                                 ].sort_values("trade_date").copy()
+                                    
+    #                                 if stock_data.empty or str(sim_date) not in set(stock_data["trade_date"].astype(str)):
+    #                                     continue
+                                    
+    #                                 # 构建评估上下文
+    #                                 ctx_df = _build_eval_ctx(stock_data)
+    #                                 tdx.EXTRA_CONTEXT.update({"TS": str(ts_code), "REF_DATE": str(sim_date)})
+                                    
+    #                                 # 运行排名策略 - 使用scoring_core的规则评估逻辑
+    #                                 score = 0.0
+    #                                 tiebreak_j = None
+                                    
+    #                                 # 准备上下文（与scoring_core保持一致）
+    #                                 ctx = {
+    #                                     "df": stock_data,
+    #                                     "ref_date": sim_date,
+    #                                     "ts_code": str(ts_code)
+    #                                 }
+                                    
+    #                                 for rule in _iter_unique_rules():
+    #                                     try:
+    #                                         # 使用scoring_core的规则评估函数
+    #                                         rule_result = _eval_single_rule(stock_data, rule, sim_date, ctx, compute_hit_dates=False)
+    #                                         add = rule_result.get("add", 0.0)
+    #                                         if add != 0:
+    #                                             score += float(add)
+    #                                     except Exception as e:
+    #                                         logger.debug(f"规则 {rule.get('name', '')} 评估失败: {e}")
+    #                                         pass
+                                    
+    #                                 # 获取J值作为tiebreak
+    #                                 if "j" in stock_data.columns or "kdj_j" in stock_data.columns:
+    #                                     j_col = "j" if "j" in stock_data.columns else "kdj_j"
+    #                                     j_values = pd.to_numeric(stock_data[j_col], errors="coerce")
+    #                                     if not j_values.empty and pd.notna(j_values.iloc[-1]):
+    #                                         tiebreak_j = float(j_values.iloc[-1])
+                                    
+    #                                 score = max(score, float(SC_MIN_SCORE))
+                                    
+    #                                 results.append({
+    #                                     "ts_code": str(ts_code),
+    #                                     "score": score,
+    #                                     "tiebreak_j": tiebreak_j if tiebreak_j is not None else 999.0,
+    #                                     "ref_date": ref_date,
+    #                                     "sim_date": sim_date
+    #                                 })
+    #                             except Exception as e:
+    #                                 logger.warning(f"股票 {ts_code} 评分失败: {e}")
+    #                                 continue
+                            
+    #                         # 转换为DataFrame并排序
+    #                         df_results = pd.DataFrame(results)
+    #                         if df_results.empty:
+    #                             return df_results
+                            
+    #                         # 排序
+    #                         if tie == "kdj_j_asc":
+    #                             df_results = df_results.sort_values(["score", "tiebreak_j", "ts_code"], 
+    #                                                                ascending=[False, True, True])
+    #                         else:
+    #                             df_results = df_results.sort_values(["score", "ts_code"], 
+    #                                                                ascending=[False, True])
+                            
+    #                         # 添加排名
+    #                         df_results["rank"] = range(1, len(df_results) + 1)
+                            
+    #                         # 取Top-K
+    #                         if topk > 0:
+    #                             df_results = df_results.head(topk)
+                            
+    #                         return df_results
+                        
+    #                     # 运行排名
+    #                     df_rank_results = _score_with_sim_data(sim_result, ref_use_rank, topk_rank, tie_rank, maxw_rank)
+                        
+    #                     # 显示结果
+    #                     if not df_rank_results.empty:
+    #                         st.success(f"✅ 预测排名完成：共 {len(df_rank_results)} 只股票")
+    #                         st.dataframe(df_rank_results, width='stretch')
+                            
+    #                         # 复制代码功能
+    #                         if "ts_code" in df_rank_results.columns:
+    #                             codes_rank = df_rank_results["ts_code"].astype(str).tolist()
+    #                             txt_rank = _codes_to_txt(codes_rank, st.session_state["export_pref"]["style"], 
+    #                                                    st.session_state["export_pref"]["with_suffix"])
+    #                             copy_txt_button(txt_rank, label="📋 复制预测排名代码", key=f"copy_predict_rank_{ref_use_rank}")
+                            
+    #                         # 下载
+    #                         csv_rank = df_rank_results.to_csv(index=False).encode("utf-8-sig")
+    #                         st.download_button("导出 CSV", data=csv_rank, 
+    #                                          file_name=f"predict_rank_{ref_use_rank}.csv", 
+    #                                          mime="text/csv", width='stretch')
+    #                     else:
+    #                         st.warning("⚠️ 未生成排名结果，请检查数据")
+                            
+    #             except Exception as e:
+    #                 st.error(f"运行失败：{e}")
+    #                 import traceback
+    #                 with st.expander("调试信息", expanded=False):
+    #                     st.code(traceback.format_exc(), language="text")
+    #         else:
+    #             st.warning("请检查参数设置，确保参考日和选股范围都有效")
 
     # ================== 规则编辑辅助模块 ==================
     with tab_rules:
@@ -4295,16 +4588,26 @@ if _in_streamlit():
                     if db_reading_enabled and is_details_db_available():
                         # 使用 database_manager 查询详情
                         logger.info("[数据库连接] 开始获取数据库管理器实例 (查询股票详情用于UI显示)")
-                        manager = get_database_manager()
-                        if manager:
-                            # 使用统一的函数获取details数据库路径（包含回退逻辑）
-                            details_db_path = get_details_db_path_with_fallback()
-                            if details_db_path:
-                                sql = "SELECT * FROM stock_details WHERE ref_date = ?"
-                                df_all = manager.execute_sync_query(details_db_path, sql, [ref_real], timeout=30.0)
+                        df_all = pd.DataFrame()
+                        try:
+                            manager = get_database_manager()
+                            if manager:
+                                # 使用统一的函数获取details数据库路径（包含回退逻辑）
+                                details_db_path = get_details_db_path_with_fallback()
+                                if details_db_path:
+                                    sql = "SELECT * FROM stock_details WHERE ref_date = ?"
+                                    df_all = manager.execute_sync_query(details_db_path, sql, [ref_real], timeout=30.0)
+                        except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                            # 数据库文件不存在或管理器获取失败
+                            logger.debug(f"数据库访问失败: {ref_real}: {e}")
+                            df_all = pd.DataFrame()
+                        except Exception as e:
+                            # 数据库读取失败（可能是表不存在、连接错误等）
+                            error_msg = str(e).lower()
+                            if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                logger.debug(f"Details数据库表不存在: {ref_real}")
                             else:
-                                df_all = pd.DataFrame()
-                        else:
+                                logger.debug(f"数据库读取失败: {ref_real}: {e}")
                             df_all = pd.DataFrame()
                         
                         if not df_all.empty:
@@ -4804,6 +5107,17 @@ if _in_streamlit():
             # 保存选择
             st.session_state["ref_tracking_selected"] = refT
 
+            # 添加跟踪前N名的配置项
+            top_n = st.number_input(
+                "只跟踪前多少名",
+                min_value=1,
+                max_value=10000,
+                value=SC_TRACKING_TOP_N,
+                step=1,
+                key="tracking_top_n",
+                help=f"默认值：{SC_TRACKING_TOP_N}（可在 config.py 中修改 SC_TRACKING_TOP_N）"
+            )
+
             if st.button("生成跟踪表", key="btn_run_tracking", width='stretch'):
                 
                 try:
@@ -4822,6 +5136,15 @@ if _in_streamlit():
                     if "rank" not in df_rank.columns and "score" in df_rank.columns:
                         df_rank = df_rank.sort_values(["score"], ascending=False).reset_index(drop=True)
                         df_rank["rank"] = np.arange(1, len(df_rank) + 1)
+                    
+                    # 根据配置只跟踪前N名
+                    if "rank" in df_rank.columns:
+                        original_count = len(df_rank)
+                        df_rank = df_rank[df_rank["rank"] <= top_n].copy()
+                        if df_rank.empty:
+                            st.error(f"过滤后没有数据（前 {top_n} 名），请检查排名数据或调整跟踪数量")
+                            st.stop()
+                        st.info(f"已过滤为前 {top_n} 名，共 {len(df_rank)} 只股票（原始数据：{original_count} 只）")
                     
                     codes = df_rank["ts_code"].astype(str).unique().tolist()
                     st.info(f"读取到 {len(codes)} 只股票的排名数据（参考日：{refT}）")
@@ -5190,7 +5513,17 @@ if _in_streamlit():
                     dates_from_db = query_details_recent_dates(365, db_path)  # 获取最近一年的日期
                     if dates_from_db:
                         available_detail_dates = sorted(dates_from_db, reverse=True)
-            except Exception:
+            except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                # 数据库文件不存在或管理器获取失败，忽略错误
+                logger.debug(f"数据库访问失败: {e}")
+                pass
+            except Exception as e:
+                # 数据库读取失败（可能是表不存在、连接错误等），忽略错误
+                error_msg = str(e).lower()
+                if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                    logger.debug(f"Details数据库表不存在")
+                else:
+                    logger.debug(f"数据库读取失败: {e}")
                 pass
             
             # 如果数据库没有，尝试从文件系统获取
@@ -5329,6 +5662,8 @@ if _in_streamlit():
                                     try:
                                         from database_manager import get_database_manager
                                         manager = get_database_manager()
+                                        if not manager:
+                                            raise RuntimeError("无法获取数据库管理器")
                                         sql = "SELECT ts_code, rules FROM stock_details WHERE ref_date = ?"
                                         df_details = manager.execute_sync_query(db_path, sql, [obs_date], timeout=30.0)
                                         
@@ -5405,8 +5740,16 @@ if _in_streamlit():
                                                 debug_info.append(f"{obs_date}: 从数据库读取，找到 {len(df_details)} 条记录，但无策略触发")
                                         else:
                                             debug_info.append(f"{obs_date}: 数据库中没有该日期的详情数据")
+                                    except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                                        # 数据库文件不存在或管理器获取失败
+                                        debug_info.append(f"{obs_date}: 数据库访问失败: {e}")
                                     except Exception as e:
-                                        debug_info.append(f"{obs_date}: 数据库读取失败: {e}")
+                                        # 数据库读取失败（可能是表不存在、连接错误等）
+                                        error_msg = str(e).lower()
+                                        if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                            debug_info.append(f"{obs_date}: Details数据库表不存在")
+                                        else:
+                                            debug_info.append(f"{obs_date}: 数据库读取失败: {e}")
                                 
                                 # 如果数据库读取失败，尝试从文件系统读取
                                 if df_triggers is None or df_triggers.empty:
@@ -5438,6 +5781,8 @@ if _in_streamlit():
                                             if db_path and is_details_db_available():
                                                 from database_manager import get_database_manager
                                                 manager = get_database_manager()
+                                                if not manager:
+                                                    raise RuntimeError("无法获取数据库管理器")
                                                 sql = "SELECT ts_code, rules FROM stock_details WHERE ref_date = ?"
                                                 df_details = manager.execute_sync_query(db_path, sql, [obs_date], timeout=30.0)
                                                 
@@ -5481,7 +5826,17 @@ if _in_streamlit():
                                                                         break
                                                         except Exception:
                                                             continue
-                                        except Exception:
+                                        except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                                            # 数据库文件不存在或管理器获取失败，忽略错误
+                                            logger.debug(f"数据库访问失败: {obs_date}: {e}")
+                                            pass
+                                        except Exception as e:
+                                            # 数据库读取失败（可能是表不存在、连接错误等），忽略错误
+                                            error_msg = str(e).lower()
+                                            if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                                logger.debug(f"Details数据库表不存在: {obs_date}")
+                                            else:
+                                                logger.debug(f"数据库读取失败: {obs_date}: {e}")
                                             pass
                                         
                                         # 如果数据库读取失败或没有数据，从文件系统读取
@@ -5528,17 +5883,14 @@ if _in_streamlit():
                                 
                                 # 按策略名汇总
                                 strategy_summary = df_all.groupby("name").agg({
-                                    "trigger_count": ["sum", "mean", "max"],
-                                    "coverage": ["mean", "max"],
+                                    "trigger_count": ["sum", "max"],
+                                    "coverage": ["max"],
                                     "obs_date": "nunique"
                                 }).reset_index()
-                                strategy_summary.columns = ["策略名", "总触发次数", "平均触发次数", "最大单日触发", 
-                                                           "平均覆盖率", "最大覆盖率", "触发天数"]
+                                strategy_summary.columns = ["策略名", "总触发次数", "最大单日触发", 
+                                                           "最大覆盖率", "触发天数"]
                                 
                                 # 格式化百分比
-                                strategy_summary["平均覆盖率"] = strategy_summary["平均覆盖率"].map(
-                                    lambda x: f"{x*100:.2f}%" if pd.notna(x) else None
-                                )
                                 strategy_summary["最大覆盖率"] = strategy_summary["最大覆盖率"].map(
                                     lambda x: f"{x*100:.2f}%" if pd.notna(x) else None
                                 )
@@ -5851,7 +6203,17 @@ if _in_streamlit():
                         try:
                             dates = query_details_recent_dates(1, db_path)
                             return dates[0] if dates else None
-                        except:
+                        except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                            # 数据库文件不存在或管理器获取失败
+                            logger.debug(f"获取最新日期失败: {e}")
+                            return None
+                        except Exception as e:
+                            # 数据库读取失败（可能是表不存在、连接错误等）
+                            error_msg = str(e).lower()
+                            if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                logger.debug(f"Details数据库表不存在，无法获取最新日期")
+                            else:
+                                logger.debug(f"获取最新日期失败: {e}")
                             return None
                     
                     # 只在需要显示时才调用，避免UI启动时建立连接
@@ -5889,15 +6251,36 @@ if _in_streamlit():
                                     st.info(f"共找到 {len(df)} 条记录 | 查询日期: {date_to_use}")
                                 else:
                                     st.warning("未找到数据")
+                            except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                                # 数据库文件不存在或管理器获取失败
+                                logger.debug(f"查询Details数据失败: {e}")
+                                st.error(f"查询失败: 数据库不可用（{e}）")
                             except Exception as e:
-                                st.error(f"查询失败: {e}")
+                                # 数据库读取失败（可能是表不存在、连接错误等）
+                                error_msg = str(e).lower()
+                                if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                    logger.debug(f"Details数据库表不存在，查询失败")
+                                    st.error("查询失败: Details数据库表不存在，请先运行评分生成数据")
+                                else:
+                                    logger.debug(f"查询Details数据失败: {e}")
+                                    st.error(f"查询失败: {e}")
                         
                         # 显示最近的日期列表
                         try:
                             recent_dates = query_details_recent_dates(7, db_path)
                             if recent_dates:
                                 st.caption(f"最近的交易日: {', '.join(recent_dates)}")
+                        except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                            # 数据库文件不存在或管理器获取失败，忽略错误
+                            logger.debug(f"获取最近日期列表失败: {e}")
+                            pass
                         except Exception as e:
+                            # 数据库读取失败（可能是表不存在、连接错误等），忽略错误
+                            error_msg = str(e).lower()
+                            if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                logger.debug(f"Details数据库表不存在，无法获取最近日期列表")
+                            else:
+                                logger.debug(f"获取最近日期列表失败: {e}")
                             pass
                     
                     elif query_type == "按股票代码查看":
@@ -5913,8 +6296,19 @@ if _in_streamlit():
                                     st.dataframe(df, width='stretch')
                                 else:
                                     st.warning("未找到该股票的数据")
+                            except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                                # 数据库文件不存在或管理器获取失败
+                                logger.debug(f"查询Details数据失败: {e}")
+                                st.error(f"查询失败: 数据库不可用（{e}）")
                             except Exception as e:
-                                st.error(f"查询失败: {e}")
+                                # 数据库读取失败（可能是表不存在、连接错误等）
+                                error_msg = str(e).lower()
+                                if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                    logger.debug(f"Details数据库表不存在，查询失败")
+                                    st.error("查询失败: Details数据库表不存在，请先运行评分生成数据")
+                                else:
+                                    logger.debug(f"查询Details数据失败: {e}")
+                                    st.error(f"查询失败: {e}")
                     
                     elif query_type == "Top-K股票":
                         # 如果还没有设置默认日期，使用最新日期
@@ -5941,8 +6335,19 @@ if _in_streamlit():
                                     st.info(f"查询日期: {date_to_use}")
                                 else:
                                     st.warning("未找到数据")
+                            except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                                # 数据库文件不存在或管理器获取失败
+                                logger.debug(f"查询Details数据失败: {e}")
+                                st.error(f"查询失败: 数据库不可用（{e}）")
                             except Exception as e:
-                                st.error(f"查询失败: {e}")
+                                # 数据库读取失败（可能是表不存在、连接错误等）
+                                error_msg = str(e).lower()
+                                if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                    logger.debug(f"Details数据库表不存在，查询失败")
+                                    st.error("查询失败: Details数据库表不存在，请先运行评分生成数据")
+                                else:
+                                    logger.debug(f"查询Details数据失败: {e}")
+                                    st.error(f"查询失败: {e}")
                     
                     elif query_type == "分数范围查询":
                         # 如果还没有设置默认日期，使用最新日期
@@ -5973,8 +6378,19 @@ if _in_streamlit():
                                     st.info(f"共找到 {len(df)} 条记录 | 查询日期: {date_to_use}")
                                 else:
                                     st.warning("未找到数据")
+                            except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                                # 数据库文件不存在或管理器获取失败
+                                logger.debug(f"查询Details数据失败: {e}")
+                                st.error(f"查询失败: 数据库不可用（{e}）")
                             except Exception as e:
-                                st.error(f"查询失败: {e}")
+                                # 数据库读取失败（可能是表不存在、连接错误等）
+                                error_msg = str(e).lower()
+                                if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                    logger.debug(f"Details数据库表不存在，查询失败")
+                                    st.error("查询失败: Details数据库表不存在，请先运行评分生成数据")
+                                else:
+                                    logger.debug(f"查询Details数据失败: {e}")
+                                    st.error(f"查询失败: {e}")
                     
                     # 数据库信息（美化显示）
                     with st.expander("数据库信息"):

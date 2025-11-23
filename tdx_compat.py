@@ -918,157 +918,6 @@ def get_last_diff_high_value(df, lookback_days=60):
     return result['diff_value'] if result else 0.0
 
 
-def reverse_price_to_diff_value(df, target_diff_value, method="optimize"):
-    """
-    反推到指定DIFF值时的价格（改进版：先反推价格，再重算DIFF验证）
-    
-    Args:
-        df: 历史数据
-        target_diff_value: 目标DIFF值
-        method: 求解方法
-        
-    Returns:
-        反推的收盘价，如果失败返回当前收盘价
-    """
-    try:
-        from predict_core import PriceSolver, PriceBounds
-        
-        # 设置价格约束
-        last_close = float(df['close'].iloc[-1])
-        price_bounds = PriceBounds(
-            open_min=last_close * 0.5,
-            open_max=last_close * 2.0,
-            high_min=last_close * 0.5,
-            high_max=last_close * 2.0,
-            low_min=last_close * 0.5,
-            low_max=last_close * 2.0,
-            close_min=last_close * 0.5,
-            close_max=last_close * 2.0
-        )
-        
-        # 创建求解器
-        solver = PriceSolver(
-            max_iterations=1000,
-            tolerance=1e-6,
-            verbose=False
-        )
-        
-        # 求解价格
-        result = solver.solve_price(
-            condition="diff",  # DIFF指标
-            target_value=target_diff_value,
-            historical_data=df,
-            price_bounds=price_bounds,
-            method=method
-        )
-        
-        if result.success:
-            # 改进：用反推的价格重新计算DIFF指标进行验证
-            reverse_price = result.prices['close']
-            verified_price = _verify_and_adjust_diff_price(df, reverse_price, target_diff_value)
-            return verified_price
-        else:
-            return last_close
-            
-    except Exception as e:
-        print(f"反推价格失败: {e}")
-        return float(df['close'].iloc[-1])
-
-
-def _verify_and_adjust_diff_price(df, initial_price, target_diff_value, max_iterations=10, tolerance=1e-4):
-    """
-    验证并调整反推价格，确保DIFF值准确
-    
-    Args:
-        df: 历史数据
-        initial_price: 初始反推价格
-        target_diff_value: 目标DIFF值
-        max_iterations: 最大调整次数
-        tolerance: 容差
-        
-    Returns:
-        调整后的价格
-    """
-    try:
-        current_price = initial_price
-        
-        for i in range(max_iterations):
-            # 构造包含新价格的完整数据
-            test_data = df.copy()
-            test_data = test_data.iloc[:-1]  # 移除最后一行
-            
-            # 添加新的价格行
-            new_row = test_data.iloc[-1].copy()
-            new_row['close'] = current_price
-            new_row['open'] = current_price * 0.99  # 简单设置开盘价
-            new_row['high'] = current_price * 1.01  # 简单设置最高价
-            new_row['low'] = current_price * 0.99   # 简单设置最低价
-            
-            test_data = pd.concat([test_data, pd.DataFrame([new_row])], ignore_index=True)
-            
-            # 重新计算DIFF指标
-            test_data = _calculate_macd_diff_for_verification(test_data)
-            
-            # 获取最新的DIFF值
-            actual_diff = test_data['diff'].iloc[-1]
-            
-            # 检查是否达到目标
-            diff_error = abs(actual_diff - target_diff_value)
-            if diff_error <= tolerance:
-                return current_price
-            
-            # 调整价格（简单的线性调整）
-            if abs(target_diff_value) > 1e-10:  # 避免除零
-                if actual_diff < target_diff_value:
-                    # DIFF值太小，需要提高价格
-                    current_price *= (1 + diff_error / abs(target_diff_value) * 0.1)
-                else:
-                    # DIFF值太大，需要降低价格
-                    current_price *= (1 - diff_error / abs(target_diff_value) * 0.1)
-            else:
-                # 目标DIFF值接近0，使用固定调整
-                if actual_diff < target_diff_value:
-                    current_price *= 1.01
-                else:
-                    current_price *= 0.99
-            
-            # 确保价格在合理范围内
-            last_close = float(df['close'].iloc[-1])
-            current_price = max(last_close * 0.5, min(last_close * 2.0, current_price))
-        
-        return current_price
-        
-    except Exception as e:
-        print(f"价格验证调整失败: {e}")
-        return initial_price
-
-
-def _calculate_macd_diff_for_verification(df):
-    """
-    为验证目的计算MACD和DIFF指标
-    """
-    close = df['close']
-    
-    # 计算EMA
-    ema12 = close.ewm(span=12).mean()
-    ema26 = close.ewm(span=26).mean()
-    
-    # 计算DIFF
-    diff = ema12 - ema26
-    
-    # 计算DEA
-    dea = diff.ewm(span=9).mean()
-    
-    # 计算MACD
-    macd = (diff - dea) * 2
-    
-    df['diff'] = diff
-    df['dea'] = dea
-    df['macd'] = macd
-    
-    return df
-
-
 def GET_LAST_DIFF_HIGH_PRICE(lookback_days=60):
     """
     获取上次DIFF最高点时的收盘价
@@ -1107,26 +956,6 @@ def GET_LAST_DIFF_HIGH_VALUE(lookback_days=60):
         return 0.0
 
 
-def REVERSE_PRICE_TO_DIFF(target_diff_value, method="optimize"):
-    """
-    反推到指定DIFF值时的价格
-    
-    Args:
-        target_diff_value: 目标DIFF值
-        method: 求解方法
-        
-    Returns:
-        反推的收盘价，如果失败返回当前收盘价
-    """
-    try:
-        df = EXTRA_CONTEXT.get("DF", None)
-        if df is not None:
-            return reverse_price_to_diff_value(df, target_diff_value, method)
-        return float(df['close'].iloc[-1]) if df is not None and not df.empty else 0.0
-    except Exception:
-        return 0.0
-
-
 # 注册到额外上下文，供表达式直接调用
 EXTRA_CONTEXT["TS_PCT"] = TS_PCT
 EXTRA_CONTEXT["TS_RANK"] = TS_RANK
@@ -1140,7 +969,6 @@ EXTRA_CONTEXT.update({
     "FIND_LAST_LOWEST_J": FIND_LAST_LOWEST_J,
     "GET_LAST_DIFF_HIGH_PRICE": GET_LAST_DIFF_HIGH_PRICE,
     "GET_LAST_DIFF_HIGH_VALUE": GET_LAST_DIFF_HIGH_VALUE,
-    "REVERSE_PRICE_TO_DIFF": REVERSE_PRICE_TO_DIFF,
 })
 
 
@@ -1198,7 +1026,6 @@ FUNC_MAP = {
     "GET_LAST_CONDITION_PRICE": "GET_LAST_CONDITION_PRICE",
     "GET_LAST_DIFF_HIGH_PRICE": "GET_LAST_DIFF_HIGH_PRICE",
     "GET_LAST_DIFF_HIGH_VALUE": "GET_LAST_DIFF_HIGH_VALUE",
-    "REVERSE_PRICE_TO_DIFF": "REVERSE_PRICE_TO_DIFF",
 }
 
 
@@ -1499,7 +1326,6 @@ def evaluate(script, df, extra_context=None):
         "GET_LAST_CONDITION_PRICE": GET_LAST_CONDITION_PRICE,
         "GET_LAST_DIFF_HIGH_PRICE": GET_LAST_DIFF_HIGH_PRICE,
         "GET_LAST_DIFF_HIGH_VALUE": GET_LAST_DIFF_HIGH_VALUE,
-        "REVERSE_PRICE_TO_DIFF": REVERSE_PRICE_TO_DIFF,
     }
     if extra_context:
         ctx.update(extra_context) 

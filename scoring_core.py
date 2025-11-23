@@ -2192,12 +2192,43 @@ def _filter_rules_by_ref_date(rules: list[dict], ref_date: str) -> list[dict]:
             # 如果窗口内没有命中日期，则跳过该规则（不保留）
         else:
             # 对于其他所有类型（LAST/ANY/ALL/RECENT/DIST/NEAR/COUNT>=k/CONSEC>=m/ANY_n/ALL_n等单次型规则）
-            # 如果规则命中了（ok=True），直接用ref_date作为命中日期（因为打分的时候就是基于ref_date的）
+            # 如果规则命中了（ok=True），需要根据scope类型决定如何处理hit_dates
             if ok:
                 filtered_rule = rule.copy()
-                filtered_rule["hit_date"] = ref_date
-                filtered_rule["hit_dates"] = [ref_date]
-                filtered_rule["hit_count"] = 1
+                # 对于ANY scope，应该保留所有满足条件的日期，而不是只用ref_date
+                if scope == "ANY":
+                    # 如果rule中已经有计算好的hit_dates，保留这些日期（过滤出<= ref_date且在窗口内的日期）
+                    if hit_dates:
+                        hit_dates_str = [str(d) for d in hit_dates if d]
+                        window_hit_dates = []
+                        for d_str in hit_dates_str:
+                            try:
+                                d_dt = dt.datetime.strptime(d_str, "%Y%m%d")
+                                if d_dt <= ref_date_dt:
+                                    window_hit_dates.append(d_str)
+                            except (ValueError, TypeError):
+                                continue
+                        # 去重并排序
+                        window_hit_dates = sorted(set(window_hit_dates))
+                        if window_hit_dates:
+                            filtered_rule["hit_dates"] = window_hit_dates
+                            filtered_rule["hit_date"] = window_hit_dates[-1]  # 使用最后一个命中日期
+                            filtered_rule["hit_count"] = len(window_hit_dates)
+                        else:
+                            # 如果没有有效的hit_dates，fallback到ref_date
+                            filtered_rule["hit_date"] = ref_date
+                            filtered_rule["hit_dates"] = [ref_date]
+                            filtered_rule["hit_count"] = 1
+                    else:
+                        # 如果没有hit_dates，fallback到ref_date
+                        filtered_rule["hit_date"] = ref_date
+                        filtered_rule["hit_dates"] = [ref_date]
+                        filtered_rule["hit_count"] = 1
+                else:
+                    # 对于LAST/ALL等其他scope，直接用ref_date作为命中日期（因为打分的时候就是基于ref_date的）
+                    filtered_rule["hit_date"] = ref_date
+                    filtered_rule["hit_dates"] = [ref_date]
+                    filtered_rule["hit_count"] = 1
                 filtered_rules.append(filtered_rule)
             # 如果规则没命中，则跳过该规则（不保留）
     
@@ -3983,7 +4014,40 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
             ok, err = _eval_rule(dfD, rule, ref_date, ctx)
         
         if err: res["error"] = err
-        gate_ok, _, _ = _eval_gate(dfD, rule, ref_date, ctx)
+        
+        # Gate判断逻辑
+        # 对于LAST scope，gate在参考日判断
+        # 对于ANY/EACH/CONSEC/COUNT>=k等多日窗口scope，gate应该在满足when条件的日期判断
+        gate_norm = _normalize_gate(rule)
+        if gate_norm:
+            if scope == "LAST":
+                # LAST scope：gate在参考日判断
+                gate_ok, _, _ = _eval_gate(dfD, rule, ref_date, ctx)
+            elif ok and w and not win_df.empty:
+                # 多日窗口scope：找到所有满足when条件的日期，对每个日期判断gate
+                # 如果至少有一个日期同时满足when和gate，则gate_ok=True
+                gate_ok = False
+                try:
+                    # 获取所有满足when条件的日期
+                    hit_dates = _list_true_dates(dfD, w, ref_date=ref_date, window=score_window, timeframe=tf, ctx=ctx)
+                    for date_str in hit_dates:
+                        try:
+                            day_gate_ok, gate_err, _ = _eval_gate(dfD, rule, date_str, ctx)
+                            if day_gate_ok and not gate_err:
+                                gate_ok = True
+                                break  # 找到一个满足的日期即可
+                        except Exception:
+                            continue
+                except Exception:
+                    # 如果出错，fallback到参考日判断
+                    gate_ok, _, _ = _eval_gate(dfD, rule, ref_date, ctx)
+            else:
+                # 如果没有when条件或ok=False，fallback到参考日判断
+                gate_ok, _, _ = _eval_gate(dfD, rule, ref_date, ctx)
+        else:
+            # 没有gate，视为通过
+            gate_ok = True
+        
         res["gate_ok"] = gate_ok
         if ok and gate_ok and pts:
             res["add"] = float(pts)

@@ -20,7 +20,7 @@ import sys
 import time
 import threading
 import random
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 from dataclasses import dataclass
 from datetime import datetime
 import pandas as pd
@@ -751,6 +751,35 @@ class StockDownloader:
         self.stats = DownloadStats()
         self._lock = threading.Lock()
     
+    def _load_stock_list_from_cache(self) -> List[str]:
+        """兜底：从缓存或数据库获取股票列表"""
+        try:
+            db_manager = get_database_manager()
+        except Exception as e:
+            logger.error(f"获取数据库管理器失败，无法加载股票缓存: {e}")
+            return []
+        
+        # 1) stock_list.csv 缓存
+        try:
+            cached_codes = db_manager.get_stock_list_from_cache()
+            if cached_codes:
+                logger.warning(f"使用缓存股票列表兜底，共 {len(cached_codes)} 只")
+                return cached_codes
+        except Exception as e:
+            logger.debug(f"读取股票列表缓存失败: {e}")
+        
+        # 2) 数据库已有股票列表
+        try:
+            db_codes = db_manager.get_stock_list(adj_type=self.config.adj_type)
+            if db_codes:
+                logger.warning(f"使用数据库股票列表兜底，共 {len(db_codes)} 只")
+                return db_codes
+        except Exception as e:
+            logger.debug(f"读取数据库股票列表失败: {e}")
+        
+        logger.error("缓存和数据库都无法提供股票列表，兜底失败")
+        return []
+    
     def _get_data_processor(self):
         """获取数据处理器（延迟创建，只在主线程中创建）"""
         if self._data_processor is None:
@@ -953,34 +982,53 @@ class StockDownloader:
         
         return ts_code, "error: 未知错误", None
     
-    def download_all_stocks(self) -> DownloadStats:
-        """下载所有股票数据，由主线程统一写入数据库"""
+    def download_all_stocks(self, stock_codes: Optional[List[str]] = None) -> DownloadStats:
+        """下载股票数据，由主线程统一写入数据库
+        
+        Args:
+            stock_codes: 如果提供，则仅下载指定股票；否则下载全市场
+        """
         logger.info("开始下载股票数据...")
         
         # 获取股票列表
-        try:
-            stock_list = self.tushare_manager.get_stock_list()
-            if stock_list is None or stock_list.empty:
-                logger.error("获取股票列表失败：返回结果为空")
-                return self.stats
-            
-            if 'ts_code' not in stock_list.columns:
-                logger.error(f"股票列表缺少 'ts_code' 列，可用列: {stock_list.columns.tolist()}")
-                return self.stats
-            
-            stock_codes = stock_list['ts_code'].tolist()
-            
-            if not stock_codes:
-                logger.error("股票列表为空，无法下载")
-                return self.stats
-            
-            self.stats.total_stocks = len(stock_codes)
-            logger.info(f"准备下载 {len(stock_codes)} 只股票的数据，日期范围: {self.config.start_date} - {self.config.end_date}")
-        except Exception as e:
-            logger.error(f"获取股票列表时发生异常: {e}")
-            import traceback
-            logger.error(f"异常详情: {traceback.format_exc()}")
+        if stock_codes is None:
+            try:
+                stock_list = self.tushare_manager.get_stock_list()
+                if stock_list is None or stock_list.empty:
+                    logger.error("获取股票列表失败：返回结果为空")
+                    stock_codes = self._load_stock_list_from_cache()
+                elif 'ts_code' not in stock_list.columns:
+                    logger.error(f"股票列表缺少 'ts_code' 列，可用列: {stock_list.columns.tolist()}")
+                    stock_codes = self._load_stock_list_from_cache()
+                else:
+                    stock_codes = stock_list['ts_code'].tolist()
+            except Exception as e:
+                logger.error(f"获取股票列表时发生异常: {e}")
+                import traceback
+                logger.error(f"异常详情: {traceback.format_exc()}")
+                stock_codes = self._load_stock_list_from_cache()
+        else:
+            logger.info(f"使用外部提供的股票列表，共 {len(stock_codes)} 只")
+            normalized_codes: List[str] = []
+            seen_codes: Set[str] = set()
+            for code in stock_codes:
+                if not code:
+                    continue
+                norm_code = normalize_ts(code) or str(code).strip()
+                if not norm_code:
+                    continue
+                if norm_code in seen_codes:
+                    continue
+                seen_codes.add(norm_code)
+                normalized_codes.append(norm_code)
+            stock_codes = normalized_codes
+        
+        if not stock_codes:
+            logger.error("股票列表为空，无法下载")
             return self.stats
+        
+        self.stats.total_stocks = len(stock_codes)
+        logger.info(f"准备下载 {len(stock_codes)} 只股票的数据，日期范围: {self.config.start_date} - {self.config.end_date}")
         
         # 在主线程中创建数据库连接和数据处理器
         logger.info("[数据库连接] 开始获取数据库管理器实例 (主线程统一写入)")
@@ -1493,6 +1541,118 @@ class DownloadManager:
             处理后的结束日期字符串
         """
         return self.db_manager.get_smart_end_date(end_date_config)
+
+    def _get_reference_stock_codes(self) -> List[str]:
+        """
+        获取用于完整性校验的股票代码列表
+        
+        优先顺序：
+        1. 本地缓存 stock_list.csv（避免频繁访问API）
+        2. 数据库现有股票列表（按配置的复权类型）
+        3. 实时调用 Tushare 获取（与下载流程保持一致）
+        """
+        # 1) 读取缓存
+        try:
+            cached_codes = self.db_manager.get_stock_list_from_cache()
+            if cached_codes:
+                logger.debug(f"使用缓存股票列表进行完整性校验，共 {len(cached_codes)} 只")
+                return cached_codes
+        except Exception as e:
+            logger.debug(f"读取缓存股票列表失败，尝试其他来源: {e}")
+        
+        # 2) 从数据库读取
+        try:
+            db_codes = self.db_manager.get_stock_list(adj_type=self.config.adj_type)
+            if db_codes:
+                logger.debug(f"使用数据库股票列表进行完整性校验，共 {len(db_codes)} 只")
+                return db_codes
+        except Exception as e:
+            logger.debug(f"从数据库获取股票列表失败，尝试调用Tushare: {e}")
+        
+        # 3) 调用Tushare
+        try:
+            stock_list_df = self.tushare_manager.get_stock_list()
+            if stock_list_df is not None and not stock_list_df.empty and "ts_code" in stock_list_df.columns:
+                codes = stock_list_df["ts_code"].astype(str).tolist()
+                logger.info(f"使用Tushare股票列表进行完整性校验，共 {len(codes)} 只")
+                return codes
+            logger.warning("Tushare返回的股票列表为空，无法进行完整性校验")
+        except Exception as e:
+            logger.error(f"调用Tushare获取股票列表失败，无法进行完整性校验: {e}")
+        
+        return []
+
+    def _check_latest_date_completeness(self, trade_date: str) -> Dict[str, Any]:
+        """
+        校验指定日期的股票数据是否完整
+        
+        Returns:
+            {
+                "trade_date": str,
+                "can_check": bool,
+                "expected_count": int,
+                "actual_count": int,
+                "missing_codes": List[str]
+            }
+        """
+        result = {
+            "trade_date": trade_date,
+            "can_check": False,
+            "expected_count": 0,
+            "actual_count": 0,
+            "missing_codes": []
+        }
+        
+        if not trade_date:
+            logger.warning("未提供需要校验的日期，无法检查数据完整性")
+            return result
+        
+        reference_codes = self._get_reference_stock_codes()
+        if not reference_codes:
+            logger.warning("无法获取股票列表，跳过最新日期数据完整性检查")
+            return result
+        
+        result["expected_count"] = len(reference_codes)
+        result["can_check"] = True
+        
+        try:
+            df = self.db_manager.query_stock_data(
+                start_date=trade_date,
+                end_date=trade_date,
+                columns=["ts_code"],
+                adj_type=self.config.adj_type
+            )
+            
+            if df.empty or "ts_code" not in df.columns:
+                logger.warning(f"数据库中未查询到日期 {trade_date} 的股票数据，将视为全部缺失")
+                result["actual_count"] = 0
+                result["missing_codes"] = reference_codes.copy()
+                return result
+            
+            actual_codes: Set[str] = set(df["ts_code"].astype(str).tolist())
+            result["actual_count"] = len(actual_codes)
+            
+            missing_codes = [code for code in reference_codes if code and code not in actual_codes]
+            result["missing_codes"] = missing_codes
+            
+            if missing_codes:
+                logger.warning(
+                    f"检测到最新日期 {trade_date} 缺失 {len(missing_codes)} 只股票数据 "
+                    f"(实际: {result['actual_count']}, 期望: {result['expected_count']})"
+                )
+            else:
+                logger.info(
+                    f"最新日期 {trade_date} 数据完整 "
+                    f"(股票数: {result['actual_count']}/{result['expected_count']})"
+                )
+            
+            return result
+        
+        except Exception as e:
+            logger.warning(f"检查日期 {trade_date} 的股票数据完整性失败: {e}")
+            result["can_check"] = False
+            result["missing_codes"] = []
+            return result
     
     def determine_download_strategy(self) -> Dict[str, Any]:
         """确定下载策略"""
@@ -1543,7 +1703,38 @@ class DownloadManager:
                 
                 # 如果计算出的开始日期晚于配置的结束日期，则跳过下载
                 if actual_start_date > actual_end_date:
-                    logger.info(f"数据已是最新，无需下载 (最新日期: {latest_date}, 计算出的开始日期: {actual_start_date}, 实际结束日期: {actual_end_date})")
+                    coverage_info = self._check_latest_date_completeness(latest_date)
+                    missing_codes = coverage_info.get("missing_codes", []) if isinstance(coverage_info, dict) else []
+                    can_check = coverage_info.get("can_check", False) if isinstance(coverage_info, dict) else False
+                    
+                    if can_check and missing_codes:
+                        logger.warning(
+                            f"最新日期 {latest_date} 虽然与目标结束日期一致，但检测到 {len(missing_codes)} 只股票缺失数据，"
+                            f"将强制补齐该日期的缺失股票"
+                        )
+                        return {
+                            "skip_download": False,
+                            "is_first_download": is_first_download,
+                            "latest_date": latest_date,
+                            "start_date": latest_date,
+                            "end_date": latest_date,
+                            "adj_type": self.config.adj_type,
+                            "asset_type": self.config.asset_type,
+                            "stock_whitelist": missing_codes,
+                            "latest_date_completeness": coverage_info,
+                            "fill_missing_latest_date": True
+                        }
+                    
+                    if not can_check:
+                        logger.warning(
+                            f"无法校验最新日期 {latest_date} 的数据完整性，默认认为数据已最新，跳过下载"
+                        )
+                    else:
+                        logger.info(
+                            f"数据已是最新，无需下载 (最新日期: {latest_date}, 计算出的开始日期: {actual_start_date}, "
+                            f"实际结束日期: {actual_end_date})"
+                        )
+                    
                     logger.perf(f"跳过下载原因: 开始日期({actual_start_date}) > 结束日期({actual_end_date})")
                     return {
                         "skip_download": True,
@@ -1552,7 +1743,10 @@ class DownloadManager:
                         "start_date": actual_start_date,
                         "end_date": actual_end_date,
                         "adj_type": self.config.adj_type,
-                        "asset_type": self.config.asset_type
+                        "asset_type": self.config.asset_type,
+                        "stock_whitelist": None,
+                        "latest_date_completeness": coverage_info,
+                        "fill_missing_latest_date": False
                     }
             except Exception as e:
                 logger.warning(f"计算增量下载日期失败: {e}")
@@ -1564,7 +1758,10 @@ class DownloadManager:
             "end_date": actual_end_date,
             "adj_type": self.config.adj_type,
             "asset_type": self.config.asset_type,
-            "skip_download": False
+            "skip_download": False,
+            "stock_whitelist": None,
+            "latest_date_completeness": None,
+            "fill_missing_latest_date": False
         }
         
         return strategy
@@ -1587,7 +1784,14 @@ class DownloadManager:
         # 传递是否为首次下载的信息
         is_first_download = strategy.get("is_first_download", False)
         downloader = StockDownloader(stock_config, is_first_download=is_first_download)
-        return downloader.download_all_stocks()
+        
+        stock_whitelist = strategy.get("stock_whitelist")
+        if stock_whitelist:
+            logger.warning(
+                f"本次仅下载 {len(stock_whitelist)} 只股票以补齐最新日期 {strategy.get('end_date')}"
+            )
+        
+        return downloader.download_all_stocks(stock_whitelist)
     
     def download_indices(self, strategy: Dict[str, Any], whitelist: List[str] = None) -> DownloadStats:
         """下载指数数据"""
@@ -1627,6 +1831,12 @@ class DownloadManager:
             logger.warning(f"如果最新日期 >= 结束日期，说明数据已经是最新的，无需下载")
             logger.warning("=" * 60)
             return {"stock": DownloadStats(), "index": DownloadStats()}
+        
+        if strategy.get("fill_missing_latest_date"):
+            missing_count = len(strategy.get("stock_whitelist") or [])
+            logger.warning(
+                f"触发最新日期补齐流程: 需要补齐 {missing_count} 只股票 (日期 {strategy.get('end_date')})"
+            )
         
         # 添加智能日期判断的详细说明（如果配置为"today"）
         if self.config.end_date.lower() == "today":

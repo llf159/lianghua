@@ -1464,7 +1464,13 @@ class DatabaseManager:
                 
             except Exception as e:
                 error_msg = str(e)
-                is_timeout = "timeout" in error_msg.lower() or "超时" in error_msg
+                error_msg_lower = error_msg.lower()
+                is_timeout = "timeout" in error_msg_lower or "超时" in error_msg
+                is_table_not_exist = (
+                    "catalog" in error_msg_lower and "does not exist" in error_msg_lower
+                ) or any(keyword in error_msg_lower for keyword in [
+                    "table", "does not exist", "no such table", "catalog", "relation"
+                ]) and ("stock_details" in error_msg or "stock_data" in error_msg)
                 
                 if attempt < max_retries and is_timeout:
                     # 如果是超时错误且还有重试次数，等待后重试
@@ -1482,6 +1488,9 @@ class DatabaseManager:
                     
                     if is_timeout:
                         logger.error(f"数据库请求最终超时 {request.request_id}: {error_msg}")
+                    elif is_table_not_exist:
+                        # 表不存在是预期情况，使用debug级别
+                        logger.debug(f"数据库表不存在 {request.request_id}: {error_msg}")
                     else:
                         logger.error(f"数据库请求失败 {request.request_id}: {error_msg}")
                     break
@@ -2999,31 +3008,34 @@ class DatabaseManager:
                 return status
             
             # 获取日期范围和统计信息
-            stats_sql = """
-                SELECT 
-                    MIN(ref_date) as min_date,
-                    MAX(ref_date) as max_date,
-                    COUNT(*) as total_records,
-                    COUNT(DISTINCT ts_code) as stock_count
-                FROM stock_details
-            """
-            df = self.execute_sync_query(db_path, stats_sql, [], timeout=30.0)
-            
-            if not df.empty:
-                row = df.iloc[0]
-                status["min_date"] = str(row["min_date"]) if row["min_date"] else None
-                status["max_date"] = str(row["max_date"]) if row["max_date"] else None
-                status["total_records"] = int(row["total_records"])
-                status["stock_count"] = int(row["stock_count"])
+            try:
+                stats_sql = """
+                    SELECT 
+                        MIN(ref_date) as min_date,
+                        MAX(ref_date) as max_date,
+                        COUNT(*) as total_records,
+                        COUNT(DISTINCT ts_code) as stock_count
+                    FROM stock_details
+                """
+                df = self.execute_sync_query(db_path, stats_sql, [], timeout=30.0)
+                
+                if not df.empty:
+                    row = df.iloc[0]
+                    status["min_date"] = str(row["min_date"]) if row["min_date"] else None
+                    status["max_date"] = str(row["max_date"]) if row["max_date"] else None
+                    status["total_records"] = int(row["total_records"])
+                    status["stock_count"] = int(row["stock_count"])
+            except Exception as e:
+                _handle_details_db_error(e, db_path, "获取细节数据统计信息")
             
             status["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
             return status
             
         except Exception as e:
-            logger.error(f"获取细节数据状态失败: {e}")
+            _handle_details_db_error(e, db_path if 'db_path' in locals() else None, "获取细节数据状态")
             return {
-                "database_path": None,
+                "database_path": db_path if 'db_path' in locals() else None,
                 "database_exists": False,
                 "error": str(e),
                 "min_date": None,
@@ -4578,6 +4590,24 @@ def is_details_db_available(check_file_exists: bool = True) -> bool:
         return False
 
 
+def _handle_details_db_error(e: Exception, db_path: Optional[str] = None, operation: str = "操作") -> None:
+    """
+    统一的Details数据库错误处理函数
+    
+    Args:
+        e: 异常对象
+        db_path: 数据库路径（用于日志）
+        operation: 操作名称（用于日志）
+    """
+    error_msg = str(e).lower()
+    if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+        logger.debug(f"Details数据库表不存在: {db_path if db_path else 'unknown'}")
+    elif isinstance(e, (FileNotFoundError, RuntimeError, AttributeError, ImportError)):
+        logger.debug(f"{operation}失败: {e}")
+    else:
+        logger.error(f"{operation}失败: {e}")
+
+
 def get_details_db_path(db_path: Optional[str] = None) -> str:
     """
     获取Details数据库路径
@@ -4664,32 +4694,37 @@ def get_details_table_info(db_path: Optional[str] = None, use_cache: bool = True
             df = manager.execute_sync_query(db_path, sql, timeout=30.0)
             result['table_structure'] = df.to_dict('records') if not df.empty else []
         except Exception as e:
-            logger.warning(f"获取表结构失败: {e}")
+            _handle_details_db_error(e, db_path, "获取表结构")
+            if 'table' not in str(e).lower() or 'does not exist' not in str(e).lower():
+                logger.warning(f"获取表结构失败: {e}")
         
         # 如果缓存中没有统计信息，从数据库读取
         if result['total_records'] == 0 and result['stock_count'] == 0 and not result.get('date_range'):
             logger.debug("从数据库读取Details表统计信息")
-            # 获取记录数
-            count_sql = "SELECT COUNT(*) as total FROM stock_details"
-            count_df = manager.execute_sync_query(db_path, count_sql, timeout=30.0)
-            result['total_records'] = count_df.iloc[0]['total'] if not count_df.empty else 0
-            
-            # 获取日期范围
-            date_sql = """
-            SELECT 
-                MIN(ref_date) as min_date,
-                MAX(ref_date) as max_date,
-                COUNT(DISTINCT ref_date) as date_count
-            FROM stock_details
-            """
-            date_df = manager.execute_sync_query(db_path, date_sql, timeout=30.0)
-            if not date_df.empty:
-                result['date_range'] = date_df.to_dict('records')[0]
-            
-            # 获取股票数量
-            stock_sql = "SELECT COUNT(DISTINCT ts_code) as stock_count FROM stock_details"
-            stock_df = manager.execute_sync_query(db_path, stock_sql, timeout=30.0)
-            result['stock_count'] = stock_df.iloc[0]['stock_count'] if not stock_df.empty else 0
+            try:
+                # 获取记录数
+                count_sql = "SELECT COUNT(*) as total FROM stock_details"
+                count_df = manager.execute_sync_query(db_path, count_sql, timeout=30.0)
+                result['total_records'] = count_df.iloc[0]['total'] if not count_df.empty else 0
+                
+                # 获取日期范围
+                date_sql = """
+                SELECT 
+                    MIN(ref_date) as min_date,
+                    MAX(ref_date) as max_date,
+                    COUNT(DISTINCT ref_date) as date_count
+                FROM stock_details
+                """
+                date_df = manager.execute_sync_query(db_path, date_sql, timeout=30.0)
+                if not date_df.empty:
+                    result['date_range'] = date_df.to_dict('records')[0]
+                
+                # 获取股票数量
+                stock_sql = "SELECT COUNT(DISTINCT ts_code) as stock_count FROM stock_details"
+                stock_df = manager.execute_sync_query(db_path, stock_sql, timeout=30.0)
+                result['stock_count'] = stock_df.iloc[0]['stock_count'] if not stock_df.empty else 0
+            except Exception as e:
+                _handle_details_db_error(e, db_path, "从数据库读取统计信息")
         
         return result
     except Exception as e:
@@ -4711,7 +4746,16 @@ def query_details_by_stock(ts_code: str, limit: int = 10, db_path: Optional[str]
     """
     try:
         db_path = get_details_db_path(db_path)
+        
+        # 检查数据库文件是否存在
+        if not os.path.exists(db_path):
+            logger.debug(f"Details数据库文件不存在: {db_path}")
+            return pd.DataFrame()
+        
         manager = get_database_manager()
+        if not manager:
+            logger.debug("无法获取数据库管理器")
+            return pd.DataFrame()
         
         sql = """
         SELECT * FROM stock_details 
@@ -4721,7 +4765,7 @@ def query_details_by_stock(ts_code: str, limit: int = 10, db_path: Optional[str]
         """
         return manager.execute_sync_query(db_path, sql, [ts_code, limit], timeout=30.0)
     except Exception as e:
-        logger.error(f"query_details_by_stock 失败: {e}")
+        _handle_details_db_error(e, db_path, "query_details_by_stock")
         return pd.DataFrame()
 
 
@@ -4739,7 +4783,16 @@ def query_details_by_date(ref_date: str, limit: int = 100, db_path: Optional[str
     """
     try:
         db_path = get_details_db_path(db_path)
+        
+        # 检查数据库文件是否存在
+        if not os.path.exists(db_path):
+            logger.debug(f"Details数据库文件不存在: {db_path}")
+            return pd.DataFrame()
+        
         manager = get_database_manager()
+        if not manager:
+            logger.debug("无法获取数据库管理器")
+            return pd.DataFrame()
         
         if limit == -1:
             # -1表示返回全部记录，不使用LIMIT
@@ -4758,7 +4811,7 @@ def query_details_by_date(ref_date: str, limit: int = 100, db_path: Optional[str
             """
             return manager.execute_sync_query(db_path, sql, [ref_date, limit], timeout=30.0)
     except Exception as e:
-        logger.error(f"query_details_by_date 失败: {e}")
+        _handle_details_db_error(e, db_path, "query_details_by_date")
         return pd.DataFrame()
 
 
@@ -4776,7 +4829,16 @@ def query_details_top_stocks(ref_date: str, top_k: int = 50, db_path: Optional[s
     """
     try:
         db_path = get_details_db_path(db_path)
+        
+        # 检查数据库文件是否存在
+        if not os.path.exists(db_path):
+            logger.debug(f"Details数据库文件不存在: {db_path}")
+            return pd.DataFrame()
+        
         manager = get_database_manager()
+        if not manager:
+            logger.debug("无法获取数据库管理器")
+            return pd.DataFrame()
         
         sql = """
         SELECT * FROM stock_details 
@@ -4785,8 +4847,15 @@ def query_details_top_stocks(ref_date: str, top_k: int = 50, db_path: Optional[s
         LIMIT ?
         """
         return manager.execute_sync_query(db_path, sql, [ref_date, top_k], timeout=30.0)
+    except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+        logger.debug(f"query_details_top_stocks 失败: {e}")
+        return pd.DataFrame()
     except Exception as e:
-        logger.error(f"query_details_top_stocks 失败: {e}")
+        error_msg = str(e).lower()
+        if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+            logger.debug(f"Details数据库表不存在: {db_path}")
+        else:
+            logger.error(f"query_details_top_stocks 失败: {e}")
         return pd.DataFrame()
 
 
@@ -4806,7 +4875,16 @@ def query_details_score_range(ref_date: str, min_score: float, max_score: float,
     """
     try:
         db_path = get_details_db_path(db_path)
+        
+        # 检查数据库文件是否存在
+        if not os.path.exists(db_path):
+            logger.debug(f"Details数据库文件不存在: {db_path}")
+            return pd.DataFrame()
+        
         manager = get_database_manager()
+        if not manager:
+            logger.debug("无法获取数据库管理器")
+            return pd.DataFrame()
         
         sql = """
         SELECT * FROM stock_details 
@@ -4815,7 +4893,7 @@ def query_details_score_range(ref_date: str, min_score: float, max_score: float,
         """
         return manager.execute_sync_query(db_path, sql, [ref_date, min_score, max_score], timeout=30.0)
     except Exception as e:
-        logger.error(f"query_details_score_range 失败: {e}")
+        _handle_details_db_error(e, db_path, "query_details_score_range")
         return pd.DataFrame()
 
 
@@ -4832,8 +4910,17 @@ def query_details_recent_dates(days: int = 7, db_path: Optional[str] = None) -> 
     """
     try:
         db_path = get_details_db_path(db_path)
+        
+        # 检查数据库文件是否存在
+        if not os.path.exists(db_path):
+            logger.debug(f"Details数据库文件不存在: {db_path}")
+            return []
+        
         logger.debug(f"[数据库连接] 开始获取数据库管理器实例 (查询最近{days}个交易日的details数据)")
         manager = get_database_manager()
+        if not manager:
+            logger.debug("无法获取数据库管理器")
+            return []
         
         sql = """
         SELECT DISTINCT ref_date 
@@ -4844,7 +4931,7 @@ def query_details_recent_dates(days: int = 7, db_path: Optional[str] = None) -> 
         df = manager.execute_sync_query(db_path, sql, [days], timeout=30.0)
         return df['ref_date'].tolist() if not df.empty else []
     except Exception as e:
-        logger.error(f"query_details_recent_dates 失败: {e}")
+        _handle_details_db_error(e, db_path, "query_details_recent_dates")
         return []
 
 
@@ -4861,7 +4948,16 @@ def get_details_stock_summary(ts_code: str, db_path: Optional[str] = None) -> Di
     """
     try:
         db_path = get_details_db_path(db_path)
+        
+        # 检查数据库文件是否存在
+        if not os.path.exists(db_path):
+            logger.debug(f"Details数据库文件不存在: {db_path}")
+            return {}
+        
         manager = get_database_manager()
+        if not manager:
+            logger.debug("无法获取数据库管理器")
+            return {}
         
         sql = """
         SELECT 
@@ -4882,7 +4978,7 @@ def get_details_stock_summary(ts_code: str, db_path: Optional[str] = None) -> Di
         df = manager.execute_sync_query(db_path, sql, [ts_code], timeout=30.0)
         return df.to_dict('records')[0] if not df.empty else {}
     except Exception as e:
-        logger.error(f"get_details_stock_summary 失败: {e}")
+        _handle_details_db_error(e, db_path, "get_details_stock_summary")
         return {}
 
 # ========== 状态管理便捷函数（保持向后兼容，合并自 database_status） ==========
