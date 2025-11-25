@@ -576,8 +576,16 @@ class DatabaseConnectionPool:
         """
         import duckdb
         
-        # 根据 read_only 参数创建相应类型的连接
+        # 根据连接池模式创建相应类型的连接
+        # 对于写入连接池，所有连接都必须是读写模式，避免与其他连接产生配置冲突
+        pool_mode_read_only = self.read_only
         use_read_only = read_only
+        if not pool_mode_read_only and read_only:
+            logger.debug("写入连接池收到只读请求，强制使用读写模式以保持 DuckDB 连接配置一致")
+            use_read_only = False
+        elif pool_mode_read_only and not read_only:
+            logger.debug("只读连接池收到写入请求，强制使用只读模式")
+            use_read_only = True
         process_name = "MainProcess"
         process_id = os.getpid()
         
@@ -679,7 +687,7 @@ class DatabaseConnectionPool:
             current_time = time.time()
             self._connection_created_times[conn_id] = current_time
             self._connection_last_used[conn_id] = current_time
-            self._connection_types[conn_id] = read_only
+            self._connection_types[conn_id] = use_read_only
             
             self._stats['total_created'] += 1
             logger.info(
@@ -743,6 +751,19 @@ class DatabaseConnectionPool:
         """获取连接 - 真正的连接池复用版本，支持阻塞等待"""
         with self._condition:
             try:
+                # 写库连接池收到只读请求时，强制使用读写模式，避免 DuckDB 配置不一致
+                effective_read_only = read_only
+                if not self.read_only and read_only:
+                    logger.debug(
+                        "写入连接池收到只读请求，强制使用读写模式以避免 DuckDB 连接配置冲突"
+                    )
+                    effective_read_only = False
+                elif self.read_only and not read_only:
+                    logger.debug(
+                        "只读连接池收到写入请求，强制使用只读模式"
+                    )
+                    effective_read_only = True
+
                 # 先尝试从池中获取可用连接
                 if not self._pool.empty():
                     try:
@@ -751,7 +772,7 @@ class DatabaseConnectionPool:
                         
                         # 检查连接是否仍然有效且类型匹配
                         conn_id = id(conn)
-                        if (conn_read_only == read_only and 
+                        if (conn_read_only == effective_read_only and 
                             conn_id in self._connection_created_times):
                             
                             # 检查连接是否过期
@@ -764,7 +785,7 @@ class DatabaseConnectionPool:
                                 self._active_connections.add(conn)
                                 self._stats['pool_hits'] += 1
                                 self._stats['active_count'] = len(self._active_connections)
-                                logger.debug(f"复用数据库连接: {self.db_path} (只读: {read_only})")
+                                logger.debug(f"复用数据库连接: {self.db_path} (只读: {effective_read_only})")
                                 return conn
                             else:
                                 # 连接过期，关闭并创建新连接
@@ -797,11 +818,11 @@ class DatabaseConnectionPool:
                     logger.debug(f"等待成功，获得可用连接槽位 (等待时间: {time.time() - start_time:.2f}秒)")
                 
                 # 创建新连接
-                conn = self._create_connection(read_only)
+                conn = self._create_connection(effective_read_only)
                 self._active_connections.add(conn)
                 self._stats['pool_misses'] += 1
                 self._stats['active_count'] = len(self._active_connections)
-                logger.debug(f"[数据库连接] 创建新连接: {self.db_path} (只读: {read_only})")
+                logger.debug(f"[数据库连接] 创建新连接: {self.db_path} (只读: {effective_read_only})")
                 return conn
                 
             except Exception as e:
@@ -3696,8 +3717,6 @@ class DatabaseSchemaManager:
                 self._init_duckdb_details_tables(db_path)
             elif db_type.lower() == "sqlite":
                 self._init_sqlite_details_tables(db_path)
-            elif db_type.lower() == "postgres":
-                self._init_postgresql_details_tables(db_path)
             else:
                 raise ValueError(f"不支持的数据库类型: {db_type}")
                 
@@ -3780,41 +3799,6 @@ class DatabaseSchemaManager:
         finally:
             conn.close()
     
-    def _init_postgresql_details_tables(self, dsn: str):
-        """初始化PostgreSQL股票详情表结构"""
-        import psycopg2
-        
-        conn = psycopg2.connect(dsn)
-        try:
-            conn.autocommit = False
-            cur = conn.cursor()
-            
-            create_table_sql = """
-            CREATE TABLE IF NOT EXISTS stock_details (
-                ts_code TEXT NOT NULL,
-                ref_date TEXT NOT NULL,
-                score DOUBLE PRECISION,
-                tiebreak DOUBLE PRECISION,
-                highlights JSONB,
-                drawbacks JSONB,
-                opportunities JSONB,
-                rank INTEGER,
-                total INTEGER,
-                rules JSONB,
-                PRIMARY KEY (ts_code, ref_date)
-            )
-            """
-            cur.execute(create_table_sql)
-            
-            # 创建索引
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_sd_ref_date ON stock_details(ref_date)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_sd_rank ON stock_details(rank)")
-            
-            conn.commit()
-            
-        finally:
-            conn.close()
-
 # 扩展DatabaseManager类，添加表结构初始化功能
 def _add_schema_manager_to_database_manager():
     """为DatabaseManager添加表结构管理器"""

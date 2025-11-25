@@ -750,8 +750,8 @@ import indicators as ind
 import predict_core as pr
 from rule_editor import render_rule_editor
 from predict_core import (
-    PredictionInput, PositionCheckInput,
-    run_prediction, run_position_checks,
+    PredictionInput, PositionCheckInput, PredictRankingInput,
+    run_prediction, run_position_checks, run_predict_ranking,
     load_prediction_rules, load_position_policies, load_opportunity_policies,
     Scenario
 )
@@ -997,6 +997,9 @@ def se_progress_to_streamlit():
     # 主线程消费：供 run_se_run_for_date_in_bg 循环调用
     def _drain():
         try:
+            if callable(_orig_drain):
+                # 先从 scoring_core 的队列中取事件并交给本地队列
+                _orig_drain()
             while True:
                 ev = _evq.get_nowait()
                 _render_event(*ev)
@@ -1926,6 +1929,10 @@ def pred_progress_to_streamlit():
             "pred_build_universe_done": "构建模拟清单",
             "pred_start": "模拟开始",
             "pred_progress": "模拟进行中",
+            "pred_rank_start": "准备模拟数据",
+            "pred_rank_sim_done": "模拟完成，开始评分",
+            "pred_rank_score_progress": "评分进行中",
+            "pred_rank_done": "预测排名完成",
             "pred_done": "模拟完成",
         }.get(phase, phase)
         
@@ -1941,18 +1948,27 @@ def pred_progress_to_streamlit():
     # 主线程消费：供 run_prediction_in_bg 循环调用
     def _drain():
         try:
+            if callable(_orig_drain):
+                _orig_drain()
             while True:
                 ev = _evq.get_nowait()
                 _render_event(*ev)
         except _q.Empty:
             pass
 
+    _orig_handler = getattr(pr, "_progress_handler", None)
     _orig_drain = getattr(pr, "drain_progress_events", None)
+    pr.set_progress_handler(_enqueue_handler)
     pr.drain_progress_events = _drain  # 关键：把"抽干"替换成主线程渲染
 
     try:
         yield status, bar, info
     finally:
+        # 还原 handler
+        try:
+            pr.set_progress_handler(_orig_handler)
+        except Exception:
+            pass
         # 还原 drain（保持模块整洁）
         if callable(_orig_drain):
             pr.drain_progress_events = _orig_drain
@@ -1994,6 +2010,42 @@ def run_prediction_in_bg(inp):
             raise result["err"]
         return result["df"]
 
+
+def run_predict_ranking_in_bg(inp):
+    """在后台线程运行 run_predict_ranking，并把进度转发到主线程"""
+    with pred_progress_to_streamlit() as (status, bar, info):
+        done = threading.Event()
+        result = {"df": None, "path": None, "err": None}
+
+        def _worker():
+            try:
+                result["df"], result["path"] = run_predict_ranking(inp)
+            except Exception as e:
+                result["err"] = e
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+        while not done.is_set():
+            try:
+                pr.drain_progress_events()
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+        try:
+            pr.drain_progress_events()
+        except Exception:
+            pass
+
+        if status is not None:
+            status.update(label="已完成", state="complete")
+        if result["err"]:
+            raise result["err"]
+        return result["df"], result["path"]
+
 # ===== 主ui部分 =====
 if _in_streamlit():
     # ===== 页眉 =====
@@ -2022,11 +2074,11 @@ if _in_streamlit():
         st.session_state["export_pref"] = {"style": "space", "with_suffix": True}
 
     # ===== 顶层页签 =====
-    tab_rank, tab_detail, tab_position, tab_predict, tab_rules, tab_attn, tab_custom, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
-        ["排名", "个股详情", "持仓建议", "明日模拟", "规则编辑", "强度榜", "自选榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
+    # tab_rank, tab_detail, tab_position, tab_predict, tab_rules, tab_attn, tab_custom, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
+    #     ["排名", "个股详情", "持仓建议", "明日模拟", "规则编辑", "强度榜", "自选榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
 
-    # tab_rank, tab_detail, tab_position, tab_predict, tab_predict_rank, tab_rules, tab_attn, tab_custom, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
-    #     ["排名", "个股详情", "持仓建议", "明日模拟", "预测排名", "规则编辑", "强度榜", "自选榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
+    tab_rank, tab_detail, tab_position, tab_predict, tab_predict_rank, tab_rules, tab_attn, tab_custom, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
+        ["排名", "个股详情", "持仓建议", "明日模拟", "预测排名", "规则编辑", "强度榜", "自选榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
 
     # ================== 排名 ==================
     with tab_rank:
@@ -2183,7 +2235,7 @@ if _in_streamlit():
                 
                 rows_to_show = None
                 if show_mode == "限制条数":
-                    rows_to_show = st.number_input("显示行数", min_value=5, max_value=1000, value=cfg_int("SC_TOPK_ROWS", 30), key="topk_rows_cfg")
+                    rows_to_show = st.number_input("显示行数", min_value=5, max_value=1000, value=cfg_int("SC_TOPK_ROWS", 100), key="topk_rows_cfg")
                 
                 if not df_filtered.empty:
                     if show_mode == "显示全部":
@@ -2846,8 +2898,7 @@ if _in_streamlit():
                 except Exception as e:
                     logger.debug(f"显示未触发规则失败: {e}")
                     # 静默失败，不影响主流程
-                
-                # st.markdown('<div id="rank_rule_anchor"></div>', unsafe_allow_html=True)
+
                 st.markdown('<div id="detail_rule_anchor_detail"></div>', unsafe_allow_html=True)
 
     # ================== 持仓建议 ==================
@@ -3330,280 +3381,164 @@ if _in_streamlit():
                 st.warning("请检查参数设置，确保参考日和选股范围都有效")
 
     # ================== 预测排名 ==================
-    # with tab_predict_rank:
-    #     st.subheader("预测排名")
-    #     st.info("💡 使用模拟数据运行排名策略，得到预测的排名结果")
+    with tab_predict_rank:
+        st.subheader("预测排名")
+        st.info("使用模拟数据运行排名策略，得到预测的排名结果")
         
-    #     # 使用 st.form 防止参数变化时立即刷新UI
-    #     with st.form("predict_rank_form"):
-    #         with st.expander("输入参数", expanded=True):
-    #             c1, c2 = st.columns([1,1])
-    #             with c1:
-    #                 pred_rank_ref = st.text_input("参考日（YYYYMMDD；留空=自动取最新交易日）", value="", key="pred_rank_ref_input")
-    #                 if not pred_rank_ref.strip():
-    #                     # 显示当前会自动使用的参考日
-    #                     auto_ref = _pick_smart_ref_date()
-    #                     if auto_ref:
-    #                         st.caption(f"💡 将自动使用最新交易日: {auto_ref}")
-    #                     else:
-    #                         st.caption("⚠️ 无法自动获取最新交易日，请手动输入")
-    #                 recalc_mode_rank = st.radio("指标重算", ["自选", "全部(all)", "不重算(none)"],
-    #                                             index=0, horizontal=True, key="pred_rank_recalc_mode")
-    #                 if recalc_mode_rank == "自选":
-    #                     recompute_opts_rank = st.multiselect("仅重算需要的指标",
-    #                                                     _indicator_options(),
-    #                                                     default=["kdj"],
-    #                                                     key="pred_rank_recompute_pick")
-    #                     recompute_to_pass_rank = tuple(recompute_opts_rank) if recompute_opts_rank else ("kdj",)
-    #                 elif recalc_mode_rank == "全部(all)":
-    #                     recompute_to_pass_rank = "all"
-    #                 else:
-    #                     recompute_to_pass_rank = "none"
-    #             with c2:
-    #                 uni_choice_rank = st.selectbox(
-    #                     "选股范围",
-    #                     ["自定义（下方文本）","全市场","仅白名单","仅黑名单","仅特别关注榜"],
-    #                     index=0, key="pred_rank_uni_choice")
-    #                 # 文本框仅在"自定义"时使用
-    #                 pasted_rank = st.text_area("选股范围（支持多种分隔符：空格、换行、逗号、分号、竖线等；可混合 ts_code / 简写）", height=120, placeholder="例：\n000001.SZ 600000.SH 000001\n或：\n000001.SZ,600000.SH;000001|300001", disabled=(not uni_choice_rank.startswith("自定义")), key="pred_rank_pasted")
+        # 使用 st.form 防止参数变化时立即刷新UI
+        with st.form("predict_rank_form"):
+            with st.expander("输入参数", expanded=True):
+                c1, c2 = st.columns([1,1])
+                with c1:
+                    pred_rank_ref = st.text_input("参考日（YYYYMMDD；留空=自动取最新交易日）", value="", key="pred_rank_ref_input")
+                    if not pred_rank_ref.strip():
+                        # 显示当前会自动使用的参考日
+                        auto_ref = _pick_smart_ref_date()
+                        if auto_ref:
+                            st.caption(f"💡 将自动使用最新交易日: {auto_ref}")
+                        else:
+                            st.caption("⚠️ 无法自动获取最新交易日，请手动输入")
+                    recalc_mode_rank = st.radio("指标重算", ["自选", "全部(all)", "不重算(none)"],
+                                                index=1, horizontal=True, key="pred_rank_recalc_mode")
+                    if recalc_mode_rank == "自选":
+                        recompute_opts_rank = st.multiselect("仅重算需要的指标",
+                                                        _indicator_options(),
+                                                        default=["kdj"],
+                                                        key="pred_rank_recompute_pick")
+                        recompute_to_pass_rank = tuple(recompute_opts_rank) if recompute_opts_rank else ("kdj",)
+                    elif recalc_mode_rank == "全部(all)":
+                        recompute_to_pass_rank = "all"
+                    else:
+                        recompute_to_pass_rank = "none"
+                with c2:
+                    uni_choice_rank = st.selectbox(
+                        "股票范围",
+                        ["自定义（下方文本）","全市场","仅白名单","仅黑名单","仅特别关注榜"],
+                        index=1, key="pred_rank_uni_choice")
+                    # 文本框仅在"自定义"时使用
+                    pasted_rank = st.text_area("股票范围（支持多种分隔符：空格、换行、逗号、分号、竖线等；可混合 ts_code / 简写）", height=120, placeholder="例：\n000001.SZ 600000.SH 000001\n或：\n000001.SZ,600000.SH;000001|300001", disabled=(not uni_choice_rank.startswith("自定义")), key="pred_rank_pasted")
             
-    #         # 全局场景设置
-    #         with st.container(border=True):
-    #             st.markdown("**全局场景设置**")
-    #             cc1, cc2, cc3 = st.columns([1,1,1])
-    #             with cc1:
-    #                 scen_mode_rank = st.selectbox("价格模式", ["close_pct","open_pct","gap_then_close_pct","flat","limit_up","limit_down"], index=0, key="pred_rank_scen_mode")
-    #                 pct_rank = st.number_input("涨跌幅 pct（%）", value=2.0, step=0.5, format="%.2f", key="pred_rank_pct")
-    #                 gap_pct_rank = st.number_input("跳空 gap_pct（%）", value=0.0, step=0.5, format="%.2f", key="pred_rank_gap_pct")
-    #             with cc2:
-    #                 vol_mode_rank = st.selectbox("量能模式", ["same","pct","mult"], index=2, key="pred_rank_vol_mode")
-    #                 vol_arg_rank = st.number_input("量能参数（% 或 倍数）", value=1.2, step=0.1, format="%.2f", key="pred_rank_vol_arg")
-    #                 hl_mode_rank = st.selectbox("高低生成", ["follow","atr_like","range_pct"], index=0, key="pred_rank_hl_mode")
-    #             with cc3:
-    #                 range_pct_rank = st.number_input("range_pct（%）", value=2.0, step=0.5, format="%.2f", key="pred_rank_range_pct")
-    #                 atr_mult_rank = st.number_input("atr_mult", value=1.0, step=0.1, format="%.2f", key="pred_rank_atr_mult")
-    #                 lock_hi_open_rank = st.checkbox("锁定收盘高于开盘", value=False, key="pred_rank_lock_hi_open")
+            # 全局场景设置
+            with st.container(border=True):
+                st.markdown("**全局场景设置**")
+                cc1, cc2, cc3 = st.columns([1,1,1])
+                with cc1:
+                    scen_mode_rank = st.selectbox("价格模式", ["close_pct","open_pct","gap_then_close_pct","flat","limit_up","limit_down"], index=0, key="pred_rank_scen_mode")
+                    pct_rank = st.number_input("涨跌幅 pct（%）", value=2.0, step=0.5, format="%.2f", key="pred_rank_pct")
+                    gap_pct_rank = st.number_input("跳空 gap_pct（%）", value=0.0, step=0.5, format="%.2f", key="pred_rank_gap_pct")
+                with cc2:
+                    vol_mode_rank = st.selectbox("量能模式", ["same","pct","mult"], index=2, key="pred_rank_vol_mode")
+                    vol_arg_rank = st.number_input("量能参数（% 或 倍数）", value=1.2, step=0.1, format="%.2f", key="pred_rank_vol_arg")
+                    hl_mode_rank = st.selectbox("高低生成", ["follow","atr_like","range_pct"], index=0, key="pred_rank_hl_mode")
+                with cc3:
+                    range_pct_rank = st.number_input("range_pct（%）", value=2.0, step=0.5, format="%.2f", key="pred_rank_range_pct")
+                    atr_mult_rank = st.number_input("atr_mult", value=1.0, step=0.1, format="%.2f", key="pred_rank_atr_mult")
+                    lock_hi_open_rank = st.checkbox("锁定收盘高于开盘", value=False, key="pred_rank_lock_hi_open")
             
-    #         # 排名参数
-    #         with st.container(border=True):
-    #             st.markdown("**排名参数**")
-    #             rank_c1, rank_c2 = st.columns([1,1])
-    #             with rank_c1:
-    #                 topk_rank = st.number_input("Top-K", min_value=1, max_value=2000, value=50, key="pred_rank_topk")
-    #                 tie_rank = st.selectbox("同分排序（Tie-break）", ["none", "kdj_j_asc"], index=1, key="pred_rank_tie")
-    #             with rank_c2:
-    #                 maxw_rank = st.number_input("最大并行数", min_value=1, max_value=64, value=8, key="pred_rank_maxw")
-            
-    #         # 提交按钮
-    #         submitted_rank = st.form_submit_button("🚀 运行预测排名", width='stretch')
+            # 提交按钮
+            submitted_rank = st.form_submit_button("🚀 运行预测排名", width='stretch')
         
-    #     # 只有在表单提交时才执行计算
-    #     if submitted_rank:
-    #         # 参考日与代码集
-    #         ref_use_rank = pred_rank_ref.strip() or _pick_smart_ref_date() or ""
+        # 只有在表单提交时才执行计算
+        if submitted_rank:
+            # 参考日与代码集
+            ref_use_rank = pred_rank_ref.strip() or _pick_smart_ref_date() or ""
             
-    #         # 解析粘贴的文本范围
-    #         def _parse_codes_rank(txt: str):
-    #             out = []
-    #             if not txt:
-    #                 return out
-    #             import re
-    #             separators = r'[\s\n\r\t,;|]+'
-    #             codes = re.split(separators, txt)
-    #             for code in codes:
-    #                 s = code.strip()
-    #                 if not s:
-    #                     continue
-    #                 try:
-    #                     out.append(normalize_ts(s))
-    #                 except Exception:
-    #                     continue
-    #             return sorted(set([x for x in out if x]))
-    #         uni_rank = _parse_codes_rank(pasted_rank)
+            # 解析粘贴的文本范围
+            def _parse_codes_rank(txt: str):
+                out = []
+                if not txt:
+                    return out
+                import re
+                separators = r'[\s\n\r\t,;|]+'
+                codes = re.split(separators, txt)
+                for code in codes:
+                    s = code.strip()
+                    if not s:
+                        continue
+                    try:
+                        out.append(normalize_ts(s))
+                    except Exception:
+                        continue
+                return sorted(set([x for x in out if x]))
+            uni_rank = _parse_codes_rank(pasted_rank)
             
-    #         # 创建Scenario对象
-    #         scen_rank = Scenario(
-    #             mode=scen_mode_rank, 
-    #             pct=pct_rank, 
-    #             gap_pct=gap_pct_rank, 
-    #             vol_mode=vol_mode_rank, 
-    #             vol_arg=vol_arg_rank,
-    #             hl_mode=hl_mode_rank, 
-    #             range_pct=range_pct_rank, 
-    #             atr_mult=atr_mult_rank,
-    #             lock_higher_than_open=lock_hi_open_rank
-    #         )
+            # 创建Scenario对象
+            scen_rank = Scenario(
+                mode=scen_mode_rank, 
+                pct=pct_rank, 
+                gap_pct=gap_pct_rank, 
+                vol_mode=vol_mode_rank, 
+                vol_arg=vol_arg_rank,
+                hl_mode=hl_mode_rank, 
+                range_pct=range_pct_rank, 
+                atr_mult=atr_mult_rank,
+                lock_higher_than_open=lock_hi_open_rank
+            )
             
-    #         _uni_map_rank = {"全市场": "all", "仅白名单": "white", "仅黑名单": "black", "仅特别关注榜": "attention"}
-    #         use_codes_rank = uni_choice_rank.startswith("自定义")
-    #         if use_codes_rank:
-    #             uni_arg_rank = uni_rank
-    #         else:
-    #             uni_label_rank = _uni_map_rank.get(uni_choice_rank, "all")
-    #             uni_arg_rank = _resolve_pred_universe(uni_label_rank, ref_use_rank)
+            _uni_map_rank = {"全市场": "all", "仅白名单": "white", "仅黑名单": "black", "仅特别关注榜": "attention"}
+            use_codes_rank = uni_choice_rank.startswith("自定义")
+            if use_codes_rank:
+                uni_arg_rank = uni_rank
+            else:
+                uni_label_rank = _uni_map_rank.get(uni_choice_rank, "all")
+                uni_arg_rank = _resolve_pred_universe(uni_label_rank, ref_use_rank)
             
-    #         # 只有当 ref 有效且范围"非空"时才允许运行
-    #         can_run_rank = bool(ref_use_rank) and bool(uni_arg_rank)
+            # 只有当 ref 有效且范围"非空"时才允许运行
+            can_run_rank = bool(ref_use_rank) and bool(uni_arg_rank)
             
-    #         if not use_codes_rank and not uni_arg_rank:
-    #             st.info(f"【{uni_choice_rank}】在 {ref_use_rank} 无可用代码源，请先在\"排名\"页签生成当日 all/top 文件或检查名单缓存。")
+            if not use_codes_rank and not uni_arg_rank:
+                st.info(f"【{uni_choice_rank}】在 {ref_use_rank} 无可用代码源，请先在\"排名\"页签生成当日 all/top 文件或检查名单缓存。")
             
-    #         if use_codes_rank:
-    #             if uni_arg_rank:
-    #                 st.success(f"✅ 自定义名单解析成功：共 {len(uni_arg_rank)} 只股票")
-    #                 preview_codes_rank = uni_arg_rank[:5]
-    #                 st.caption(f"预览：{', '.join(preview_codes_rank)}{'...' if len(uni_arg_rank) > 5 else ''}")
-    #             else:
-    #                 st.warning("⚠️ 自定义名单为空，请检查输入的股票代码格式")
+            if use_codes_rank:
+                if uni_arg_rank:
+                    st.success(f"✅ 自定义名单解析成功：共 {len(uni_arg_rank)} 只股票")
+                    preview_codes_rank = uni_arg_rank[:5]
+                    st.caption(f"预览：{', '.join(preview_codes_rank)}{'...' if len(uni_arg_rank) > 5 else ''}")
+                else:
+                    st.warning("⚠️ 自定义名单为空，请检查输入的股票代码格式")
             
-    #         if can_run_rank:
-    #             try:
-    #                 with st.spinner("正在生成模拟数据并运行排名..."):
-    #                     # 1. 生成模拟数据
-    #                     from predict_core import simulate_next_day, FileCache
-    #                     cache_rank = FileCache("cache/sim_pred")
+            if can_run_rank:
+                try:
+                    inp_rank = PredictRankingInput(
+                        ref_date=ref_use_rank,
+                        universe=uni_arg_rank,
+                        scenario=scen_rank,
+                        recompute_indicators=recompute_to_pass_rank,
+                        cache_dir="cache/sim_pred_rank",
+                        use_prescreen=True,
+                        output_dir=os.path.join(cfg.SC_OUTPUT_DIR, "predict")
+                    )
+                    df_rank_results, rank_path = run_predict_ranking_in_bg(inp_rank)
+
+                    # 显示结果
+                    if not df_rank_results.empty:
+                        st.success(f"✅ 预测排名完成：共 {len(df_rank_results)} 只股票")
+                        st.dataframe(df_rank_results, width='stretch')
+                        if rank_path:
+                            st.caption(f"已写入: {rank_path}")
                         
-    #                     sim_result = simulate_next_day(
-    #                         ref_use_rank, 
-    #                         uni_arg_rank, 
-    #                         scen_rank,
-    #                         recompute_indicators=recompute_to_pass_rank,
-    #                         cache=cache_rank
-    #                     )
+                        # 复制代码功能
+                        if "ts_code" in df_rank_results.columns:
+                            codes_rank = df_rank_results["ts_code"].astype(str).tolist()
+                            txt_rank = _codes_to_txt(codes_rank, st.session_state["export_pref"]["style"], 
+                                                   st.session_state["export_pref"]["with_suffix"])
+                            copy_txt_button(txt_rank, label="📋 复制预测排名代码", key=f"copy_predict_rank_{ref_use_rank}")
                         
-    #                     st.success(f"✅ 模拟数据生成完成：共 {len(sim_result.df_sim)} 只股票")
+                        # 下载
+                        csv_rank = df_rank_results.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button("导出 CSV", data=csv_rank, 
+                                         file_name=os.path.basename(rank_path) if rank_path else f"predict_rank_{ref_use_rank}.csv", 
+                                         mime="text/csv", width='stretch')
+                    else:
+                        st.warning("⚠️ 未生成排名结果，请检查数据")
                         
-    #                     # 2. 对模拟数据运行排名策略
-    #                     # 需要创建一个临时函数来对模拟数据运行排名
-    #                     # 这里我们需要将模拟数据传递给排名系统
-    #                     # 由于排名系统从数据库读取数据，我们需要一个变通方法
-    #                     # 方案：创建一个临时函数，直接对模拟数据运行排名策略
-                        
-    #                     st.info("正在对模拟数据运行排名策略...")
-                        
-    #                     # 使用模拟数据运行排名
-    #                     # 这里我们需要修改排名逻辑，使其能够接受模拟数据
-    #                     # 暂时使用一个简化的方法：直接对模拟日期的数据进行评分
-                        
-    #                     # 创建一个临时的评分函数，使用模拟数据
-    #                     def _score_with_sim_data(sim_result, ref_date, topk, tie, maxw):
-    #                         """使用模拟数据运行排名"""
-    #                         from predict_core import _build_eval_ctx
-    #                         import tdx_compat as tdx
-    #                         from scoring_core import _iter_unique_rules, SC_MIN_SCORE, _eval_single_rule
-                            
-    #                         results = []
-    #                         sim_date = sim_result.sim_date
-                            
-    #                         # 对每只股票进行评分
-    #                         for ts_code in sim_result.df_sim["ts_code"].unique():
-    #                             try:
-    #                                 # 获取该股票的历史+模拟数据
-    #                                 stock_data = sim_result.df_concat[
-    #                                     sim_result.df_concat["ts_code"].astype(str) == str(ts_code)
-    #                                 ].sort_values("trade_date").copy()
-                                    
-    #                                 if stock_data.empty or str(sim_date) not in set(stock_data["trade_date"].astype(str)):
-    #                                     continue
-                                    
-    #                                 # 构建评估上下文
-    #                                 ctx_df = _build_eval_ctx(stock_data)
-    #                                 tdx.EXTRA_CONTEXT.update({"TS": str(ts_code), "REF_DATE": str(sim_date)})
-                                    
-    #                                 # 运行排名策略 - 使用scoring_core的规则评估逻辑
-    #                                 score = 0.0
-    #                                 tiebreak_j = None
-                                    
-    #                                 # 准备上下文（与scoring_core保持一致）
-    #                                 ctx = {
-    #                                     "df": stock_data,
-    #                                     "ref_date": sim_date,
-    #                                     "ts_code": str(ts_code)
-    #                                 }
-                                    
-    #                                 for rule in _iter_unique_rules():
-    #                                     try:
-    #                                         # 使用scoring_core的规则评估函数
-    #                                         rule_result = _eval_single_rule(stock_data, rule, sim_date, ctx, compute_hit_dates=False)
-    #                                         add = rule_result.get("add", 0.0)
-    #                                         if add != 0:
-    #                                             score += float(add)
-    #                                     except Exception as e:
-    #                                         logger.debug(f"规则 {rule.get('name', '')} 评估失败: {e}")
-    #                                         pass
-                                    
-    #                                 # 获取J值作为tiebreak
-    #                                 if "j" in stock_data.columns or "kdj_j" in stock_data.columns:
-    #                                     j_col = "j" if "j" in stock_data.columns else "kdj_j"
-    #                                     j_values = pd.to_numeric(stock_data[j_col], errors="coerce")
-    #                                     if not j_values.empty and pd.notna(j_values.iloc[-1]):
-    #                                         tiebreak_j = float(j_values.iloc[-1])
-                                    
-    #                                 score = max(score, float(SC_MIN_SCORE))
-                                    
-    #                                 results.append({
-    #                                     "ts_code": str(ts_code),
-    #                                     "score": score,
-    #                                     "tiebreak_j": tiebreak_j if tiebreak_j is not None else 999.0,
-    #                                     "ref_date": ref_date,
-    #                                     "sim_date": sim_date
-    #                                 })
-    #                             except Exception as e:
-    #                                 logger.warning(f"股票 {ts_code} 评分失败: {e}")
-    #                                 continue
-                            
-    #                         # 转换为DataFrame并排序
-    #                         df_results = pd.DataFrame(results)
-    #                         if df_results.empty:
-    #                             return df_results
-                            
-    #                         # 排序
-    #                         if tie == "kdj_j_asc":
-    #                             df_results = df_results.sort_values(["score", "tiebreak_j", "ts_code"], 
-    #                                                                ascending=[False, True, True])
-    #                         else:
-    #                             df_results = df_results.sort_values(["score", "ts_code"], 
-    #                                                                ascending=[False, True])
-                            
-    #                         # 添加排名
-    #                         df_results["rank"] = range(1, len(df_results) + 1)
-                            
-    #                         # 取Top-K
-    #                         if topk > 0:
-    #                             df_results = df_results.head(topk)
-                            
-    #                         return df_results
-                        
-    #                     # 运行排名
-    #                     df_rank_results = _score_with_sim_data(sim_result, ref_use_rank, topk_rank, tie_rank, maxw_rank)
-                        
-    #                     # 显示结果
-    #                     if not df_rank_results.empty:
-    #                         st.success(f"✅ 预测排名完成：共 {len(df_rank_results)} 只股票")
-    #                         st.dataframe(df_rank_results, width='stretch')
-                            
-    #                         # 复制代码功能
-    #                         if "ts_code" in df_rank_results.columns:
-    #                             codes_rank = df_rank_results["ts_code"].astype(str).tolist()
-    #                             txt_rank = _codes_to_txt(codes_rank, st.session_state["export_pref"]["style"], 
-    #                                                    st.session_state["export_pref"]["with_suffix"])
-    #                             copy_txt_button(txt_rank, label="📋 复制预测排名代码", key=f"copy_predict_rank_{ref_use_rank}")
-                            
-    #                         # 下载
-    #                         csv_rank = df_rank_results.to_csv(index=False).encode("utf-8-sig")
-    #                         st.download_button("导出 CSV", data=csv_rank, 
-    #                                          file_name=f"predict_rank_{ref_use_rank}.csv", 
-    #                                          mime="text/csv", width='stretch')
-    #                     else:
-    #                         st.warning("⚠️ 未生成排名结果，请检查数据")
-                            
-    #             except Exception as e:
-    #                 st.error(f"运行失败：{e}")
-    #                 import traceback
-    #                 with st.expander("调试信息", expanded=False):
-    #                     st.code(traceback.format_exc(), language="text")
-    #         else:
-    #             st.warning("请检查参数设置，确保参考日和选股范围都有效")
+                except Exception as e:
+                    st.error(f"运行失败：{e}")
+                    import traceback
+                    with st.expander("调试信息", expanded=False):
+                        st.code(traceback.format_exc(), language="text")
+            else:
+                st.warning("请检查参数设置，确保参考日和股票范围都有效")
 
     # ================== 规则编辑辅助模块 ==================
     with tab_rules:
@@ -5911,7 +5846,155 @@ if _in_streamlit():
                                 df_detail_display = df_detail_display.sort_values(["日期", "触发次数"], ascending=[True, False]).reset_index(drop=True)
                                 st.dataframe(df_detail_display, width='stretch', height=400)
                                 
-                                # 6) 后续跟踪
+                                # 6) 未触发的策略
+                                try:
+                                    show_when_untriggered = st.checkbox(
+                                        "显示规则 when 表达式",
+                                        value=False,
+                                        key="stats_show_when"
+                                    )
+                                    
+                                    # 参考所有策略列表，找出统计区间内未触发的策略
+                                    all_rules = getattr(se, "SC_RULES", []) or []
+                                    triggered_rule_names = set(df_all["name"].astype(str).unique())
+                                    
+                                    # 预先构建 name -> when / explain 映射
+                                    name_to_when = {}
+                                    name_to_explain = {}
+                                    for r in all_rules:
+                                        rule_name = str(r.get("name", ""))
+                                        if not rule_name:
+                                            continue
+                                        if "clauses" in r and r["clauses"]:
+                                            ws = [c.get("when", "") for c in r["clauses"] if c.get("when")]
+                                            name_to_when[rule_name] = " AND ".join(ws)
+                                        else:
+                                            name_to_when[rule_name] = str(r.get("when", ""))
+                                        
+                                        explain_val = r.get("explain")
+                                        if explain_val:
+                                            name_to_explain[rule_name] = str(explain_val)
+                                    
+                                    untriggered_rules = []
+                                    for r in all_rules:
+                                        rule_name = str(r.get("name", ""))
+                                        if not rule_name or rule_name in triggered_rule_names:
+                                            continue
+                                        
+                                        tf = str(r.get("timeframe", "D")).upper()
+                                        scope = str(r.get("scope", "ANY")).upper().strip()
+                                        win = None if scope == "LAST" else int(r.get("score_windows", 60))
+                                        points = float(r.get("points", 0))
+                                        
+                                        gate = r.get("gate")
+                                        gate_str = ""
+                                        if gate:
+                                            if isinstance(gate, dict):
+                                                gate_when = gate.get("when", "")
+                                                if gate_when:
+                                                    gate_str = f"gate: {gate_when}"
+                                            elif isinstance(gate, str):
+                                                gate_str = f"gate: {gate}"
+                                        
+                                        # 汇总子句信息
+                                        clauses_info = ""
+                                        if "clauses" in r and r.get("clauses"):
+                                            clauses = r.get("clauses", [])
+                                            clause_parts = []
+                                            for c in clauses:
+                                                c_tf = str(c.get("timeframe", "D")).upper()
+                                                c_scope = str(c.get("scope", "ANY")).upper().strip()
+                                                if c_scope == "LAST":
+                                                    clause_parts.append(f"{c_tf}/-/LAST")
+                                                else:
+                                                    c_win = int(c.get("score_windows", 60))
+                                                    clause_parts.append(f"{c_tf}/{c_win}/{c_scope}")
+                                            if clause_parts:
+                                                clauses_info = f"子句: {len(clauses)}个 ({', '.join(clause_parts)})"
+                                        
+                                        rule_data = {
+                                            "name": rule_name,
+                                            "timeframe": tf,
+                                            "scope": scope,
+                                            "points": points,
+                                            "gate": gate_str if gate_str else "",
+                                            "clauses": clauses_info if clauses_info else "",
+                                            "when": name_to_when.get(rule_name, ""),
+                                            "explain": name_to_explain.get(rule_name, str(r.get("explain", "")))
+                                        }
+                                        if scope != "LAST":
+                                            rule_data["score_windows"] = win
+                                        
+                                        untriggered_rules.append(rule_data)
+                                    
+                                    if untriggered_rules:
+                                        st.subheader("未触发的策略")
+                                        untriggered_df = pd.DataFrame(untriggered_rules)
+                                        
+                                        # 可选隐藏 when 列
+                                        if not show_when_untriggered and "when" in untriggered_df.columns:
+                                            untriggered_df = untriggered_df.drop(columns=["when"])
+                                        
+                                        # 确定列顺序
+                                        col_order = ["name"]
+                                        for col in ["timeframe", "scope", "points"]:
+                                            if col in untriggered_df.columns:
+                                                col_order.append(col)
+                                        if "score_windows" in untriggered_df.columns:
+                                            if "scope" in untriggered_df.columns:
+                                                has_non_last = (untriggered_df["scope"].astype(str).str.upper() != "LAST").any()
+                                                if has_non_last:
+                                                    col_order.append("score_windows")
+                                            else:
+                                                col_order.append("score_windows")
+                                        for col in ["gate", "clauses"]:
+                                            if col in untriggered_df.columns:
+                                                col_order.append(col)
+                                        if show_when_untriggered and "when" in untriggered_df.columns:
+                                            col_order.append("when")
+                                        if "explain" in untriggered_df.columns:
+                                            col_order.append("explain")
+                                        col_order = [c for c in col_order if c in untriggered_df.columns]
+                                        untriggered_display = untriggered_df[col_order].copy()
+                                        
+                                        # 列配置
+                                        untriggered_column_config = {}
+                                        try:
+                                            if "name" in untriggered_display.columns:
+                                                untriggered_column_config["name"] = st.column_config.TextColumn("策略名称", help="策略的简短名称")
+                                            if "timeframe" in untriggered_display.columns:
+                                                untriggered_column_config["timeframe"] = st.column_config.TextColumn("时间周期", help="D(日线)/W(周线)/M(月线)", width="small")
+                                            if "score_windows" in untriggered_display.columns:
+                                                untriggered_column_config["score_windows"] = st.column_config.TextColumn("计分窗口", help="计分窗口条数（scope 为 LAST 时为空）", width="small")
+                                            if "scope" in untriggered_display.columns:
+                                                untriggered_column_config["scope"] = st.column_config.TextColumn("命中口径", help="ANY/EACH/PERBAR等", width="small")
+                                            if "points" in untriggered_display.columns:
+                                                untriggered_column_config["points"] = st.column_config.NumberColumn("分数", help="命中时加/减分", width="small")
+                                            if "gate" in untriggered_display.columns:
+                                                untriggered_column_config["gate"] = st.column_config.TextColumn("前置门槛", help="前置条件表达式", width="medium")
+                                            if "clauses" in untriggered_display.columns:
+                                                untriggered_column_config["clauses"] = st.column_config.TextColumn("子句信息", help="多子句组合信息", width="medium")
+                                            if "when" in untriggered_display.columns:
+                                                untriggered_column_config["when"] = st.column_config.TextColumn("条件表达式", help="TDX风格表达式", width="large")
+                                            if "explain" in untriggered_display.columns:
+                                                untriggered_column_config["explain"] = st.column_config.TextColumn("详细说明", help="策略的详细说明", width="medium")
+                                        except Exception:
+                                            untriggered_column_config = None
+                                        
+                                        st.dataframe(
+                                            untriggered_display,
+                                            width='stretch',
+                                            height=420,
+                                            hide_index=True,
+                                            column_config=untriggered_column_config if untriggered_column_config else None
+                                        )
+                                        st.caption("以上策略在所选统计区间内未出现触发。")
+                                    else:
+                                        st.info("所选区间内所有策略均有触发。")
+                                except Exception as e:
+                                    logger.debug(f"显示未触发策略失败: {e}")
+                                
+                                # 7) 后续跟踪
                                 if track_days > 0 and strategy_stocks_map:
                                     st.subheader("触发策略的后续跟踪")
                                     

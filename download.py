@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -20,9 +20,41 @@ import sys
 import time
 import threading
 import random
+from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple, Set
 from dataclasses import dataclass
 from datetime import datetime
+
+# 在单独运行时自动切换到虚拟环境（支持 Linux/Windows）
+def _bootstrap_venv():
+    if __name__ != "__main__":
+        return
+    # 已在虚拟环境中则不处理
+    if hasattr(sys, "real_prefix") or sys.prefix != sys.base_prefix:
+        return
+
+    project_root = Path(__file__).resolve().parent
+    venv_path = project_root / "venv"
+    if sys.platform.startswith("win"):
+        venv_bin = venv_path / "Scripts"
+        venv_python = venv_bin / "python.exe"
+    else:
+        venv_bin = venv_path / "bin"
+        venv_python = venv_bin / "python"
+    if not venv_python.exists():
+        return
+    # 让后续子进程与当前进程都感知到虚拟环境
+    os.environ["VIRTUAL_ENV"] = str(venv_path)
+    bin_path = str(venv_bin)
+    os.environ["PATH"] = f"{bin_path}{os.pathsep}{os.environ.get('PATH', '')}"
+    os.environ.pop("PYTHONHOME", None)
+    print("检测到未激活虚拟环境，自动切换到 venv ...")
+    os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+
+
+_bootstrap_venv()
+
+# 第三方与项目内导入放在虚拟环境激活逻辑之后
 import pandas as pd
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1954,7 +1986,14 @@ def download_data(start_date: str, end_date: str, adj_type: str = "qfq",
     )
     
     manager = DownloadManager(config)
-    return manager.run_download(assets)
+    try:
+        return manager.run_download(assets)
+    finally:
+        # 确保后台数据库线程被优雅关闭，避免进程悬挂
+        try:
+            manager.db_manager.shutdown(wait=True)
+        except Exception as e:
+            logger.warning(f"下载结束时关闭数据库管理器失败: {e}")
 
 
 def main():
@@ -1991,7 +2030,7 @@ def main():
             if stats.failed_stocks:
                 logger.warning(f"{asset_type} 失败股票: {[code for code, _ in stats.failed_stocks[:10]]}")
         
-        logger.perf("下载任务完成")
+        logger.perf("下载任务完成，若出现失败可重新运行以补齐数据")
         
     except Exception as e:
         logger.error(f"下载任务失败: {e}")

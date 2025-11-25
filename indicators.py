@@ -11,7 +11,7 @@ class IndMeta:
     out: Dict[str, int]                 # 输出列 -> 小数位，如 {"j":2}、{"z_slope":3, "z_score":3}
     tdx: Optional[str] = None           # 可选：TDX 脚本
     py_func: Optional[Callable] = None  # 可选：Python 兜底函数
-    kwargs: Dict = field(default_factory=dict)
+    kwargs: Dict = field(default_factory=dict) # 传给 py_func 的参数
     tags: List[str] = field(default_factory=list)  # 使用场景标签，如 ["product","prelaunch"]
     warmup: Optional[int] = None        # 该指标建议的预热天数
 REGISTRY: Dict[str, IndMeta] = {
@@ -158,6 +158,7 @@ def names_by_tag(tag: str) -> List[str]:
 def get_all_indicator_names():
     """获取所有指标名称"""
     return list(REGISTRY.keys())
+
 
 # def names_in_expr(expr: str) -> List[str]:
 #     """
