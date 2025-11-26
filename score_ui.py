@@ -1431,6 +1431,87 @@ def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
     return None
 
 
+def _get_rank_from_files(ref_date: str, ts_code: str) -> tuple[int | None, int | None] | None:
+    """从全量/Top排名文件获取指定日期的排名"""
+    ts_code = str(ts_code)
+    all_path = _path_all(ref_date)
+    if all_path.exists():
+        try:
+            df_all = _read_df(all_path, dtype={"ts_code": str}, encoding="utf-8-sig")
+            if not df_all.empty:
+                row = df_all.loc[df_all["ts_code"].astype(str) == ts_code]
+                if not row.empty:
+                    total_val = len(df_all)
+                    rank_val = None
+                    if "rank" in df_all.columns:
+                        rv = row["rank"].iloc[0]
+                        if pd.notna(rv):
+                            rank_val = int(rv)
+                    if rank_val is None:
+                        rank_val = int(row.index[0]) + 1
+                    return rank_val, int(total_val)
+        except Exception as e:
+            logger.debug(f"读取全量排名文件失败 {ref_date}: {e}")
+    top_path = _path_top(ref_date)
+    if top_path.exists():
+        try:
+            df_top = _read_df(top_path, dtype={"ts_code": str}, encoding="utf-8-sig")
+            if not df_top.empty:
+                row = df_top.loc[df_top["ts_code"].astype(str) == ts_code]
+                if not row.empty:
+                    total_val = len(df_top)
+                    if "rank" in df_top.columns:
+                        rv = row["rank"].iloc[0]
+                        if pd.notna(rv):
+                            return int(rv), int(total_val)
+                    return int(row.index[0]) + 1, int(total_val)
+        except Exception as e:
+            logger.debug(f"读取Top排名文件失败 {ref_date}: {e}")
+    return None
+
+
+def _get_prev_rank_history(ts_code: str, ref_date: str, max_days: int = 15) -> list[dict]:
+    """获取 ref_date 前 max_days 个交易日内的排名（优先 DB，兜底文件）"""
+    if not ts_code or not ref_date:
+        return []
+    try:
+        cal = get_trade_dates() or []
+        if ref_date not in cal:
+            return []
+        idx = cal.index(ref_date)
+        start = max(0, idx - max_days)
+        prev_dates = cal[start:idx][::-1]  # 最近的在前
+    except Exception as e:
+        logger.debug(f"生成前日排名日期窗口失败 {ref_date}: {e}")
+        return []
+
+    results: list[dict] = []
+    db_enabled = is_details_db_reading_enabled() and is_details_db_available()
+    details_db_path = get_details_db_path_with_fallback() if db_enabled else None
+    manager = get_database_manager() if db_enabled else None
+
+    for d in prev_dates:
+        rank_pair = None
+        if db_enabled and details_db_path and manager:
+            try:
+                sql = "SELECT rank, total FROM stock_details WHERE ts_code = ? AND ref_date = ?"
+                df = manager.execute_sync_query(details_db_path, sql, [ts_code, d], timeout=15.0)
+                if df is not None and not df.empty:
+                    rv = df["rank"].iloc[0] if "rank" in df.columns else None
+                    tv = df["total"].iloc[0] if "total" in df.columns else None
+                    if pd.notna(rv):
+                        rank_pair = (int(rv), int(tv) if pd.notna(tv) else None)
+            except Exception as e:
+                logger.debug(f"查询前日排名失败 {ts_code}_{d}: {e}")
+
+        if rank_pair is None:
+            rank_pair = _get_rank_from_files(d, ts_code)
+
+        if rank_pair and rank_pair[0] is not None:
+            results.append({"date": d, "rank": rank_pair[0], "total": rank_pair[1]})
+    return results
+
+
 def _codes_to_txt(codes: List[str], style: str="space", with_suffix: bool=True) -> str:
     def fmt(c):
         c = normalize_ts(c)
@@ -2474,8 +2555,15 @@ if _in_streamlit():
                             except Exception:
                                 pass
 
+                prev_ranks = _get_prev_rank_history(ts, ref_real, max_days=15)
+                has_prev_ranks = bool(prev_ranks)
+                if has_prev_ranks:
+                    colA, colB, colC = st.columns([1, 1, 1])
+                else:
+                    colA, colB = st.columns([1, 1])
+                    colC = None
+
                 # 总览 + 高亮/缺点（美化显示）
-                colA, colB = st.columns([1,1])
                 with colA:
                     st.markdown("**总览**")
                     # 美化显示summary内容
@@ -2577,9 +2665,22 @@ if _in_streamlit():
                                 if d:
                                     rule_name = _get_rule_name(d)
                                     st.error(f"• {rule_name}")
-                        
+                    
                         if not highlights and not drawbacks:
                             st.caption("暂无")
+
+                if has_prev_ranks and colC:
+                    with colC:
+                        st.markdown("**前日排名**")
+                        with st.container(border=True):
+                            for item in prev_ranks:
+                                if not item:
+                                    continue
+                                rank_text = f"{item.get('rank')}"
+                                total_val = item.get("total")
+                                if isinstance(total_val, int) and total_val > 0:
+                                    rank_text = f"{rank_text} / {total_val}"
+                                st.write(f"{item.get('date', '')} · {rank_text}")
 
                 # 交易性机会
                 ops = (summary.get("opportunities") or [])

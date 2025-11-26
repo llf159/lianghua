@@ -576,16 +576,8 @@ class DatabaseConnectionPool:
         """
         import duckdb
         
-        # 根据连接池模式创建相应类型的连接
-        # 对于写入连接池，所有连接都必须是读写模式，避免与其他连接产生配置冲突
-        pool_mode_read_only = self.read_only
+        # 根据 read_only 参数创建相应类型的连接
         use_read_only = read_only
-        if not pool_mode_read_only and read_only:
-            logger.debug("写入连接池收到只读请求，强制使用读写模式以保持 DuckDB 连接配置一致")
-            use_read_only = False
-        elif pool_mode_read_only and not read_only:
-            logger.debug("只读连接池收到写入请求，强制使用只读模式")
-            use_read_only = True
         process_name = "MainProcess"
         process_id = os.getpid()
         
@@ -687,7 +679,7 @@ class DatabaseConnectionPool:
             current_time = time.time()
             self._connection_created_times[conn_id] = current_time
             self._connection_last_used[conn_id] = current_time
-            self._connection_types[conn_id] = use_read_only
+            self._connection_types[conn_id] = read_only
             
             self._stats['total_created'] += 1
             logger.info(
@@ -751,19 +743,6 @@ class DatabaseConnectionPool:
         """获取连接 - 真正的连接池复用版本，支持阻塞等待"""
         with self._condition:
             try:
-                # 写库连接池收到只读请求时，强制使用读写模式，避免 DuckDB 配置不一致
-                effective_read_only = read_only
-                if not self.read_only and read_only:
-                    logger.debug(
-                        "写入连接池收到只读请求，强制使用读写模式以避免 DuckDB 连接配置冲突"
-                    )
-                    effective_read_only = False
-                elif self.read_only and not read_only:
-                    logger.debug(
-                        "只读连接池收到写入请求，强制使用只读模式"
-                    )
-                    effective_read_only = True
-
                 # 先尝试从池中获取可用连接
                 if not self._pool.empty():
                     try:
@@ -772,7 +751,7 @@ class DatabaseConnectionPool:
                         
                         # 检查连接是否仍然有效且类型匹配
                         conn_id = id(conn)
-                        if (conn_read_only == effective_read_only and 
+                        if (conn_read_only == read_only and 
                             conn_id in self._connection_created_times):
                             
                             # 检查连接是否过期
@@ -785,7 +764,7 @@ class DatabaseConnectionPool:
                                 self._active_connections.add(conn)
                                 self._stats['pool_hits'] += 1
                                 self._stats['active_count'] = len(self._active_connections)
-                                logger.debug(f"复用数据库连接: {self.db_path} (只读: {effective_read_only})")
+                                logger.debug(f"复用数据库连接: {self.db_path} (只读: {read_only})")
                                 return conn
                             else:
                                 # 连接过期，关闭并创建新连接
@@ -818,11 +797,11 @@ class DatabaseConnectionPool:
                     logger.debug(f"等待成功，获得可用连接槽位 (等待时间: {time.time() - start_time:.2f}秒)")
                 
                 # 创建新连接
-                conn = self._create_connection(effective_read_only)
+                conn = self._create_connection(read_only)
                 self._active_connections.add(conn)
                 self._stats['pool_misses'] += 1
                 self._stats['active_count'] = len(self._active_connections)
-                logger.debug(f"[数据库连接] 创建新连接: {self.db_path} (只读: {effective_read_only})")
+                logger.debug(f"[数据库连接] 创建新连接: {self.db_path} (只读: {read_only})")
                 return conn
                 
             except Exception as e:
@@ -1190,13 +1169,21 @@ class DatabaseManager:
         db_path_lower = abs_path.lower().replace('\\', '/')
         is_write_database = 'details' in db_path_lower or 'detail' in db_path_lower
         
-        # stock_data.db 识别为写入数据库（因为下载场景总是需要写入）
-        # 这样可以避免先创建 read_only=True 连接池，后续需要写入时关闭只读连接池的配置冲突
-        if 'stock_data' in db_path_lower and db_path_lower.endswith('.db'):
+        # stock_data.db：排名/查询场景优先使用只读池，写入时再按需切换到写池
+        # 这样可以在纯读场景减少对数据库的占用，避免误判为写锁
+        is_stock_data_db = 'stock_data' in db_path_lower and db_path_lower.endswith('.db')
+        if is_stock_data_db and not read_only:
+            # 只有明确需要写入时才强制使用写池
             is_write_database = True
             logger.debug(
-                f"数据库 {abs_path} 识别为写入数据库（stock_data.db），"
-                f"所有连接将使用 read_only=False 以避免配置冲突"
+                f"数据库 {abs_path} 需要写入（stock_data.db），"
+                f"本次连接使用读写池以避免配置冲突"
+            )
+        elif is_stock_data_db:
+            # 纯读场景使用只读池；若后续出现写请求，会先关闭只读池再切换
+            logger.debug(
+                f"数据库 {abs_path} 检测为 stock_data.db，当前为只读请求，"
+                f"优先使用只读连接池以减少占用。如后续发生写入会自动切换。"
             )
         
         with self._lock:
