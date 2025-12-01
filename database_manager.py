@@ -1169,13 +1169,21 @@ class DatabaseManager:
         db_path_lower = abs_path.lower().replace('\\', '/')
         is_write_database = 'details' in db_path_lower or 'detail' in db_path_lower
         
-        # stock_data.db 识别为写入数据库（因为下载场景总是需要写入）
-        # 这样可以避免先创建 read_only=True 连接池，后续需要写入时关闭只读连接池的配置冲突
-        if 'stock_data' in db_path_lower and db_path_lower.endswith('.db'):
+        # stock_data.db：排名/查询场景优先使用只读池，写入时再按需切换到写池
+        # 这样可以在纯读场景减少对数据库的占用，避免误判为写锁
+        is_stock_data_db = 'stock_data' in db_path_lower and db_path_lower.endswith('.db')
+        if is_stock_data_db and not read_only:
+            # 只有明确需要写入时才强制使用写池
             is_write_database = True
             logger.debug(
-                f"数据库 {abs_path} 识别为写入数据库（stock_data.db），"
-                f"所有连接将使用 read_only=False 以避免配置冲突"
+                f"数据库 {abs_path} 需要写入（stock_data.db），"
+                f"本次连接使用读写池以避免配置冲突"
+            )
+        elif is_stock_data_db:
+            # 纯读场景使用只读池；若后续出现写请求，会先关闭只读池再切换
+            logger.debug(
+                f"数据库 {abs_path} 检测为 stock_data.db，当前为只读请求，"
+                f"优先使用只读连接池以减少占用。如后续发生写入会自动切换。"
             )
         
         with self._lock:
@@ -2149,8 +2157,10 @@ class DatabaseManager:
     def get_stock_list_from_cache(self) -> List[str]:
         """从缓存获取股票列表（优化版）"""
         try:
-            from config import DATA_ROOT
-            cache_file = os.path.join(DATA_ROOT, "stock_list.csv")
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            cache_dir = os.path.dirname(db_path)
+            cache_file = os.path.join(cache_dir, "stock_list.csv")
             
             if os.path.exists(cache_file):
                 import pandas as pd
@@ -3696,8 +3706,6 @@ class DatabaseSchemaManager:
                 self._init_duckdb_details_tables(db_path)
             elif db_type.lower() == "sqlite":
                 self._init_sqlite_details_tables(db_path)
-            elif db_type.lower() == "postgres":
-                self._init_postgresql_details_tables(db_path)
             else:
                 raise ValueError(f"不支持的数据库类型: {db_type}")
                 
@@ -3780,41 +3788,6 @@ class DatabaseSchemaManager:
         finally:
             conn.close()
     
-    def _init_postgresql_details_tables(self, dsn: str):
-        """初始化PostgreSQL股票详情表结构"""
-        import psycopg2
-        
-        conn = psycopg2.connect(dsn)
-        try:
-            conn.autocommit = False
-            cur = conn.cursor()
-            
-            create_table_sql = """
-            CREATE TABLE IF NOT EXISTS stock_details (
-                ts_code TEXT NOT NULL,
-                ref_date TEXT NOT NULL,
-                score DOUBLE PRECISION,
-                tiebreak DOUBLE PRECISION,
-                highlights JSONB,
-                drawbacks JSONB,
-                opportunities JSONB,
-                rank INTEGER,
-                total INTEGER,
-                rules JSONB,
-                PRIMARY KEY (ts_code, ref_date)
-            )
-            """
-            cur.execute(create_table_sql)
-            
-            # 创建索引
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_sd_ref_date ON stock_details(ref_date)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_sd_rank ON stock_details(rank)")
-            
-            conn.commit()
-            
-        finally:
-            conn.close()
-
 # 扩展DatabaseManager类，添加表结构初始化功能
 def _add_schema_manager_to_database_manager():
     """为DatabaseManager添加表结构管理器"""

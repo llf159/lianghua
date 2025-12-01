@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -17,6 +17,44 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
+import importlib
+
+# 在单独运行时自动切换到虚拟环境（支持 Linux/Windows）
+def _bootstrap_venv():
+    if __name__ != "__main__":
+        return
+    # 已在虚拟环境中则不处理
+    if hasattr(sys, "real_prefix") or sys.prefix != sys.base_prefix:
+        return
+
+    project_root = Path(__file__).resolve().parent
+    try:
+        cfg = importlib.import_module("config")
+        venv_name = getattr(cfg, "VENV_NAME", "venv") or "venv"
+    except Exception:
+        venv_name = "venv"
+    venv_path = project_root / venv_name
+    if sys.platform.startswith("win"):
+        venv_bin = venv_path / "Scripts"
+        venv_python = venv_bin / "python.exe"
+    else:
+        venv_bin = venv_path / "bin"
+        venv_python = venv_bin / "python"
+    if not venv_python.exists():
+        return
+    # 让后续子进程与当前进程都感知到虚拟环境
+    os.environ["VIRTUAL_ENV"] = str(venv_path)
+    bin_path = str(venv_bin)
+    os.environ["PATH"] = f"{bin_path}{os.pathsep}{os.environ.get('PATH', '')}"
+    os.environ.pop("PYTHONHOME", None)
+    print(f"检测到未激活虚拟环境，自动切换到 {venv_name} ...")
+    os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+
+
+_bootstrap_venv()
+
+# 第三方与项目内导入放在虚拟环境激活逻辑之后
 import time
 import threading
 import random
@@ -25,6 +63,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import pandas as pd
 import numpy as np
+from utils import stock_list_cache_path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 from tqdm import tqdm
@@ -72,6 +111,8 @@ class DownloadConfig:
     enable_adaptive_rate_limit: bool = True
     rate_limit_burst_capacity: int = 10
     warmup_batch_size: int = 50  # warmup查询的批处理大小
+    refresh_stock_list_on_download: bool = True
+    token: Optional[str] = None
 
 @dataclass
 class DownloadStats:
@@ -369,18 +410,59 @@ class TokenBucketRateLimiter:
 # 为了向后兼容，保留RateLimiter作为TokenBucketRateLimiter的别名
 RateLimiter = TokenBucketRateLimiter
 
+# ================= Token 处理 =================
+def _is_placeholder_token(token: Optional[str]) -> bool:
+    """检查 token 是否为空或占位符。"""
+    if token is None:
+        return True
+    t = str(token).strip()
+    if not t:
+        return True
+    if t.startswith("在这里"):
+        return True
+    if t.lower() in {"your_token", "token", "input_your_token"}:
+        return True
+    return False
+
+
+def resolve_tushare_token(token: Optional[str] = None, *, allow_prompt: bool = True) -> str:
+    """
+    获取有效的 Tushare token，优先顺序：
+    1) 显式传入
+    2) 环境变量 TUSHARE_TOKEN / TS_TOKEN
+    3) config.TOKEN
+    4) 交互式输入（仅在 tty 且允许提示时）
+    """
+    candidates = [
+        token,
+        os.environ.get("TUSHARE_TOKEN"),
+        os.environ.get("TS_TOKEN"),
+        TOKEN,
+    ]
+    for cand in candidates:
+        if not _is_placeholder_token(cand):
+            return str(cand).strip()
+
+    if allow_prompt and sys.stdin.isatty():
+        try:
+            user_token = input("请输入 Tushare Pro Token（不会保存，直接使用本次运行）: ").strip()
+            if user_token:
+                return user_token
+        except Exception:
+            pass
+
+    raise ValueError("Tushare Pro 未配置：请在 config.TOKEN 中设置有效 token，或设置环境变量 TUSHARE_TOKEN")
+
+
 # ================= Tushare接口管理 =================
 class TushareManager:
     """Tushare接口管理器"""
     
-    def __init__(self, token: str = None, rate_limiter: TokenBucketRateLimiter = None):
-        self.token = token or TOKEN
+    def __init__(self, token: str = None, rate_limiter: TokenBucketRateLimiter = None, allow_prompt: bool = True):
+        self.token = resolve_tushare_token(token, allow_prompt=allow_prompt)
         self._pro = None
         self.rate_limiter = rate_limiter or TokenBucketRateLimiter()
-        
-        if not self.token or self.token.startswith("在这里"):
-            raise ValueError("Tushare Pro 未配置：请在 config.TOKEN 中设置有效 token")
-        
+
         # 设置token
         ts.set_token(self.token)
         self._pro = ts.pro_api()
@@ -610,6 +692,7 @@ class DataProcessor:
             return df
         
         try:
+            warmup_days = warmup_for(self.indicator_names)
             historical_data = None
             
             # 优先使用预加载的缓存数据
@@ -619,7 +702,16 @@ class DataProcessor:
             else:
                 # 如果没有缓存，按需从数据库获取（兼容旧逻辑）
                 historical_data = self._get_historical_data_for_warmup(ts_code, adj_type, df)
-            
+
+            # warmup数据长度检查：不足则不输出并提示
+            if warmup_days > 0:
+                hist_len = 0 if historical_data is None or historical_data.empty else len(historical_data)
+                if hist_len < warmup_days:
+                    logger.warning(
+                        f"{ts_code} warmup数据不足，需至少 {warmup_days} 行历史数据，实际 {hist_len} 行，跳过输出"
+                    )
+                    return None
+
             if historical_data is not None and not historical_data.empty:
                 # 合并历史数据和新增数据
                 combined_data = pd.concat([historical_data, df], ignore_index=True)
@@ -743,18 +835,38 @@ class StockDownloader:
             adaptive=config.enable_adaptive_rate_limit
         )
         
-        self.tushare_manager = TushareManager(rate_limiter=rate_limiter)
+        self.tushare_manager = TushareManager(
+            token=config.token,
+            rate_limiter=rate_limiter,
+        )
         # 延迟创建data_processor，只在需要时创建（主线程中）
         self._data_processor = None
         # 预加载的历史数据缓存（增量下载时使用）
         self._warmup_cache: Dict[str, pd.DataFrame] = {}  # {ts_code: historical_data}
         self.stats = DownloadStats()
         self._lock = threading.Lock()
+        # 数据库管理器仅在主线程中按需创建
+        self.db_manager: Optional[DatabaseManager] = None
+
+    def _persist_stock_list_cache(self, df: pd.DataFrame) -> None:
+        """把股票列表缓存到数据库目录下的 stock_list.csv，供其他模块复用。"""
+        try:
+            if df is None or df.empty or "ts_code" not in df.columns:
+                return
+            cache_path = stock_list_cache_path()
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cols = [c for c in ["ts_code", "symbol", "name", "area", "industry", "list_date"] if c in df.columns]
+            df[cols].to_csv(cache_path, index=False, encoding="utf-8-sig")
+            logger.info(f"股票列表已缓存：{cache_path}（保留，不再清理）")
+        except Exception as e:
+            logger.warning(f"写入股票列表缓存失败：{e}")
     
     def _load_stock_list_from_cache(self) -> List[str]:
         """兜底：从缓存或数据库获取股票列表"""
         try:
-            db_manager = get_database_manager()
+            if self.db_manager is None:
+                self.db_manager = get_database_manager()
+            db_manager = self.db_manager
         except Exception as e:
             logger.error(f"获取数据库管理器失败，无法加载股票缓存: {e}")
             return []
@@ -905,6 +1017,11 @@ class StockDownloader:
                                 self.config.adj_type,
                                 warmup_cache=self._warmup_cache
                             )
+                            if data_with_indicators is None:
+                                logger.warning(f"{ts_code} warmup数据不足，跳过输出")
+                                with self._lock:
+                                    self.stats.empty_count += 1
+                                return ts_code, "empty", None
                             # 准备数据用于数据库
                             final_data = data_processor.prepare_data_for_database(
                                 data_with_indicators, self.config.adj_type
@@ -989,23 +1106,67 @@ class StockDownloader:
             stock_codes: 如果提供，则仅下载指定股票；否则下载全市场
         """
         logger.info("开始下载股票数据...")
+
+        # 在主线程中创建数据库连接，供缓存/兜底使用
+        if self.db_manager is None:
+            logger.info("[数据库连接] 开始获取数据库管理器实例 (股票下载器)")
+            self.db_manager = get_database_manager()
         
         # 获取股票列表
         if stock_codes is None:
-            try:
-                stock_list = self.tushare_manager.get_stock_list()
-                if stock_list is None or stock_list.empty:
-                    logger.error("获取股票列表失败：返回结果为空")
-                    stock_codes = self._load_stock_list_from_cache()
-                elif 'ts_code' not in stock_list.columns:
-                    logger.error(f"股票列表缺少 'ts_code' 列，可用列: {stock_list.columns.tolist()}")
-                    stock_codes = self._load_stock_list_from_cache()
+            stock_list = None
+            # 下载新数据时：可选择主动刷新名单
+            if getattr(self.config, "refresh_stock_list_on_download", True):
+                try:
+                    stock_list = self.tushare_manager.get_stock_list()
+                except Exception as e:
+                    logger.warning(f"刷新股票列表失败（继续尝试缓存/数据库）: {e}")
+                    stock_list = None
+                if stock_list is not None and not stock_list.empty and "ts_code" in stock_list.columns:
+                    self._persist_stock_list_cache(stock_list)
+                    stock_codes = stock_list["ts_code"].astype(str).tolist()
+
+            if stock_codes is None:
+                # 优先使用本地缓存/数据库，只有完全没有名单时才调用 Tushare
+                try:
+                    cached_codes = self.db_manager.get_stock_list_from_cache()
+                except Exception as e:
+                    logger.debug(f"读取缓存股票列表失败: {e}")
+                    cached_codes = []
+
+                if cached_codes:
+                    logger.info(f"使用缓存股票列表，共 {len(cached_codes)} 只")
+                    stock_codes = cached_codes
                 else:
-                    stock_codes = stock_list['ts_code'].tolist()
-            except Exception as e:
-                logger.error(f"获取股票列表时发生异常: {e}")
-                import traceback
-                logger.error(f"异常详情: {traceback.format_exc()}")
+                    try:
+                        db_codes = self.db_manager.get_stock_list(adj_type=self.config.adj_type)
+                    except Exception as e:
+                        logger.debug(f"读取数据库股票列表失败: {e}")
+                        db_codes = []
+
+                    if db_codes:
+                        logger.info(f"使用数据库股票列表，共 {len(db_codes)} 只")
+                        stock_codes = db_codes
+                    else:
+                        try:
+                            stock_list = self.tushare_manager.get_stock_list()
+                        except Exception as e:
+                            logger.error(f"获取股票列表时发生异常: {e}")
+                            import traceback
+                            logger.error(f"异常详情: {traceback.format_exc()}")
+                            stock_list = None
+
+                        if stock_list is None or stock_list.empty:
+                            logger.error("获取股票列表失败：返回结果为空")
+                            stock_codes = self._load_stock_list_from_cache()
+                        elif 'ts_code' not in stock_list.columns:
+                            logger.error(f"股票列表缺少 'ts_code' 列，可用列: {stock_list.columns.tolist()}")
+                            stock_codes = self._load_stock_list_from_cache()
+                        else:
+                            self._persist_stock_list_cache(stock_list)
+                            stock_codes = stock_list['ts_code'].tolist()
+            # 最后兜底再清洗一遍
+            if not stock_codes:
                 stock_codes = self._load_stock_list_from_cache()
         else:
             logger.info(f"使用外部提供的股票列表，共 {len(stock_codes)} 只")
@@ -1029,10 +1190,10 @@ class StockDownloader:
         
         self.stats.total_stocks = len(stock_codes)
         logger.info(f"准备下载 {len(stock_codes)} 只股票的数据，日期范围: {self.config.start_date} - {self.config.end_date}")
-        
+
         # 在主线程中创建数据库连接和数据处理器
-        logger.info("[数据库连接] 开始获取数据库管理器实例 (主线程统一写入)")
-        db_manager = get_database_manager()
+        db_manager = self.db_manager or get_database_manager()
+        logger.info("[数据库连接] 获取数据库管理器实例成功 (主线程统一写入)")
         data_processor = DataProcessor(db_manager)
         
         # 如果是增量下载且启用了warmup，批量预加载历史数据到内存
@@ -1185,7 +1346,10 @@ class IndexDownloader:
             adaptive=config.enable_adaptive_rate_limit
         )
         
-        self.tushare_manager = TushareManager(rate_limiter=rate_limiter)
+        self.tushare_manager = TushareManager(
+            token=config.token,
+            rate_limiter=rate_limiter,
+        )
         self.stats = DownloadStats()
         self._lock = threading.Lock()
     
@@ -1444,11 +1608,24 @@ class DownloadManager:
         self.config = config
         logger.info("[数据库连接] 开始获取数据库管理器实例 (初始化下载管理器)")
         self.db_manager = get_database_manager()
-        self.tushare_manager = TushareManager()
+        self.tushare_manager = TushareManager(token=config.token)
         
         # 在数据库初始化之前判断是否为首次下载
         self.is_first_download = self._check_if_first_download()
         self._ensure_database_initialized()
+
+    def _persist_stock_list_cache(self, df: pd.DataFrame) -> None:
+        """把股票列表缓存到数据库目录下的 stock_list.csv，供其他模块复用。"""
+        try:
+            if df is None or df.empty or "ts_code" not in df.columns:
+                return
+            cache_path = stock_list_cache_path()
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cols = [c for c in ["ts_code", "symbol", "name", "area", "industry", "list_date"] if c in df.columns]
+            df[cols].to_csv(cache_path, index=False, encoding="utf-8-sig")
+            logger.info(f"股票列表已缓存：{cache_path}（保留，不再清理）")
+        except Exception as e:
+            logger.warning(f"写入股票列表缓存失败：{e}")
     
     def _check_if_first_download(self) -> bool:
         """检查是否为首次下载（使用状态文件，不读取数据库）"""
@@ -1548,8 +1725,8 @@ class DownloadManager:
         
         优先顺序：
         1. 本地缓存 stock_list.csv（避免频繁访问API）
-        2. 数据库现有股票列表（按配置的复权类型）
-        3. 实时调用 Tushare 获取（与下载流程保持一致）
+        2. 实时调用 Tushare 获取（与下载流程保持一致）
+        3. 数据库现有股票列表（按配置的复权类型，兜底）
         """
         # 1) 读取缓存
         try:
@@ -1560,25 +1737,26 @@ class DownloadManager:
         except Exception as e:
             logger.debug(f"读取缓存股票列表失败，尝试其他来源: {e}")
         
-        # 2) 从数据库读取
-        try:
-            db_codes = self.db_manager.get_stock_list(adj_type=self.config.adj_type)
-            if db_codes:
-                logger.debug(f"使用数据库股票列表进行完整性校验，共 {len(db_codes)} 只")
-                return db_codes
-        except Exception as e:
-            logger.debug(f"从数据库获取股票列表失败，尝试调用Tushare: {e}")
-        
-        # 3) 调用Tushare
+        # 2) 调用Tushare（当缓存不存在时必须拉取）
         try:
             stock_list_df = self.tushare_manager.get_stock_list()
             if stock_list_df is not None and not stock_list_df.empty and "ts_code" in stock_list_df.columns:
+                self._persist_stock_list_cache(stock_list_df)
                 codes = stock_list_df["ts_code"].astype(str).tolist()
                 logger.info(f"使用Tushare股票列表进行完整性校验，共 {len(codes)} 只")
                 return codes
             logger.warning("Tushare返回的股票列表为空，无法进行完整性校验")
         except Exception as e:
             logger.error(f"调用Tushare获取股票列表失败，无法进行完整性校验: {e}")
+        
+        # 3) 从数据库读取（兜底）
+        try:
+            db_codes = self.db_manager.get_stock_list(adj_type=self.config.adj_type)
+            if db_codes:
+                logger.debug(f"使用数据库股票列表进行完整性校验，共 {len(db_codes)} 只")
+                return db_codes
+        except Exception as e:
+            logger.debug(f"从数据库获取股票列表失败，兜底失败: {e}")
         
         return []
 
@@ -1778,7 +1956,8 @@ class DownloadManager:
             adj_type=strategy["adj_type"],
             asset_type="stock",
             threads=self.config.threads,
-            enable_warmup=self.config.enable_warmup
+            enable_warmup=self.config.enable_warmup,
+            token=self.config.token,
         )
         
         # 传递是否为首次下载的信息
@@ -1799,13 +1978,41 @@ class DownloadManager:
             logger.info("跳过指数数据下载")
             return DownloadStats()
         
+        # 指数也做一次增量检查，避免重复全量下载
+        start_date = strategy["start_date"]
+        end_date = strategy["end_date"]
+        index_latest = None
+        try:
+            status = self.db_manager.get_stock_data_status(use_cache=False)
+            index_latest = (status.get("adj_types", {}) or {}).get("ind", {}).get("max_date")
+        except Exception as e:
+            logger.warning(f"获取指数最新日期失败，按原配置下载: {e}")
+        
+        if index_latest:
+            try:
+                from datetime import datetime, timedelta
+                next_date = (datetime.strptime(str(index_latest), "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
+                # 如果指数已经覆盖到结束日期，跳过下载
+                if next_date > end_date:
+                    logger.info(f"指数数据已覆盖到 {index_latest}，结束日期为 {end_date}，跳过指数下载")
+                    stats = DownloadStats()
+                    stats.skip_count = len(whitelist) if whitelist else 0
+                    return stats
+                # 否则从最新日期的下一天开始增量
+                if next_date > start_date:
+                    logger.info(f"指数最新日期 {index_latest}，增量开始日期调整为 {next_date}")
+                    start_date = next_date
+            except Exception as e:
+                logger.warning(f"解析指数最新日期失败，按原配置下载: {e}")
+        
         index_config = DownloadConfig(
-            start_date=strategy["start_date"],
-            end_date=strategy["end_date"],
+            start_date=start_date,
+            end_date=end_date,
             adj_type="ind",  # 指数使用ind
             asset_type="index",
             threads=self.config.threads,
-            enable_warmup=False  # 指数不需要指标计算
+            enable_warmup=False,  # 指数不需要指标计算
+            token=self.config.token,
         )
         
         downloader = IndexDownloader(index_config)
@@ -1925,7 +2132,8 @@ class DownloadManager:
 # ================= 便捷函数 =================
 def download_data(start_date: str, end_date: str, adj_type: str = "qfq", 
                  assets: List[str] = None, threads: int = 8, 
-                 enable_warmup: bool = True, enable_adaptive_rate_limit: bool = True) -> Dict[str, DownloadStats]:
+                 enable_warmup: bool = True, enable_adaptive_rate_limit: bool = True,
+                 token: Optional[str] = None) -> Dict[str, DownloadStats]:
     """
     便捷下载函数
     
@@ -1937,6 +2145,7 @@ def download_data(start_date: str, end_date: str, adj_type: str = "qfq",
         threads: 并发线程数
         enable_warmup: 是否启用指标warmup
         enable_adaptive_rate_limit: 是否启用自适应限频
+        token: Tushare token（为空时自动从环境/config读取，交互式终端会提示输入）
     
     Returns:
         下载结果统计
@@ -1950,11 +2159,29 @@ def download_data(start_date: str, end_date: str, adj_type: str = "qfq",
         adj_type=adj_type,
         threads=threads,
         enable_warmup=enable_warmup,
-        enable_adaptive_rate_limit=enable_adaptive_rate_limit
+        enable_adaptive_rate_limit=enable_adaptive_rate_limit,
+        token=token,
     )
     
     manager = DownloadManager(config)
-    return manager.run_download(assets)
+    try:
+        return manager.run_download(assets)
+    finally:
+        # 确保后台数据库线程被优雅关闭，避免进程悬挂
+        try:
+            manager.db_manager.shutdown(wait=True)
+        except Exception as e:
+            logger.warning(f"下载结束时关闭数据库管理器失败: {e}")
+
+
+def wait_for_exit(prompt: str = "下载完成，按任意键退出...") -> None:
+    """在交互式终端中等待用户按键后退出，便于查看输出。"""
+    if not sys.stdin.isatty():
+        return
+    try:
+        input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 def main():
@@ -1991,7 +2218,7 @@ def main():
             if stats.failed_stocks:
                 logger.warning(f"{asset_type} 失败股票: {[code for code, _ in stats.failed_stocks[:10]]}")
         
-        logger.perf("下载任务完成")
+        logger.perf("下载任务完成，若出现失败可重新运行以补齐数据")
         
     except Exception as e:
         logger.error(f"下载任务失败: {e}")
@@ -2010,6 +2237,7 @@ def main_cli():
     parser.add_argument('--threads', type=int, default=STOCK_INC_THREADS, help='并发线程数')
     parser.add_argument('--no-warmup', action='store_true', help='禁用指标warmup')
     parser.add_argument('--no-adaptive-rate-limit', action='store_true', help='禁用自适应限频')
+    parser.add_argument('--token', type=str, default=None, help='Tushare token（留空则读取环境/config，交互式时会提示输入）')
     parser.add_argument('--interactive', action='store_true', help='交互式模式')
     
     args = parser.parse_args()
@@ -2026,7 +2254,8 @@ def main_cli():
         assets=args.assets,
         threads=args.threads,
         enable_warmup=not args.no_warmup,
-        enable_adaptive_rate_limit=not args.no_adaptive_rate_limit
+        enable_adaptive_rate_limit=not args.no_adaptive_rate_limit,
+        token=args.token,
     )
     
     # 打印结果
@@ -2051,6 +2280,9 @@ def main_interactive():
     # 获取用户输入
     start_date = input(f"开始日期 (默认: {START_DATE}): ").strip() or START_DATE
     end_date = input(f"结束日期 (默认: {END_DATE}): ").strip() or END_DATE
+    token_default = "" if _is_placeholder_token(TOKEN) else str(TOKEN)
+    token_input = input("Tushare Token (留空使用 config/环境变量): ").strip()
+    token_use = token_input or token_default
     
     # 如果用户输入了today，给出智能判断说明
     if end_date.lower() == "today":
@@ -2100,6 +2332,7 @@ def main_interactive():
     print(f"  并发线程: {threads}")
     print(f"  自适应限频: {'是' if enable_adaptive_rate_limit else '否'}")
     print(f"  资产类型: {', '.join(assets)}")
+    print(f"  Token 来源: {'自定义输入' if token_input else ('环境变量/config' if token_use else '未设置')}")
     
     confirm = input("\n确认开始下载? (y/N): ").strip().lower()
     if confirm != 'y':
@@ -2116,7 +2349,8 @@ def main_interactive():
             assets=assets,
             threads=threads,
             enable_warmup=True,
-            enable_adaptive_rate_limit=enable_adaptive_rate_limit
+            enable_adaptive_rate_limit=enable_adaptive_rate_limit,
+            token=token_use or None,
         )
         
         # 打印结果
@@ -2227,3 +2461,5 @@ if __name__ == "__main__":
         main_cli()
     else:
         main()
+    
+    wait_for_exit()

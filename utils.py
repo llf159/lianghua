@@ -7,11 +7,22 @@ import pandas as pd
 import os
 import re
 import glob
+from pathlib import Path
 from typing import Optional
 from log_system import get_logger
+from config import DATA_ROOT, UNIFIED_DB_PATH
 
 # 初始化日志记录器
 logger = get_logger("utils")
+
+def stock_list_cache_path(base_dir: Optional[str] = None) -> Path:
+    """
+    返回股票列表缓存文件路径，位于数据库所在目录下的 stock_list.csv。
+    base_dir 可覆盖 DATA_ROOT。
+    """
+    root = Path(base_dir or DATA_ROOT)
+    db_path = root / UNIFIED_DB_PATH
+    return db_path.parent / "stock_list.csv"
 
 def ensure_datetime_index(df, file_path=None):
     for date_col in ['trade_date', 'date', '交易日期', 'datetime']:

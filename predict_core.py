@@ -11,7 +11,10 @@ import pandas as pd
 import datetime as dt
 import re
 import warnings
+import queue
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from scipy.optimize import minimize, minimize_scalar
+from tqdm import tqdm
 from log_system import get_logger, log_function_calls, log_data_processing, log_algorithm_execution
 
 # 初始化日志记录器
@@ -1132,14 +1135,37 @@ def simulate_next_day(
                     meta = ind.REGISTRY[name]
                     try:
                         res = meta.py_func(sub, **(getattr(meta, "kwargs", {}) or {}))
+                        target_cols = list((meta.out or {}).keys())
+
+                        # Series：优先写入声明的输出列（如 kdj -> j）
                         if isinstance(res, pd.Series):
-                            sub[name] = res
+                            if len(target_cols) == 1:
+                                sub[target_cols[0]] = res
+                            else:
+                                sub[name] = res
+
+                        # DataFrame：按输出列名对齐，否则全量写入
                         elif isinstance(res, pd.DataFrame):
-                            for c in res.columns:
-                                sub[str(c)] = res[c]
+                            if target_cols:
+                                for c in target_cols:
+                                    if c in res.columns:
+                                        sub[str(c)] = res[c]
+                            else:
+                                for c in res.columns:
+                                    sub[str(c)] = res[c]
+
+                        # dict：键即列名
                         elif isinstance(res, dict):
                             for c, s in res.items():
                                 sub[str(c)] = s
+
+                        # tuple/list：与声明的输出列一一对应
+                        elif isinstance(res, (list, tuple)) and target_cols and len(res) == len(target_cols):
+                            for c, s in zip(target_cols, res):
+                                sub[str(c)] = s
+
+                        else:
+                            sub[name] = res
                     except Exception as e:
                         # 指标计算失败影响数据完整性，直接抛出异常
                         error_msg = f"指标{name}计算失败（股票{ts}）: {e}"
@@ -1349,6 +1375,19 @@ class PredictionInput:
     cache_dir: Optional[str] = None          # 缓存目录
 
 
+@dataclass
+class PredictRankingInput:
+    """预测排名输入参数"""
+    ref_date: str
+    universe: List[str]
+    scenario: Scenario
+    recompute_indicators: Iterable[str] | Literal["all","none"] = ("kdj",)
+    cache_dir: Optional[str] = None
+    tie_break: Optional[str] = None
+    use_prescreen: bool = True
+    output_dir: Optional[str] = None
+
+
 def run_prediction(inp: PredictionInput) -> pd.DataFrame:
     """
     执行股票预测分析
@@ -1479,6 +1518,141 @@ def run_prediction(inp: PredictionInput) -> pd.DataFrame:
     
     logger.debug(f"预测完成: 结果行数={len(df)}")
     return df
+
+
+def _score_predict_one(args: tuple[Any, ...]) -> tuple[Any, ...]:
+    """
+    单票评分（预测排名用），用于线程/进程池。
+    返回值与 scoring_core.score_dataframe 保持一致，便于主流程统一处理。
+    """
+    ts_code, df_sub, ref_date, sim_date, use_prescreen, tie_break = args
+    if df_sub is None or df_sub.empty:
+        return (ts_code, None, None, None, None)
+
+    try:
+        from scoring_core import score_dataframe  # 延迟导入避免模块级开销
+        start_date = str(df_sub["trade_date"].astype(str).min())
+        return score_dataframe(
+            df_sub,
+            sim_date,
+            ts_code,
+            start_date=start_date,
+            allow_prescreen=use_prescreen,
+            tie_break=tie_break
+        )
+    except Exception as e:
+        logger.warning(f"[predict_rank][{ts_code}] 评分失败: {e}")
+        return (ts_code, None, (ts_code, ref_date, f"评分失败:{e}"), None, None)
+
+
+def run_predict_ranking(inp: PredictRankingInput) -> tuple[pd.DataFrame, Optional[Path]]:
+    """
+    基于模拟数据运行排名策略，不写入details，生成独立的scorepredict文件。
+    """
+    _emit("pred_rank_start", message="准备生成模拟数据")
+    cache = FileCache(inp.cache_dir) if inp.cache_dir else None
+    tie_break = inp.tie_break or getattr(cfg, "SC_TIE_BREAK", "kdj_j_asc")
+    scen_hash = scenario_hash(inp.scenario)
+
+    sim = simulate_next_day(
+        inp.ref_date,
+        inp.universe,
+        inp.scenario,
+        recompute_indicators=inp.recompute_indicators,
+        cache=cache
+    )
+
+    # 确保评分函数可用（失败则提前返回）
+    try:
+        from scoring_core import score_dataframe  # noqa: F401
+    except Exception as e:
+        logger.error(f"导入评分函数失败: {e}")
+        return pd.DataFrame(columns=["ts_code","score","tiebreak_j","ref_date","sim_date","scenario_id","rank"]), None
+
+    rows = []
+    # 统一转换 ts_code 类型并分组，避免并发时重复切片
+    sim_df = sim.df_concat.copy()
+    sim_df["ts_code"] = sim_df["ts_code"].astype(str)
+    grouped = {ts: grp.copy() for ts, grp in sim_df.groupby("ts_code")}
+    codes = sorted(grouped.keys())
+    total_codes = len(codes)
+    _emit("pred_rank_sim_done", total=total_codes, current=0, message=f"模拟完成，待评分 {total_codes} 只股票")
+
+    # 与正式排名一致的执行器选择逻辑
+    max_workers = getattr(cfg, "SC_MAX_WORKERS", None) or min(os.cpu_count() * 2, 16)
+    env_use_proc = str(os.getenv("SC_USE_PROCESS_POOL", "")).strip().lower() in {"1", "true", "yes"}
+    use_proc_cfg = bool(getattr(cfg, "SC_USE_PROCESS_POOL", False) or env_use_proc)
+    can_use_proc = use_proc_cfg
+    logger.info(f"[执行器] 选择: {'ProcessPool' if can_use_proc else 'ThreadPool'} (cfg={use_proc_cfg}, os={os.name})")
+
+    ExecutorCls = ProcessPoolExecutor if can_use_proc else ThreadPoolExecutor
+    if can_use_proc:
+        os.environ["DB_PROCESS_COUNT"] = str(max_workers)
+        logger.info(f"[多进程] 设置环境变量 DB_PROCESS_COUNT={max_workers}，用于优化子进程连接池大小")
+
+    _emit("pred_rank_score_progress", current=0, total=total_codes, message=f"评分开始 workers={max_workers}")
+    done = 0
+    with ExecutorCls(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _score_predict_one,
+                (ts, grouped.get(ts), inp.ref_date, sim.sim_date, inp.use_prescreen, tie_break)
+            ): ts for ts in codes
+        }
+
+        for fut in tqdm(as_completed(futures), total=len(futures), desc=f"评分 {inp.ref_date}"):
+            ts = futures[fut]
+            try:
+                ts_code, detail, black, *_ = fut.result()
+            except Exception as e:
+                logger.warning(f"[predict_rank][{ts}] 并发评分失败: {e}")
+                done += 1
+                _emit("pred_rank_score_progress", current=done, total=total_codes, message=f"评分 {ts} 失败")
+                continue
+
+            done += 1
+            _emit("pred_rank_score_progress", current=done, total=total_codes, message=f"评分 {ts}")
+
+            if black or detail is None:
+                continue
+
+            tb_val = detail.tiebreak if detail.tiebreak is not None else np.inf
+            rows.append({
+                "ts_code": ts_code,
+                "score": float(detail.score),
+                "tiebreak_j": tb_val,
+                "ref_date": inp.ref_date,
+                "sim_date": sim.sim_date,
+                "scenario_id": scen_hash
+            })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        logger.info("预测排名结果为空")
+        _emit("pred_rank_done", current=total_codes, total=total_codes, message="预测排名完成（无结果）")
+        return df, None
+
+    tie_lower = (tie_break or "").lower()
+    if tie_lower in {"kdj_j", "kdj_j_asc"}:
+        df = df.sort_values(["score", "tiebreak_j", "ts_code"], ascending=[False, True, True])
+    else:
+        df = df.sort_values(["score", "ts_code"], ascending=[False, True])
+
+    df["rank"] = range(1, len(df) + 1)
+    df["tiebreak_j"] = df["tiebreak_j"].replace(np.inf, np.nan)
+    _emit("pred_rank_done", current=total_codes, total=total_codes, message="预测排名完成")
+
+    out_dir = Path(inp.output_dir or getattr(cfg, "SC_OUTPUT_DIR", "output/score")) / "predict"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"scorepredict_{inp.ref_date}_{sim.sim_date}_{scen_hash}.csv"
+    try:
+        df.to_csv(out_path, index=False, encoding="utf-8-sig")
+        logger.debug(f"预测排名已保存: {out_path}")
+    except Exception as e:
+        logger.warning(f"保存预测排名文件失败: {e}")
+        out_path = None
+
+    return df.reset_index(drop=True), out_path
 
 # ---------------- 主入口：个股持仓检查 ----------------
 @dataclass
@@ -1697,10 +1871,12 @@ __all__ = [
     "PerStockOverride",
     "SimResult",
     "PredictionInput",
+    "PredictRankingInput",
     "PositionCheckInput",
     "simulate_next_day",
     "eval_when_exprs",
     "run_prediction",
+    "run_predict_ranking",
     "run_position_checks",
     "load_prediction_rules",
     "load_position_policies",
@@ -1714,19 +1890,30 @@ __all__ = [
     "solve_price_for_condition",
 ]
 
-# ---------------- 进度回调（已废弃，使用新日志系统） ----------------
+# ---------------- 进度回调 ----------------
 _progress_handler = None
+_PROGRESS_Q: queue.Queue = queue.Queue()
+
 def set_progress_handler(fn):
-    """设置进度处理器（已废弃，使用新的日志系统）"""
+    """设置进度处理器"""
     global _progress_handler
     _progress_handler = fn
-    # 不再输出警告，因为已经迁移到新的日志系统
+    return True
+
+
+def _push_progress(phase, current=None, total=None, message=None, **kw):
+    ev = {"phase": phase, "current": current, "total": total, "message": message}
+    if kw:
+        ev.update(kw)
+    try:
+        _PROGRESS_Q.put_nowait(ev)
+    except Exception:
+        pass
 
 
 def _emit(phase, current=None, total=None, message=None, **kw):
-    """发送进度事件（已废弃）"""
-    # 使用新的日志系统替代废弃的进度处理器
-    # 降级为 debug，减少日志噪音
+    """发送进度事件（兼容旧日志逻辑）"""
+    _push_progress(phase, current=current, total=total, message=message, **kw)
     if message:
         if total and current is not None:
             logger.debug(f"[{phase}] {message} ({current}/{total})")
@@ -1740,5 +1927,17 @@ def _emit(phase, current=None, total=None, message=None, **kw):
 
 
 def drain_progress_events():
-    """清空进度事件队列（已废弃）"""
-    pass
+    """清空进度事件队列"""
+    n = 0
+    while True:
+        try:
+            ev = _PROGRESS_Q.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            if _progress_handler:
+                _progress_handler(**ev)
+        except Exception as e:
+            logger.debug(f"[progress-consumer-error] {e}")
+        n += 1
+    return n

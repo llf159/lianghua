@@ -10,6 +10,7 @@ import os
 
 # ================= 基础路径配置 =================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VENV_NAME = "venv"  # 虚拟环境目录名（位于项目根目录下），若不存在则使用系统环境
 
 # ================= 数据源配置 =================
 # Tushare API Token（必填）
@@ -153,7 +154,6 @@ SC_PRESCREEN_LOOKBACK_D = 180  # 初选窗口（多用于周/月线）
 # 评分参数
 SC_BASE_SCORE = 50  # 基础分数
 SC_MIN_SCORE = 0  # 最低分数
-SC_TOP_K = 100  # 输出前K名
 SC_TIE_BREAK = "kdj_j_asc"  # 并列打破：使用 KDJ 的 J 值（越小越靠前）
 
 # 并行与读取优化
@@ -180,14 +180,10 @@ SC_CACHE_DIR = os.path.join(BASE_DIR, "cache", "scorelists")
 
 # 个股详情存储配置
 SC_DETAIL_STORAGE = "database"     # 存储方式：'json' | 'database' | 'both'
-SC_DETAIL_DB_TYPE = "duckdb"     # 数据库类型：'sqlite' | 'duckdb' | 'postgres'
-SC_DETAIL_DB_PATH = "details/details.db"   # 数据库文件路径（相对于SC_OUTPUT_DIR，postgres模式下忽略）
+SC_DETAIL_DB_TYPE = "duckdb"       # 数据库类型：'sqlite' | 'duckdb'
+SC_DETAIL_DB_PATH = "details/details.db"   # 数据库文件路径（相对于SC_OUTPUT_DIR）
 SC_USE_DB_STORAGE = True  # 是否使用数据库存储
 SC_DB_FALLBACK_TO_JSON = True  # 数据库存储失败时是否回退到JSON
-
-# PostgreSQL 配置
-SC_PG_DSN = "postgresql://postgres:password@localhost:5432/stock_data"  # 通用PostgreSQL连接字符串
-SC_DETAIL_DB_DSN = "postgresql://postgres:password@localhost:5432/stock_details"  # 专用详情数据库连接字符串
 
 # 明细写入策略
 SC_DETAIL_WRITE_MODE = "json_then_import"  # 写入策略: "immediate" | "queued" | "json_then_import"
@@ -213,7 +209,7 @@ SC_BENCH_FEATURES = ["rs", "exret", "beta", "corr"]  # 输出哪些特征
 # 其他配置
 SC_UNIVERSE = "all"                 # 打分范围：all / white / black / attention 或 直接给一个 ts_code 列表
 SC_HIDE_FORMULA = True              # details JSON 不写 when；UI 可选择显示
-SC_TOPK_ROWS = 30                   # UI：Top-K 显示行数（仅用于前端展示）
+SC_TRACKING_TOP_N = 200             # 排名跟踪：只跟踪前多少名（默认200）
 
 # ================= 回测配置 =================
 # 策略参数
