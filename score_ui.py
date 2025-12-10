@@ -140,7 +140,7 @@ from utils import (
 )
 # 使用 database_manager 替代 data_reader
 from database_manager import (
-    get_database_manager, query_stock_data, get_trade_dates, 
+    get_database_manager, query_stock_data, batch_query_stock_data, get_trade_dates, 
     get_stock_list, get_latest_trade_date, get_smart_end_date,
     get_database_info, get_data_source_status, close_all_connections,
     clear_connections_only,
@@ -185,6 +185,22 @@ def _prev_trade_date(ref_date: str, d: int) -> str:
     i = cal.index(ref_date)
     j = max(0, i - int(d))
     return cal[j]
+
+
+def _shift_trade_date(ref_date: str, offset: int, *, clamp: bool = False) -> Optional[str]:
+    """根据交易日历偏移 offset 天（可正可负），超界时返回 None/收尾（clamp=True）。"""
+    cal = get_trade_dates() or []
+    if ref_date not in cal:
+        return None
+    idx = cal.index(ref_date) + int(offset)
+    if 0 <= idx < len(cal):
+        return cal[idx]
+    if clamp and cal:
+        if idx < 0:
+            return cal[0]
+        if idx >= len(cal):
+            return cal[-1]
+    return None
 
 
 def _read_stock_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
@@ -1081,6 +1097,540 @@ def _resolve_user_code_input(raw: str) -> str | None:
     except Exception:
         return norm or None
     return norm or None
+
+
+def _parse_code_list(raw_text: str) -> list[str]:
+    """解析多行/分隔符的代码或名称输入，返回去重后的 ts_code 列表。"""
+    parts = re.split(r"[\s,;，、]+", raw_text or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        code = _resolve_user_code_input(p)
+        if code and code not in seen:
+            seen.add(code)
+            out.append(code)
+    return out
+
+
+def _parse_hold_windows(raw_text: str, fallback: Sequence[int] = (3, 5)) -> list[int]:
+    """解析持仓窗口输入，返回正整数列表。"""
+    try:
+        vals = []
+        for x in re.split(r"[，,\\s]+", str(raw_text or "")):
+            if not x.strip():
+                continue
+            v = int(float(x))
+            if v > 0:
+                vals.append(v)
+        vals = sorted(set(vals))
+        return vals or list(fallback)
+    except Exception:
+        return list(fallback)
+
+
+def _calc_holding_snapshot(
+    codes: Sequence[str],
+    ref_date: str,
+    hold_days: Sequence[int] = (3, 5),
+    turnover_target: float = 60.0,
+) -> pd.DataFrame:
+    """
+    基于参考日次日开盘买入，计算持仓收益与累计换手耗时。
+    - 买入日：参考日的下一个交易日；若无则返回空表
+    - 收益：持有 n 日，到目标日收盘卖出的相对收益（%）
+    - 换手：累计 tor 达到 turnover_target 所需的交易日数
+    """
+    if not codes or not ref_date:
+        return pd.DataFrame()
+
+    # 规范化并去重
+    codes_norm: list[str] = []
+    seen: set[str] = set()
+    for c in codes:
+        norm = _resolve_user_code_input(c) or normalize_ts(str(c))
+        if norm and norm not in seen:
+            seen.add(norm)
+            codes_norm.append(norm)
+    if not codes_norm:
+        return pd.DataFrame()
+
+    cal = get_trade_dates() or []
+    # 选取买入日：参考日是交易日则取次一交易日；否则取参考日之后的首个交易日；仍无则用参考日
+    entry_date = None
+    if str(ref_date) in cal:
+        entry_date = _shift_trade_date(str(ref_date), 1, clamp=True)
+    if not entry_date:
+        entry_date = next((d for d in cal if d >= str(ref_date)), None)
+    if not entry_date:
+        entry_date = str(ref_date)
+
+    max_hold = max(hold_days) if hold_days else 0
+    end_date = (
+        _shift_trade_date(entry_date, max_hold + 5, clamp=True)
+        or _shift_trade_date(ref_date, max_hold + 5, clamp=True)
+        or (cal[-1] if cal else ref_date)
+    )
+
+    try:
+        df_price = batch_query_stock_data(
+            db_path=os.path.join(DATA_ROOT, UNIFIED_DB_PATH),
+            ts_codes=codes_norm,
+            start_date=str(ref_date),
+            end_date=str(end_date),
+            columns=["ts_code", "trade_date", "open", "close", "tor"],
+            adj_type="qfq",
+        )
+    except Exception:
+        df_price = pd.DataFrame()
+
+    if df_price is None or df_price.empty:
+        return pd.DataFrame(columns=["ts_code", "名称"] + [f"{d}日持仓收益(%)" for d in hold_days] + ["60%换手耗时(天)"])
+
+    df_price = normalize_trade_date(df_price, "trade_date").sort_values(["ts_code", "trade_date"])
+    df_price["trade_date"] = df_price["trade_date"].astype(str)
+    hold_cols = {d: f"{d}日持仓收益(%)" for d in hold_days}
+    rows: list[dict[str, Any]] = []
+
+    for code in codes_norm:
+        sub = df_price[df_price["ts_code"] == code].copy()
+        sub = sub.sort_values("trade_date")
+        row = {
+            "ts_code": code,
+            "名称": _stock_name_of(code) or "",
+            "买入日": None,
+            "买入价": None,
+            "退出日": None,
+            "退出价": None,
+        }
+        for h, col_name in hold_cols.items():
+            row[col_name] = None
+        row["60%换手耗时(天)"] = None
+        row["累计换手(%)"] = None
+
+        if sub.empty:
+            rows.append(row)
+            continue
+
+        # 买入日：>= entry_date 的第一天
+        entry_row = sub[sub["trade_date"] >= entry_date].head(1)
+        if entry_row.empty:
+            entry_row = sub.tail(1)
+        if entry_row.empty:
+            rows.append(row)
+            continue
+
+        entry_trade_date = str(entry_row["trade_date"].iloc[0])
+        try:
+            entry_px = float(entry_row["open"].iloc[0])
+            if not np.isfinite(entry_px) or entry_px <= 0:
+                raise ValueError()
+        except Exception:
+            try:
+                entry_px = float(entry_row["close"].iloc[0])
+            except Exception:
+                entry_px = None
+        if entry_px is None or not np.isfinite(entry_px) or entry_px <= 0:
+            rows.append(row)
+            continue
+
+        row["买入日"] = entry_trade_date
+        row["买入价"] = entry_px
+        after_entry = sub[sub["trade_date"] >= entry_trade_date].copy()
+
+        for h, col_name in hold_cols.items():
+            # 使用个股自身的交易日序列，取买入日后的第 h 个交易日（不足则用最后一日）
+            if after_entry.empty:
+                continue
+            idx = min(max(int(h) - 1, 0), len(after_entry) - 1)
+            exit_row = after_entry.iloc[[idx]]
+            row["退出日"] = str(exit_row["trade_date"].iloc[0])
+            try:
+                exit_px = float(exit_row["close"].iloc[0])
+            except Exception:
+                exit_px = None
+            if exit_px is None or not np.isfinite(exit_px) or exit_px <= 0:
+                continue
+            row["退出价"] = exit_px
+            row[col_name] = (exit_px / entry_px - 1.0) * 100.0
+
+        if "tor" in after_entry.columns:
+            tor_series = pd.to_numeric(after_entry["tor"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            if not tor_series.empty:
+                # tor 已是百分比数值，直接累加
+                threshold = turnover_target
+                csum = tor_series.cumsum()
+                row["累计换手(%)"] = float(csum.iloc[-1]) if np.isfinite(csum.iloc[-1]) else None
+                hit_idx = np.where(csum.values >= threshold)[0]
+                if len(hit_idx) > 0:
+                    row["60%换手耗时(天)"] = int(hit_idx[0]) + 1
+
+        rows.append(row)
+
+    cols = ["ts_code", "名称", "买入日", "买入价", "退出日", "退出价"] + list(hold_cols.values()) + ["60%换手耗时(天)", "累计换手(%)"]
+    df_out = pd.DataFrame(rows)
+    # 只保留需要的列（防止空数据缺列）
+    df_out = df_out[[c for c in cols if c in df_out.columns]]
+    return df_out
+
+
+def _compute_turnover_days(ts_code: str, ref_date: str, target: float = 60.0) -> tuple[Optional[int], Optional[float], Optional[str], int, Optional[str], Optional[str]]:
+    """
+    直接从统一行情库读取换手率，返回 (天数, 累计换手, 错误信息, 参与天数, 开始日期, 结束日期)。
+    - entry_date：参考日次一交易日；若参考日不在该股数据内，用第一条可用数据。
+    """
+    try:
+        import duckdb  # 直接只读查询，避免外部日志依赖
+    except Exception as e:
+        return None, None, f"duckdb 不可用: {e}", 0, None, None
+
+    try:
+        path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+        con = duckdb.connect(path, read_only=True)
+        df = con.execute(
+            "SELECT trade_date, tor FROM stock_data WHERE ts_code = ? AND adj_type = 'qfq' ORDER BY trade_date",
+            [ts_code]
+        ).fetchdf()
+    except Exception as e:
+        return None, None, f"数据库读取失败: {e}", 0, None, None
+
+    if df is None or df.empty:
+        return None, None, "数据库无该票行情", 0, None, None
+
+    try:
+        df["trade_date"] = df["trade_date"].astype(str)
+        # 选取 ref_date 及之前的数据，向后（过去）累加换手直到达到目标
+        if ref_date is None or not str(ref_date).strip():
+            ref_date = df["trade_date"].max()
+        sub = df[df["trade_date"] <= str(ref_date)].copy()
+        if sub.empty:
+            # 如果 ref_date 早于最早数据，则退回全量
+            sub = df.copy()
+        sub = sub.sort_values("trade_date", ascending=False)
+        tor = pd.to_numeric(sub["tor"], errors="coerce").fillna(0.0)
+        if tor.empty:
+            return None, None, "无换手率数据", 0, None, None
+
+        csum = tor.cumsum()  # 按从 ref_date 往前的顺序
+        cum_total = float(csum.iloc[-1]) if np.isfinite(csum.iloc[-1]) else None
+        hit_idx = np.where(csum.values >= target)[0]
+        days = int(hit_idx[0]) + 1 if len(hit_idx) > 0 else None
+        used_days = int(len(tor))
+        # 起止日期：起点为用到的最远那天，终点为 ref_date 或最近一天
+        end_d = str(sub["trade_date"].iloc[0]) if used_days else None
+        start_d = str(sub["trade_date"].iloc[hit_idx[0]]) if len(hit_idx) > 0 else str(sub["trade_date"].iloc[-1]) if used_days else None
+        return days, cum_total, None, used_days, start_d, end_d
+    except Exception as e:
+        return None, None, f"计算失败: {e}", 0, None, None
+
+
+def _render_price_kline_chart(
+    ts: str,
+    ref_real: str,
+    *,
+    options_codes: Sequence[str] | None = None,
+    nav_state_prefix: str = "detail",
+    default_window: int = 60,
+    expander_label: str = "价格 K 线",
+):
+    """复用个股详情的 K 线绘制逻辑，可复用到其他页签（非折叠展示）。"""
+    if not ts:
+        st.info("请选择股票后再绘制K线。")
+        return
+
+    with st.container(border=True):
+        st.markdown(f"**{expander_label}**")
+        try:
+            trade_dates = get_trade_dates()
+            ref_for_plot = ref_real or (trade_dates[-1] if trade_dates else None)
+
+            df_price = query_stock_data(
+                db_path=os.path.join(DATA_ROOT, UNIFIED_DB_PATH),
+                ts_code=ts,
+                start_date=None,
+                end_date=None,
+                adj_type="qfq",
+                limit=None
+            )
+            if df_price is None or df_price.empty:
+                st.warning("暂无价格数据")
+            elif not {"open","high","low","close","trade_date"}.issubset(df_price.columns):
+                st.warning("价格数据缺少必要列（open/high/low/close/trade_date）")
+            else:
+                df_price = df_price.copy()
+                df_price["trade_date"] = pd.to_datetime(df_price["trade_date"])
+                df_price = df_price.sort_values("trade_date")  # 加载全部数据
+                visible_range = None
+                if len(df_price) > default_window:
+                    start_vis = df_price["trade_date"].iloc[-default_window]
+                    end_vis = df_price["trade_date"].iloc[-1]
+                    # 为最新K线预留额外右侧空间，避免贴边
+                    pad_days = max(3, int(default_window * 0.1))
+                    end_vis_padded = end_vis + pd.Timedelta(days=pad_days)
+                    visible_range = [start_vis, end_vis_padded]
+
+                fig = make_subplots(
+                    rows=3, cols=1, shared_xaxes=True,
+                    row_heights=[0.6, 0.2, 0.2],
+                    vertical_spacing=0.05,
+                    specs=[[{"secondary_y": False}], [{}], [{}]]
+                )
+                # 主图 K 线
+                fig.add_trace(
+                    go.Candlestick(
+                        x=df_price["trade_date"],
+                        open=df_price["open"],
+                        high=df_price["high"],
+                        low=df_price["low"],
+                        close=df_price["close"],
+                        increasing_line_color="#e74c3c",
+                        decreasing_line_color="#2ecc71",
+                        name="K线"
+                    ),
+                    row=1, col=1, secondary_y=False
+                )
+
+                # 多空信号（列缺失则不显示）
+                try:
+                    signal_cols = [c for c in ("duokong_short", "duokong_long") if c in df_price.columns]
+                    if signal_cols:
+                        if "duokong_short" in df_price.columns:
+                            ser_short = pd.to_numeric(df_price["duokong_short"], errors="coerce")
+                            if ser_short.notna().any():
+                                fig.add_trace(
+                                    go.Scatter(
+                                        x=df_price["trade_date"],
+                                        y=ser_short,
+                                        mode="lines",
+                                        line=dict(color="#000000", width=1),
+                                        name="duokong_short"
+                                    ),
+                                    row=1, col=1, secondary_y=False
+                                )
+                        if "duokong_long" in df_price.columns:
+                            ser_long = pd.to_numeric(df_price["duokong_long"], errors="coerce")
+                            if ser_long.notna().any():
+                                fig.add_trace(
+                                    go.Scatter(
+                                        x=df_price["trade_date"],
+                                        y=ser_long,
+                                        mode="lines",
+                                        line=dict(color="#e74c3c", width=1),
+                                        name="duokong_long"
+                                    ),
+                                    row=1, col=1, secondary_y=False
+                                )
+                except Exception:
+                    pass
+
+                # 副图：J 值、RSI6、RSI12 共用同一纵轴
+                try:
+                    indicator_cols = {
+                        "J": "j",
+                        "RSI6": "rsi6",
+                        "RSI12": "rsi12",
+                    }
+                    added_indicator = False
+                    indicator_latest = []
+                    indicator_all_vals = []
+                    for name, col in indicator_cols.items():
+                        if col in df_price.columns:
+                            ser = pd.to_numeric(df_price[col], errors="coerce")
+                            if ser.notna().any():
+                                fig.add_trace(
+                                    go.Scatter(
+                                        x=df_price["trade_date"],
+                                        y=ser,
+                                        mode="lines",
+                                        line=dict(width=1.2),
+                                        name=name,
+                                    ),
+                                    row=2,
+                                    col=1,
+                                )
+                                added_indicator = True
+                                indicator_all_vals.append(ser)
+                                indicator_latest.append(f"{name}: {ser.dropna().iloc[-1]:.2f}")
+                    if added_indicator:
+                        fig.update_yaxes(title_text="J / RSI", row=2, col=1)
+                        try:
+                            # 在副图顶部展示最新数值，类似常见行情软件
+                            y_top = None
+                            if indicator_all_vals:
+                                y_top = max(s.max() for s in indicator_all_vals if pd.notna(s.max()))
+                            if y_top is not None and indicator_latest:
+                                x_left = visible_range[0] if visible_range else df_price["trade_date"].min()
+                                fig.add_annotation(
+                                    text=" | ".join(indicator_latest),
+                                    x=x_left,
+                                    y=y_top,
+                                    xref="x2",
+                                    yref="y2",
+                                    showarrow=False,
+                                    font=dict(size=11, color="#2c3e50"),
+                                    bgcolor="rgba(255,255,255,0.7)",
+                                    align="left",
+                                    xanchor="left",
+                                    yanchor="top",
+                                )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # 成交量柱
+                try:
+                    if "vol" in df_price.columns and "close" in df_price.columns:
+                        vols = df_price["vol"]
+                        closes = df_price["close"]
+                        prev_close = closes.shift(1)
+                        colors = np.where(closes >= prev_close, "#e74c3c", "#2ecc71")
+                        fig.add_trace(
+                            go.Bar(
+                                x=df_price["trade_date"],
+                                y=vols,
+                                marker_color=colors,
+                                name="成交量"
+                            ),
+                            row=3, col=1
+                        )
+                except Exception:
+                    pass
+
+                # 根据默认可见窗口计算价格轴范围，按中值上下各 10% 预留，避免大片空白
+                price_range = None
+                try:
+                    price_window = (
+                        df_price.tail(default_window)
+                        if visible_range
+                        else df_price
+                    )
+                    low_v = price_window["low"].min()
+                    high_v = price_window["high"].max()
+                    if pd.notna(low_v) and pd.notna(high_v) and low_v > 0:
+                        mid_v = (low_v + high_v) / 2
+                        pad = max((high_v - low_v) * 0.1, mid_v * 0.1)
+                        y_min = min(low_v, mid_v - pad)
+                        y_max = max(high_v, mid_v + pad)
+                        if y_max > y_min:
+                            price_range = [y_min, y_max]
+                except Exception:
+                    price_range = None
+
+                fig.update_layout(
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    height=620,
+                    xaxis_rangeslider_visible=False,
+                    xaxis_title="日期",
+                    yaxis_title="价格",
+                )
+                if price_range:
+                    fig.update_yaxes(range=price_range, row=1, col=1, secondary_y=False)
+                if visible_range:
+                    fig.update_xaxes(range=visible_range, row=1, col=1)
+                    fig.update_xaxes(range=visible_range, row=2, col=1)
+                    fig.update_xaxes(range=visible_range, row=3, col=1)
+                # 纵轴刻度：按 10% 迭代（乘以 1.1）
+                try:
+                    y_min, y_max = df_price["low"].min(), df_price["high"].max()
+                    if pd.notna(y_min) and pd.notna(y_max) and y_min > 0 and y_max > 0:
+                        tickvals = []
+                        val = y_min / 1.1
+                        while val <= y_max * 1.05 and len(tickvals) < 120:
+                            tickvals.append(round(val, 2))
+                            val *= 1.1
+                        if len(tickvals) >= 2:
+                            fig.update_yaxes(tickmode="array", tickvals=tickvals, row=1, col=1, secondary_y=False)
+                except Exception:
+                    pass
+
+                # 跳过周末/节假日
+                try:
+                    rangebreaks = [
+                        dict(bounds=["sat", "mon"]),
+                        dict(bounds=["sun", "mon"])
+                    ]
+                    trade_days = set(df_price["trade_date"].dt.normalize())
+                    full_days = pd.date_range(df_price["trade_date"].min(), df_price["trade_date"].max(), freq="D")
+                    holidays = [d for d in full_days if d not in trade_days and d.weekday() < 5]
+                    if holidays and len(holidays) <= 500:
+                        rangebreaks.append(dict(values=holidays))
+                    fig.update_xaxes(rangebreaks=rangebreaks, row=1, col=1)
+                    fig.update_xaxes(rangebreaks=rangebreaks, row=2, col=1)
+                    fig.update_xaxes(rangebreaks=rangebreaks, row=3, col=1)
+                except Exception:
+                    pass
+
+                # 参考日标记：在成交量子图下方绘制一个原点
+                try:
+                    ref_dt = None
+                    # 优先使用参考日；无参考日则用数据中最新日期
+                    if ref_for_plot:
+                        ref_dt = pd.to_datetime(str(ref_for_plot))
+                    if ref_dt is None or pd.isna(ref_dt):
+                        ref_dt = df_price["trade_date"].max()
+
+                    if pd.notna(ref_dt):
+                        min_dt, max_dt = df_price["trade_date"].min(), df_price["trade_date"].max()
+                        if ref_dt < min_dt:
+                            ref_dt = min_dt
+                        elif ref_dt > max_dt:
+                            ref_dt = max_dt
+                        else:
+                            idx = (df_price["trade_date"] - ref_dt).abs().idxmin()
+                            ref_dt = df_price.loc[idx, "trade_date"]
+
+                        row_ref = df_price.loc[df_price["trade_date"] == ref_dt].tail(1)
+                        if not row_ref.empty:
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=[ref_dt],
+                                    y=[0],
+                                    mode="markers",
+                                    marker=dict(color="#34495e", size=10, symbol="circle"),
+                                    name="参考日标记",
+                                    hoverinfo="skip",
+                                    showlegend=False
+                                ),
+                                row=3, col=1
+                            )
+                except Exception:
+                    pass
+
+                fig.update_yaxes(title_text="价格", row=1, col=1, secondary_y=False)
+                fig.update_yaxes(title_text="成交量", row=3, col=1)
+
+                # 唯一 key 避免多次相同参数冲突
+                chart_key = f"{nav_state_prefix}_kline_{ts}_{str(ref_real)}"
+                st.plotly_chart(fig, width="stretch", key=chart_key)
+
+                # 按排名顺序的“上一条 / 下一条”导航
+                if options_codes and ts and ts in options_codes:
+                    try:
+                        codes_list = list(options_codes)
+                        idx = codes_list.index(ts)
+                    except Exception:
+                        codes_list = list(options_codes)
+                        idx = codes_list.index(ts) if ts in codes_list else -1
+                    if idx >= 0:
+                        ts_name = _stock_name_of(ts) or "—"
+                        if len(codes_list) > 1:
+                            prev_code = codes_list[idx - 1] if idx > 0 else None
+                            next_code = codes_list[idx + 1] if idx < len(codes_list) - 1 else None
+                            nav_prev, nav_mid, nav_next = st.columns([1, 2, 1])
+                            with nav_prev:
+                                if st.button("← 上一条", disabled=prev_code is None, key=f"{nav_state_prefix}_prev_{ts}"):
+                                    st.session_state[f"{nav_state_prefix}_pending_code"] = prev_code
+                                    st.session_state[f"{nav_state_prefix}_last_code"] = prev_code
+                                    st.rerun()
+                            with nav_mid:
+                                st.caption(f"{idx+1}/{len(codes_list)} · {ts} · {ts_name}")
+                            with nav_next:
+                                if st.button("下一条 →", disabled=next_code is None, key=f"{nav_state_prefix}_next_{ts}"):
+                                    st.session_state[f"{nav_state_prefix}_pending_code"] = next_code
+                                    st.session_state[f"{nav_state_prefix}_last_code"] = next_code
+                                    st.rerun()
+        except Exception as e:
+            st.warning(f"无法绘制K线：{e}")
 
 @cache_data(show_spinner=False, hash_funcs={Path: _safe_path_hash}, ttl=60)
 def _read_df(path: Path, usecols=None, dtype=None, encoding: str = "utf-8-sig") -> pd.DataFrame:
@@ -2283,8 +2833,8 @@ if _in_streamlit():
     # tab_rank, tab_detail, tab_position, tab_predict, tab_rules, tab_attn, tab_custom, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
     #     ["排名", "个股详情", "持仓建议", "明日模拟", "规则编辑", "强度榜", "自选榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
 
-    tab_rank, tab_detail, tab_position, tab_predict, tab_predict_rank, tab_rules, tab_attn, tab_custom, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
-        ["排名", "个股详情", "持仓建议", "明日模拟", "预测排名", "规则编辑", "强度榜", "自选榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
+    tab_rank, tab_detail, tab_kline, tab_position, tab_predict, tab_predict_rank, tab_rules, tab_attn, tab_custom, tab_screen, tab_tools, tab_port, tab_stats, tab_data_view, tab_logs, = st.tabs(
+        ["排名", "个股详情", "K线看板", "持仓建议", "明日模拟", "预测排名", "规则编辑", "强度榜", "自选榜", "选股", "工具箱", "组合模拟/持仓", "统计", "数据管理", "日志"])
 
     # ================== 排名 ==================
     with tab_rank:
@@ -2314,7 +2864,7 @@ if _in_streamlit():
             st.session_state["details_db_reading_enabled"] = False
             logger.info(f"用户点击运行评分按钮: 参考日={ref_to_use}, 并行数={maxw}, 范围={universe}，已禁用details数据库读取")
             
-            # 关闭details数据库的连接池，断开所有连接
+            # 关闭相关数据库的连接池，确保排名运行前没有遗留连接
             try:
                 manager = get_database_manager()
                 if manager:
@@ -2322,6 +2872,15 @@ if _in_streamlit():
                     if details_db_path:
                         manager.close_db_pools(details_db_path)
                         logger.info(f"已关闭details数据库连接池: {details_db_path}")
+                    
+                    # 统一库（stock_data.db）也关闭，避免与排名写入冲突
+                    try:
+                        from config import DATA_ROOT, UNIFIED_DB_PATH
+                        unified_db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                        manager.close_db_pools(unified_db_path)
+                        logger.info(f"已关闭主库连接池: {unified_db_path}")
+                    except Exception as e_inner:
+                        logger.warning(f"关闭主库连接池失败: {e_inner}")
             except Exception as e:
                 logger.warning(f"关闭details数据库连接池时出错: {e}")
             
@@ -2584,6 +3143,33 @@ if _in_streamlit():
         
         code_norm = normalize_ts(effective_code) if effective_code else ""
 
+        def _build_external_chart_links(ts_code: str):
+            """生成外部行情/图表链接，便于快速跳转查看。"""
+            if not ts_code or "." not in ts_code:
+                return []
+            base, _, suffix = ts_code.partition(".")
+            base = base.strip()
+            suffix = suffix.lower()
+            prefix_map = {
+                "sz": "sz",
+                "sh": "sh",
+                "bj": "bj",
+                "szse": "sz",
+                "sse": "sh",
+                "bse": "bj"
+            }
+            prefix = prefix_map.get(suffix)
+            if not prefix or not base:
+                return []
+            links = []
+            links.append(("东方财富", f"https://quote.eastmoney.com/{prefix}{base}.html"))
+            links.append(("新浪财经", f"https://finance.sina.com.cn/realstock/company/{prefix}{base}/nc.shtml"))
+            links.append(("腾讯自选股", f"https://gu.qq.com/{prefix}{base}/gp"))
+            tv_market = {"sz": "SZSE", "sh": "SSE", "bj": "BSE"}.get(prefix)
+            if tv_market:
+                links.append(("TradingView", f"https://cn.tradingview.com/chart/?symbol={tv_market}:{base}"))
+            return links
+
         # —— 渲染详情（含 old 版功能） ——
         if code_norm and ref_real:
             obj = _load_detail_json(ref_real, code_norm)
@@ -2807,292 +3393,12 @@ if _in_streamlit():
                         st.caption("暂无")
 
                 # 价格K线（完整行情，标记参考日；跳过周末/节假日缺口）
-                with st.expander("价格 K 线", expanded=True):
-                    try:
-                        trade_dates = get_trade_dates()
-                        ref_for_plot = ref_real or (trade_dates[-1] if trade_dates else None)
-
-                        df_price = query_stock_data(
-                            db_path=os.path.join(DATA_ROOT, UNIFIED_DB_PATH),
-                            ts_code=ts,
-                            start_date=None,
-                            end_date=None,
-                            adj_type="qfq",
-                            limit=None
-                        )
-                        if df_price is None or df_price.empty:
-                            st.warning("暂无价格数据")
-                        elif not {"open","high","low","close","trade_date"}.issubset(df_price.columns):
-                            st.warning("价格数据缺少必要列（open/high/low/close/trade_date）")
-                        else:
-                            df_price = df_price.copy()
-                            df_price["trade_date"] = pd.to_datetime(df_price["trade_date"])
-                            df_price = df_price.sort_values("trade_date")  # 加载全部数据
-                            visible_range = None
-                            default_window = 60
-                            if len(df_price) > default_window:
-                                start_vis = df_price["trade_date"].iloc[-default_window]
-                                end_vis = df_price["trade_date"].iloc[-1]
-                                # 为最新K线预留额外右侧空间，避免贴边
-                                pad_days = max(3, int(default_window * 0.1))
-                                end_vis_padded = end_vis + pd.Timedelta(days=pad_days)
-                                visible_range = [start_vis, end_vis_padded]
-
-                            fig = make_subplots(
-                                rows=3, cols=1, shared_xaxes=True,
-                                row_heights=[0.6, 0.2, 0.2],
-                                vertical_spacing=0.05,
-                                specs=[[{"secondary_y": False}], [{}], [{}]]
-                            )
-                            # 主图 K 线
-                            fig.add_trace(
-                                go.Candlestick(
-                                    x=df_price["trade_date"],
-                                    open=df_price["open"],
-                                    high=df_price["high"],
-                                    low=df_price["low"],
-                                    close=df_price["close"],
-                                    increasing_line_color="#e74c3c",
-                                    decreasing_line_color="#2ecc71",
-                                    name="K线"
-                                ),
-                                row=1, col=1, secondary_y=False
-                            )
-
-                            # 多空信号（列缺失则不显示）
-                            try:
-                                signal_cols = [c for c in ("duokong_short", "duokong_long") if c in df_price.columns]
-                                if signal_cols:
-                                    if "duokong_short" in df_price.columns:
-                                        ser_short = pd.to_numeric(df_price["duokong_short"], errors="coerce")
-                                        if ser_short.notna().any():
-                                            fig.add_trace(
-                                                go.Scatter(
-                                                    x=df_price["trade_date"],
-                                                    y=ser_short,
-                                                    mode="lines",
-                                                    line=dict(color="#000000", width=1),
-                                                    name="duokong_short"
-                                                ),
-                                                row=1, col=1, secondary_y=False
-                                            )
-                                    if "duokong_long" in df_price.columns:
-                                        ser_long = pd.to_numeric(df_price["duokong_long"], errors="coerce")
-                                        if ser_long.notna().any():
-                                            fig.add_trace(
-                                                go.Scatter(
-                                                    x=df_price["trade_date"],
-                                                    y=ser_long,
-                                                    mode="lines",
-                                                    line=dict(color="#e74c3c", width=1),
-                                                    name="duokong_long"
-                                                ),
-                                                row=1, col=1, secondary_y=False
-                                            )
-                            except Exception:
-                                pass
-
-                            # 副图：J 值、RSI6、RSI12 共用同一纵轴
-                            try:
-                                indicator_cols = {
-                                    "J": "j",
-                                    "RSI6": "rsi6",
-                                    "RSI12": "rsi12",
-                                }
-                                added_indicator = False
-                                indicator_latest = []
-                                indicator_all_vals = []
-                                for name, col in indicator_cols.items():
-                                    if col in df_price.columns:
-                                        ser = pd.to_numeric(df_price[col], errors="coerce")
-                                        if ser.notna().any():
-                                            fig.add_trace(
-                                                go.Scatter(
-                                                    x=df_price["trade_date"],
-                                                    y=ser,
-                                                    mode="lines",
-                                                    line=dict(width=1.2),
-                                                    name=name,
-                                                ),
-                                                row=2,
-                                                col=1,
-                                            )
-                                            added_indicator = True
-                                            indicator_all_vals.append(ser)
-                                            indicator_latest.append(f"{name}: {ser.dropna().iloc[-1]:.2f}")
-                                if added_indicator:
-                                    fig.update_yaxes(title_text="J / RSI", row=2, col=1)
-                                    try:
-                                        # 在副图顶部展示最新数值，类似常见行情软件
-                                        y_top = None
-                                        if indicator_all_vals:
-                                            y_top = max(s.max() for s in indicator_all_vals if pd.notna(s.max()))
-                                        if y_top is not None and indicator_latest:
-                                            x_left = visible_range[0] if visible_range else df_price["trade_date"].min()
-                                            fig.add_annotation(
-                                                text=" | ".join(indicator_latest),
-                                                x=x_left,
-                                                y=y_top,
-                                                xref="x2",
-                                                yref="y2",
-                                                showarrow=False,
-                                                font=dict(size=11, color="#2c3e50"),
-                                                bgcolor="rgba(255,255,255,0.7)",
-                                                align="left",
-                                                xanchor="left",
-                                                yanchor="top",
-                                            )
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-
-                            # 成交量柱
-                            try:
-                                if "vol" in df_price.columns and "close" in df_price.columns:
-                                    vols = df_price["vol"]
-                                    closes = df_price["close"]
-                                    prev_close = closes.shift(1)
-                                    colors = np.where(closes >= prev_close, "#e74c3c", "#2ecc71")
-                                    fig.add_trace(
-                                        go.Bar(
-                                            x=df_price["trade_date"],
-                                            y=vols,
-                                            marker_color=colors,
-                                            name="成交量"
-                                        ),
-                                        row=3, col=1
-                                    )
-                            except Exception:
-                                pass
-
-                            # 根据默认可见窗口计算价格轴范围，按中值上下各 10% 预留，避免大片空白
-                            price_range = None
-                            try:
-                                price_window = (
-                                    df_price.tail(default_window)
-                                    if visible_range
-                                    else df_price
-                                )
-                                low_v = price_window["low"].min()
-                                high_v = price_window["high"].max()
-                                if pd.notna(low_v) and pd.notna(high_v) and low_v > 0:
-                                    mid_v = (low_v + high_v) / 2
-                                    pad = max((high_v - low_v) * 0.1, mid_v * 0.1)
-                                    y_min = min(low_v, mid_v - pad)
-                                    y_max = max(high_v, mid_v + pad)
-                                    if y_max > y_min:
-                                        price_range = [y_min, y_max]
-                            except Exception:
-                                price_range = None
-
-                            fig.update_layout(
-                                margin=dict(l=10, r=10, t=10, b=10),
-                                height=620,
-                                xaxis_rangeslider_visible=False,
-                                xaxis_title="日期",
-                                yaxis_title="价格",
-                            )
-                            if price_range:
-                                fig.update_yaxes(range=price_range, row=1, col=1, secondary_y=False)
-                            if visible_range:
-                                fig.update_xaxes(range=visible_range, row=1, col=1)
-                                fig.update_xaxes(range=visible_range, row=2, col=1)
-                                fig.update_xaxes(range=visible_range, row=3, col=1)
-                            # 纵轴刻度：按 10% 迭代（乘以 1.1）
-                            try:
-                                y_min, y_max = df_price["low"].min(), df_price["high"].max()
-                                if pd.notna(y_min) and pd.notna(y_max) and y_min > 0 and y_max > 0:
-                                    tickvals = []
-                                    val = y_min / 1.1
-                                    while val <= y_max * 1.05 and len(tickvals) < 120:
-                                        tickvals.append(round(val, 2))
-                                        val *= 1.1
-                                    if len(tickvals) >= 2:
-                                        fig.update_yaxes(tickmode="array", tickvals=tickvals, row=1, col=1, secondary_y=False)
-                            except Exception:
-                                pass
-
-                            # 跳过周末/节假日
-                            try:
-                                rangebreaks = [
-                                    dict(bounds=["sat", "mon"]),
-                                    dict(bounds=["sun", "mon"])
-                                ]
-                                trade_days = set(df_price["trade_date"].dt.normalize())
-                                full_days = pd.date_range(df_price["trade_date"].min(), df_price["trade_date"].max(), freq="D")
-                                holidays = [d for d in full_days if d not in trade_days and d.weekday() < 5]
-                                if holidays and len(holidays) <= 500:
-                                    rangebreaks.append(dict(values=holidays))
-                                fig.update_xaxes(rangebreaks=rangebreaks, row=1, col=1)
-                                fig.update_xaxes(rangebreaks=rangebreaks, row=2, col=1)
-                                fig.update_xaxes(rangebreaks=rangebreaks, row=3, col=1)
-                            except Exception:
-                                pass
-
-                            # 参考日标记：在成交量子图下方绘制一个原点
-                            try:
-                                ref_dt = None
-                                # 优先使用参考日；无参考日则用数据中最新日期
-                                if ref_for_plot:
-                                    ref_dt = pd.to_datetime(str(ref_for_plot))
-                                if ref_dt is None or pd.isna(ref_dt):
-                                    ref_dt = df_price["trade_date"].max()
-
-                                if pd.notna(ref_dt):
-                                    min_dt, max_dt = df_price["trade_date"].min(), df_price["trade_date"].max()
-                                    if ref_dt < min_dt:
-                                        ref_dt = min_dt
-                                    elif ref_dt > max_dt:
-                                        ref_dt = max_dt
-                                    else:
-                                        idx = (df_price["trade_date"] - ref_dt).abs().idxmin()
-                                        ref_dt = df_price.loc[idx, "trade_date"]
-
-                                    row_ref = df_price.loc[df_price["trade_date"] == ref_dt].tail(1)
-                                    if not row_ref.empty:
-                                        fig.add_trace(
-                                            go.Scatter(
-                                                x=[ref_dt],
-                                                y=[0],
-                                                mode="markers",
-                                                marker=dict(color="#34495e", size=10, symbol="circle"),
-                                                name="参考日标记",
-                                                hoverinfo="skip",
-                                                showlegend=False
-                                            ),
-                                            row=3, col=1
-                                        )
-                            except Exception:
-                                pass
-
-                            fig.update_yaxes(title_text="价格", row=1, col=1, secondary_y=False)
-                            fig.update_yaxes(title_text="成交量", row=3, col=1)
-
-                            st.plotly_chart(fig, width="stretch")
-
-                            # 按排名顺序的“上一条 / 下一条”导航
-                            if options_codes and effective_code and effective_code in options_codes:
-                                idx = options_codes.index(effective_code)
-                                ts_name = _stock_name_of(effective_code) or "—"
-                                if len(options_codes) > 1:
-                                    prev_code = options_codes[idx - 1] if idx > 0 else None
-                                    next_code = options_codes[idx + 1] if idx < len(options_codes) - 1 else None
-                                    nav_prev, nav_mid, nav_next = st.columns([1, 2, 1])
-                                    with nav_prev:
-                                        if st.button("← 上一条", disabled=prev_code is None, key=f"detail_prev_{ts}"):
-                                            st.session_state["detail_pending_code"] = prev_code
-                                            st.session_state["detail_last_code"] = prev_code
-                                            st.rerun()
-                                    with nav_mid:
-                                        st.caption(f"{idx+1}/{len(options_codes)} · {effective_code} · {ts_name}")
-                                    with nav_next:
-                                        if st.button("下一条 →", disabled=next_code is None, key=f"detail_next_{ts}"):
-                                            st.session_state["detail_pending_code"] = next_code
-                                            st.session_state["detail_last_code"] = next_code
-                                            st.rerun()
-                    except Exception as e:
-                        st.warning(f"无法绘制K线：{e}")
+                _render_price_kline_chart(
+                    ts=code_norm,
+                    ref_real=ref_real,
+                    options_codes=options_codes,
+                    nav_state_prefix="detail",
+                )
 
                 # 逐规则明细（可选显示 when）
                 # rules字段已经通过_load_detail_json统一解析为list[dict]格式
@@ -3401,7 +3707,220 @@ if _in_streamlit():
                     logger.debug(f"显示未触发规则失败: {e}")
                     # 静默失败，不影响主流程
 
+                # 外部行情图表快捷链接
+                external_links = _build_external_chart_links(ts)
+                if external_links:
+                    st.markdown("**外部行情图表**（新标签打开）")
+                    link_lines = [
+                        f'- <a href="{url}" target="_blank" rel="noopener noreferrer">{name}</a>'
+                        for name, url in external_links
+                    ]
+                    # 使用换行保持 Markdown 列表格式
+                    st.markdown("\n".join(link_lines), unsafe_allow_html=True)
+
                 st.markdown('<div id="detail_rule_anchor_detail"></div>', unsafe_allow_html=True)
+
+    # ================== K线看板 ==================
+    with tab_kline:
+        st.subheader("K线看板")
+
+        # —— 预先计算参考日/可选股票，供顶部图表使用（控件放在下方） ——
+        available_detail_dates = []
+        try:
+            from database_manager import query_details_recent_dates
+            db_path = get_details_db_path_with_fallback()
+            if db_path and is_details_db_available():
+                dates_from_db = query_details_recent_dates(365, db_path)
+                if dates_from_db:
+                    available_detail_dates = sorted(dates_from_db, reverse=True)
+        except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+            logger.debug(f"数据库访问失败: {e}")
+        except Exception as e:
+            logger.debug(f"读取 details 日期失败: {e}")
+
+        # 参考日默认值
+        if "kline_ref_date_single" not in st.session_state:
+            st.session_state["kline_ref_date_single"] = _get_latest_date_from_files() or ""
+        ref_real_kline = (st.session_state.get("kline_ref_date_single") or "").strip() or _get_latest_date_from_files() or ""
+        df_all_rank_kline = _read_rank_all_sorted(ref_real_kline) if ref_real_kline else pd.DataFrame()
+        df_top_ref_kline = df_all_rank_kline.head(200) if not df_all_rank_kline.empty else pd.DataFrame()
+        options_codes_kline = df_top_ref_kline["ts_code"].astype(str).tolist() if ("ts_code" in df_top_ref_kline.columns and not df_top_ref_kline.empty) else []
+        display_codes_saved = st.session_state.get("kline_display_list", [])
+        # 若已有生成名单，则导航/选择优先使用该名单
+        nav_codes_kline = display_codes_saved if display_codes_saved else options_codes_kline
+
+        pending_code_kline = st.session_state.pop("kline_pending_code", None) if "kline_pending_code" in st.session_state else None
+        if "kline_last_code" not in st.session_state:
+            st.session_state["kline_last_code"] = ""
+        if "kline_code_from_top" not in st.session_state and nav_codes_kline:
+            st.session_state["kline_code_from_top"] = nav_codes_kline[0]
+
+        code_from_list_kline = st.session_state.get("kline_code_from_top", "")
+        manual_code_raw_kline = st.session_state.get("kline_manual_code", "")
+        manual_prev_kline = st.session_state.get("kline_manual_code_prev", "")
+        manual_changed_kline = manual_code_raw_kline != manual_prev_kline
+        resolved_manual_kline = _resolve_user_code_input(manual_code_raw_kline)
+        resolved_select_kline = _resolve_user_code_input(code_from_list_kline)
+        resolved_pending_kline = _resolve_user_code_input(pending_code_kline)
+
+        if manual_changed_kline and resolved_manual_kline:
+            effective_code_kline = resolved_manual_kline
+        elif resolved_pending_kline:
+            effective_code_kline = resolved_pending_kline
+        elif resolved_select_kline:
+            effective_code_kline = resolved_select_kline
+        else:
+            effective_code_kline = resolved_manual_kline or ""
+
+        st.session_state["kline_manual_code_prev"] = manual_code_raw_kline
+        if effective_code_kline:
+            st.session_state["kline_last_code"] = effective_code_kline
+
+        code_norm_kline = normalize_ts(effective_code_kline) if effective_code_kline else ""
+        if code_norm_kline and ref_real_kline:
+            _render_price_kline_chart(
+                ts=code_norm_kline,
+                ref_real=ref_real_kline,
+                options_codes=nav_codes_kline,
+                nav_state_prefix="kline",
+            )
+            turnover_display = "—"
+            turnover_hint = ""
+            try:
+                days, cum_val, err, used_days, start_d, end_d = _compute_turnover_days(code_norm_kline, ref_real_kline, target=60.0)
+                if err:
+                    turnover_hint = err
+                if days is not None:
+                    turnover_display = f"{days} 天"
+                elif cum_val is not None:
+                    turnover_hint = f"累计 {cum_val:.1f}%（未到 60%）"
+                # 附加调试：累加了多少天、起止范围
+                if used_days:
+                    extra = f" · 累计天数 {used_days}"
+                    if start_d and end_d:
+                        extra += f"（{start_d}~{end_d}）"
+                    turnover_hint = (turnover_hint + extra).strip(" ·")
+            except Exception as e:
+                turnover_hint = f"计算失败: {e}"
+
+            with st.container(border=True):
+                st.markdown("**展示参数**")
+                info_col1, info_col2 = st.columns([1, 1])
+                with info_col1:
+                    st.metric("参考日", ref_real_kline or "—")
+                with info_col2:
+                    st.metric("60%换手耗时", turnover_display)
+                    # if turnover_hint:
+                    #     st.caption(turnover_hint)
+        else:
+            st.info("请选择股票和参考日以绘制K线。")
+
+        st.divider()
+        with st.container(border=True):
+            st.markdown("**参数与名单**")
+            colA, colB = st.columns([1, 2])
+            with colA:
+                new_ref = st.text_input("参考日（默认=最新文件）", value=ref_real_kline, key="kline_ref_date_single")
+                ref_real_kline = (new_ref or "").strip() or ref_real_kline
+
+                list_source = st.radio("名单来源", ["TopK导入", "自定义名单"], horizontal=True, key="kline_list_source")
+                topk_value = st.number_input("TopK数量", min_value=1, max_value=5000, value=100, step=5, key="kline_list_topk")
+                ref_for_list = st.text_input("TopK参考日（默认=上方参考日/最新）", value=ref_real_kline, key="kline_list_ref_input")
+
+            with colB:
+                options_for_select = nav_codes_kline
+                if options_for_select:
+                    default_idx = 0
+                    if pending_code_kline and pending_code_kline in options_for_select:
+                        default_idx = options_for_select.index(pending_code_kline)
+                        st.session_state["kline_code_from_top"] = pending_code_kline
+                    elif st.session_state.get("kline_code_from_top") in options_for_select:
+                        default_idx = options_for_select.index(st.session_state["kline_code_from_top"])
+                    elif st.session_state["kline_last_code"] and st.session_state["kline_last_code"] in options_for_select:
+                        default_idx = options_for_select.index(st.session_state["kline_last_code"])
+
+                    st.selectbox(
+                        "从排名前列选择",
+                        options=options_for_select,
+                        index=default_idx,
+                        placeholder="选择股票 ↓",
+                        key="kline_code_from_top"
+                    )
+                else:
+                    st.selectbox(
+                        "从排名前列选择",
+                        options=[""],
+                        index=0,
+                        placeholder="暂无可选股票",
+                        key="kline_code_from_top"
+                    )
+
+                st.text_input(
+                    "或手动输入代码/简称",
+                    value=st.session_state.get("kline_manual_code", ""),
+                    placeholder="如 000001.SH / 000001 / 平安银行",
+                    key="kline_manual_code"
+                )
+
+                custom_text = st.text_area(
+                    "自定义名单（换行/逗号分隔，可填代码或名称）",
+                    value=st.session_state.get("kline_custom_text", ""),
+                    placeholder="000001.SZ\n平安银行\n600519.SH",
+                    height=120,
+                    key="kline_custom_text_area"
+                )
+
+            build_btn = st.button("生成展示名单并刷新指标", key="kline_build_list_btn", width="stretch")
+
+        if build_btn:
+            list_ref_to_use = (ref_for_list or ref_real_kline or "").strip()
+            codes_list: list[str] = []
+            if list_source == "TopK导入":
+                if not list_ref_to_use:
+                    st.error("请选择参考日以从TopK导入。")
+                else:
+                    try:
+                        df_topk = _slice_top_from_all(list_ref_to_use, int(topk_value))
+                        if df_topk.empty:
+                            st.error(f"无法从排名文件读取Top-{int(topk_value)}股票（参考日：{list_ref_to_use}）")
+                        else:
+                            codes_list = df_topk["ts_code"].astype(str).tolist()
+                    except Exception as e:
+                        st.error(f"读取TopK失败：{e}")
+            else:
+                codes_list = _parse_code_list(custom_text)
+
+            # 去重并保存
+            if codes_list:
+                seen = set()
+                deduped = []
+                for c in codes_list:
+                    if c and c not in seen:
+                        seen.add(c)
+                        deduped.append(c)
+                codes_list = deduped
+                st.session_state["kline_display_list"] = codes_list
+                st.session_state["kline_display_ref"] = list_ref_to_use
+                st.session_state["kline_custom_text"] = custom_text
+                st.success(f"已生成名单：{len(codes_list)} 只，参考日 {list_ref_to_use or '—'}")
+                # 自动让 K 线跟随名单首只票（通过 pending_code + rerun，避免修改已实例化的控件）
+                first_code = normalize_ts(codes_list[0])
+                st.session_state["kline_pending_code"] = first_code
+                st.session_state["kline_last_code"] = first_code
+                try:
+                    st.rerun()
+                except Exception:
+                    pass
+            else:
+                st.warning("名单为空，请检查TopK文件或自定义输入。")
+
+        display_codes = st.session_state.get("kline_display_list", [])
+        display_ref = st.session_state.get("kline_display_ref") or ref_real_kline
+        if display_codes and display_ref:
+            st.caption(f"当前名单（参考日 {display_ref}），共 {len(display_codes)} 只：")
+            st.dataframe(pd.DataFrame({"ts_code": display_codes}), width="stretch", height=320, hide_index=True)
+        else:
+            st.info("点击上方按钮生成展示名单。")
 
     # ================== 持仓建议 ==================
     with tab_position:
@@ -7337,7 +7856,7 @@ if _in_streamlit():
                                             fig.update_yaxes(title_text="价格", row=1, col=1, secondary_y=False)
                                             fig.update_yaxes(title_text="成交量", row=2, col=1)
 
-                                            st.plotly_chart(fig, width="stretch")
+                                            st.plotly_chart(fig, width="stretch", key=f"data_view_chart_{ts_code_normalized}_{start_date}_{end_date}")
                                         except Exception as e:
                                             st.warning(f"无法绘制图表: {e}")
                                     # 统计总行数（忽略limit）

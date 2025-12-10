@@ -50,14 +50,14 @@ REGISTRY: Dict[str, IndMeta] = {
         name="rsi",
         out={"rsi": 2},  # 小数位数
         tdx="""
-            N := 14;
+            N := 12;
             LC := REF(CLOSE, 1);
             RSI := SMA(MAX(CLOSE - LC, 0), N, 1) / SMA(ABS(CLOSE - LC), N, 1) * 100;
         """,
         py_func=lambda df, **kw: rsi(df['close'], **kw),
         kwargs={"period": 14},  # Python 兜底参数
         tags=["product","prelaunch"],
-        warmup=14,
+        warmup=60,
     ),
     "DIFF": IndMeta(
         name="DIFF",
@@ -79,6 +79,17 @@ def compute(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
     for name in names or []:
         meta = REGISTRY.get(name)
         if not meta:
+            continue
+
+        # 检查数据量是否满足该指标的预热需求，不够则直接填充None并跳过计算
+        required_len = 0
+        try:
+            required_len = int(meta.warmup or 0)
+        except Exception:
+            required_len = 0
+        if required_len > 0 and len(out_df) < required_len:
+            for col in meta.out.keys():
+                out_df[col] = pd.Series([None] * len(out_df), index=out_df.index, dtype="object")
             continue
 
         tdx_ok = False
@@ -131,6 +142,11 @@ def compute(df: pd.DataFrame, names: List[str]) -> pd.DataFrame:
                 error_msg += f"\n  TDX计算错误: {tdx_error}"
             error_msg += "\n  没有可用的Python实现作为兜底"
             raise RuntimeError(error_msg)
+
+        # warmup遮挡：即使样本量足够整体计算，也将前 warmup 行置 None，避免早期样本使用不稳定值
+        if required_len > 0 and len(out_df) >= required_len:
+            for col in meta.out.keys():
+                out_df.loc[out_df.index[:required_len], col] = None
 
     # 应用精度控制
     decs = outputs_for(names)

@@ -113,6 +113,7 @@ class DownloadConfig:
     warmup_batch_size: int = 50  # warmup查询的批处理大小
     refresh_stock_list_on_download: bool = True
     token: Optional[str] = None
+    download_tor: bool = False  # 是否下载换手率因子（tor）
 
 @dataclass
 class DownloadStats:
@@ -562,7 +563,8 @@ class TushareManager:
             raise
     
     def get_stock_daily(self, ts_code: str, start_date: str, end_date: str, 
-                       adj: str = None) -> pd.DataFrame:
+                       adj: str = None,
+                       include_tor: bool = False) -> pd.DataFrame:
         """获取股票日线数据（使用pro_bar接口获取原始数据）"""
         try:
             # 构建参数字典
@@ -571,8 +573,10 @@ class TushareManager:
                 'start_date': start_date,
                 'end_date': end_date,
                 'freq': 'D',
-                'asset': 'E'
+                'asset': 'E',
             }
+            if include_tor:
+                params['factors'] = ['tor']  # 需要换手率字段
             
             # 只有当adj不为None且不是'raw'时才添加adj参数
             if adj and adj != 'raw':
@@ -650,6 +654,15 @@ class DataProcessor:
         
         # 复制数据
         df = df.copy()
+
+        # 重命名字段：换手率列使用短名，便于后续存储/计算
+        rename_map = {
+            "turnover_rate": "tor",
+        }
+        df = df.rename(columns=rename_map)
+        # tor 是基础列，缺失时补 NaN，避免后续取列报错
+        if "tor" not in df.columns:
+            df["tor"] = np.nan
         
         # 删除不需要的列
         columns_to_drop = ["pre_close", "change", "pct_chg"]
@@ -658,13 +671,13 @@ class DataProcessor:
                 df = df.drop(columns=[col])
         
         # 数值化处理
-        numeric_columns = ["open", "high", "low", "close", "vol", "amount"]
+        numeric_columns = ["open", "high", "low", "close", "vol", "amount", "tor"]
         for col in numeric_columns:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         
         # 精度控制
-        price_columns = ["open", "high", "low", "close", "vol", "amount"]
+        price_columns = ["open", "high", "low", "close", "vol", "amount", "tor"]
         for col in price_columns:
             if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
                 df[col] = df[col].astype(float).round(2)
@@ -692,7 +705,6 @@ class DataProcessor:
             return df
         
         try:
-            warmup_days = warmup_for(self.indicator_names)
             historical_data = None
             
             # 优先使用预加载的缓存数据
@@ -702,15 +714,6 @@ class DataProcessor:
             else:
                 # 如果没有缓存，按需从数据库获取（兼容旧逻辑）
                 historical_data = self._get_historical_data_for_warmup(ts_code, adj_type, df)
-
-            # warmup数据长度检查：不足则不输出并提示
-            if warmup_days > 0:
-                hist_len = 0 if historical_data is None or historical_data.empty else len(historical_data)
-                if hist_len < warmup_days:
-                    logger.warning(
-                        f"{ts_code} warmup数据不足，需至少 {warmup_days} 行历史数据，实际 {hist_len} 行，跳过输出"
-                    )
-                    return None
 
             if historical_data is not None and not historical_data.empty:
                 # 合并历史数据和新增数据
@@ -755,19 +758,16 @@ class DataProcessor:
             warmup_days = warmup_for(self.indicator_names)
             if warmup_days <= 0:
                 return None
-            
-            # 获取新数据的最早日期
+
+            # 获取新数据的最早日期，用于界定历史数据的上限
             min_date = new_data['trade_date'].min()
-            
-            # 计算历史数据的结束日期（新数据开始日期的前一天）
             from datetime import datetime, timedelta
             min_date_obj = datetime.strptime(str(min_date), '%Y%m%d')
             end_date_obj = min_date_obj - timedelta(days=1)
             end_date = end_date_obj.strftime('%Y%m%d')
-            
-            # 计算历史数据的开始日期 - 减少查询范围
-            start_date_obj = min_date_obj - timedelta(days=warmup_days)  # 只取必要的warmup数据
-            start_date = start_date_obj.strftime('%Y%m%d')
+
+            # 按条数取 warmup 所需行数，额外多取一些作为缓冲
+            need_rows = max(warmup_days + 10, warmup_days)
             
             # 添加超时和重试机制
             max_retries = 2
@@ -776,9 +776,10 @@ class DataProcessor:
                     # 从数据库获取历史数据
                     historical_df = self.db_manager.query_stock_data(
                         ts_code=ts_code,
-                        start_date=start_date,
                         end_date=end_date,
-                        adj_type=adj_type
+                        adj_type=adj_type,
+                        limit=need_rows,
+                        order="desc"  # 取最新 N 行
                     )
                     
                     if historical_df.empty:
@@ -811,9 +812,11 @@ class DataProcessor:
         # 添加复权类型列
         df = df.copy()
         df['adj_type'] = adj_type
+        if "tor" not in df.columns:
+            df["tor"] = np.nan
         
         # 确保列顺序正确
-        base_columns = ['ts_code', 'trade_date', 'adj_type', 'open', 'high', 'low', 'close', 'vol', 'amount']
+        base_columns = ['ts_code', 'trade_date', 'adj_type', 'open', 'high', 'low', 'close', 'vol', 'amount', 'tor']
         indicator_columns = [col for col in df.columns if col not in base_columns]
         df = df[base_columns + indicator_columns]
         
@@ -829,9 +832,16 @@ class StockDownloader:
         # 不在初始化时创建数据库连接，避免子线程创建连接
         
         # 创建限频器（使用令牌桶算法）
+        calls_per_min = config.rate_limit_calls_per_min
+        safe_calls_per_min = config.safe_calls_per_min
+        if config.download_tor:
+            # tor 需要 daily_basic，Tushare 限频 200/min，强制下调
+            calls_per_min = min(200, calls_per_min)
+            safe_calls_per_min = min(190, safe_calls_per_min, calls_per_min - 1 if calls_per_min > 1 else calls_per_min)
+            logger.warning(f"检测到下载tor，限频强制调整为 {calls_per_min}/min（safe={safe_calls_per_min}）以适配 daily_basic 限额")
         rate_limiter = TokenBucketRateLimiter(
-            calls_per_min=config.rate_limit_calls_per_min,
-            safe_calls_per_min=config.safe_calls_per_min,
+            calls_per_min=calls_per_min,
+            safe_calls_per_min=safe_calls_per_min,
             adaptive=config.enable_adaptive_rate_limit
         )
         
@@ -910,17 +920,15 @@ class StockDownloader:
             if warmup_days <= 0:
                 logger.info("指标不需要warmup，跳过预加载")
                 return
-            
-            # 计算需要加载的日期范围
+            need_rows = max(warmup_days + 10, warmup_days)  # 按条数取，额外多取一些做缓冲
+
+            # 计算历史数据的结束日期（新数据开始日期前一天），只用作上界避免覆盖增量段
             from datetime import datetime, timedelta
             start_date_obj = datetime.strptime(self.config.start_date, '%Y%m%d')
-            # 加载warmup_days天前的数据（加上一些缓冲）
-            load_start_obj = start_date_obj - timedelta(days=warmup_days + 10)  # 多加载10天作为缓冲
-            load_start = load_start_obj.strftime('%Y%m%d')
             load_end_obj = start_date_obj - timedelta(days=1)
             load_end = load_end_obj.strftime('%Y%m%d')
             
-            logger.info(f"预加载历史数据范围: {load_start} - {load_end} (warmup天数: {warmup_days})")
+            logger.info(f"预加载历史数据按条数获取: 每只股票 {need_rows} 条，截止 {load_end} (warmup天数: {warmup_days})")
             
             # 批量查询所有股票的历史数据
             logger.info(f"开始批量查询 {len(stock_codes)} 只股票的历史数据...")
@@ -938,9 +946,10 @@ class StockDownloader:
                     # 从数据库查询历史数据
                     historical_df = db_manager.query_stock_data(
                         ts_code=ts_code,
-                        start_date=load_start,
                         end_date=load_end,
-                        adj_type=self.config.adj_type
+                        adj_type=self.config.adj_type,
+                        limit=need_rows,
+                        order="desc"  # 直接取最新 N 行，避开停牌日期空洞
                     )
                     
                     if not historical_df.empty:
@@ -961,6 +970,12 @@ class StockDownloader:
         except Exception as e:
             logger.warning(f"批量预加载历史数据失败: {e}，将使用按需加载模式")
             # 预加载失败不影响下载，将使用原来的按需加载模式
+        finally:
+            try:
+                # 预加载完成后主动清理连接池，避免长时间占用读连接
+                db_manager.clear_connections_only()
+            except Exception as e:
+                logger.debug(f"预加载后清理数据库连接失败: {e}")
     
     def download_stock_data(self, ts_code: str, data_processor: DataProcessor = None) -> Tuple[str, str, Optional[pd.DataFrame]]:
         """下载单只股票数据，边下载边计算指标并返回处理后的数据
@@ -987,7 +1002,8 @@ class StockDownloader:
                     ts_code=ts_code,
                     start_date=self.config.start_date,
                     end_date=self.config.end_date,
-                    adj=self.config.adj_type if self.config.adj_type != "raw" else None
+                    adj=self.config.adj_type if self.config.adj_type != "raw" else None,
+                    include_tor=self.config.download_tor
                 )
                 
                 if raw_data is None or raw_data.empty:
@@ -1273,6 +1289,9 @@ class StockDownloader:
                                     logger.error(f"{result_code} 写入失败: {write_result['error']}")
                                     with self._lock:
                                         self.stats.error_count += 1
+                                        self.stats.failed_stocks.append(
+                                            (result_code, write_result.get("error") or "写入失败")
+                                        )
                                     continue
                             else:
                                 logger.warning(f"{result_code} 写入请求超时（60秒），数据可能仍在后台处理中，继续处理下一只股票")
@@ -1293,6 +1312,7 @@ class StockDownloader:
                         logger.warning(f"下载失败 {result_code}: {status}")
                         with self._lock:
                             self.stats.error_count += 1
+                            self.stats.failed_stocks.append((result_code, status))
                 except Exception as e:
                     logger.error(f"处理任务异常 {ts_code}: {e}")
                     with self._lock:
@@ -1958,6 +1978,10 @@ class DownloadManager:
             threads=self.config.threads,
             enable_warmup=self.config.enable_warmup,
             token=self.config.token,
+            rate_limit_calls_per_min=self.config.rate_limit_calls_per_min,
+            safe_calls_per_min=self.config.safe_calls_per_min,
+            enable_adaptive_rate_limit=self.config.enable_adaptive_rate_limit,
+            download_tor=self.config.download_tor,
         )
         
         # 传递是否为首次下载的信息
@@ -2018,7 +2042,8 @@ class DownloadManager:
         downloader = IndexDownloader(index_config)
         return downloader.download_all_indices(whitelist)
     
-    def run_download(self, assets: List[str] = None, index_whitelist: List[str] = None) -> Dict[str, DownloadStats]:
+    def run_download(self, assets: List[str] = None, index_whitelist: List[str] = None,
+                     retry_on_failure: bool = True) -> Dict[str, DownloadStats]:
         """运行下载任务"""
         if assets is None:
             assets = ["stock"]
@@ -2028,6 +2053,42 @@ class DownloadManager:
         
         # 确定下载策略（内部已经处理了智能结束日期）
         strategy = self.determine_download_strategy()
+        
+        def _collect_totals(res: Dict[str, DownloadStats]) -> Tuple[int, int, int]:
+            total_success = sum(stats.success_count for stats in res.values())
+            total_error = sum(stats.error_count for stats in res.values())
+            total_empty = sum(stats.empty_count for stats in res.values())
+            return total_success, total_error, total_empty
+        
+        def _log_results(res: Dict[str, DownloadStats], heading: str) -> Tuple[int, int, int]:
+            total_success, total_error, total_empty = _collect_totals(res)
+            logger.perf(heading)
+            for asset_type, stats in res.items():
+                logger.perf(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
+                if stats.failed_stocks:
+                    logger.warning(f"{asset_type} 失败股票: {[code for code, _ in stats.failed_stocks[:5]]}")
+            logger.perf(f"总计: 成功={total_success}, 空数据={total_empty}, 失败={total_error}")
+            return total_success, total_error, total_empty
+        
+        def _unique_failed_codes(failed_list: List[Tuple[str, str]]) -> List[str]:
+            codes: List[str] = []
+            seen: Set[str] = set()
+            for code, _ in failed_list or []:
+                if code and code not in seen:
+                    seen.add(code)
+                    codes.append(code)
+            return codes
+        
+        def _merge_stats(original: DownloadStats, retry_stats: DownloadStats) -> DownloadStats:
+            """合并重试结果，保留首次统计中的总量与跳过信息。"""
+            merged = DownloadStats()
+            merged.total_stocks = original.total_stocks
+            merged.skip_count = original.skip_count
+            merged.empty_count = original.empty_count + retry_stats.empty_count
+            merged.success_count = original.success_count + retry_stats.success_count
+            merged.error_count = retry_stats.error_count
+            merged.failed_stocks = retry_stats.failed_stocks or []
+            return merged
         
         # 检查是否需要跳过下载（必须在访问其他键之前检查）
         if strategy.get("skip_download", False):
@@ -2118,14 +2179,45 @@ class DownloadManager:
         finally:
             overall_progress.close()
         
-        # 打印最终统计信息
-        logger.perf("=== 下载任务完成 ===")
-        for asset_type, stats in results.items():
-            logger.perf(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
-            if stats.failed_stocks:
-                logger.warning(f"{asset_type} 失败股票: {[code for code, _ in stats.failed_stocks[:5]]}")
+        # 打印首次尝试的统计信息
+        total_success, total_error, total_empty = _log_results(results, "=== 下载任务完成（首次尝试） ===")
         
-        logger.perf(f"总计: 成功={total_success}, 空数据={total_empty}, 失败={total_error}")
+        # 如果有失败并且允许自动重试，针对失败项再尝试一次
+        if retry_on_failure and total_error > 0:
+            retry_results: Dict[str, DownloadStats] = {}
+            retry_stock_codes: List[str] = []
+            retry_index_codes: List[str] = []
+            
+            if "stock" in assets and "stock" in results:
+                retry_stock_codes = _unique_failed_codes(results["stock"].failed_stocks)
+            if "index" in assets and "index" in results:
+                retry_index_codes = _unique_failed_codes(results["index"].failed_stocks)
+            
+            if retry_stock_codes or retry_index_codes:
+                logger.warning(f"检测到 {total_error} 个失败，开始自动重试一次...")
+                if retry_stock_codes:
+                    retry_strategy = dict(strategy)
+                    retry_strategy["stock_whitelist"] = retry_stock_codes
+                    retry_strategy["skip_download"] = False
+                    logger.perf(f"股票重试列表共 {len(retry_stock_codes)} 只")
+                    retry_results["stock"] = self.download_stocks(retry_strategy)
+                
+                if retry_index_codes:
+                    logger.perf(f"指数重试列表共 {len(retry_index_codes)} 只")
+                    retry_results["index"] = self.download_indices(strategy, retry_index_codes)
+                
+                # 合并重试结果
+                if retry_results:
+                    merged_results: Dict[str, DownloadStats] = {}
+                    for asset_type in set(list(results.keys()) + list(retry_results.keys())):
+                        if asset_type in retry_results and asset_type in results:
+                            merged_results[asset_type] = _merge_stats(results[asset_type], retry_results[asset_type])
+                        elif asset_type in retry_results:
+                            merged_results[asset_type] = retry_results[asset_type]
+                        else:
+                            merged_results[asset_type] = results[asset_type]
+                    results = merged_results
+                    total_success, total_error, total_empty = _log_results(results, "=== 自动重试后结果 ===")
         
         return results
 
@@ -2161,6 +2253,9 @@ def download_data(start_date: str, end_date: str, adj_type: str = "qfq",
         enable_warmup=enable_warmup,
         enable_adaptive_rate_limit=enable_adaptive_rate_limit,
         token=token,
+        rate_limit_calls_per_min=CALLS_PER_MIN,
+        safe_calls_per_min=SAFE_CALLS_PER_MIN,
+        download_tor=DOWNLOAD_TOR,
     )
     
     manager = DownloadManager(config)

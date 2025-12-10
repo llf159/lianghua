@@ -433,59 +433,29 @@ def _calc_rule_total_window(rule_or_clause: dict, tf: str) -> int:
     return total_window
 
 
-# 策略编译时计算最大 score_windows（按 timeframe 分组）
+# 策略编译时计算最大总窗口（按 timeframe 分组）
 def _compute_max_windows_by_tf(rules: List[dict]) -> dict:
     """
-    计算策略规则中每个 timeframe 的最大 score_windows 值。
+    计算策略规则中每个 timeframe 的最大总窗口（计分窗口 + 表达式窗口）。
     这个值用于作为 data_window（数据获取窗口），确保所有规则都有足够的历史数据用于计算。
     
     Returns:
-        dict: {timeframe: max_score_windows}，例如 {"D": 60, "W": 10, "M": 3}
+        dict: {timeframe: max_total_window}，例如 {"D": 60, "W": 10, "M": 3}
     """
     max_wins = {}
-    
-    def _extract_window(rule_or_clause: dict, tf: str) -> int:
-        """从规则或子句中提取 score_windows 值（用于计算最大 data_window）"""
-        if rule_or_clause.get("timeframe", "D").upper() == tf:
-            # 注意：scope: LAST 的规则没有 score_windows，不参与计算
-            scope = rule_or_clause.get("scope", "ANY")
-            scope_upper = str(scope).upper().strip() if scope else "ANY"
-            if scope_upper == "LAST":
-                return 0  # scope: LAST 不需要窗口，不参与计算
-            
-            # 对于 RECENT/DIST/NEAR scope，如果有 dist_points，从 dist_points 中提取最大日期
-            if scope_upper in {"RECENT", "DIST", "NEAR"}:
-                bins = rule_or_clause.get("dist_points") or rule_or_clause.get("distance_points") or []
-                if bins:
-                    max_range = 0
-                    for b in bins:
-                        if isinstance(b, dict):
-                            hi = int(b.get("max", b.get("lag", 0)))
-                        else:
-                            hi = int(b[1]) if len(b) > 1 else 0
-                        max_range = max(max_range, hi)
-                    if max_range > 0:
-                        return max_range + 1  # 返回最大区间+1
-            
-            # score_windows 现在是必填字段，但为了向后兼容，如果没有则使用默认值
-            score_windows = rule_or_clause.get("score_windows")
-            if score_windows is None:
-                return SC_LOOKBACK_D  # 使用默认值
-            return int(score_windows)
-        return 0
     
     for rule in rules:
         if "clauses" in rule and rule["clauses"]:
             # 带子句的规则：检查每个子句
             for clause in rule["clauses"]:
                 for tf in ["D", "W", "M"]:
-                    win = _extract_window(clause, tf)
+                    win = _calc_rule_total_window(clause, tf)
                     if win > 0:
                         max_wins[tf] = max(max_wins.get(tf, 0), win)
         else:
             # 单条规则
             for tf in ["D", "W", "M"]:
-                win = _extract_window(rule, tf)
+                win = _calc_rule_total_window(rule, tf)
                 if win > 0:
                     max_wins[tf] = max(max_wins.get(tf, 0), win)
     
@@ -1986,7 +1956,8 @@ def _recent_points(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = Non
 
 
 def _select_columns_for_rules() -> List[str]:
-    need = {"trade_date", "open", "high", "low", "close", "vol", "amount"}
+    # 基础列：行情 + tor（换手率）即使缺失也作为基础列拉取
+    need = {"trade_date", "open", "high", "low", "close", "vol", "amount", "tor"}
     # 指标输出列：优先通过 get_all_indicator_names + outputs_for 自动获取；失败则使用旧的手工兜底集合
     default_indicator_cols = {"j","vr","bbi","z_score","duokong_long","duokong_short","diff","bar_color","rsi6","rsi12","bupiao_short","bupiao_long"}
     indicator_cols: set[str] = set()

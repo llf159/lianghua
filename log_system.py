@@ -226,8 +226,9 @@ class DebugLogger:
         self._lock = threading.Lock()
     
     def _clear_old_logs(self):
-        """清除之前的日志文件（包括备份文件）"""
+        """清理旧日志文件，保留最近 N 个"""
         try:
+            max_keep = 3  # 每个等级最多保留的文件数（含当前 + 备份）
             # 清除所有与该logger相关的日志文件
             log_patterns = [
                 f"{self.name}_info.log*",
@@ -241,17 +242,22 @@ class DebugLogger:
             
             deleted_count = 0
             for pattern in log_patterns:
-                for log_file in self.log_dir.glob(pattern):
+                files = sorted(
+                    self.log_dir.glob(pattern),
+                    key=lambda p: p.stat().st_mtime if p.exists() else 0,
+                    reverse=True
+                )
+                for log_file in files[max_keep:]:
                     try:
                         log_file.unlink()
                         deleted_count += 1
-                    except Exception as e:
+                    except Exception:
                         # 如果文件被占用或其他错误，忽略继续处理其他文件
                         pass
             
             if deleted_count > 0:
-                print(f"已清除 {deleted_count} 个旧日志文件: {self.name}")
-        except Exception as e:
+                print(f"已清理旧日志文件 {deleted_count} 个 (保留最近 {max_keep} 个): {self.name}")
+        except Exception:
             # 清除失败不影响日志系统初始化
             pass
     
@@ -629,6 +635,9 @@ _log_queue_lock = threading.Lock()
 
 def _get_log_queue() -> Optional[multiprocessing.Queue]:
     """获取全局日志队列（仅在主进程中创建）"""
+    # 某些受限环境（如CI/沙箱）可能不允许创建多进程锁/队列，允许通过环境变量禁用
+    if os.environ.get("LOG_DISABLE_MP_QUEUE", "").lower() in ("1", "true", "yes"):
+        return None
     global _log_queue
     if _log_queue is None and _is_main_process():
         with _log_queue_lock:

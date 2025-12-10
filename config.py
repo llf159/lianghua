@@ -23,6 +23,8 @@ DATA_ROOT = os.path.join(BASE_DIR, "stock_data")
 ASSETS = ["stock", "index"]  # 可选: ["stock"], ["index"], ["stock","index"]
 START_DATE = "20250101"  # 数据下载开始日期 'YYYYMMDD'
 END_DATE = "today"  # today或具体日期 'YYYYMMDD'
+# 是否下载换手率因子（tor）。开启后 pro_bar 会额外调用 daily_basic，Tushare 限频以 daily_basic 的 200/min 为准
+DOWNLOAD_TOR = True
 
 # 指数白名单
 INDEX_WHITELIST = [

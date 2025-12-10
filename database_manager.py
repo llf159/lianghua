@@ -2339,7 +2339,8 @@ class DatabaseManager:
         return None
     
     def query_stock_data(self, db_path: str = None, ts_code: str = None, start_date: str = None, 
-                        end_date: str = None, columns: List[str] = None, adj_type: str = "qfq", limit: Optional[int] = None) -> pd.DataFrame:
+                        end_date: str = None, columns: List[str] = None, adj_type: str = "qfq", limit: Optional[int] = None,
+                        order: str = "asc") -> pd.DataFrame:
         """
         查询股票数据 - 统一接口，优先使用预加载缓存
         
@@ -2351,6 +2352,7 @@ class DatabaseManager:
             columns: 需要的列
             adj_type: 复权类型
             limit: 限制返回行数
+            order: 排序方向，asc/desc（默认升序；desc 常用于取最新 N 行）
         
         Returns:
             股票数据 DataFrame
@@ -2408,7 +2410,12 @@ class DatabaseManager:
             if conditions:
                 sql += " WHERE " + " AND ".join(conditions)
             
-            sql += " ORDER BY ts_code, trade_date"
+            order = (order or "asc").lower()
+            order = "desc" if order == "desc" else "asc"
+            if ts_code:
+                sql += f" ORDER BY trade_date {order}"
+            else:
+                sql += f" ORDER BY ts_code, trade_date {order}"
 
             # 限制返回行数（如提供）
             if limit is not None:
@@ -3424,10 +3431,11 @@ def get_stock_list(db_path: str = None, adj_type: str = "raw") -> List[str]:
 
 
 def query_stock_data(db_path: str = None, ts_code: str = None, start_date: str = None, 
-                    end_date: str = None, columns: List[str] = None, adj_type: str = "qfq", limit: Optional[int] = None) -> pd.DataFrame:
+                    end_date: str = None, columns: List[str] = None, adj_type: str = "qfq", limit: Optional[int] = None,
+                    order: str = "asc") -> pd.DataFrame:
     """查询股票数据的便捷函数"""
     manager = get_database_manager()
-    return manager.query_stock_data(db_path, ts_code, start_date, end_date, columns, adj_type, limit)
+    return manager.query_stock_data(db_path, ts_code, start_date, end_date, columns, adj_type, limit, order)
 
 
 def register_preload_cache(cache_name: str, data: pd.DataFrame, ref_date: str, 
@@ -3502,6 +3510,11 @@ class DatabaseSchemaManager:
             all_columns = []
             for meta in REGISTRY.values():
                 all_columns.extend(meta.out.keys())
+            # 额外补充pro_bar因子返回但非指标的字段（如换手率）
+            extra_factor_cols = ['tor']
+            for col in extra_factor_cols:
+                if col not in all_columns:
+                    all_columns.append(col)
             return all_columns
         except ImportError:
             # 如果无法导入indicators模块，返回默认的指标列
@@ -3512,7 +3525,9 @@ class DatabaseSchemaManager:
                 'rsi6', 'rsi12', 'rsi24',
                 'macd', 'macd_signal', 'macd_hist',
                 'boll_upper', 'boll_mid', 'boll_lower',
-                'atr', 'cci', 'williams_r', 'obv'
+                'atr', 'cci', 'williams_r', 'obv',
+                # pro_bar换手率因子（短名）
+                'tor'
             ]
     
     def _build_indicator_columns_sql(self) -> List[str]:

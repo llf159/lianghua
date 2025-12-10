@@ -409,30 +409,47 @@ def BARSLAST(cond):
     idx = pd.Series(np.where(cond, np.arange(len(cond)), np.nan), index=cond.index).ffill().infer_objects(copy=False)
     return pd.Series(np.arange(len(cond)), index=cond.index) - idx
 
+def _rolling_strict(x, n, func):
+    """严格 rolling：窗口内任意 NaN 则返回 NaN。"""
+    s = pd.Series(x)
+    n_int = max(int(n), 1)
+    return s.rolling(n_int, min_periods=n_int).apply(
+        lambda arr: func(arr) if not np.isnan(arr).any() else np.nan,
+        raw=True
+    )
+
 def MA(x, n):  
-    return x.rolling(int(n), min_periods=1).mean()
+    return _rolling_strict(x, n, lambda a: np.mean(a))
 
 def SUM(x, n): 
-    return x.rolling(int(n), min_periods=1).sum()
+    return _rolling_strict(x, n, lambda a: np.sum(a))
 
 def HHV(x, n): 
-    return x.rolling(int(n), min_periods=1).max()
+    return _rolling_strict(x, n, lambda a: np.max(a))
 
 def LLV(x, n): 
-    return x.rolling(int(n), min_periods=1).min()
+    return _rolling_strict(x, n, lambda a: np.min(a))
 
 def STD(x, n): 
-    return x.rolling(int(n), min_periods=1).std(ddof=0)
+    return _rolling_strict(x, n, lambda a: np.std(a, ddof=0))
 
 def REF(x, n=1):
     return x.shift(int(n))
 
 def EMA(x, n):
-    return x.ewm(span=int(n), adjust=False).mean()
+    s = pd.Series(x)
+    res = s.ewm(span=int(n), adjust=False).mean()
+    if s.isna().any():
+        res = res.mask(s.isna(), np.nan)
+    return res
 
 def SMA(x, n, m):
     alpha = float(m) / float(n)
-    return x.ewm(alpha=alpha, adjust=False).mean()
+    s = pd.Series(x)
+    res = s.ewm(alpha=alpha, adjust=False).mean()
+    if s.isna().any():
+        res = res.mask(s.isna(), np.nan)
+    return res
 
 def ABS(x):
     return np.abs(x)
@@ -475,18 +492,24 @@ def RSV(C, H, L, n=9):
 def TS_PCT(x, n):
     """返回与 x 同索引的序列：每日对应“该日值在最近 n 天窗口内的百分位（0..1）”"""
     s = pd.Series(x)
+    n_int = max(int(n), 1)
     def pct(arr):
+        if np.isnan(arr).any():
+            return np.nan
         last = arr[-1]
         return float((arr <= last).sum()) / len(arr)
-    return s.rolling(int(n), min_periods=1).apply(lambda a: pct(a.values), raw=False)
+    return s.rolling(n_int, min_periods=n_int).apply(lambda a: pct(a.values), raw=False)
 
 def TS_RANK(x, n):
     """返回每日对应“该日值在最近 n 天窗口内的名次（1..n）”"""
     s = pd.Series(x)
+    n_int = max(int(n), 1)
     def rk(arr):
+        if np.isnan(arr).any():
+            return np.nan
         last = arr[-1]
         return float((arr <= last).sum())
-    return s.rolling(int(n), min_periods=1).apply(lambda a: rk(a.values), raw=False)
+    return s.rolling(n_int, min_periods=n_int).apply(lambda a: rk(a.values), raw=False)
 
 def _iter_custom_tag_series(pattern: str, df_index):
     """从 EXTRA_CONTEXT['CUSTOM_TAGS'] 里按名称匹配，取出与 df_index 对齐的布尔序列"""
@@ -992,6 +1015,8 @@ VAR_MAP = {
     "D": "df['d']",
     "d": "df['d']",  # 添加小写版本
     "VR": "df['vr']",
+    "TOR": "df['tor']",
+    "tor": "df['tor']",
     "Z_SLOPE": "df['z_slope']",
     "BBI": "df['bbi']",
     "BUPIAO_SHORT": "df['bupiao_short']",
