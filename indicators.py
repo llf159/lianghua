@@ -38,6 +38,15 @@ REGISTRY: Dict[str, IndMeta] = {
         tags=["product","prelaunch"],
         warmup=20,
     ),
+    "volume_ratio_prev": IndMeta(
+        name="volume_ratio_prev",
+        out={"vr_prev": 4},
+        tdx="VR_PREV := SAFE_DIV(V, REF(V, 1));",
+        py_func=lambda df, **kw: volume_ratio_prev(df, **kw),
+        kwargs={"n": 20},
+        tags=["product","prelaunch"],
+        warmup=2,
+    ),
     "bbi": IndMeta(
         name="bbi",
         out={"bbi": 2},
@@ -55,9 +64,9 @@ REGISTRY: Dict[str, IndMeta] = {
             RSI := SMA(MAX(CLOSE - LC, 0), N, 1) / SMA(ABS(CLOSE - LC), N, 1) * 100;
         """,
         py_func=lambda df, **kw: rsi(df['close'], **kw),
-        kwargs={"period": 14},  # Python 兜底参数
+        kwargs={"period": 12},  # Python 兜底参数
         tags=["product","prelaunch"],
-        warmup=60,
+        warmup=12,
     ),
     "DIFF": IndMeta(
         name="DIFF",
@@ -345,6 +354,14 @@ def volume_ratio(df, n=20):
     vr = df['vol'] / avg_volume
     return vr
 
+def volume_ratio_prev(df, n=20):
+    """
+    量能环比 = 今日成交量 / 昨日成交量
+    """
+    vol = df['vol']
+    vr_prev = vol / (vol.shift(1) + EPS)
+    return vr_prev
+
 def cci(df, n=14):
     tp = (df["high"] + df["low"] + df["close"]) / 3
     ma = tp.rolling(n).mean()
@@ -358,29 +375,3 @@ def bbi(df):
     ma24 = df['close'].rolling(24).mean()
 
     return (ma3 + ma6 + ma12 + ma24) / 4
-
-def z_score(df, n=60, ema_n=5, vr_n=20, cap=2):
-    """
-    Z优化 = 2*EMA( Zscore( (C-O)/O *100, 窗口=n ), ema_n )  ×  min( V/MA(V,vr_n), cap )
-    """
-    oc = (df["close"] - df["open"]) / (df["open"] + EPS) * 100.0
-    mean = oc.rolling(n, min_periods=n).mean()
-    std  = oc.rolling(n, min_periods=n).std(ddof=0).replace(0, EPS)
-    z0 = (oc - mean) / std
-    z  = z0.ewm(span=ema_n, adjust=False).mean() * 2.0
-    vr = df["vol"] / (df["vol"].rolling(vr_n, min_periods=vr_n).mean() + EPS)
-    w  = vr.clip(upper=cap)
-    return (z * w).fillna(0.0)
-
-def duokong(df):
-    """知行中期多空线"""
-    ema1 = ema(df['close'], span=10)
-    ema2 = ema(ema1, span=10)
-    return ema2
-
-def duokong_long(df):
-    c = df["close"]
-    return (c.rolling(14).mean()
-          + c.rolling(28).mean()
-          + c.rolling(57).mean()
-          + c.rolling(114).mean()) / 4

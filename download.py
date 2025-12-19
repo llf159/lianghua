@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 import importlib
@@ -86,6 +87,48 @@ from tdx_compat import evaluate as tdx_eval
 
 # 初始化日志
 logger = get_logger("download")
+
+
+def _tqdm_ncols(default: int = 100) -> int:
+    """根据终端宽度动态压缩进度条，防止终端过窄时换行刷屏。"""
+    try:
+        env_override = os.environ.get("TQDM_COLS")
+        if env_override:
+            return max(40, int(env_override))
+        width = shutil.get_terminal_size(fallback=(default, 20)).columns
+        return max(50, min(width - 2, 140))
+    except Exception:
+        return default
+
+
+def _tqdm_kwargs(**extra) -> Dict[str, Any]:
+    """统一 tqdm 参数，强制输出（即使非 TTY），可用 TQDM_DISABLE=1 关闭。"""
+    disable_env = os.environ.get("TQDM_DISABLE", "").strip()
+    disable = disable_env in {"1", "true", "yes"}
+    base = dict(
+        ncols=_tqdm_ncols(),
+        dynamic_ncols=True,
+        mininterval=0.1,
+        maxinterval=1.0,
+        disable=disable,
+    )
+    base.update(extra)
+    return base
+
+
+def _refresh_postfix(bar: tqdm, data: Dict[str, Any]) -> None:
+    """安全刷新 tqdm 的后缀，确保控制台实时显示进度计数"""
+    try:
+        bar.set_postfix(data, refresh=True)
+    except Exception:
+        try:
+            bar.set_postfix(data)
+        except Exception:
+            return
+    try:
+        bar.refresh()
+    except Exception:
+        pass
 
 # 导入tushare
 try:
@@ -159,6 +202,8 @@ class TokenBucketRateLimiter:
         self.calls_per_min = calls_per_min
         self.safe_calls_per_min = safe_calls_per_min
         self.adaptive = adaptive
+        self._user_bucket_capacity = bucket_capacity
+        self._user_refill_rate = refill_rate
         
         # 从config读取令牌桶参数，如果没有则使用默认值
         try:
@@ -188,6 +233,32 @@ class TokenBucketRateLimiter:
             self.min_wait = min_wait or 0.05
             self.extra_delay = extra_delay or 0.5
             self.extra_delay_threshold = extra_delay_threshold or 480
+        
+        # 保守模式（多进程/多实例时使用）：进一步收紧安全阈值
+        try:
+            env_factor = float(os.environ.get("TUSHARE_RATE_SAFETY_FACTOR", "1.0"))
+            if env_factor < 1.0:
+                self.safe_calls_per_min = int(self.safe_calls_per_min * env_factor)
+                self.calls_per_min = int(self.calls_per_min * env_factor)
+                logger.warning(f"启用保守限频模式：安全阈值调整为 {self.safe_calls_per_min}/min，最大 {self.calls_per_min}/min")
+        except Exception:
+            pass
+
+        # 如果未显式设置补充速率，按缩放后的限频重算
+        if not self._user_refill_rate:
+            self.refill_rate = self.calls_per_min / 60.0
+
+        # 动态计算令牌桶容量：低限频更细粒度，高限频允许适度突发
+        def _auto_capacity(limit_per_min: int) -> int:
+            # 约 2% 的每分钟额度作为容量，最低 2，最高 12，避免固定 8 粒度
+            return max(2, min(12, int(limit_per_min * 0.02)))
+
+        if not self._user_bucket_capacity:
+            self.bucket_capacity = _auto_capacity(self.calls_per_min)
+
+        # 动态放大 min_wait，限频越低越需要拉开线程间距
+        min_gap = 30.0 / max(1, self.calls_per_min)  # roughly spread 30 calls across 1 min
+        self.min_wait = max(self.min_wait, min_gap)
         
         # 令牌桶状态
         self._tokens = float(self.bucket_capacity)  # 当前令牌数
@@ -936,8 +1007,9 @@ class StockDownloader:
                 total=len(stock_codes),
                 desc="预加载历史数据",
                 unit="只",
-                ncols=100,
-                leave=False
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]",
+                leave=False,
+                **_tqdm_kwargs()
             )
             
             loaded_count = 0
@@ -963,6 +1035,7 @@ class StockDownloader:
                     # 预加载失败不影响下载，继续处理下一只股票
                 
                 preload_progress.update(1)
+                _refresh_postfix(preload_progress, {"完成": preload_progress.n})
             
             preload_progress.close()
             logger.info(f"预加载完成：成功加载 {loaded_count}/{len(stock_codes)} 只股票的历史数据")
@@ -1222,8 +1295,8 @@ class StockDownloader:
             total=len(stock_codes),
             desc="下载并计算指标",
             unit="只",
-            ncols=100,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            **_tqdm_kwargs()
         )
         
         # 用于收集需要批量写入的数据（如果启用批量写入模式）
@@ -1321,7 +1394,7 @@ class StockDownloader:
                 
                 # 更新进度条
                 progress_bar.update(1)
-                progress_bar.set_postfix({
+                _refresh_postfix(progress_bar, {
                     '成功': self.stats.success_count,
                     '空数据': self.stats.empty_count,
                     '失败': self.stats.error_count
@@ -1507,8 +1580,8 @@ class IndexDownloader:
             total=len(whitelist),
             desc="下载指数数据",
             unit="只",
-            ncols=100,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            **_tqdm_kwargs()
         )
         
         # 收集所有下载的数据
@@ -1544,7 +1617,7 @@ class IndexDownloader:
                 
                 # 更新进度条
                 progress_bar.update(1)
-                progress_bar.set_postfix({
+                _refresh_postfix(progress_bar, {
                     '成功': len(collected_data),
                     '空数据': self.stats.empty_count,
                     '失败': self.stats.error_count
@@ -2092,12 +2165,12 @@ class DownloadManager:
         
         # 检查是否需要跳过下载（必须在访问其他键之前检查）
         if strategy.get("skip_download", False):
-            logger.warning("=" * 60)
+            logger.warning("=" * 30)
             logger.warning("数据已是最新，跳过下载")
-            logger.warning("=" * 60)
+            logger.warning("=" * 30)
             logger.warning(f"跳过原因: 最新日期={strategy.get('latest_date', 'N/A')}, 计算出的开始日期={strategy.get('start_date', 'N/A')}, 实际结束日期={strategy.get('end_date', 'N/A')}")
             logger.warning(f"如果最新日期 >= 结束日期，说明数据已经是最新的，无需下载")
-            logger.warning("=" * 60)
+            logger.warning("=" * 30)
             return {"stock": DownloadStats(), "index": DownloadStats()}
         
         if strategy.get("fill_missing_latest_date"):
@@ -2110,9 +2183,9 @@ class DownloadManager:
         if self.config.end_date.lower() == "today":
             # strategy['end_date'] 已经是智能处理后的日期
             smart_end_date = strategy['end_date']
-            logger.info("=" * 60)
+            logger.info("=" * 30)
             logger.info("智能日期判断说明")
-            logger.info("=" * 60)
+            logger.info("=" * 30)
             logger.perf(f"• 配置的结束日期: today (今日)")
             logger.perf(f"• 智能判断后的实际结束日期: {smart_end_date}")
             logger.info("• 智能判断逻辑:")
@@ -2120,7 +2193,7 @@ class DownloadManager:
             logger.info("  - 如果今天是交易日且当前时间 >= 15:00，使用今天")
             logger.info("  - 如果今天不是交易日，使用最近的交易日")
             logger.info("  - 如果无法获取交易日历，使用今天")
-            logger.info("=" * 60)
+            logger.info("=" * 30)
         
         # 显示中文下载策略信息（使用strategy中已经智能处理后的结束日期）
         logger.info(f"下载策略: 首次下载={strategy['is_first_download']}, 最新日期={strategy['latest_date']}, 开始日期={strategy['start_date']}, 结束日期={strategy['end_date']}, 复权类型={strategy['adj_type']}, 资产类型={strategy['asset_type']}, 跳过下载={strategy['skip_download']}")
@@ -2134,9 +2207,8 @@ class DownloadManager:
             total=total_assets,
             desc="总体下载进度",
             unit="类",
-            ncols=100,
-            position=0,
-            leave=True
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]",
+            **_tqdm_kwargs(position=0, leave=True)
         )
         
         try:
@@ -2147,7 +2219,7 @@ class DownloadManager:
                 logger.perf(f"开始下载股票数据: {strategy['start_date']} - {strategy['end_date']}")
                 results["stock"] = self.download_stocks(strategy)
                 overall_progress.update(1)
-                overall_progress.set_postfix({
+                _refresh_postfix(overall_progress, {
                     '股票成功': results["stock"].success_count,
                     '股票失败': results["stock"].error_count
                 })
@@ -2159,7 +2231,7 @@ class DownloadManager:
                 logger.perf(f"开始下载指数数据: {strategy['start_date']} - {strategy['end_date']}")
                 results["index"] = self.download_indices(strategy, index_whitelist)
                 overall_progress.update(1)
-                overall_progress.set_postfix({
+                _refresh_postfix(overall_progress, {
                     '指数成功': results["index"].success_count,
                     '指数失败': results["index"].error_count
                 })
@@ -2170,7 +2242,7 @@ class DownloadManager:
             total_error = sum(stats.error_count for stats in results.values())
             total_empty = sum(stats.empty_count for stats in results.values())
             
-            overall_progress.set_postfix({
+            _refresh_postfix(overall_progress, {
                 '总成功': total_success,
                 '总失败': total_error,
                 '总空数据': total_empty
@@ -2288,13 +2360,13 @@ def main():
     assets = ASSETS
     threads = STOCK_INC_THREADS
     
-    logger.perf("=" * 60)
+    logger.perf("=" * 30)
     logger.perf("开始下载数据")
-    logger.perf("=" * 60)
+    logger.perf("=" * 30)
     logger.perf(f"日期范围: {start_date} - {end_date}")
     logger.perf(f"复权类型: {adj_type}")
     logger.perf(f"资产类型: {', '.join(assets)}")
-    logger.perf("=" * 60)
+    logger.perf("=" * 30)
     
     try:
         # 执行下载
@@ -2361,14 +2433,14 @@ def main_cli():
         print(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
         if stats.failed_stocks:
             print(f"失败股票: {[code for code, _ in stats.failed_stocks[:5]]}")
-    print("=" * 60)
+    print("=" * 30)
 
 
 def main_interactive():
     """交互式模式"""
-    print("=" * 60)
+    print("=" * 30)
     print("股票数据下载工具")
-    print("=" * 60)
+    print("=" * 30)
     print("基于database_manager的下载模块")
     print()
     
