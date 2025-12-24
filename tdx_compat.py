@@ -4,7 +4,7 @@ import logging
 import numpy as np
 import pandas as pd
 from functools import lru_cache
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, Optional
 
 EPS = 1e-12
 EXTRA_CONTEXT: dict = {}   # 运行时可注入自定义函数/变量，比如 TS/REF_DATE/RANK_*
@@ -979,6 +979,48 @@ def GET_LAST_DIFF_HIGH_VALUE(lookback_days=60):
         return 0.0
 
 
+def _calc_limit_up_pct(ts_code: Optional[str], df=None) -> float:
+    """
+    按板块推断涨停幅度：
+    - 创业板/科创板：20%（300/301/688/689）
+    - 北交所：30%（后缀 .BJ）
+    - ST 股：5%（名称包含 ST / *ST，优先级最高）
+    - 其余主板：10%
+    """
+    try:
+        ts = (ts_code or "").strip()
+        ts_upper = ts.upper()
+        core = ts_upper.split(".")[0] if ts_upper else ""
+        suffix = ""
+        if "." in ts_upper:
+            _, _, suffix = ts_upper.partition(".")
+            suffix = suffix.lower()
+
+        pct = 0.095
+        if suffix == "bj":
+            pct = 0.295
+        elif core.startswith(("300", "301", "688", "689")):
+            pct = 0.195
+        else:
+            pct = 0.095
+
+        try:
+            if df is not None:
+                st_pattern = re.compile(r'^\s*\*?ST', flags=re.IGNORECASE)
+                for col in ("name", "ts_name", "ts_fullname", "stock_name"):
+                    if col in df.columns:
+                        ser = df[col]
+                        if ser.dropna().astype(str).str.contains(st_pattern).any():
+                            pct = 0.05
+                            break
+        except Exception:
+            pass
+
+        return float(pct)
+    except Exception:
+        return 0.10
+
+
 # 注册到额外上下文，供表达式直接调用
 EXTRA_CONTEXT["TS_PCT"] = TS_PCT
 EXTRA_CONTEXT["TS_RANK"] = TS_RANK
@@ -1025,6 +1067,8 @@ VAR_MAP = {
     "duokong_short": "df['duokong_short']",
     "DUOKONG_LONG": "df['duokong_long']",
     "duokong_long": "df['duokong_long']",
+    "ZHANG": "ZHANG",
+    "zhang": "ZHANG",
     
 }
 
@@ -1136,16 +1180,11 @@ def evaluate_bool(script: str, df, prefer_keys=("sig", "last_expr", "SIG", "LAST
 
 
 def _replace_variables(expr):
-    keys = sorted(VAR_MAP.keys(), key=len, reverse=True)
-    
     # 保护字符串字面量，避免在字符串内进行替换
-    # 使用占位符临时替换字符串内容
-    import re
     strings = {}
     placeholders = []
     counter = 0
-    
-    # 找到所有引号内的内容（支持单引号和双引号，处理转义字符）
+
     def replace_string(match):
         nonlocal counter
         placeholder = f"__STRING_{counter}__"
@@ -1153,30 +1192,41 @@ def _replace_variables(expr):
         placeholders.append(placeholder)
         counter += 1
         return placeholder
-    
-    # 使用更健壮的正则表达式匹配字符串字面量
+
     # 匹配 '...' 或 "..." 形式的字符串，支持转义引号
     pattern = r"""('[^'\\]*(?:\\.[^'\\]*)*')|("[^"\\]*(?:\\.[^"\\]*)*")"""
     expr_protected = re.sub(pattern, replace_string, expr)
-    
-    # 在非字符串部分进行变量替换
-    for k in keys:
-        replacement = VAR_MAP[k]
-        if replacement in expr_protected:
-            continue  # 如果已经替换过，跳过
-        expr_protected = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(k)}(?![A-Za-z0-9_])', replacement, expr_protected)
-    
+
+    # 构造忽略大小写的变量替换
+    key_map = {k.upper(): v for k, v in VAR_MAP.items()}
+    if not key_map:
+        return expr
+    joined = "|".join(sorted(map(re.escape, key_map.keys()), key=len, reverse=True))
+    regex = re.compile(rf'(?<![A-Za-z0-9_])({joined})(?![A-Za-z0-9_])', flags=re.IGNORECASE)
+
+    def repl(match):
+        return key_map.get(match.group(1).upper(), match.group(0))
+
+    expr_protected = regex.sub(repl, expr_protected)
+
     # 恢复字符串字面量
     for placeholder in placeholders:
         expr_protected = expr_protected.replace(placeholder, strings[placeholder])
-    
+
     return expr_protected
 
 
 def _replace_functions(expr):
-    for k, v in FUNC_MAP.items():
-        expr = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(k)}\s*\(', v + "(", expr)
-    return expr
+    func_map = {k.upper(): v for k, v in FUNC_MAP.items()}
+    if not func_map:
+        return expr
+    joined = "|".join(sorted(map(re.escape, func_map.keys()), key=len, reverse=True))
+    regex = re.compile(rf'(?<![A-Za-z0-9_])({joined})\s*\(', flags=re.IGNORECASE)
+
+    def repl(match):
+        return func_map.get(match.group(1).upper(), match.group(0)) + "("
+
+    return regex.sub(repl, expr)
 
 
 def _replace_logicals(expr):
@@ -1354,6 +1404,11 @@ def evaluate(script, df, extra_context=None):
     }
     if extra_context:
         ctx.update(extra_context) 
+
+    # 根据当前标的推断涨停幅度，暴露 ZHANG 变量（10%/20%/30%/5%ST）
+    zhang_pct = _calc_limit_up_pct(EXTRA_CONTEXT.get("TS"), df)
+    ctx["ZHANG"] = zhang_pct
+    ctx["zhang"] = zhang_pct
     
     # 添加 DataFrame 列的动态访问支持
     # 这样 VAR_MAP 中的 "J": "df['j']" 就能正确工作

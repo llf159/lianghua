@@ -8,3 +8,4 @@ output/
 /old/
 /log/
 /cache/
+/tools/__*

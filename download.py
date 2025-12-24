@@ -87,6 +87,11 @@ from tdx_compat import evaluate as tdx_eval
 
 # 初始化日志
 logger = get_logger("download")
+PROJECT_ROOT = Path(__file__).resolve().parent
+CONCEPT_DATA_FILES = [
+    PROJECT_ROOT / "stock_data" / "concepts" / "em" / "stock_concepts.csv",
+    PROJECT_ROOT / "stock_data" / "concepts" / "ths" / "stock_concepts.csv",
+]
 
 
 def _tqdm_ncols(default: int = 100) -> int:
@@ -129,6 +134,30 @@ def _refresh_postfix(bar: tqdm, data: Dict[str, Any]) -> None:
         bar.refresh()
     except Exception:
         pass
+
+
+def _concept_data_exists() -> bool:
+    """检查概念数据是否已存在（任一文件存在且非空）。"""
+    for path in CONCEPT_DATA_FILES:
+        try:
+            if path.exists() and path.stat().st_size > 0:
+                return True
+        except Exception as e:
+            logger.debug("检查概念数据文件失败 %s: %s", path, e)
+    return False
+
+
+def _confirm_concept_download() -> bool:
+    """缺失概念数据时，询问是否下载。非交互环境默认继续以保持行为一致。"""
+    if not sys.stdin.isatty():
+        logger.perf("未检测到概念数据，非交互环境默认继续下载。")
+        return True
+    try:
+        choice = input("未检测到概念数据，是否现在下载？[y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        logger.perf("未检测到概念数据，用户取消操作。")
+        return False
+    return choice == "y"
 
 # 导入tushare
 try:
@@ -361,6 +390,7 @@ class TokenBucketRateLimiter:
             # 记录本次调用
             self._recent_calls.append(now)
             self._total_calls += 1
+
     
     def record_success(self):
         """记录成功调用"""
@@ -689,6 +719,7 @@ class TushareManager:
         except Exception as e:
             logger.error(f"获取交易日列表失败: {e}")
             raise
+
     
     def get_smart_end_date(self, end_date_config: str) -> str:
         """
@@ -709,6 +740,18 @@ class TushareManager:
             if end_date_config.lower() == "today":
                 return datetime.now().strftime("%Y%m%d")
             return end_date_config
+
+    def get_daily_basic_by_date(self, trade_date: str, fields: str) -> pd.DataFrame:
+        """按交易日获取 daily_basic（一次性全市场）。"""
+        try:
+            return self._make_api_call(
+                self._pro.daily_basic,
+                trade_date=trade_date,
+                fields=fields,
+            )
+        except Exception as e:
+            logger.error(f"获取 daily_basic 失败 trade_date={trade_date}: {e}")
+            raise
 
 # ================= 数据处理器 =================
 class DataProcessor:
@@ -906,10 +949,10 @@ class StockDownloader:
         calls_per_min = config.rate_limit_calls_per_min
         safe_calls_per_min = config.safe_calls_per_min
         if config.download_tor:
-            # tor 需要 daily_basic，Tushare 限频 200/min，强制下调
+            # daily_basic 限频 200/min，tor 会触发
             calls_per_min = min(200, calls_per_min)
             safe_calls_per_min = min(190, safe_calls_per_min, calls_per_min - 1 if calls_per_min > 1 else calls_per_min)
-            logger.warning(f"检测到下载tor，限频强制调整为 {calls_per_min}/min（safe={safe_calls_per_min}）以适配 daily_basic 限额")
+            logger.warning(f"检测到 daily_basic 需求（tor），限频强制调整为 {calls_per_min}/min（safe={safe_calls_per_min}）以适配 daily_basic 限额")
         rate_limiter = TokenBucketRateLimiter(
             calls_per_min=calls_per_min,
             safe_calls_per_min=safe_calls_per_min,
@@ -936,7 +979,9 @@ class StockDownloader:
                 return
             cache_path = stock_list_cache_path()
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cols = [c for c in ["ts_code", "symbol", "name", "area", "industry", "list_date"] if c in df.columns]
+            cols = [c for c in ["ts_code", "symbol", "name", "area", "industry", "list_date",
+                                "trade_date", "total_share", "float_share", "total_mv", "circ_mv"]
+                    if c in df.columns]
             df[cols].to_csv(cache_path, index=False, encoding="utf-8-sig")
             logger.info(f"股票列表已缓存：{cache_path}（保留，不再清理）")
         except Exception as e:
@@ -972,6 +1017,35 @@ class StockDownloader:
         
         logger.error("缓存和数据库都无法提供股票列表，兜底失败")
         return []
+
+    def _attach_total_share_to_list(self, stock_list: pd.DataFrame) -> pd.DataFrame:
+        """在刷新名单后，一次性补充最新交易日的总股本等字段。"""
+        if stock_list is None or stock_list.empty or "ts_code" not in stock_list.columns:
+            return stock_list
+        trade_date = None
+        try:
+            trade_date = self.tushare_manager.get_smart_end_date("today")
+        except Exception as e:
+            logger.warning(f"获取最新交易日失败，跳过总股本补充：{e}")
+        if not trade_date:
+            return stock_list
+        try:
+            fields = "ts_code,trade_date,total_share,float_share,total_mv,circ_mv"
+            basic_df = self.tushare_manager.get_daily_basic_by_date(trade_date=trade_date, fields=fields)
+            if basic_df is None or basic_df.empty:
+                logger.warning(f"daily_basic 在 {trade_date} 无数据，跳过总股本补充")
+                return stock_list
+            basic_df = basic_df.drop_duplicates(subset=["ts_code"])
+            # 数值化
+            for col in ["total_share", "float_share", "total_mv", "circ_mv"]:
+                if col in basic_df.columns:
+                    basic_df[col] = pd.to_numeric(basic_df[col], errors="coerce")
+            merged = stock_list.merge(basic_df, on="ts_code", how="left")
+            logger.info(f"已为股票列表补充总股本等字段（trade_date={trade_date}）")
+            return merged
+        except Exception as e:
+            logger.warning(f"补充总股本失败，继续使用原名单：{e}")
+            return stock_list
     
     def _get_data_processor(self):
         """获取数据处理器（延迟创建，只在主线程中创建）"""
@@ -1212,6 +1286,7 @@ class StockDownloader:
                     logger.warning(f"刷新股票列表失败（继续尝试缓存/数据库）: {e}")
                     stock_list = None
                 if stock_list is not None and not stock_list.empty and "ts_code" in stock_list.columns:
+                    stock_list = self._attach_total_share_to_list(stock_list)
                     self._persist_stock_list_cache(stock_list)
                     stock_codes = stock_list["ts_code"].astype(str).tolist()
 
@@ -2332,7 +2407,20 @@ def download_data(start_date: str, end_date: str, adj_type: str = "qfq",
     
     manager = DownloadManager(config)
     try:
-        return manager.run_download(assets)
+        results = manager.run_download(assets)
+        # 下载完股票后抓取概念（爬虫）
+        if "stock" in assets:
+            try:
+                if not _concept_data_exists() and not _confirm_concept_download():
+                    logger.perf("缺少概念数据，用户选择跳过抓取。")
+                else:
+                    from scrape_concepts import main as scrape_concepts
+                    logger.perf("开始抓取概念数据（爬虫,可能失败）...")
+                    scrape_concepts()
+                    logger.perf("概念抓取完成，输出目录 stock_data/concepts")
+            except Exception as e:
+                logger.warning(f"概念抓取失败，已跳过：{e}")
+        return results
     finally:
         # 确保后台数据库线程被优雅关闭，避免进程悬挂
         try:
@@ -2621,6 +2709,7 @@ def get_smart_end_date(end_date_config: str) -> str:
         if end_date_config.lower() == "today":
             return datetime.now().strftime("%Y%m%d")
         return end_date_config
+
 
 
 if __name__ == "__main__":

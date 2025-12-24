@@ -14,7 +14,8 @@ PY
 [ -n "$VENV_NAME" ] || VENV_NAME="venv"
 
 VENV_DIR="$PWD/$VENV_NAME"
-if [ -x "$VENV_DIR/bin/activate" ]; then
+if [ -f "$VENV_DIR/bin/activate" ]; then
+    # 使用 -f 避免因权限位不是可执行而误判
     source "$VENV_DIR/bin/activate"
 else
     echo "未找到虚拟环境 $VENV_NAME，使用系统环境运行。"

@@ -8,9 +8,10 @@ import os
 import re
 import glob
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence, Dict
+from functools import lru_cache
 from log_system import get_logger
-from config import DATA_ROOT, UNIFIED_DB_PATH
+from config import DATA_ROOT, UNIFIED_DB_PATH, CONCEPT_READ_SOURCE
 
 # 初始化日志记录器
 logger = get_logger("utils")
@@ -102,24 +103,154 @@ def normalize_ts(ts_input: str, asset: str = "stock") -> str:
     return s
 
 
+def normalize_em_ts_code(ts_code: str) -> str:
+    """
+    将东财无前导0的证券代码转为 Tushare 风格（补0 + 交易所后缀）。
+    """
+    s = str(ts_code or "").strip()
+    if not s:
+        return ""
+    # 取数字部分，防止出现 '1234.SS'
+    s = re.sub(r"\\D", "", s)
+    if not s:
+        return ""
+    s = s.zfill(6)
+    return normalize_ts(s, asset="stock")
+
+
 def market_label(ts_code: str) -> str:
     """根据 ts_code 前缀粗分市场板块。"""
     s = (ts_code or "").split(".")[0]
-    if s.startswith(("600","601","603","605")):
+    if s.startswith(("2")):
+        return "B股"
+    if s.startswith("60"):
         return "沪A"
-    if s.startswith(("000","001","002","003")):
+    if s.startswith("00"):
         return "深A"
-    if s.startswith(("300","301","302","303","304","305","306","307","308","309")):
+    if s.startswith("3"):
         return "创业板"
-    if s.startswith(("688","689")):
+    if s.startswith("68"):
         return "科创板"
-    if s.startswith((
-        "430","831","832","833","834","835","836","837","838","839",
-        "80","81","82","83","84","85","86","87","88","89",
-        "920","921","922","923","924","925","926","927","928","929"
-    )):
+    if s.startswith(("4", "8", "9")):
         return "北交所"
     return "其他"
+
+# ================= 概念加载工具 =================
+def _concept_filter(names_str: str, blacklist: Sequence[str]) -> Optional[str]:
+    """过滤黑名单概念，返回拼接字符串或 None。"""
+    if not names_str:
+        return None
+    bl = {str(x).strip().lower() for x in blacklist if str(x).strip()}
+    names = [n.strip() for n in str(names_str).split(",") if n.strip()]
+    kept = [n for n in names if n.lower() not in bl]
+    if not kept:
+        return None
+    return ",".join(kept)
+
+
+@lru_cache(maxsize=1)
+def _load_concept_files(concept_dir: Optional[str] = None) -> Dict[str, pd.DataFrame]:
+    base_dir = Path(concept_dir) if concept_dir else Path(DATA_ROOT) / "concepts"
+    em_dir = base_dir / "em"
+    ths_dir = base_dir / "ths"
+    concept_path = em_dir / "concepts.csv"
+    members_path = em_dir / "concept_members.csv"
+    stock_map_em_path = em_dir / "stock_concepts.csv"
+    stock_map_ths_path = ths_dir / "stock_concepts.csv"
+    manual_paths = [
+        base_dir / "manual_concepts.csv",
+        base_dir / "manual" / "stock_concepts.csv",
+    ]
+
+    def _read(path: Path) -> pd.DataFrame:
+        if not path.exists():
+            return pd.DataFrame()
+        return pd.read_csv(path, dtype=str)
+
+    return {
+        "concepts": _read(concept_path),
+        "members": _read(members_path),
+        "stock_map_em": _read(stock_map_em_path),
+        "stock_map_ths": _read(stock_map_ths_path),
+        "stock_map_manual": next((df for df in (_read(p) for p in manual_paths) if not df.empty), pd.DataFrame()),
+    }
+
+
+def get_concept_mapping(concept_dir: Optional[str] = None, blacklist: Sequence[str] = (), prefer_names: bool = True) -> Dict[str, str]:
+    """返回 ts_code -> 概念字符串映射，按黑名单过滤。"""
+    data = _load_concept_files(concept_dir)
+    stock_map_em = data.get("stock_map_em")
+    stock_map_ths = data.get("stock_map_ths")
+    stock_map_manual = data.get("stock_map_manual")
+    if stock_map_em is None or not isinstance(stock_map_em, pd.DataFrame):
+        stock_map_em = pd.DataFrame()
+    if stock_map_ths is None or not isinstance(stock_map_ths, pd.DataFrame):
+        stock_map_ths = pd.DataFrame()
+    if stock_map_manual is None or not isinstance(stock_map_manual, pd.DataFrame):
+        stock_map_manual = pd.DataFrame()
+    members = data["members"]
+    bl = tuple(blacklist or ())
+    mapping: Dict[str, str] = {}
+    mode = str(CONCEPT_READ_SOURCE or "mix").strip().lower()
+    if mode == "em":
+        source_df = stock_map_em if not stock_map_em.empty else members
+    elif mode == "ths":
+        source_df = stock_map_ths
+    else:
+        source_df = stock_map_em if not stock_map_em.empty else members
+    if source_df.empty and stock_map_ths.empty:
+        return mapping
+    def _pick_column(df: pd.DataFrame) -> Optional[str]:
+        """选择可用的概念列，兼容 em / ths / 手工格式。"""
+        if df is None or df.empty:
+            return None
+        name_candidates = ["concepts_name", "concepts", "概念", "concept_name"]
+        code_candidates = ["concepts_code", "concept_code"]
+        preferred = name_candidates + code_candidates if prefer_names else code_candidates + name_candidates
+        for col in preferred:
+            if col in df.columns:
+                return col
+        return None
+
+    def _fill_from(df: pd.DataFrame, allow_overwrite: bool = True) -> None:
+        if df is None or df.empty:
+            return
+        concept_col = _pick_column(df)
+        for _, row in df.iterrows():
+            ts_code = str(row.get("ts_code", "")).strip()
+            if not ts_code:
+                continue
+            if not allow_overwrite and ts_code in mapping:
+                continue
+            raw = row.get(concept_col) if concept_col and isinstance(row.get(concept_col), str) else None
+            filtered = _concept_filter(raw, bl) if raw else None
+            if filtered:
+                mapping[ts_code] = filtered
+
+    # 手工数据优先，适配 em/ths/自定义列名
+    _fill_from(stock_map_manual, allow_overwrite=True)
+    _fill_from(source_df, allow_overwrite=True)
+    # 使用同花顺结果补充未覆盖的股票（仅 mix 模式）
+    if mode == "mix" and not stock_map_ths.empty:
+        _fill_from(stock_map_ths, allow_overwrite=False)
+    return mapping
+
+
+def concept_text_for_stock(ts_code: str, concept_dir: Optional[str] = None, blacklist: Sequence[str] = (), prefer_names: bool = True) -> Optional[str]:
+    """返回单只股票概念字符串。"""
+    mapping = get_concept_mapping(concept_dir=concept_dir, blacklist=blacklist, prefer_names=prefer_names)
+    return mapping.get(str(ts_code))
+
+
+def add_concept_column(df: pd.DataFrame, ts_col: str = "ts_code", out_col: str = "概念",
+                       concept_dir: Optional[str] = None, blacklist: Sequence[str] = (), prefer_names: bool = True) -> pd.DataFrame:
+    """若存在代码列则追加概念列（黑名单已过滤）。"""
+    if df is None or df.empty or ts_col not in df.columns:
+        return df
+    df = df.copy()
+    mapping = get_concept_mapping(concept_dir=concept_dir, blacklist=blacklist, prefer_names=prefer_names)
+    df[out_col] = df[ts_col].astype(str).map(mapping).fillna("")
+    return df
 
 # 策略文件读取工具
 from dataclasses import dataclass

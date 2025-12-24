@@ -1004,6 +1004,9 @@ class DatabaseManager:
         # 预加载数据缓存（用于存储全市场预加载数据）
         self._preload_caches: Dict[str, Dict[str, Any]] = {}  # key: cache_name, value: cache_dict
         self._preload_cache_lock = threading.RLock()
+        # 全表内存缓存（针对小体量数据库，加速查询）
+        self._full_table_cache: Dict[Tuple[str, str], pd.DataFrame] = {}  # key=(db_path, adj_type)
+        self._full_cache_lock = threading.RLock()
         
         # 状态文件管理（合并自 database_status）
         try:
@@ -2337,6 +2340,91 @@ class DatabaseManager:
                     continue
         
         return None
+
+    def _can_use_full_cache(self, db_path: str) -> bool:
+        """
+        判断是否启用全表内存缓存：
+        - 优先 FULL_STOCK_CACHE_MAX_MB 设定绝对阈值（MB）
+        - 否则按内存占比阈值判断：默认最多占用物理内存的 20%（可用 FULL_STOCK_CACHE_RATIO 调整）
+        - 配置 FULL_STOCK_CACHE_ENABLED=False 或环境变量 FULL_STOCK_CACHE_DISABLE=1 时禁用
+        """
+        try:
+            from config import FULL_STOCK_CACHE_ENABLED
+        except Exception:
+            FULL_STOCK_CACHE_ENABLED = True
+        
+        if not FULL_STOCK_CACHE_ENABLED:
+            logger.debug("[full-cache] FULL_STOCK_CACHE_ENABLED=False，禁用全表缓存")
+            return False
+        
+        if os.environ.get("FULL_STOCK_CACHE_DISABLE", "").lower() in ("1", "true", "yes"):
+            return False
+        # 1) 显式 MB 阈值优先
+        try:
+            if "FULL_STOCK_CACHE_MAX_MB" in os.environ:
+                max_mb = float(os.environ.get("FULL_STOCK_CACHE_MAX_MB", 0))
+            else:
+                max_mb = None
+        except Exception:
+            max_mb = None
+        # 2) 按内存占比计算阈值
+        if max_mb is None or max_mb <= 0:
+            try:
+                ratio = float(os.environ.get("FULL_STOCK_CACHE_RATIO", 0.2))
+                ratio = min(max(ratio, 0.01), 0.8)  # clamp 1%~80%
+            except Exception:
+                ratio = 0.2
+            total_mem = None
+            try:
+                import psutil  # type: ignore
+                total_mem = psutil.virtual_memory().total
+            except Exception:
+                try:
+                    total_mem = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+                except Exception:
+                    total_mem = None
+            if total_mem:
+                max_mb = (total_mem / (1024 * 1024)) * ratio
+            else:
+                max_mb = 2048.0  # 回退
+        try:
+            size_mb = os.path.getsize(db_path) / (1024 * 1024)
+            return size_mb <= max_mb
+        except Exception:
+            return False
+
+    def _get_full_table_cache(self, db_path: str, adj_type: str) -> Optional[pd.DataFrame]:
+        """
+        返回指定 adj_type 的全表内存缓存；若不存在且符合条件则加载。
+        仅在单进程场景可靠，多进程会各自维护一份内存副本。
+        """
+        key = (db_path, adj_type or "")
+        with self._full_cache_lock:
+            if key in self._full_table_cache:
+                return self._full_table_cache[key]
+        
+        if not self._can_use_full_cache(db_path):
+            return None
+        
+        try:
+            sql = "SELECT * FROM stock_data"
+            params: List[Any] = []
+            if adj_type:
+                sql += " WHERE adj_type = ?"
+                params.append(adj_type)
+            sql += " ORDER BY ts_code, trade_date"
+            df = self.execute_sync_query(db_path, sql, params, timeout=300.0)
+            if df.empty:
+                return None
+            if "trade_date" in df.columns and df["trade_date"].dtype != object:
+                df["trade_date"] = df["trade_date"].astype(str)
+            with self._full_cache_lock:
+                self._full_table_cache[key] = df
+            logger.info(f"[full-cache] 已加载全表缓存: {db_path}, adj={adj_type}, 行数={len(df)}")
+            return df
+        except Exception as e:
+            logger.warning(f"[full-cache] 加载失败: {db_path}, adj={adj_type}, err={e}")
+            return None
     
     def query_stock_data(self, db_path: str = None, ts_code: str = None, start_date: str = None, 
                         end_date: str = None, columns: List[str] = None, adj_type: str = "qfq", limit: Optional[int] = None,
@@ -2382,6 +2470,54 @@ class DatabaseManager:
             if not os.path.exists(db_path):
                 logger.warning(f"数据库文件不存在: {db_path}")
                 return pd.DataFrame()
+
+            # 生成缓存键
+            cache_key = self._get_cache_key([ts_code] if ts_code else None, start_date, end_date, columns, adj_type)
+            
+            # 有 limit 的场景不加载全表缓存，避免增量预加载时整表进内存拖慢启动
+            use_full_cache = limit is None
+            if use_full_cache:
+                full_df = self._get_full_table_cache(db_path, adj_type)
+                if full_df is not None:
+                    df_mem = full_df
+                    # 条件过滤
+                    mask = pd.Series(True, index=df_mem.index)
+                    if ts_code:
+                        mask &= df_mem["ts_code"] == ts_code
+                    if start_date:
+                        mask &= df_mem["trade_date"] >= str(start_date)
+                    if end_date:
+                        mask &= df_mem["trade_date"] <= str(end_date)
+                    if adj_type:
+                        mask &= df_mem["adj_type"] == adj_type
+                    df_mem = df_mem.loc[mask]
+
+                    if columns:
+                        keep_cols = [c for c in columns if c in df_mem.columns]
+                        base_cols = [c for c in ["ts_code", "trade_date"] if c in df_mem.columns]
+                        col_order: List[str] = []
+                        for c in base_cols + keep_cols:
+                            if c not in col_order:
+                                col_order.append(c)
+                        if col_order:
+                            df_mem = df_mem[col_order]
+
+                    # 排序与 limit
+                    order = (order or "asc").lower()
+                    asc = False if order == "desc" else True
+                    sort_cols = ["trade_date"]
+                    if not ts_code:
+                        sort_cols = ["ts_code", "trade_date"]
+                    df_mem = df_mem.sort_values(sort_cols, ascending=asc)
+                    if limit is not None:
+                        try:
+                            limit_int = int(limit)
+                            if limit_int > 0:
+                                df_mem = df_mem.head(limit_int)
+                        except Exception:
+                            pass
+
+                    return df_mem.reset_index(drop=True).copy()
             
             # 构建查询条件
             conditions = []
@@ -2500,9 +2636,41 @@ class DatabaseManager:
             if not os.path.exists(db_path):
                 logger.warning(f"数据库文件不存在: {db_path}")
                 return pd.DataFrame()
-            
+
             # 生成缓存键
             cache_key = self._get_cache_key(ts_codes, start_date, end_date, columns, adj_type)
+            
+            # 尝试使用全表内存缓存（小体量数据库）
+            full_df = self._get_full_table_cache(db_path, adj_type)
+            if full_df is not None:
+                df_mem = full_df
+                mask = pd.Series(True, index=df_mem.index)
+                if ts_codes:
+                    mask &= df_mem["ts_code"].isin(ts_codes)
+                if start_date:
+                    mask &= df_mem["trade_date"] >= str(start_date)
+                if end_date:
+                    mask &= df_mem["trade_date"] <= str(end_date)
+                if adj_type:
+                    mask &= df_mem["adj_type"] == adj_type
+                df_mem = df_mem.loc[mask]
+
+                if columns:
+                    keep_cols = [c for c in columns if c in df_mem.columns]
+                    base_cols = [c for c in ["ts_code", "trade_date"] if c in df_mem.columns]
+                    col_order: List[str] = []
+                    for c in base_cols + keep_cols:
+                        if c not in col_order:
+                            col_order.append(c)
+                    if col_order:
+                        df_mem = df_mem[col_order]
+
+                df_mem = df_mem.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+
+                # 设置查询缓存，避免后续重复过滤
+                if not df_mem.empty:
+                    self._set_cached_data(cache_key, df_mem)
+                return df_mem
             
             # 尝试从缓存获取
             cached_df = self._get_cached_data(cache_key)
@@ -3615,6 +3783,8 @@ class DatabaseSchemaManager:
             
             # 动态添加缺失的指标列
             self._add_missing_indicator_columns(conn, "duckdb")
+            # 补充扩展基础列（如总股本）
+            self._ensure_stock_extra_columns(conn, "duckdb")
             
             # 创建优化索引 - 简化索引配置
             # 主键 (ts_code, trade_date, adj_type) 已经覆盖了大部分查询场景
@@ -3661,6 +3831,8 @@ class DatabaseSchemaManager:
             
             # 动态添加缺失的指标列
             self._add_missing_indicator_columns(conn, "sqlite")
+            # 补充扩展基础列（如总股本）
+            self._ensure_stock_extra_columns(conn, "sqlite")
             
             # 创建索引 - 优化后只保留必要的复合索引
             # 主键 (ts_code, trade_date, adj_type) 已经覆盖了大部分查询场景
@@ -3706,6 +3878,30 @@ class DatabaseSchemaManager:
                         logger.warning(f"添加指标列失败 {col}: {e}")
         except Exception as e:
             logger.warning(f"动态添加指标列失败: {e}")
+
+    def _ensure_stock_extra_columns(self, conn, db_type: str):
+        """为 stock_data 表补充扩展基础列（如总股本），不存在则添加。"""
+        extra_columns = {
+            "total_share": "DECIMAL(20,4)",
+        }
+        try:
+            if db_type == "duckdb":
+                result = conn.execute("DESCRIBE stock_data").fetchall()
+                existing_cols = [row[0] for row in result]
+            else:
+                cursor = conn.execute("PRAGMA table_info(stock_data)")
+                existing_cols = [row[1] for row in cursor.fetchall()]
+
+            for col, type_sql in extra_columns.items():
+                if col not in existing_cols:
+                    try:
+                        alter_sql = f'ALTER TABLE stock_data ADD COLUMN "{col}" {type_sql}'
+                        conn.execute(alter_sql)
+                        logger.info(f"补充 stock_data 列: {col}")
+                    except Exception as e:
+                        logger.warning(f"添加扩展列失败 {col}: {e}")
+        except Exception as e:
+            logger.warning(f"检查/补充扩展列失败: {e}")
     
     def init_stock_details_tables(self, db_path: str, db_type: str = "duckdb"):
         """初始化股票详情表结构"""

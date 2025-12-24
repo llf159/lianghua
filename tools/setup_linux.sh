@@ -6,4 +6,4 @@ sudo apt install -y python3-venv
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install pandas numpy openpyxl tqdm tabulate scipy matplotlib pyarrow gradio xlsxwriter plotly tushare streamlit duckdb flask rich
+pip install pandas numpy openpyxl tqdm tabulate scipy matplotlib pyarrow gradio xlsxwriter plotly tushare streamlit duckdb flask rich selenium

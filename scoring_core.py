@@ -106,6 +106,11 @@ def _get_database_manager_functions():
 def _read_data_via_dispatcher(ts_code: str, start_date: str, end_date: str, columns: List[str]) -> pd.DataFrame:
     """通过数据库管理器读取股票数据"""
     try:
+        # 优先从预加载排名缓存截取
+        df_cache = _slice_rank_cache(ts_code, start_date, end_date, columns)
+        if df_cache is not None:
+            return df_cache
+
         from database_manager import query_stock_data
         
         # 使用 database_manager 的 query_stock_data 函数
@@ -1302,6 +1307,39 @@ def _get_rank_data_from_cache(ref_date: str, N: int, codes: List[str]) -> Option
     _CACHE_STATS["hits"] += 1
     LOGGER.debug(f"[缓存命中] 使用预加载数据: {len(_RANK_DATA_CACHE['data'])} 条记录")
     return _RANK_DATA_CACHE["data"]
+
+def _slice_rank_cache(ts_code: str, start_date: str, end_date: str, columns: List[str]) -> Optional[pd.DataFrame]:
+    """
+    尝试直接从预加载的排名数据中截取单票数据，避免重复查询/切片。
+    仅当缓存存在且覆盖请求区间且列齐全时返回 DataFrame，否则返回 None。
+    """
+    data = _RANK_DATA_CACHE.get("data")
+    if data is None or data.empty:
+        return None
+    cache_start = _RANK_DATA_CACHE.get("start_date")
+    cache_ref = _RANK_DATA_CACHE.get("ref_date")
+    if cache_start and start_date and cache_start > start_date:
+        return None
+    if cache_ref and end_date and cache_ref < end_date:
+        return None
+    need_cols = set(columns or [])
+    need_cols.update({"ts_code", "trade_date"})
+    if not need_cols.issubset(set(data.columns)):
+        return None
+    df = data[data["ts_code"] == ts_code]
+    if df.empty:
+        return None
+    if start_date:
+        df = df[df["trade_date"] >= str(start_date)]
+    if end_date:
+        df = df[df["trade_date"] <= str(end_date)]
+    if df.empty:
+        return None
+    cols_order = [c for c in ["ts_code", "trade_date"] if c in df.columns]
+    cols_order += [c for c in columns or [] if c in df.columns and c not in cols_order]
+    if cols_order:
+        df = df[cols_order]
+    return df.sort_values("trade_date").reset_index(drop=True).copy()
 
 
 def _rank_series(s: pd.Series, ascending: bool) -> pd.Series:
@@ -5100,6 +5138,8 @@ def backfill_category_rolling(category_type: str = "strength",
 def build_custom_rank(combo_name: str,
                       rule_names: list[str],
                       agg_mode: str = "OR",
+                      rule_groups: Optional[list[dict]] = None,
+                      group_mode: str = "AND",
                       ref_date: Optional[str] = None,
                       universe: str = "all",
                       tiebreak: str = "kdj_j_asc",
@@ -5111,6 +5151,8 @@ def build_custom_rank(combo_name: str,
       - combo_name: 策略组合名称（用于文件名）
       - rule_names: 策略名列表
       - agg_mode: 聚合模式 'OR'（任一命中）| 'AND'（全部命中）
+      - rule_groups: 混合逻辑组（列表，每组包含 mode: OR/AND 与 rules: [...]），提供时优先使用
+      - group_mode: 组间聚合模式（默认 AND：所有组均满足；OR：任意组满足）
       - ref_date: 参考日（留空=自动最新）
       - universe: 选股范围 'all' | 'white' | 'black' | 'attention' | 'strength'
       - tiebreak: 同分排序方式
@@ -5122,6 +5164,29 @@ def build_custom_rank(combo_name: str,
     from database_manager import get_database_manager
     import json
     
+    # 规范化混合逻辑组
+    normalized_groups = []
+    for g in rule_groups or []:
+        if not isinstance(g, dict):
+            continue
+        rules_in_group = [str(r) for r in g.get("rules", []) if str(r)]
+        if not rules_in_group:
+            continue
+        mode = str(g.get("mode", "OR")).upper()
+        if mode not in ("OR", "AND"):
+            mode = "OR"
+        normalized_groups.append({"mode": mode, "rules": rules_in_group})
+    rule_groups = normalized_groups
+    
+    # 基础规则集合（兼容旧参数）
+    rule_names = list(rule_names or [])
+    group_rule_names = set(r for g in rule_groups for r in g.get("rules", []))
+    if rule_groups and not rule_names:
+        rule_names = sorted(group_rule_names)
+    target_rule_set = set(rule_names) | group_rule_names
+    rule_names_set = set(rule_names)
+    trigger_collect_rules = rule_names if rule_names else sorted(target_rule_set)
+    
     # 获取 details 数据库路径
     def _get_details_db_path():
         """获取 details 数据库路径"""
@@ -5130,6 +5195,32 @@ def build_custom_rank(combo_name: str,
         if os.path.isfile(db_path):
             return db_path
         return None
+    
+    def _hit_logic(names_triggered: set[str]) -> bool:
+        """根据混合逻辑或简单逻辑判断命中"""
+        if rule_groups:
+            group_results = []
+            for g in rule_groups:
+                rules_in_group = g.get("rules", [])
+                if not rules_in_group:
+                    continue
+                mode = g.get("mode", "OR")
+                if mode == "AND":
+                    res = all((r in names_triggered) for r in rules_in_group)
+                else:
+                    res = any((r in names_triggered) for r in rules_in_group)
+                group_results.append(res)
+            if not group_results:
+                return False
+            if str(group_mode).upper() == "OR":
+                return any(group_results)
+            return all(group_results)
+        
+        if not rule_names_set:
+            return False
+        if agg_mode.upper() == "OR":
+            return any((n in names_triggered) for n in rule_names_set)
+        return all((n in names_triggered) for n in rule_names_set)
     
     ref_date = ref_date or _pick_ref_date()
     if not ref_date:
@@ -5215,7 +5306,7 @@ def build_custom_rank(combo_name: str,
                         n = rr.get("name")
                         if n:
                             # 检查是否在选中的策略中
-                            if n in rule_names:
+                            if n in target_rule_set:
                                 names_triggered.add(str(n))
                                 # 收集触发日期
                                 hit_date = rr.get("hit_date")
@@ -5237,15 +5328,12 @@ def build_custom_rank(combo_name: str,
                     continue
                 
                 # 判断是否命中
-                if agg_mode.upper() == "OR":
-                    hit = any((n in names_triggered) for n in rule_names)
-                else:  # AND
-                    hit = all((n in names_triggered) for n in rule_names)
+                hit = _hit_logic(names_triggered)
                 
                 if hit:
                     # 收集所有选中策略的触发日期
                     trigger_dates_list = []
-                    for rule_name in rule_names:
+                    for rule_name in trigger_collect_rules:
                         if rule_name in hit_dates_map:
                             trigger_dates_list.extend(hit_dates_map[rule_name])
                     trigger_dates_list = sorted(set(trigger_dates_list))
@@ -5288,7 +5376,7 @@ def build_custom_rank(combo_name: str,
                             n = rr.get("name")
                             if n:
                                 # 检查是否在选中的策略中
-                                if n in rule_names:
+                                if n in target_rule_set:
                                     names_triggered.add(str(n))
                                     # 收集触发日期
                                     hit_date = rr.get("hit_date")
@@ -5310,15 +5398,12 @@ def build_custom_rank(combo_name: str,
                         continue
                     
                     # 判断是否命中
-                    if agg_mode.upper() == "OR":
-                        hit = any((n in names_triggered) for n in rule_names)
-                    else:  # AND
-                        hit = all((n in names_triggered) for n in rule_names)
+                    hit = _hit_logic(names_triggered)
                     
                     if hit:
                         # 收集所有选中策略的触发日期
                         trigger_dates_list = []
-                        for rule_name in rule_names:
+                        for rule_name in trigger_collect_rules:
                             if rule_name in hit_dates_map:
                                 trigger_dates_list.extend(hit_dates_map[rule_name])
                         trigger_dates_list = sorted(set(trigger_dates_list))
@@ -5333,7 +5418,11 @@ def build_custom_rank(combo_name: str,
         
         if not rows:
             exclude_info = f"，排除策略={exclude_rules}" if exclude_rules else ""
-            LOGGER.info(f"[自选榜] {combo_name} 未筛到命中标的（参考日={ref_date}，策略={rule_names}，聚合模式={agg_mode}，选股范围={universe}，股票数={len(codes_all) if codes_all else 0}{exclude_info}）")
+            LOGGER.info(
+                f"[自选榜] {combo_name} 未筛到命中标的（参考日={ref_date}，策略={rule_names or trigger_collect_rules}，"
+                f"聚合模式={agg_mode if not rule_groups else f'mixed(groups={len(rule_groups)}, mode={group_mode})'}，"
+                f"选股范围={universe}，股票数={len(codes_all) if codes_all else 0}{exclude_info}）"
+            )
             return None
         
         # 构建DataFrame并排序

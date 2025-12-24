@@ -35,6 +35,22 @@ INDEX_WHITELIST = [
 # 复权方式
 API_ADJ = "qfq"  # 可选: "qfq" | "hfq" | "raw"
 
+# 概念显示黑名单（列表中的概念名称不展示）
+CONCEPT_BLACKLIST = ["百元股", "创业板综", "融资融券", "QFII重仓", "并购重组概念", "2025中报扭亏", "参股保险", "2025三季报预增", 
+                     "注册制次新股", "国家大基金持股", "同花顺果指数", "科创次新股", "2025中报预增", "中字头股票", "回购增持再贷款概念",
+                     "新股与次新股"]
+# 概念读取数据源：下载阶段固定同时抓取东财 + 同花顺，读取时可选择
+CONCEPT_READ_SOURCE = "ths"  # em=仅东财；ths=仅同花顺；mix=东财优先，不足用同花顺补
+# 概念榜小样本收缩强度（置信调整），值越大对覆盖数少的概念压制越强，常用 5~10
+CONCEPT_SHRINK_ALPHA = 5
+
+# 同花顺抓取代理配置（供 scrape_concepts 使用；端口<=0 表示仅直连）
+THS_PROXY_HOST = os.getenv("THS_PROXY_HOST", "127.0.0.1")
+try:
+    THS_PROXY_PORT = int(os.getenv("THS_PROXY_PORT", "12334"))
+except Exception:
+    THS_PROXY_PORT = 12334
+
 # ================= 限频控制配置 =================
 # API调用频率限制：你的权限额度
 CALLS_PER_MIN = 500
@@ -87,6 +103,8 @@ DUCKDB_THREADS = 16  # DuckDB使用的线程数（所有连接统一使用此值
 DUCKDB_MEMORY_LIMIT = "18GB"  # DuckDB内存限制（所有连接统一使用此值）
 DUCKDB_TEMP_DIR = os.path.join(DATA_ROOT, "duckdb_tmp")  # 临时文件目录
 DUCKDB_CLEAR_DAILY_BEFORE = False  # 是否在写入前清理每日数据
+# 全表内存缓存开关（针对小体量数据库，默认开启；关闭后始终走数据库查询）
+FULL_STOCK_CACHE_ENABLED = True
 
 # 数据库连接配置（由数据库连接配置管理器统一应用）
 DB_QUERY_TIMEOUT = 30  # 查询超时时间（秒），读写连接为2倍
