@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os, io, json, re
+import os, io, json, re, math
 import warnings
 from pathlib import Path
 from datetime import datetime, timedelta, date
@@ -1003,6 +1003,41 @@ def _path_detail(ref: str, ts: str) -> Path: return DET_DIR / ref / f"{normalize
 def _today_str() -> str:
     return date.today().strftime("%Y%m%d")
 
+def _normalize_rank_date_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """统一排名文件的日期列：优先保留 ref_date，若只有 trade_date 则重命名；两者同时存在则去掉 trade_date。"""
+    if df is None or df.empty:
+        return df
+    df2 = df.copy()
+    has_ref = "ref_date" in df2.columns
+    has_trade = "trade_date" in df2.columns
+    if has_ref and has_trade:
+        df2 = df2.drop(columns=["trade_date"])
+    elif has_trade and not has_ref:
+        df2 = df2.rename(columns={"trade_date": "ref_date"})
+    return df2
+
+
+def _cleanup_rank_file_dates(path: str | Path) -> None:
+    """落盘后的排名文件去重日期列，确保只保留 ref_date。"""
+    try:
+        p = Path(path)
+        if not p.exists() or p.suffix.lower() != ".csv":
+            return
+        df = pd.read_csv(p, dtype={"ts_code": str}, encoding="utf-8-sig", engine="c")
+        if df is None or df.empty:
+            return
+        df_norm = _normalize_rank_date_cols(df)
+        try:
+            unchanged = df_norm.equals(df)
+        except Exception:
+            unchanged = False
+        if unchanged:
+            return
+        # 如有调整，覆盖写回
+        df_norm.to_csv(p, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        logger.debug(f"清理排名日期列失败 {path}: {e}")
+
 @cache_data(show_spinner=False, ttl=120)
 def _read_rank_all_sorted(ref: str) -> pd.DataFrame:
     """读取全量排名并保证含 rank 列与顺序"""
@@ -1012,7 +1047,7 @@ def _read_rank_all_sorted(ref: str) -> pd.DataFrame:
     df = _read_df(path, dtype={"ts_code": str})
     if df is None or df.empty:
         return pd.DataFrame()
-    df_sorted = df.copy()
+    df_sorted = _normalize_rank_date_cols(df)
     if "rank" in df_sorted.columns:
         df_sorted = df_sorted.sort_values("rank")
     else:
@@ -1251,6 +1286,55 @@ def _format_market_caps(ts_code: str):
             return None
 
     return fmt(info.get("total_mv")), fmt(info.get("circ_mv"))
+
+# 总市值分桶（亿元）
+_CAP_BUCKETS = [
+    ("≤50亿", 0.0, 50.0),
+    ("50-100亿", 50.0, 100.0),
+    ("100-200亿", 100.0, 200.0),
+    ("200-500亿", 200.0, 500.0),
+    ("500-1000亿", 500.0, 1000.0),
+    (">1000亿", 1000.0, None),
+]
+_CAP_BUCKET_MAP = {label: (lo, hi) for label, lo, hi in _CAP_BUCKETS}
+
+
+def _total_mv_billion(ts_code: str, mp: Optional[dict[str, dict]] = None) -> float:
+    """查总市值，单位亿元；查不到返回 NaN。"""
+    mp = mp or _get_stock_basic_map()
+    if not mp:
+        return float("nan")
+    ts = str(ts_code).strip()
+    info = mp.get(ts) or (mp.get(ts.split(".")[0]) if "." in ts else None)
+    if not info:
+        return float("nan")
+    val = info.get("total_mv")
+    try:
+        v = float(val)
+    except Exception:
+        return float("nan")
+    return v / 1e4  # tushare 单位万元 → 亿元
+
+
+def _apply_total_mv_filter(df: pd.DataFrame, buckets: Sequence[str], *, out_col: str = "total_mv_亿") -> pd.DataFrame:
+    """按总市值分桶过滤并附加列；buckets 为空则不筛选。"""
+    if df is None or df.empty:
+        return df
+    df2 = df.copy()
+    mp = _get_stock_basic_map()
+    df2[out_col] = df2["ts_code"].astype(str).apply(lambda x: _total_mv_billion(x, mp))
+    ranges = [_CAP_BUCKET_MAP[b] for b in buckets if b in _CAP_BUCKET_MAP]
+    if not ranges:
+        return df2
+    mv = pd.to_numeric(df2[out_col], errors="coerce")
+    mask = pd.Series(False, index=df2.index)
+    for lo, hi in ranges:
+        part = mv >= lo
+        if hi is not None:
+            part &= mv < hi
+        mask |= part
+    # 没有命中桶的（NaN）会被过滤掉
+    return df2[mask]
 
 
 def _get_kline_price_cache() -> dict[str, pd.DataFrame]:
@@ -1542,6 +1626,8 @@ def _render_price_kline_chart(
     default_window: int = 60,
     expander_label: str = "价格 K 线",
     price_cache: Optional[dict[str, pd.DataFrame]] = None,
+    load_full_history: bool = True,
+    window_days: int = 320,
 ):
     """复用个股详情的 K 线绘制逻辑，可复用到其他页签（非折叠展示）。"""
     if not ts:
@@ -1558,10 +1644,17 @@ def _render_price_kline_chart(
             if price_cache is not None and ts in price_cache:
                 df_price = price_cache[ts]
             else:
+                # 仅在需要时加载全量数据，个股详情可按窗口截取减少 IO
+                start_date = None
+                if not load_full_history and ref_real:
+                    try:
+                        start_date = _prev_trade_date(ref_real, int(window_days))
+                    except Exception:
+                        start_date = None
                 df_price = query_stock_data(
                     db_path=os.path.join(DATA_ROOT, UNIFIED_DB_PATH),
                     ts_code=ts,
-                    start_date=None,
+                    start_date=start_date,
                     end_date=None,
                     adj_type="qfq",
                     limit=None
@@ -1991,6 +2084,10 @@ def run_se_run_for_date_in_bg(arg):
                     logger.warning(f"[评分] 数据库连接测试失败: {e}")
                 
                 result["path"] = se.run_for_date(arg)
+                try:
+                    _cleanup_rank_file_dates(result["path"])
+                except Exception as e:
+                    logger.debug(f"评分文件日期列清理失败: {e}")
             except Exception as e:
                 result["err"] = e
             finally:
@@ -3075,8 +3172,8 @@ if _in_streamlit():
     if "export_pref" not in st.session_state:
         st.session_state["export_pref"] = {"style": "space", "with_suffix": True}
 
-    tab_rank, tab_detail, tab_kline, tab_screen, tab_stats, tab_attn, tab_custom, tab_sector, tab_position, tab_predict, tab_rules, tab_tools, tab_port, tab_data_view, tab_logs, = st.tabs(
-        ["排名", "个股详情", "K线看板", "选股", "统计", "衍生榜", "自选榜", "板块榜", "持仓建议", "明日模拟", "规则编辑", "工具箱", "组合模拟/持仓", "数据管理", "日志"])
+    tab_rank, tab_detail, tab_kline, tab_screen, tab_stats, tab_attn, tab_custom, tab_position, tab_predict, tab_rules, tab_tools, tab_port, tab_data_view, tab_logs, = st.tabs(
+        ["排名", "个股详情", "K线看板", "选股", "统计", "衍生榜", "自选榜", "持仓建议", "明日模拟", "规则编辑", "工具箱", "组合模拟/持仓", "数据管理", "日志"])
 
     # ================== 排名 ==================
     with tab_rank:
@@ -3235,6 +3332,11 @@ if _in_streamlit():
                             return name_map.get(ts.split(".")[0], "")
                         return ""
                     df_filtered["名称"] = df_filtered["ts_code"].apply(_lookup_name)
+                    # 添加总市值（亿元），用于展示
+                    mp_basic = _get_stock_basic_map()
+                    df_filtered["总市值(亿)"] = df_filtered["ts_code"].apply(
+                        lambda x: _total_mv_billion(str(x), mp_basic)
+                    )
                     df_filtered = add_concept_column(df_filtered, ts_col="ts_code", out_col="概念", blacklist=CONCEPT_BLACKLIST)
                 
                 # 展示方式设置
@@ -3263,6 +3365,13 @@ if _in_streamlit():
                         cols.remove("名称")
                         ts_idx = cols.index("ts_code") + 1 if "ts_code" in cols else 1
                         cols.insert(ts_idx, "名称")
+                        display_df = display_df[cols]
+                    # 将总市值列靠近名称
+                    if "总市值(亿)" in display_df.columns and "名称" in display_df.columns:
+                        cols = display_df.columns.tolist()
+                        cols.remove("总市值(亿)")
+                        name_idx = cols.index("名称") + 1 if "名称" in cols else len(cols)
+                        cols.insert(name_idx, "总市值(亿)")
                         display_df = display_df[cols]
                     
                     st.dataframe(display_df, width='stretch', height=420)
@@ -3627,6 +3736,8 @@ if _in_streamlit():
                     ref_real=ref_real,
                     options_codes=options_codes,
                     nav_state_prefix="detail",
+                    load_full_history=False,  # 个股详情只拉取当前展示窗口的数据，避免加载过多
+                    window_days=280,
                 )
 
                 # 逐规则明细（可选显示 when）
@@ -3962,12 +4073,9 @@ if _in_streamlit():
         if "kline_ref_date_single" not in st.session_state:
             st.session_state["kline_ref_date_single"] = _get_latest_date_from_files() or ""
         ref_real_kline = (st.session_state.get("kline_ref_date_single") or "").strip() or _get_latest_date_from_files() or ""
-        df_all_rank_kline = _read_rank_all_sorted(ref_real_kline) if ref_real_kline else pd.DataFrame()
-        df_top_ref_kline = df_all_rank_kline.head(200) if not df_all_rank_kline.empty else pd.DataFrame()
-        options_codes_kline = df_top_ref_kline["ts_code"].astype(str).tolist() if ("ts_code" in df_top_ref_kline.columns and not df_top_ref_kline.empty) else []
         display_codes_saved = st.session_state.get("kline_display_list", [])
-        # 若已有生成名单，则导航/选择优先使用该名单
-        nav_codes_kline = display_codes_saved if display_codes_saved else options_codes_kline
+        # 仅在用户点击生成名单后使用缓存名单，默认不导入 TopK
+        nav_codes_kline = display_codes_saved
 
         pending_code_kline = st.session_state.pop("kline_pending_code", None) if "kline_pending_code" in st.session_state else None
         if "kline_last_code" not in st.session_state:
@@ -3995,11 +4103,9 @@ if _in_streamlit():
 
         code_norm_kline = normalize_ts(effective_code_kline) if effective_code_kline else ""
 
-        # 进入时自动预加载当前名单，避免单独按钮
+        # 不在启动时预加载 TopK，只有已有名单时才预加载
         if nav_codes_kline:
             _prefetch_kline_prices(nav_codes_kline, adj_type="qfq")
-        elif code_norm_kline:
-            _prefetch_kline_prices([code_norm_kline], adj_type="qfq")
 
         if code_norm_kline and ref_real_kline:
             _render_price_kline_chart(
@@ -4139,9 +4245,15 @@ if _in_streamlit():
                 )
 
                 if list_source == "自定义名单":
+                    custom_default = st.session_state.get("kline_custom_text", "")
+                    col_clear1, col_clear2 = st.columns([1, 1])
+                    with col_clear1:
+                        if st.button("清空自定义名单", key="btn_clear_kline_custom", use_container_width=True):
+                            st.session_state["kline_custom_text"] = ""
+                            st.session_state["kline_custom_text_area"] = ""
                     custom_text = st.text_area(
                         "自定义名单（换行/逗号分隔，可填代码或名称）",
-                        value=st.session_state.get("kline_custom_text", ""),
+                        value=st.session_state.get("kline_custom_text", custom_default),
                         placeholder="000001.SZ\n平安银行\n600519.SH",
                         height=120,
                         key="kline_custom_text_area"
@@ -5139,7 +5251,7 @@ if _in_streamlit():
         with s3:
             speed_topn = st.number_input("输出 Top-N", min_value=5, max_value=1000, value=100, key="speed_topn")
         btn_speed = st.button("生成涨速榜", key="btn_speed_rank", width='stretch')
-        st.caption("计算方式：对比 N 日前与观察日的排名，rank_old - rank_new 为涨速基准，越大表示排名提升越快。")
+        st.caption("计算方式：排名映射为贡献度（对数+二次积分，100 名内封顶0.33），贡献度差值越大表示排名提升越快。")
 
         def _speed_file_path(start_date: str, end_date: str, n_days: int) -> Path:
             return SPEED_DIR / f"speed_rank_{start_date}_{end_date}_n{int(n_days)}.csv"
@@ -5157,7 +5269,7 @@ if _in_streamlit():
         def _ensure_rank(df: pd.DataFrame) -> pd.DataFrame:
             if df is None or df.empty:
                 return pd.DataFrame()
-            _df = df.copy()
+            _df = _normalize_rank_date_cols(df)
             if "rank" not in _df.columns:
                 if "score" not in _df.columns:
                     return pd.DataFrame()
@@ -5165,6 +5277,35 @@ if _in_streamlit():
                 _df["rank"] = np.arange(1, len(_df) + 1)
             _df["rank"] = pd.to_numeric(_df["rank"], errors="coerce")
             return _df[["ts_code", "rank"]].dropna()
+
+        SPEED_RANK_MAX_DEFAULT = 6000.0  # 默认榜尾名次，用于计算贡献度的对数刻度
+        SPEED_RANK_FLAT = 100.0          # 100 名以内贡献封顶
+        SPEED_CONTRIB_CAP = 0.33         # 贡献封顶值（与前期讨论保持一致）
+
+        def _rank_contribution_score(rank_series: pd.Series, *, max_rank: float | None = None) -> pd.Series:
+            """将排名映射到贡献度（封顶），越靠前贡献越高，100 名内平坦。"""
+            if rank_series is None or len(rank_series) == 0:
+                return pd.Series([], dtype=float)
+            # 选用数据中的最大排名与默认值的较大者，保持对数尺度稳定
+            max_in_series = pd.to_numeric(rank_series, errors="coerce").max()
+            _max_rank = max(
+                float(max_rank) if max_rank is not None and np.isfinite(max_rank) else 0.0,
+                float(max_in_series) if pd.notna(max_in_series) else 0.0,
+                SPEED_RANK_MAX_DEFAULT,
+                SPEED_RANK_FLAT + 1.0
+            )
+            denom = math.log(_max_rank / SPEED_RANK_FLAT) if _max_rank > SPEED_RANK_FLAT else 1.0
+
+            def _calc(val):
+                if not np.isfinite(val):
+                    return np.nan
+                r = max(float(val), 1.0)
+                x = math.log(_max_rank / r) / denom if denom > 0 else 0.0
+                x = min(max(x, 0.0), 1.0)
+                contrib = (x ** 2) / 2.0
+                return min(contrib, SPEED_CONTRIB_CAP)
+
+            return pd.to_numeric(rank_series, errors="coerce").apply(_calc)
 
         def _build_speed_board(start_use: str, end_use: str, n_days: int, *, reuse_file: bool = True, save_file: bool = True) -> tuple[pd.DataFrame, Path]:
             """返回涨速榜数据及文件路径，优先复用落盘文件。"""
@@ -5174,7 +5315,7 @@ if _in_streamlit():
             if reuse_file and file_path.exists():
                 try:
                     df_cached = _read_df(file_path, dtype={"ts_code": str})
-                    if not df_cached.empty:
+                    if not df_cached.empty and {"contrib_delta"}.issubset(df_cached.columns):
                         return df_cached, file_path
                 except Exception as e:
                     st.warning(f"读取缓存涨速榜失败（将重算）：{e}")
@@ -5193,11 +5334,16 @@ if _in_streamlit():
 
             n_days_float = float(n_days)
             df_speed["rank_delta"] = df_speed["rank_old"] - df_speed["rank_new"]
-            df_speed["speed_per_day"] = (df_speed["rank_delta"] / n_days_float).round(0).astype(int)
+
+            max_rank_for_scale = pd.concat([df_speed["rank_old"], df_speed["rank_new"]], ignore_index=True).max()
+            df_speed["contrib_old"] = _rank_contribution_score(df_speed["rank_old"], max_rank=max_rank_for_scale)
+            df_speed["contrib_new"] = _rank_contribution_score(df_speed["rank_new"], max_rank=max_rank_for_scale)
+            df_speed["contrib_delta"] = (df_speed["contrib_new"] - df_speed["contrib_old"]).round(6)
+            df_speed["speed_norm"] = (df_speed["contrib_delta"] / SPEED_CONTRIB_CAP).round(6)
             df_speed["start_date"] = start_use
             df_speed["end_date"] = end_use
             df_speed = df_speed.sort_values(
-                ["speed_per_day", "rank_new", "rank_old", "ts_code"],
+                ["contrib_delta", "rank_new", "rank_old", "ts_code"],
                 ascending=[False, True, True, True]
             ).reset_index(drop=True)
 
@@ -5217,7 +5363,8 @@ if _in_streamlit():
             top_df = add_concept_column(top_df, blacklist=CONCEPT_BLACKLIST, out_col="概念")
             if "概念" not in top_df.columns:
                 return pd.DataFrame()
-            prior_speed = pd.to_numeric(df_base.get("speed_per_day"), errors="coerce").mean()
+            # 采用总贡献度增量作为概念强度基准
+            prior_speed = pd.to_numeric(df_base.get("contrib_delta"), errors="coerce").mean()
 
             rank_meta = _read_rank_all_sorted(ref_date) if ref_date else pd.DataFrame()
             if not rank_meta.empty:
@@ -5243,7 +5390,7 @@ if _in_streamlit():
                     concept_item = {
                         "ts_code": r.get("ts_code", ""),
                         "name": r.get("name", ""),
-                        "speed": float(r.get("speed_per_day", 0) or 0),
+                        "speed": float(r.get("contrib_delta", 0) or 0),
                         "rank_new": pd.to_numeric(r.get("rank_new"), errors="coerce"),
                     "rank_old": pd.to_numeric(r.get("rank_old"), errors="coerce"),
                     "rank_meta": pd.to_numeric(r.get("rank_meta"), errors="coerce"),
@@ -5270,8 +5417,7 @@ if _in_streamlit():
                 )
                 stocks_str = "; ".join(
                     [
-                        f"{row.ts_code}({int(row.rank_for_sort) if np.isfinite(row.rank_for_sort) else '-'} | {int(row.speed)})"
-                        if np.isfinite(row.speed) else f"{row.ts_code}"
+                        f"{row.ts_code}({int(row.rank_for_sort) if np.isfinite(row.rank_for_sort) else '-'})"
                         for row in df_c_sorted.itertuples()
                     ]
                 )
@@ -5384,115 +5530,68 @@ if _in_streamlit():
                     int(res.get("rows_eff", speed_topn)),
                 )
 
-        # ===== 排名概念榜（独立榜单） =====
-        st.subheader("排名概念榜")
-        cc1, cc2, cc3 = st.columns([2, 1, 1])
-        with cc1:
-            concept_rank_ref = st.text_input("参考日（YYYYMMDD；留空=最新评分）", value=_get_latest_date_from_files() or "", key="concept_rank_ref")
-        with cc2:
-            concept_rank_topn = st.number_input("取前 Top-N（基于排名）", min_value=5, max_value=5000, value=1000, key="concept_rank_topn")
-        with cc3:
-            concept_rank_concept_topk = st.number_input("概念榜显示 Top-K", min_value=5, max_value=500, value=50, key="concept_rank_concept_topk")
-        btn_concept_rank = st.button("生成概念榜", key="btn_rank_concept", width='stretch')
-
-        def _build_concept_board_from_rank(df_rank: pd.DataFrame, head_n: int) -> tuple[pd.DataFrame, dict]:
-            """基于排名 Top-N 汇总概念强度，返回榜单与每概念成分详情；加入小样本收缩。"""
-            if df_rank is None or df_rank.empty or head_n <= 0:
-                return pd.DataFrame(), {}
-            top_df = df_rank.head(int(head_n)).copy()
-            top_df = add_concept_column(top_df, blacklist=CONCEPT_BLACKLIST, out_col="概念")
-            if "概念" not in top_df.columns:
-                return pd.DataFrame(), {}
-            tb_col = "tiebreak_j" if "tiebreak_j" in top_df.columns else ("tiebreak" if "tiebreak" in top_df.columns else None)
-
-            def _strength(row: pd.Series) -> float:
-                sc = row.get("score")
-                if pd.notna(sc):
-                    try:
-                        return float(sc)
-                    except Exception:
-                        pass
-                r = pd.to_numeric(row.get("rank"), errors="coerce")
-                if pd.notna(r):
-                    return max(float(head_n + 1 - r), 0.0)
-                return 0.0
-
-            top_df["强度"] = top_df.apply(_strength, axis=1)
-            prior_strength = pd.to_numeric(top_df.get("强度"), errors="coerce").mean()
-
-            concept_bucket: Dict[str, List[Dict[str, Any]]] = {}
-            for _, r in top_df.iterrows():
-                concepts = [c for c in str(r.get("概念", "")).split(",") if c]
-                if not concepts:
-                    continue
-                tb_val = None
-                if tb_col and pd.notna(r.get(tb_col)):
-                    tb_val = pd.to_numeric(r.get(tb_col), errors="coerce")
-                item = {
-                    "ts_code": r.get("ts_code", ""),
-                    "name": r.get("name", ""),
-                    "rank": pd.to_numeric(r.get("rank"), errors="coerce"),
-                    "tiebreak": tb_val,
-                    "strength": float(r.get("强度", 0) or 0),
-                }
-                for c in concepts:
-                    concept_bucket.setdefault(c, []).append(item)
-
-            concept_rows: List[Dict[str, Any]] = []
-            concept_details: Dict[str, pd.DataFrame] = {}
-            for cname, items in concept_bucket.items():
-                df_c = pd.DataFrame(items)
-                if df_c.empty:
-                    continue
-                # 使用不以下划线开头的列名，避免 itertuples 属性访问被重命名
-                df_c["rank_sort"] = pd.to_numeric(df_c["rank"], errors="coerce").fillna(np.inf)
-                df_c["tb_sort"] = pd.to_numeric(df_c["tiebreak"], errors="coerce").fillna(np.inf)
-                df_c_sorted = df_c.sort_values(["rank_sort", "tb_sort", "ts_code"], ascending=[True, True, True])
-                concept_details[cname] = df_c_sorted[["ts_code", "name", "rank", "strength", "tiebreak"]]
-                stocks_str = "; ".join(
-                    [
-                        f"{row.ts_code}({int(row.rank_sort) if np.isfinite(row.rank_sort) else '-'} | {row.strength:.2f})"
-                        for row in df_c_sorted.itertuples()
-                    ]
-                )
-                concept_rows.append(
-                    {
-                        "概念": cname,
-                        "综合强度": df_c["strength"].sum(),
-                        "平均强度": _shrink_mean(df_c["strength"].mean(), len(df_c), prior_strength, CONCEPT_SHRINK_ALPHA),
-                        "覆盖数": len(df_c),
-                        "最佳排名": int(df_c_sorted.iloc[0]["rank_sort"]) if np.isfinite(df_c_sorted.iloc[0]["rank_sort"]) else "",
-                        "最佳tiebreak": float(df_c_sorted.iloc[0]["tb_sort"]) if np.isfinite(df_c_sorted.iloc[0]["tb_sort"]) else np.inf,
-                        "股票": stocks_str,
-                    }
-                )
-
-            concept_df = pd.DataFrame(concept_rows)
-            if concept_df.empty:
-                return concept_df, {}
-            concept_df = concept_df.sort_values(
-                ["平均强度", "综合强度", "最佳排名", "最佳tiebreak", "覆盖数", "概念"],
-                ascending=[False, False, True, True, False, True]
-            )
-            return concept_df.reset_index(drop=True), concept_details
-
-        if btn_concept_rank:
-            ref_use = concept_rank_ref.strip() or _get_latest_date_from_files() or ""
-            if not ref_use:
-                st.warning("未找到参考日，无法生成概念榜。")
+        # ===== 板块榜（挪入衍生榜） =====
+        st.subheader("板块榜")
+        with st.container(border=True):
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                ref_sector = st.text_input("参考日（YYYYMMDD；留空=自动最新）", value=_get_latest_date_from_files() or "", key="sector_ref_date")
+            with c2:
+                sector_speed_n = st.number_input("涨速最大 N（日）", min_value=1, max_value=30, value=5, key="sector_speed_n")
+            gen_sector_btn = st.button("生成板块榜", width="stretch", key="sector_generate")
+        
+        if gen_sector_btn:
+            ref_real = ref_sector.strip() or _get_latest_date_from_files() or ""
+            if not ref_real:
+                st.warning("未能确定参考日，无法生成板块榜。")
             else:
-                df_rank_base = _read_rank_all_sorted(ref_use)
-                if df_rank_base.empty:
-                    st.warning("该参考日的排名文件为空或缺失。")
+                days = _cached_trade_dates(DATA_ROOT, API_ADJ) or []
+                if not days:
+                    st.warning("无法获取交易日历。")
                 else:
-                    with st.container(border=True):
-                        st.caption(f"参考日：{ref_use}，Top-N={int(concept_rank_topn)}（基于排名）")
-                        concept_board_rank, _ = _build_concept_board_from_rank(df_rank_base, int(concept_rank_topn))
-                        if concept_board_rank.empty:
-                            st.caption("Top-N 排名内未匹配到概念。")
-                        else:
-                            st.markdown("**概念榜（按平均强度排序）**")
-                            st.dataframe(concept_board_rank.head(int(concept_rank_concept_topk)), width='stretch', height=420)
+                    if ref_real in days:
+                        end_idx = days.index(ref_real)
+                        end_use = ref_real
+                    else:
+                        end_idx = len(days) - 1
+                        end_use = days[end_idx]
+                        st.info(f"参考日不在交易日历中，已改用最近交易日：{end_use}")
+
+                    results_speed = []
+                    saved_speed_files = []
+                    for n_win in range(int(sector_speed_n), 0, -1):
+                        start_idx = end_idx - int(n_win)
+                        if start_idx < 0:
+                            st.warning(f"交易日不足以回溯 N={n_win}，已跳过。")
+                            continue
+                        start_use = days[start_idx]
+                        df_speed, fp_speed = _build_speed_board(start_use, end_use, n_win, reuse_file=True, save_file=True)
+                        if df_speed is None or df_speed.empty:
+                            continue
+                        concept_board_n = _build_concept_board_from_speed(df_speed, head_n=len(df_speed), ref_date=end_use)
+                        if not concept_board_n.empty:
+                            concept_board_n.insert(0, "窗口N", int(n_win))
+                            results_speed.append(concept_board_n)
+                        if fp_speed:
+                            saved_speed_files.append(fp_speed.name)
+
+                    if results_speed:
+                        with st.expander("各窗口涨速概念榜（按窗口分组，不加权）", expanded=False):
+                            for df_cb in results_speed:
+                                n_win = int(df_cb.iloc[0]["窗口N"]) if not df_cb.empty else 0
+                                st.markdown(f"**窗口 N={n_win}**")
+                                st.dataframe(df_cb.head(100), width="stretch", height=360)
+                        try:
+                            merged_speed = pd.concat(results_speed, ignore_index=True)
+                            st.markdown("**合并视图（含窗口N，按窗口分开）**")
+                            st.dataframe(merged_speed.head(200), width="stretch", height=420)
+                        except Exception:
+                            pass
+                    else:
+                        st.info("未生成涨速概念榜。")
+
+                    if saved_speed_files:
+                        st.caption(f"涨速榜已落盘：{', '.join(saved_speed_files)}（目录：{SPEED_DIR}）")
 
         st.subheader("本地读取")
 
@@ -6233,84 +6332,6 @@ if _in_streamlit():
         else:
             st.info("自定义榜单目录不存在")
 
-    # ================== 板块榜 ==================
-    with tab_sector:
-        st.subheader("板块榜")
-        with st.container(border=True):
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                ref_sector = st.text_input("参考日（YYYYMMDD；留空=自动最新）", value=_get_latest_date_from_files() or "", key="sector_ref_date")
-            with c2:
-                sector_speed_n = st.number_input("涨速最大 N（日）", min_value=1, max_value=30, value=5, key="sector_speed_n")
-            gen_sector_btn = st.button("生成板块榜", width="stretch", key="sector_generate")
-        
-        if gen_sector_btn:
-            ref_real = ref_sector.strip() or _get_latest_date_from_files() or ""
-            if not ref_real:
-                st.warning("未能确定参考日，无法生成板块榜。")
-            else:
-                # 统一处理参考日与交易日
-                days = _cached_trade_dates(DATA_ROOT, API_ADJ) or []
-                if not days:
-                    st.warning("无法获取交易日历。")
-                else:
-                    if ref_real in days:
-                        end_idx = days.index(ref_real)
-                        end_use = ref_real
-                    else:
-                        end_idx = len(days) - 1
-                        end_use = days[end_idx]
-                        st.info(f"参考日不在交易日历中，已改用最近交易日：{end_use}")
-
-                    results_speed = []
-                    saved_speed_files = []
-                    # 逐窗生成/读取涨速榜
-                    for n_win in range(int(sector_speed_n), 0, -1):
-                        start_idx = end_idx - int(n_win)
-                        if start_idx < 0:
-                            st.warning(f"交易日不足以回溯 N={n_win}，已跳过。")
-                            continue
-                        start_use = days[start_idx]
-                        df_speed, fp_speed = _build_speed_board(start_use, end_use, n_win, reuse_file=True, save_file=True)
-                        if df_speed is None or df_speed.empty:
-                            continue
-                        concept_board_n = _build_concept_board_from_speed(df_speed, head_n=len(df_speed), ref_date=end_use)
-                        if not concept_board_n.empty:
-                            concept_board_n.insert(0, "窗口N", int(n_win))
-                            results_speed.append(concept_board_n)
-                        if fp_speed:
-                            saved_speed_files.append(fp_speed.name)
-
-                    # 排名概念榜（独立算法）
-                    df_rank_base = _read_rank_all_sorted(end_use)
-                    concept_board_rank, _ = _build_concept_board_from_rank(df_rank_base, len(df_rank_base) if df_rank_base is not None else 0)
-
-                    # 展示
-                    if results_speed:
-                        with st.expander("各窗口涨速概念榜（按窗口分组，不加权）", expanded=False):
-                            for df_cb in results_speed:
-                                n_win = int(df_cb.iloc[0]["窗口N"]) if not df_cb.empty else 0
-                                st.markdown(f"**窗口 N={n_win}**")
-                                st.dataframe(df_cb.head(100), width="stretch", height=360)
-                        # 合并视图，保留窗口N列，便于全局查看
-                        try:
-                            merged_speed = pd.concat(results_speed, ignore_index=True)
-                            st.markdown("**合并视图（含窗口N，按窗口分开）**")
-                            st.dataframe(merged_speed.head(200), width="stretch", height=420)
-                        except Exception:
-                            pass
-                    else:
-                        st.info("未生成涨速概念榜。")
-
-                    if concept_board_rank is not None and not concept_board_rank.empty:
-                        st.markdown("**按排名综合的概念榜**")
-                        st.dataframe(concept_board_rank.head(100), width="stretch", height=420)
-                    else:
-                        st.info("未生成排名概念榜（可能缺少排名文件）。")
-
-                    if saved_speed_files:
-                        st.caption(f"涨速榜已落盘：{', '.join(saved_speed_files)}（目录：{SPEED_DIR}）")
-
     # ================== 选股 ==================
     with tab_screen:
         st.subheader("选股")
@@ -6342,6 +6363,13 @@ if _in_streamlit():
                 tiebreak_expr = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=1, key="screen_tiebreak_expr")
             with c6:
                 run_btn = st.form_submit_button("运行筛选", width='stretch')
+            cap_sel_expr = st.multiselect(
+                "总市值筛选（亿元，留空=不限；多选=并集）",
+                options=[b[0] for b in _CAP_BUCKETS],
+                default=[],
+                key="screen_cap_expr",
+                help="基于 stock_list.csv 的 total_mv；查不到则无法命中筛选。"
+            )
 
         if run_btn:
             logger.info(f"用户点击运行筛选: 表达式={exp[:50]}..., 级别={level}, 窗口={window}, 范围={scope_logic}")
@@ -6374,35 +6402,39 @@ if _in_streamlit():
                     if df_sel is None or df_sel.empty:
                         st.info("无命中。")
                     else:
-                        ref_for_rank = ""
-                        if "ref_date" in df_sel.columns:
-                            try:
-                                ref_candidates = df_sel["ref_date"].dropna().astype(str)
-                                if not ref_candidates.empty:
-                                    ref_for_rank = ref_candidates.iloc[0]
-                            except Exception:
-                                ref_for_rank = ""
-                        if not ref_for_rank:
-                            ref_for_rank = refD_unified.strip() or _get_latest_date_from_files() or ""
-                        df_sel_ranked = _attach_all_rank(df_sel, ref_for_rank)
-                        # 调整显示列顺序：rank → ts_code → score → 其余
-                        df_show = add_concept_column(df_sel_ranked, blacklist=CONCEPT_BLACKLIST)
-                        if "rank" in df_show.columns:
-                            base_cols = ["rank", "ts_code", "score"]
-                            ordered = [c for c in base_cols if c in df_show.columns]
-                            ordered += [c for c in df_show.columns if c not in ordered]
-                            df_show = df_show[ordered]
-                        # 结果已经按得分排序，直接显示
-                        st.caption(f"命中 {len(df_sel)} 只；参考日：{(df_sel['ref_date'].iloc[0] if 'ref_date' in df_sel.columns and len(df_sel)>0 else (refD_unified or '自动'))}")
-                        if 'score' in df_sel.columns:
-                            st.caption("已按得分排序（降序），同分时按J值升序")
-                        st.dataframe(df_show, width='stretch', height=480)
-                        # 导出 TXT（代码）
-                        if "ts_code" in df_show.columns:
-                            txt = _codes_to_txt(df_show["ts_code"].astype(str).tolist(),
-                                                st.session_state["export_pref"]["style"],
-                                                st.session_state["export_pref"]["with_suffix"])
-                            copy_txt_button(txt, label="📋 复制以上（按当前预览）", key=f"copy_screen_expr_{refD_unified or 'auto'}")
+                        df_sel = _apply_total_mv_filter(df_sel, cap_sel_expr)
+                        if df_sel.empty:
+                            st.info("总市值筛选后无命中。")
+                        else:
+                            ref_for_rank = ""
+                            if "ref_date" in df_sel.columns:
+                                try:
+                                    ref_candidates = df_sel["ref_date"].dropna().astype(str)
+                                    if not ref_candidates.empty:
+                                        ref_for_rank = ref_candidates.iloc[0]
+                                except Exception:
+                                    ref_for_rank = ""
+                            if not ref_for_rank:
+                                ref_for_rank = refD_unified.strip() or _get_latest_date_from_files() or ""
+                            df_sel_ranked = _attach_all_rank(df_sel, ref_for_rank)
+                            # 调整显示列顺序：rank → ts_code → score → 其余
+                            df_show = add_concept_column(df_sel_ranked, blacklist=CONCEPT_BLACKLIST)
+                            if "rank" in df_show.columns:
+                                base_cols = ["rank", "ts_code", "score", "total_mv_亿"]
+                                ordered = [c for c in base_cols if c in df_show.columns]
+                                ordered += [c for c in df_show.columns if c not in ordered]
+                                df_show = df_show[ordered]
+                            # 结果已经按得分排序，直接显示
+                            st.caption(f"命中 {len(df_sel)} 只；参考日：{(df_sel['ref_date'].iloc[0] if 'ref_date' in df_sel.columns and len(df_sel)>0 else (refD_unified or '自动'))}")
+                            if 'score' in df_sel.columns:
+                                st.caption("已按得分排序（降序），同分时按J值升序")
+                            st.dataframe(df_show, width='stretch', height=480)
+                            # 导出 TXT（代码）
+                            if "ts_code" in df_show.columns:
+                                txt = _codes_to_txt(df_show["ts_code"].astype(str).tolist(),
+                                                    st.session_state["export_pref"]["style"],
+                                                    st.session_state["export_pref"]["with_suffix"])
+                                copy_txt_button(txt, label="📋 复制以上（按当前预览）", key=f"copy_screen_expr_{refD_unified or 'auto'}")
             except Exception as e:
                 st.error(f"筛选失败：{e}")
 
@@ -6423,6 +6455,13 @@ if _in_streamlit():
                 tiebreak_rule = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=1, key="screen_tiebreak_rule")
             with cC:
                 run_detail = st.form_submit_button("筛选当日命中标的", width='stretch')
+            cap_sel_rule = st.multiselect(
+                "总市值筛选（亿元，留空=不限；多选=并集）",
+                options=[b[0] for b in _CAP_BUCKETS],
+                default=[],
+                key="screen_cap_rule",
+                help="基于 stock_list.csv 的 total_mv；查不到则无法命中筛选。"
+            )
 
         if run_detail:
             # 自动启用数据库读取（和个股详情里的解锁逻辑一样）
@@ -6590,23 +6629,27 @@ if _in_streamlit():
                     if df_hit.empty:
                         st.info("未筛到命中标的。")
                     else:
+                        df_hit = _apply_total_mv_filter(df_hit, cap_sel_rule)
+                        if df_hit.empty:
+                            st.info("总市值筛选后无命中。")
+                        else:
                         # 应用Tie-break排序
-                        df_hit_sorted = _apply_tiebreak_sorting(df_hit, tiebreak_rule)
-                        df_hit_sorted = _attach_all_rank(df_hit_sorted, ref_real)
-                        n = int(limit_n)
-                        df_show = df_hit_sorted if n < 0 else df_hit_sorted.head(n)
-                        # 调整列顺序：rank -> ts_code -> score -> trigger_dates
-                        col_order = ["rank", "ts_code", "score", "trigger_dates"]
-                        col_order += [c for c in df_show.columns if c not in col_order]
-                        df_show = df_show[[c for c in col_order if c in df_show.columns]]
-                        st.caption(f"命中 {len(df_hit_sorted)} 只；显示 {len(df_show)} 只；参考日：{ref_real}")
-                        st.dataframe(df_show, width='stretch', height=420)
-                        # 导出 TXT
-                        if "ts_code" in df_show.columns:
-                            txt = _codes_to_txt(df_show["ts_code"].astype(str).tolist(),
-                                                st.session_state["export_pref"]["style"],
-                                                st.session_state["export_pref"]["with_suffix"])
-                            copy_txt_button(txt, label="📋 复制以上（按当前预览）", key=f"copy_screen_rule_{ref_real}")
+                            df_hit_sorted = _apply_tiebreak_sorting(df_hit, tiebreak_rule)
+                            df_hit_sorted = _attach_all_rank(df_hit_sorted, ref_real)
+                            n = int(limit_n)
+                            df_show = df_hit_sorted if n < 0 else df_hit_sorted.head(n)
+                            # 调整列顺序：rank -> ts_code -> score -> trigger_dates
+                            col_order = ["rank", "ts_code", "score", "total_mv_亿", "trigger_dates"]
+                            col_order += [c for c in df_show.columns if c not in col_order]
+                            df_show = df_show[[c for c in col_order if c in df_show.columns]]
+                            st.caption(f"命中 {len(df_hit_sorted)} 只；显示 {len(df_show)} 只；参考日：{ref_real}")
+                            st.dataframe(df_show, width='stretch', height=420)
+                            # 导出 TXT
+                            if "ts_code" in df_show.columns:
+                                txt = _codes_to_txt(df_show["ts_code"].astype(str).tolist(),
+                                                    st.session_state["export_pref"]["style"],
+                                                    st.session_state["export_pref"]["with_suffix"])
+                                copy_txt_button(txt, label="📋 复制以上（按当前预览）", key=f"copy_screen_rule_{ref_real}")
                 except Exception as e:
                     st.error(f"读取明细失败：{e}")
 
@@ -6631,9 +6674,19 @@ if _in_streamlit():
                             if c:
                                 concept_set.add(c)
                     concept_options = sorted(concept_set)
-                    sel_concepts = st.multiselect("选择概念（可搜索，多选=取并集）", options=concept_options, default=[], key="screen_concept_filter")
-                    top_limit = int(st.number_input("显示前 N 条（-1=全量，按排名升序）", min_value=-1, value=100, step=20, key="screen_concept_topn"))
-                    show_btn = st.button("显示筛选结果", key="screen_concept_show")
+
+                    with st.form("concept_screen_form"):
+                        sel_concepts = st.multiselect("选择概念（可搜索，多选=取并集）", options=concept_options, default=[], key="screen_concept_filter")
+                        top_limit = int(st.number_input("显示前 N 条（-1=全量，按排名升序）", min_value=-1, value=100, step=20, key="screen_concept_topn"))
+                        cap_sel_concept = st.multiselect(
+                            "总市值筛选（亿元，留空=不限；多选=并集）",
+                            options=[b[0] for b in _CAP_BUCKETS],
+                            default=[],
+                            key="screen_cap_concept",
+                            help="基于 stock_list.csv 的 total_mv；查不到则无法命中筛选。"
+                        )
+                        show_btn = st.form_submit_button("显示筛选结果", use_container_width=True, type="primary")
+
                     if sel_concepts:
                         mask = df_concept_base["概念"].apply(
                             lambda s: any(c in str(s).split(",") for c in sel_concepts)
@@ -6641,6 +6694,7 @@ if _in_streamlit():
                         df_filtered = df_concept_base.loc[mask].copy()
                     else:
                         df_filtered = df_concept_base.copy()
+                    df_filtered = _apply_total_mv_filter(df_filtered, cap_sel_concept)
 
                     if show_btn:
                         if df_filtered.empty:
@@ -6659,7 +6713,7 @@ if _in_streamlit():
                             df_view = df_filtered.copy()
                             if "rank" in df_view.columns:
                                 df_view = df_view.sort_values("rank")
-                            cols_show = ["ts_code", "name", "rank"]
+                            cols_show = ["ts_code", "name", "rank", "total_mv_亿"]
                             if "J值" in df_view.columns:
                                 cols_show.append("J值")
                             cols_show.append("概念")
@@ -6988,10 +7042,16 @@ if _in_streamlit():
                     placeholder="例：\n000001.SZ 600000.SH 300750\n或 000001,600000;300750",
                     key="concept_list_input",
                 )
+                st.button(
+                    "清空名单输入",
+                    key="btn_clear_concept_list",
+                    use_container_width=True,
+                    on_click=lambda: st.session_state.__setitem__("concept_list_input", "")
+                )
             with colc2:
                 ref_for_concept = st.text_input(
                     "参考日（用于得分排序，留空=最新 all 文件）",
-                    value=_get_latest_date_from_files() or "",
+                    value=st.session_state.get("concept_ref_date", _get_latest_date_from_files() or ""),
                     key="concept_ref_date",
                 )
                 btn_concept_stat = st.button("统计概念分布", key="btn_concept_stat")
