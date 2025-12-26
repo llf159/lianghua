@@ -6,6 +6,7 @@ import warnings
 from pathlib import Path
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict, Any
+from functools import lru_cache
 import threading
 from log_system import get_logger
 import pandas as pd
@@ -216,6 +217,89 @@ def _shrink_mean(obs_mean: float, count: int, prior: float, alpha: float) -> flo
         return (float(obs_mean) * c + float(prior) * a) / (c + a) if (c + a) > 0 else float(obs_mean)
     except Exception:
         return float(obs_mean)
+
+
+@lru_cache(maxsize=1)
+def _rule_meta_map() -> dict:
+    """name -> {as, explain, show_reason} 映射，用于UI端推导高亮/缺点/机会。"""
+    meta = {}
+    try:
+        for r in (getattr(se, "SC_RULES", []) or []):
+            name = str(r.get("name", "")).strip()
+            if not name:
+                continue
+            meta[name] = {
+                "as": str(r.get("as", "auto") or "auto").lower(),
+                "explain": r.get("explain"),
+                "show_reason": r.get("show_reason", True),
+            }
+    except Exception:
+        pass
+    return meta
+
+
+def _derive_rule_buckets(rules: list[dict]) -> tuple[list[str], list[str], list[str]]:
+    """基于规则命中记录和策略元数据推导高亮/缺点/机会列表。"""
+    meta = _rule_meta_map()
+    highlights: list[str] = []
+    drawbacks: list[str] = []
+    opportunities: list[str] = []
+    seen = {"highlight": set(), "drawback": set(), "opportunity": set()}
+
+    for r in rules or []:
+        if not isinstance(r, dict):
+            continue
+        name = str(r.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            add_val = float(r.get("add", 0.0))
+        except Exception:
+            continue
+        if add_val == 0:
+            continue
+        if not bool(r.get("gate_ok", True)):
+            continue
+
+        meta_info = meta.get(name, {})
+        if meta_info.get("show_reason") is False:
+            continue
+        bucket = (meta_info.get("as") or "auto").lower()
+        if bucket == "opportunity":
+            target, key = opportunities, "opportunity"
+        elif bucket == "highlight":
+            target, key = highlights, "highlight"
+        elif bucket == "drawback":
+            target, key = drawbacks, "drawback"
+        else:
+            target, key = (highlights, "highlight") if add_val >= 0 else (drawbacks, "drawback")
+
+        text = meta_info.get("explain") or name
+        if text and text not in seen[key]:
+            target.append(str(text))
+            seen[key].add(text)
+
+    return highlights, drawbacks, opportunities
+
+
+def _parse_string_list(field_value) -> list:
+    """兼容性解析：字符串/JSON/列表 -> list[str]。"""
+    if not field_value:
+        return []
+    if isinstance(field_value, str):
+        try:
+            parsed = json.loads(field_value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            try:
+                import ast
+                parsed = ast.literal_eval(field_value)
+                return parsed if isinstance(parsed, list) else []
+            except Exception:
+                return []
+    if isinstance(field_value, list):
+        return field_value
+    return []
 
 
 def _read_stock_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
@@ -1155,7 +1239,38 @@ def _codes_triggered_on_rule(ref_date: str, rule_name: str) -> list[str]:
         if _rule_hit(rules_obj):
             codes.add(ts)
 
-    return sorted(codes)
+    codes_list = sorted({str(c).strip() for c in codes if str(c).strip()})
+    if not codes_list:
+        return codes_list
+
+    # 按排名顺序排序（有排名时优先 rank，无排名时保持字母序）
+    try:
+        df_rank = _read_rank_all_sorted(ref_date)
+        if not df_rank.empty and {"ts_code", "rank"}.issubset(df_rank.columns):
+            rank_map: dict[str, int] = {}
+            for _, row in df_rank.iterrows():
+                ts_val = str(row.get("ts_code", "")).strip()
+                r_val = row.get("rank")
+                if not ts_val or pd.isna(r_val):
+                    continue
+                try:
+                    r_int = int(r_val)
+                except Exception:
+                    continue
+                rank_map[ts_val] = r_int
+                if "." in ts_val:
+                    rank_map[ts_val.split(".")[0]] = r_int  # 兼容无后缀的代码
+
+            if rank_map:
+                missing_rank = math.inf
+                codes_list = sorted(
+                    codes_list,
+                    key=lambda x: (rank_map.get(x, rank_map.get(x.split(".")[0], missing_rank)), x),
+                )
+    except Exception as e:
+        logger.debug(f"按排名排序触发策略名单失败: {e}")
+
+    return codes_list
 
 @cache_data(show_spinner=False, ttl=600)
 def _get_stock_name_map() -> dict[str, str]:
@@ -1965,7 +2080,21 @@ def _read_df(path: Path, usecols=None, dtype=None, encoding: str = "utf-8-sig") 
 @cache_data(show_spinner=False, ttl=600)
 def _cached_trade_dates(base: str, adj: str):
     # 使用 database_manager 获取交易日列表
-    return get_trade_dates() or []
+    days = get_trade_dates() or []
+    if days:
+        return days
+    # 回退：从已有排名文件名中提取日期
+    try:
+        dates = []
+        for p in ALL_DIR.glob("score_all_*.csv"):
+            if p.is_file() and p.stat().st_size > 0:
+                m = re.search(r"(\\d{8})", p.name)
+                if m:
+                    dates.append(m.group(1))
+        return sorted(set(dates))
+    except Exception as e:
+        logger.debug(f"获取交易日列表失败（文件兜底）: {e}")
+    return []
 
 # ==== 进度转发到主线程：仅子线程/子进程入队，主线程消费并渲染 ====
 @contextmanager
@@ -2362,28 +2491,10 @@ def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
                 if not isinstance(rules, list):
                     rules = []
                 
-                # 解析 highlights/drawbacks/opportunities 字段为 list[str]
-                def parse_string_list(field_value):
-                    if not field_value:
-                        return []
-                    if isinstance(field_value, str):
-                        try:
-                            parsed = json.loads(field_value)
-                            return parsed if isinstance(parsed, list) else []
-                        except Exception:
-                            try:
-                                import ast
-                                parsed = ast.literal_eval(field_value)
-                                return parsed if isinstance(parsed, list) else []
-                            except Exception:
-                                return []
-                    elif isinstance(field_value, list):
-                        return field_value
-                    return []
-                
-                highlights = parse_string_list(row.get('highlights'))
-                drawbacks = parse_string_list(row.get('drawbacks'))
-                opportunities = parse_string_list(row.get('opportunities'))
+                derived_highlights, derived_drawbacks, derived_opportunities = _derive_rule_buckets(rules)
+                legacy_highlights = _parse_string_list(row.get('highlights')) if 'highlights' in row else []
+                legacy_drawbacks = _parse_string_list(row.get('drawbacks')) if 'drawbacks' in row else []
+                legacy_opportunities = _parse_string_list(row.get('opportunities')) if 'opportunities' in row else []
                 
                 # 获取 rank 和 total 值
                 rank_val = row.get('rank')
@@ -2393,9 +2504,9 @@ def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
                 summary = {
                     'score': row.get('score'),
                     'tiebreak': row.get('tiebreak'),
-                    'highlights': highlights,
-                    'drawbacks': drawbacks,
-                    'opportunities': opportunities,
+                    'highlights': derived_highlights or legacy_highlights,
+                    'drawbacks': derived_drawbacks or legacy_drawbacks,
+                    'opportunities': derived_opportunities or legacy_opportunities,
                     'rank': int(rank_val) if pd.notna(rank_val) else None,
                     'total': int(total_val) if pd.notna(total_val) else None,
                 }
@@ -2436,6 +2547,33 @@ def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
                 return None
             try:
                 data = json.loads(p.read_text(encoding="utf-8-sig"))
+                if not isinstance(data, dict):
+                    return None
+                rules_raw = data.get("rules") or data.get("per_rules") or []
+                rules = rules_raw if isinstance(rules_raw, list) else []
+                summary = data.get("summary") or {}
+                if not summary:
+                    summary = {
+                        "score": data.get("score"),
+                        "tiebreak": data.get("tiebreak"),
+                        "rank": data.get("rank"),
+                        "total": data.get("total"),
+                        "highlights": data.get("highlights", []),
+                        "drawbacks": data.get("drawbacks", []),
+                        "opportunities": data.get("opportunities", []),
+                    }
+                derived_highlights, derived_drawbacks, derived_opportunities = _derive_rule_buckets(rules)
+                summary["highlights"] = derived_highlights or _parse_string_list(summary.get("highlights"))
+                summary["drawbacks"] = derived_drawbacks or _parse_string_list(summary.get("drawbacks"))
+                summary["opportunities"] = derived_opportunities or _parse_string_list(summary.get("opportunities"))
+                data = {
+                    "ts_code": data.get("ts_code", ts),
+                    "ref_date": data.get("ref_date", ref),
+                    "summary": summary,
+                    "rules": rules,
+                    "rank": summary.get("rank"),
+                    "total": summary.get("total"),
+                }
                 return data
             except json.JSONDecodeError as e:
                 # JSON解析失败，记录日志但不报错
@@ -5458,13 +5596,6 @@ if _in_streamlit():
                         st.session_state["export_pref"]["with_suffix"]
                     )
                     copy_txt_button(txt, label="复制以上", key=f"copy_speed_{start_use}_{end_use}")
-                concept_topk = int(st.number_input("概念榜显示 Top-K（按平均涨速）", min_value=5, max_value=200, value=30, key=f"speed_concept_topk_{start_use}_{end_use}_{speed_n}"))
-                concept_board = _build_concept_board_from_speed(df_speed, rows_eff, end_use)
-                if concept_board.empty:
-                    st.caption("Top-N 涨速榜内未匹配到概念。")
-                else:
-                    st.markdown("**概念榜（基于上述 Top-N 涨速）**")
-                    st.dataframe(concept_board.head(concept_topk), width='stretch', height=420)
 
         if btn_speed:
             try:
@@ -8754,16 +8885,16 @@ if _in_streamlit():
                         key="details_query_type"
                     )
                     
-                    # 获取并缓存最新日期（延迟加载，避免UI启动时建立连接）
+                    # 获取并缓存最新日期（所有查询类型共享，含文件兜底）
                     @st.cache_data
                     def get_latest_details_date():
                         try:
                             dates = query_details_recent_dates(1, db_path)
-                            return dates[0] if dates else None
+                            if dates:
+                                return dates[0]
                         except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
                             # 数据库文件不存在或管理器获取失败
                             logger.debug(f"获取最新日期失败: {e}")
-                            return None
                         except Exception as e:
                             # 数据库读取失败（可能是表不存在、连接错误等）
                             error_msg = str(e).lower()
@@ -8771,12 +8902,18 @@ if _in_streamlit():
                                 logger.debug(f"Details数据库表不存在，无法获取最新日期")
                             else:
                                 logger.debug(f"获取最新日期失败: {e}")
-                            return None
+                        # 数据库失败时，回退到文件系统：output/score/details/<YYYYMMDD> 目录
+                        try:
+                            ddir = Path(SC_OUTPUT_DIR) / "details"
+                            if ddir.exists():
+                                dirs = [p.name for p in ddir.iterdir() if p.is_dir() and _is_valid_date(p.name)]
+                                if dirs:
+                                    return max(dirs)
+                        except Exception as e:
+                            logger.debug(f"文件系统兜底获取最新日期失败: {e}")
+                        return None
                     
-                    # 只在需要显示时才调用，避免UI启动时建立连接
-                    latest_date = None
-                    if query_type == "按日期查看":
-                        latest_date = get_latest_details_date()
+                    latest_date = get_latest_details_date()
                     
                     if query_type == "按日期查看":
                         # 如果还没有设置默认日期，使用最新日期
@@ -8801,26 +8938,29 @@ if _in_streamlit():
                         date_to_use = ref_date.strip() if ref_date.strip() else latest_date
                         
                         if refresh_btn or date_to_use:
-                            try:
-                                df = query_details_by_date(date_to_use, limit=limit_param, db_path=db_path)
-                                if not df.empty:
-                                    st.dataframe(df, width='stretch')
-                                    st.info(f"共找到 {len(df)} 条记录 | 查询日期: {date_to_use}")
-                                else:
-                                    st.warning("未找到数据")
-                            except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
-                                # 数据库文件不存在或管理器获取失败
-                                logger.debug(f"查询Details数据失败: {e}")
-                                st.error(f"查询失败: 数据库不可用（{e}）")
-                            except Exception as e:
-                                # 数据库读取失败（可能是表不存在、连接错误等）
-                                error_msg = str(e).lower()
-                                if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
-                                    logger.debug(f"Details数据库表不存在，查询失败")
-                                    st.error("查询失败: Details数据库表不存在，请先运行评分生成数据")
-                                else:
+                            if not date_to_use:
+                                st.error("未能确定参考日，无法查询。请手动输入或检查数据库。")
+                            else:
+                                try:
+                                    df = query_details_by_date(date_to_use, limit=limit_param, db_path=db_path)
+                                    if not df.empty:
+                                        st.dataframe(df, width='stretch')
+                                        st.info(f"共找到 {len(df)} 条记录 | 查询日期: {date_to_use}")
+                                    else:
+                                        st.warning("未找到数据")
+                                except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                                    # 数据库文件不存在或管理器获取失败
                                     logger.debug(f"查询Details数据失败: {e}")
-                                    st.error(f"查询失败: {e}")
+                                    st.error(f"查询失败: 数据库不可用（{e}）")
+                                except Exception as e:
+                                    # 数据库读取失败（可能是表不存在、连接错误等）
+                                    error_msg = str(e).lower()
+                                    if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                        logger.debug(f"Details数据库表不存在，查询失败")
+                                        st.error("查询失败: Details数据库表不存在，请先运行评分生成数据")
+                                    else:
+                                        logger.debug(f"查询Details数据失败: {e}")
+                                        st.error(f"查询失败: {e}")
                         
                         # 显示最近的日期列表
                         try:
@@ -8885,26 +9025,29 @@ if _in_streamlit():
                         date_to_use = ref_date.strip() if ref_date.strip() else latest_date
                         
                         if refresh_topk_btn or date_to_use:
-                            try:
-                                df = query_details_top_stocks(date_to_use, top_k, db_path)
-                                if not df.empty:
-                                    st.dataframe(df, width='stretch')
-                                    st.info(f"查询日期: {date_to_use}")
-                                else:
-                                    st.warning("未找到数据")
-                            except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
-                                # 数据库文件不存在或管理器获取失败
-                                logger.debug(f"查询Details数据失败: {e}")
-                                st.error(f"查询失败: 数据库不可用（{e}）")
-                            except Exception as e:
-                                # 数据库读取失败（可能是表不存在、连接错误等）
-                                error_msg = str(e).lower()
-                                if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
-                                    logger.debug(f"Details数据库表不存在，查询失败")
-                                    st.error("查询失败: Details数据库表不存在，请先运行评分生成数据")
-                                else:
+                            if not date_to_use:
+                                st.error("未能确定参考日，无法查询。请手动输入或检查数据库。")
+                            else:
+                                try:
+                                    df = query_details_top_stocks(date_to_use, top_k, db_path)
+                                    if not df.empty:
+                                        st.dataframe(df, width='stretch')
+                                        st.info(f"查询日期: {date_to_use}")
+                                    else:
+                                        st.warning("未找到数据")
+                                except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                                    # 数据库文件不存在或管理器获取失败
                                     logger.debug(f"查询Details数据失败: {e}")
-                                    st.error(f"查询失败: {e}")
+                                    st.error(f"查询失败: 数据库不可用（{e}）")
+                                except Exception as e:
+                                    # 数据库读取失败（可能是表不存在、连接错误等）
+                                    error_msg = str(e).lower()
+                                    if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                        logger.debug(f"Details数据库表不存在，查询失败")
+                                        st.error("查询失败: Details数据库表不存在，请先运行评分生成数据")
+                                    else:
+                                        logger.debug(f"查询Details数据失败: {e}")
+                                        st.error(f"查询失败: {e}")
                     
                     elif query_type == "分数范围查询":
                         # 如果还没有设置默认日期，使用最新日期
@@ -8928,26 +9071,29 @@ if _in_streamlit():
                         date_to_use = ref_date.strip() if ref_date.strip() else latest_date
                         
                         if refresh_score_btn or date_to_use:
-                            try:
-                                df = query_details_score_range(date_to_use, min_score, max_score, db_path)
-                                if not df.empty:
-                                    st.dataframe(df, width='stretch')
-                                    st.info(f"共找到 {len(df)} 条记录 | 查询日期: {date_to_use}")
-                                else:
-                                    st.warning("未找到数据")
-                            except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
-                                # 数据库文件不存在或管理器获取失败
-                                logger.debug(f"查询Details数据失败: {e}")
-                                st.error(f"查询失败: 数据库不可用（{e}）")
-                            except Exception as e:
-                                # 数据库读取失败（可能是表不存在、连接错误等）
-                                error_msg = str(e).lower()
-                                if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
-                                    logger.debug(f"Details数据库表不存在，查询失败")
-                                    st.error("查询失败: Details数据库表不存在，请先运行评分生成数据")
-                                else:
+                            if not date_to_use:
+                                st.error("未能确定参考日，无法查询。请手动输入或检查数据库。")
+                            else:
+                                try:
+                                    df = query_details_score_range(date_to_use, min_score, max_score, db_path)
+                                    if not df.empty:
+                                        st.dataframe(df, width='stretch')
+                                        st.info(f"共找到 {len(df)} 条记录 | 查询日期: {date_to_use}")
+                                    else:
+                                        st.warning("未找到数据")
+                                except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
+                                    # 数据库文件不存在或管理器获取失败
                                     logger.debug(f"查询Details数据失败: {e}")
-                                    st.error(f"查询失败: {e}")
+                                    st.error(f"查询失败: 数据库不可用（{e}）")
+                                except Exception as e:
+                                    # 数据库读取失败（可能是表不存在、连接错误等）
+                                    error_msg = str(e).lower()
+                                    if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+                                        logger.debug(f"Details数据库表不存在，查询失败")
+                                        st.error("查询失败: Details数据库表不存在，请先运行评分生成数据")
+                                    else:
+                                        logger.debug(f"查询Details数据失败: {e}")
+                                        st.error(f"查询失败: {e}")
                     
                     # 数据库信息（美化显示）
                     with st.expander("数据库信息"):

@@ -230,6 +230,148 @@ if _ths_cookie:
         _persist_ths_cookie(_ths_cookie)
 
 
+def fetch_realtime_rank(
+    src: str = "dc",
+    fields: Optional[List[str]] = None,
+    codes: Optional[List[str] | str] = None,
+) -> pd.DataFrame:
+    """
+    调用 Tushare 爬虫接口 realtime_list（doc_id=317），获取实时涨跌幅排名。
+
+    Args:
+        src: 数据源，"dc"=东财（默认），"sina"=新浪。
+        fields: 可选列白名单，留空返回全部字段。
+        codes: 可选，指定股票代码列表/字符串（支持带或不带后缀，逗号/空格/换行分隔），仅返回这些股票。
+
+    Returns:
+        按涨跌幅降序排列的 DataFrame；接口异常或无数据时返回空 DataFrame。
+    """
+    try:
+        import tushare as ts
+    except ImportError as e:
+        logger.error("未安装 tushare，请先 pip install tushare (%s)", e)
+        raise
+
+    token = getattr(cfg, "TOKEN", "") or os.environ.get("TUSHARE_TOKEN", "")
+    if token:
+        try:
+            ts.set_token(token)
+        except Exception as e:
+            logger.debug("设置 Tushare token 失败：%s", e)
+
+    try:
+        df = ts.realtime_list(src=src or "dc")
+    except Exception as e:
+        logger.error("调用 ts.realtime_list 失败：%s", e)
+        raise
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+
+    # 仅保留指定列
+    if fields:
+        keep = [c for c in fields if c in df.columns]
+        if keep:
+            df = df[keep]
+
+    # 仅保留指定股票
+    if codes:
+        if isinstance(codes, str):
+            parts = re.split(r"[\\s,;|]+", codes.strip())
+            code_list = [p for p in parts if p]
+        else:
+            code_list = [str(c) for c in codes if str(c).strip()]
+        code_set: set[str] = set()
+        for c in code_list:
+            cu = c.upper()
+            code_set.add(cu)
+            if "." in cu:
+                code_set.add(cu.split(".")[0])
+        code_col = None
+        for cand in ("ts_code", "TS_CODE", "code", "CODE"):
+            if cand in df.columns:
+                code_col = cand
+                break
+        if code_col:
+            df = df[df[code_col].astype(str).str.upper().map(
+                lambda x: x if x not in code_set and "." not in x else (x if x in code_set else x.split(".")[0])
+            ).isin(code_set)]
+
+    # 按涨跌幅排序（兼容大小写列名）
+    col_map = {c.lower(): c for c in df.columns}
+    pct_col = col_map.get("pct_change")
+    if pct_col:
+        df = df.sort_values(pct_col, ascending=False).reset_index(drop=True)
+    return df
+
+
+def fetch_realtime_quote(
+    ts_codes: Optional[List[str] | str] = None,
+    src: str = "sina",
+    fields: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    调用 Tushare 爬虫接口 realtime_quote（doc_id=315），获取实时盘口 TICK 快照。
+
+    Args:
+        ts_codes: 股票代码（字符串或列表，支持逗号/空格/换行/分号/竖线分隔）。sina 支持多只，最多 50；dc 只支持单只。
+        src: 数据源，"sina"（默认，可多只）或 "dc"（仅单只）。
+        fields: 可选列白名单，留空返回全部字段。
+
+    Returns:
+        DataFrame，包含买卖五档、成交、价格等；接口异常或无数据时返回空 DataFrame。
+    """
+    try:
+        import tushare as ts
+    except ImportError as e:
+        logger.error("未安装 tushare，请先 pip install tushare (%s)", e)
+        raise
+
+    token = getattr(cfg, "TOKEN", "") or os.environ.get("TUSHARE_TOKEN", "")
+    if token:
+        try:
+            ts.set_token(token)
+        except Exception as e:
+            logger.debug("设置 Tushare token 失败：%s", e)
+
+    # 解析/限制代码数量
+    code_list: List[str] = []
+    if ts_codes:
+        if isinstance(ts_codes, str):
+            parts = re.split(r"[\\s,;|]+", ts_codes.strip())
+            code_list = [p for p in parts if p]
+        else:
+            code_list = [str(c).strip() for c in ts_codes if str(c).strip()]
+
+    if not code_list and src.lower() == "dc":
+        raise ValueError("src=dc 需要提供单只 ts_code")
+
+    if src.lower() == "dc" and len(code_list) > 1:
+        code_list = code_list[:1]  # 东财只支持单只
+    if src.lower() == "sina" and len(code_list) > 50:
+        code_list = code_list[:50]  # 官方提示单次最多 50 只
+
+    ts_code_arg = ",".join(code_list) if code_list else None
+
+    try:
+        df = ts.realtime_quote(ts_code=ts_code_arg, src=src or "sina")
+    except Exception as e:
+        logger.error("调用 ts.realtime_quote 失败：%s", e)
+        raise
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    if fields:
+        keep = [c for c in fields if c in df.columns]
+        if keep:
+            df = df[keep]
+    return df
+
+
 def _get_json(url: str) -> Dict:
     em_limiter.wait_if_needed()
     resp = requests.get(url, headers=EM_HEADERS, timeout=10, proxies=EM_PROXIES)

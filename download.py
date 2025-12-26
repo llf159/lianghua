@@ -560,10 +560,13 @@ def resolve_tushare_token(token: Optional[str] = None, *, allow_prompt: bool = T
 class TushareManager:
     """Tushare接口管理器"""
     
-    def __init__(self, token: str = None, rate_limiter: TokenBucketRateLimiter = None, allow_prompt: bool = True):
+    def __init__(self, token: str = None, rate_limiter: TokenBucketRateLimiter = None,
+                 allow_prompt: bool = True, db_manager: Optional[DatabaseManager] = None):
         self.token = resolve_tushare_token(token, allow_prompt=allow_prompt)
         self._pro = None
         self.rate_limiter = rate_limiter or TokenBucketRateLimiter()
+        # 持有数据库管理器，延迟创建以避免不必要的连接
+        self.db_manager = db_manager
 
         # 设置token
         ts.set_token(self.token)
@@ -581,6 +584,12 @@ class TushareManager:
         # 设置直连域名
         os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost,api.tushare.pro,github.com,raw.githubusercontent.com,pypi.org,files.pythonhosted.org,huggingface.co,cdn-lfs.huggingface.co")
         os.environ.setdefault("no_proxy", os.environ["NO_PROXY"])
+
+    def _get_db_manager(self) -> DatabaseManager:
+        """延迟获取数据库管理器，保证单例复用。"""
+        if self.db_manager is None:
+            self.db_manager = get_database_manager()
+        return self.db_manager
     
     def _make_api_call(self, call_func, *args, **kwargs):
         """统一的API调用方法，包含限频和错误处理"""
@@ -715,7 +724,7 @@ class TushareManager:
         """获取交易日列表（使用数据库管理器的统一方法）"""
         try:
             # 使用数据库管理器的统一方法
-            return self.db_manager.get_trade_dates_from_tushare(start_date, end_date)
+            return self._get_db_manager().get_trade_dates_from_tushare(start_date, end_date)
         except Exception as e:
             logger.error(f"获取交易日列表失败: {e}")
             raise
@@ -733,7 +742,7 @@ class TushareManager:
         """
         try:
             # 使用数据库管理器的统一方法
-            return self.db_manager.get_smart_end_date(end_date_config)
+            return self._get_db_manager().get_smart_end_date(end_date_config)
         except Exception as e:
             logger.error(f"智能获取结束日期失败: {e}")
             # 如果智能获取失败，返回原配置或今天
@@ -1776,7 +1785,7 @@ class DownloadManager:
         self.config = config
         logger.info("[数据库连接] 开始获取数据库管理器实例 (初始化下载管理器)")
         self.db_manager = get_database_manager()
-        self.tushare_manager = TushareManager(token=config.token)
+        self.tushare_manager = TushareManager(token=config.token, db_manager=self.db_manager)
         
         # 在数据库初始化之前判断是否为首次下载
         self.is_first_download = self._check_if_first_download()

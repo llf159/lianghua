@@ -470,14 +470,20 @@ def _ensure_series(x):
     return pd.Series(x)
 
 def CROSS(a, b):
-    a = _ensure_series(a)
-    if isinstance(b, pd.Series):
-        b = b.reindex_like(a)         # 对齐索引
-        b_prev = b.shift(1)
+    # 支持任意一侧为标量、另一侧为 Series 的情况，保持索引对齐
+    a_is_series = isinstance(a, pd.Series)
+    b_is_series = isinstance(b, pd.Series)
+
+    if a_is_series or b_is_series:
+        idx = a.index if a_is_series else b.index
+        a_series = a if a_is_series else pd.Series(a, index=idx)
+        b_series = b.reindex(idx) if b_is_series else pd.Series(b, index=idx)
     else:
-        # 标量/常数：让 pandas 做广播
-        b_prev = b
-    return (a > b) & (a.shift(1) <= b_prev)
+        # 双标量退化为单元素 Series 以复用同一套逻辑
+        a_series = _ensure_series(a)
+        b_series = _ensure_series(b)
+
+    return (a_series > b_series) & (a_series.shift(1) <= b_series.shift(1))
 
 def SAFE_DIV(a, b):
     # 安全除法：b≈0 时避免 NaN/Inf

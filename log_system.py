@@ -18,6 +18,7 @@ import sys
 import logging
 import logging.handlers
 import queue
+import shutil
 # 避免logging内部报错打断业务
 logging.raiseExceptions = False
 
@@ -83,10 +84,32 @@ import time
 import threading
 from contextlib import contextmanager
 import multiprocessing
+import multiprocessing.managers
+
+try:
+    import config
+except Exception:
+    config = None
 
 # ========== 自定义等级：PREP（介于 INFO 与 WARNING 之间） ==========
 PREP_LEVEL_NUM = logging.INFO + 5  # 25
 logging.addLevelName(PREP_LEVEL_NUM, "PREP")
+
+def _resolve_file_log_level() -> int:
+    """从配置解析最低落盘等级"""
+    level_name = "INFO"
+    try:
+        if config and hasattr(config, "LOG_FILE_LEVEL"):
+            level_name = str(getattr(config, "LOG_FILE_LEVEL", "INFO")).upper()
+    except Exception:
+        pass
+    level = logging._nameToLevel.get(level_name, logging.INFO)
+    if not isinstance(level, int):
+        level = logging.INFO
+    return level
+
+
+FILE_LOG_MIN_LEVEL = _resolve_file_log_level()
 
 def _is_main_process() -> bool:
     try:
@@ -191,18 +214,28 @@ class DebugLogger:
     # 类级别集合，跟踪已清除日志的logger（每个进程独立）
     _cleared_loggers = set()
     
-    def __init__(self, name: str, log_dir: str = "log"):
+    def __init__(self, name: str, log_dir: str = "log", run_dir: Optional[Path] = None):
         self.name = name
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(exist_ok=True)
+        self.base_log_dir = Path(log_dir)
+        self.logger_dir = self.base_log_dir / self.name
+        self.logger_dir.mkdir(parents=True, exist_ok=True)
+        self._owner_pid = os.getpid()  # 记录创建该logger的进程
+        if run_dir is not None:
+            # 子进程复用父进程的运行目录，实现同一批日志输出
+            self.run_dir = Path(run_dir)
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            self.run_timestamp = self.run_dir.name
+        else:
+            self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.run_dir = self._create_run_dir()
+        # 兼容旧字段命名，后续写文件统一落在 run_dir 下
+        self.log_dir = self.run_dir
         
         # 创建主日志记录器
         self.logger = logging.getLogger(name)
-        self.logger.setLevel(logging.INFO)  # 设置最低级别为INFO，不记录DEBUG
+        # logger级别取落盘最低级别与WARNING的较小值，确保控制台WARNING可用
+        self.logger.setLevel(min(FILE_LOG_MIN_LEVEL, logging.WARNING))
         self.logger.propagate = False
-        
-        # 队列监听器引用（仅主进程使用，用于多进程日志）
-        self._queue_listener: Optional[logging.handlers.QueueListener] = None
         
         # 异步写入队列和监听器（用于文件异步写入）
         self._async_queue: Optional[queue.Queue] = None
@@ -225,38 +258,36 @@ class DebugLogger:
         self._warning_count = 0
         self._lock = threading.Lock()
     
+    def _create_run_dir(self) -> Path:
+        """为本次运行创建独立日志目录，名称为时间戳。"""
+        base_name = self.run_timestamp
+        run_dir = self.logger_dir / base_name
+        suffix = 1
+        while run_dir.exists():
+            run_dir = self.logger_dir / f"{base_name}_{suffix}"
+            suffix += 1
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
     def _clear_old_logs(self):
-        """清理旧日志文件，保留最近 N 个"""
+        """清理旧日志运行目录，保留最近 N 次运行"""
         try:
-            max_keep = 3  # 每个等级最多保留的文件数（含当前 + 备份）
-            # 清除所有与该logger相关的日志文件
-            log_patterns = [
-                f"{self.name}_info.log*",
-                f"{self.name}_prep.log*",
-                f"{self.name}_warning.log*",
-                f"{self.name}_error.log*",
-                f"{self.name}_critical.log*",
-                f"{self.name}_performance.log*",
-                f"{self.name}_debug.log*"
+            max_keep = 3  # 最多保留的运行目录数
+            run_dirs = [
+                d for d in self.logger_dir.iterdir()
+                if d.is_dir()
             ]
-            
+            run_dirs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+
             deleted_count = 0
-            for pattern in log_patterns:
-                files = sorted(
-                    self.log_dir.glob(pattern),
-                    key=lambda p: p.stat().st_mtime if p.exists() else 0,
-                    reverse=True
-                )
-                for log_file in files[max_keep:]:
-                    try:
-                        log_file.unlink()
-                        deleted_count += 1
-                    except Exception:
-                        # 如果文件被占用或其他错误，忽略继续处理其他文件
-                        pass
-            
-            if deleted_count > 0:
-                print(f"已清理旧日志文件 {deleted_count} 个 (保留最近 {max_keep} 个): {self.name}")
+            for old_dir in run_dirs[max_keep:]:
+                try:
+                    shutil.rmtree(old_dir, ignore_errors=True)
+                    deleted_count += 1
+                except Exception:
+                    pass
+
+            # 保持静默清理，避免在控制台输出冗余信息
         except Exception:
             # 清除失败不影响日志系统初始化
             pass
@@ -312,61 +343,64 @@ class DebugLogger:
         # 主进程：创建文件处理器并设置监听器
         handlers = []
         
-        # DEBUG 日志已关闭（不写入文件）
-        # debug_handler = logging.handlers.RotatingFileHandler(
-        #     self.log_dir / f"{self.name}_debug.log",
-        #     maxBytes=10*1024*1024, backupCount=5,
-        #     encoding='utf-8', delay=True
-        # )
-        # debug_handler.setLevel(logging.DEBUG)
-        # debug_handler.addFilter(_LevelOnly(logging.DEBUG))
-        # debug_handler.addFilter(_ExcludePerf())
-        # debug_handler.setFormatter(file_formatter)
-        # handlers.append(debug_handler)
+        if FILE_LOG_MIN_LEVEL <= logging.DEBUG:
+            debug_handler = logging.handlers.RotatingFileHandler(
+                self.log_dir / f"{self.name}_debug.log",
+                maxBytes=10*1024*1024, backupCount=5,
+                encoding='utf-8', delay=True
+            )
+            debug_handler.setLevel(logging.DEBUG)
+            debug_handler.addFilter(_LevelOnly(logging.DEBUG))
+            debug_handler.addFilter(_ExcludePerf())
+            debug_handler.setFormatter(file_formatter)
+            handlers.append(debug_handler)
 
-        info_handler = logging.handlers.RotatingFileHandler(
-            self.log_dir / f"{self.name}_info.log",
-            maxBytes=10*1024*1024, backupCount=5,
-            encoding='utf-8', delay=True
-        )
-        info_handler.setLevel(logging.INFO)
-        info_handler.addFilter(_LevelOnly(logging.INFO))
-        info_handler.addFilter(_ExcludePerf())
-        info_handler.setFormatter(file_formatter)
-        handlers.append(info_handler)
+        if FILE_LOG_MIN_LEVEL <= logging.INFO:
+            info_handler = logging.handlers.RotatingFileHandler(
+                self.log_dir / f"{self.name}_info.log",
+                maxBytes=10*1024*1024, backupCount=5,
+                encoding='utf-8', delay=True
+            )
+            info_handler.setLevel(logging.INFO)
+            info_handler.addFilter(_LevelOnly(logging.INFO))
+            info_handler.addFilter(_ExcludePerf())
+            info_handler.setFormatter(file_formatter)
+            handlers.append(info_handler)
 
-        prep_handler = logging.handlers.RotatingFileHandler(
-            self.log_dir / f"{self.name}_prep.log",
-            maxBytes=10*1024*1024, backupCount=5,
-            encoding='utf-8', delay=True
-        )
-        prep_handler.setLevel(PREP_LEVEL_NUM)
-        prep_handler.addFilter(_LevelOnly(PREP_LEVEL_NUM))
-        prep_handler.addFilter(_ExcludePerf())
-        prep_handler.setFormatter(file_formatter)
-        handlers.append(prep_handler)
+            prep_handler = logging.handlers.RotatingFileHandler(
+                self.log_dir / f"{self.name}_prep.log",
+                maxBytes=10*1024*1024, backupCount=5,
+                encoding='utf-8', delay=True
+            )
+            prep_handler.setLevel(PREP_LEVEL_NUM)
+            prep_handler.addFilter(_LevelOnly(PREP_LEVEL_NUM))
+            prep_handler.addFilter(_ExcludePerf())
+            prep_handler.setFormatter(file_formatter)
+            handlers.append(prep_handler)
 
-        warning_handler = logging.handlers.RotatingFileHandler(
-            self.log_dir / f"{self.name}_warning.log",
-            maxBytes=10*1024*1024, backupCount=5,
-            encoding='utf-8', delay=True
-        )
-        warning_handler.setLevel(logging.WARNING)
-        warning_handler.addFilter(_LevelOnly(logging.WARNING))
-        warning_handler.addFilter(_ExcludePerf())
-        warning_handler.setFormatter(file_formatter)
-        handlers.append(warning_handler)
+        if FILE_LOG_MIN_LEVEL <= logging.WARNING:
+            warning_handler = logging.handlers.RotatingFileHandler(
+                self.log_dir / f"{self.name}_warning.log",
+                maxBytes=10*1024*1024, backupCount=5,
+                encoding='utf-8', delay=True
+            )
+            warning_handler.setLevel(logging.WARNING)
+            warning_handler.addFilter(_LevelOnly(logging.WARNING))
+            warning_handler.addFilter(_ExcludePerf())
+            warning_handler.setFormatter(file_formatter)
+            handlers.append(warning_handler)
 
-        error_handler = logging.handlers.RotatingFileHandler(
-            self.log_dir / f"{self.name}_error.log",
-            maxBytes=10*1024*1024, backupCount=5,
-            encoding='utf-8', delay=True
-        )
-        error_handler.setLevel(logging.ERROR)
-        error_handler.addFilter(_LevelOnly(logging.ERROR))
-        error_handler.addFilter(_ExcludePerf())
-        error_handler.setFormatter(file_formatter)
-        handlers.append(error_handler)
+        if FILE_LOG_MIN_LEVEL <= logging.ERROR:
+            error_handler = logging.handlers.RotatingFileHandler(
+                self.log_dir / f"{self.name}_error.log",
+                maxBytes=10*1024*1024, backupCount=5,
+                encoding='utf-8', delay=True
+            )
+            error_handler.setLevel(logging.ERROR)
+            error_handler.addFilter(_LevelOnly(logging.ERROR))
+            error_handler.addFilter(_ExcludePerf())
+            error_handler.setFormatter(file_formatter)
+            handlers.append(error_handler)
 
         critical_handler = logging.handlers.RotatingFileHandler(
             self.log_dir / f"{self.name}_critical.log",
@@ -432,31 +466,8 @@ class DebugLogger:
             async_handler = logging.handlers.QueueHandler(self._async_queue)
             self.logger.addHandler(async_handler)
             
-            # 主进程：启动监听器处理子进程发送到进程队列的日志
-            log_queue = _get_log_queue()
-            if log_queue is not None and self._queue_listener is None:
-                # 子进程的日志也需要异步写入，所以也发送到异步队列
-                # 创建一个特殊的handler，将进程队列的日志转发到异步队列
-                class ProcessQueueToAsyncHandler(logging.Handler):
-                    def __init__(self, async_queue):
-                        super().__init__()
-                        self.async_queue = async_queue
-                    def emit(self, record):
-                        try:
-                            self.async_queue.put(record)
-                        except Exception:
-                            self.handleError(record)
-                
-                process_handler = ProcessQueueToAsyncHandler(self._async_queue)
-                process_handler.addFilter(LoggerNameFilter(self.logger.name))
-                
-                listener = logging.handlers.QueueListener(
-                    log_queue,
-                    process_handler,
-                    respect_handler_level=True
-                )
-                listener.start()
-                self._queue_listener = listener
+            # 主进程：启动全局队列监听器，避免多个监听器竞争同一队列
+            _ensure_global_queue_listener()
         else:
             # 子进程：直接添加文件处理器（虽然不会执行到这里，但保留以防万一）
             for handler in handlers:
@@ -466,46 +477,46 @@ class DebugLogger:
         self.logger.addHandler(console_handler)
 
     
-    def debug(self, message: str, **kwargs):
+    def debug(self, message: str, *args, **kwargs):
         """调试日志"""
         # 确保消息是UTF-8编码的字符串
         if isinstance(message, bytes):
             message = message.decode('utf-8', errors='replace')
-        self.logger.debug(message, **kwargs)
+        self.logger.debug(message, *args, **kwargs)
     
-    def info(self, message: str, **kwargs):
+    def info(self, message: str, *args, **kwargs):
         """信息日志"""
         # 确保消息是UTF-8编码的字符串
         if isinstance(message, bytes):
             message = message.decode('utf-8', errors='replace')
-        self.logger.info(message, **kwargs)
+        self.logger.info(message, *args, **kwargs)
     
-    def warning(self, message: str, **kwargs):
+    def warning(self, message: str, *args, **kwargs):
         """警告日志"""
         # 确保消息是UTF-8编码的字符串
         if isinstance(message, bytes):
             message = message.decode('utf-8', errors='replace')
         with self._lock:
             self._warning_count += 1
-        self.logger.warning(message, **kwargs)
+        self.logger.warning(message, *args, **kwargs)
     
-    def error(self, message: str, exc_info: bool = True, **kwargs):
+    def error(self, message: str, exc_info: bool = True, *args, **kwargs):
         """错误日志"""
         # 确保消息是UTF-8编码的字符串
         if isinstance(message, bytes):
             message = message.decode('utf-8', errors='replace')
         with self._lock:
             self._error_count += 1
-        self.logger.error(message, exc_info=exc_info, **kwargs)
+        self.logger.error(message, exc_info=exc_info, *args, **kwargs)
     
-    def critical(self, message: str, exc_info: bool = True, **kwargs):
+    def critical(self, message: str, exc_info: bool = True, *args, **kwargs):
         """严重错误日志"""
         # 确保消息是UTF-8编码的字符串
         if isinstance(message, bytes):
             message = message.decode('utf-8', errors='replace')
         with self._lock:
             self._error_count += 1
-        self.logger.critical(message, exc_info=exc_info, **kwargs)
+        self.logger.critical(message, exc_info=exc_info, *args, **kwargs)
     
     def exception(self, message: str, **kwargs):
         """异常日志（自动包含异常信息）"""
@@ -580,19 +591,11 @@ class DebugLogger:
             except Exception:
                 pass
             self._async_listener = None
-        
-        # 停止多进程队列监听器
-        if self._queue_listener is not None:
-            try:
-                self._queue_listener.stop()
-            except Exception:
-                pass
-            self._queue_listener = None
 
 
-def create_logger(name: str, log_dir: str = "log") -> DebugLogger:
+def create_logger(name: str, log_dir: str = "log", run_dir: Optional[Path] = None) -> DebugLogger:
     """创建调试日志记录器"""
-    return DebugLogger(name, log_dir)
+    return DebugLogger(name, log_dir, run_dir=run_dir)
 
 
 def log_function_calls(logger: DebugLogger):
@@ -627,39 +630,177 @@ def log_performance(logger: DebugLogger, operation: str, log_level: int = loggin
 
 # 全局日志记录器实例
 _global_loggers: Dict[str, DebugLogger] = {}
+_shared_run_dirs: Dict[str, Path] = {}  # 记录父进程的 run_dir，供无队列时子进程复用
 
 # 多进程日志队列和监听器
 _log_queue: Optional[multiprocessing.Queue] = None
 _log_listener: Optional[logging.handlers.QueueListener] = None
 _log_queue_lock = threading.Lock()
+_log_listener_lock = threading.Lock()
+_log_queue_init_failed = False
+_log_manager: Optional[multiprocessing.managers.SyncManager] = None
+_log_manager_clients: list = []
+_LOG_QUEUE_ADDR_ENV = "LOG_QUEUE_MANAGER_ADDR"
+_LOG_QUEUE_AUTH_ENV = "LOG_QUEUE_MANAGER_AUTH"
+_SHARED_RUN_DIR_PREFIX = "LOG_SHARED_RUN_DIR_"
+
+
+def _export_shared_run_dir(name: str, run_dir: Optional[Path]) -> None:
+    """将 run_dir 写入环境变量，spawn 子进程可复用"""
+    if run_dir is None:
+        return
+    try:
+        os.environ[f"{_SHARED_RUN_DIR_PREFIX}{name}"] = str(run_dir)
+    except Exception:
+        pass
+
+
+def _read_shared_run_dir(name: str) -> Optional[Path]:
+    """从环境变量读取父进程的 run_dir"""
+    try:
+        value = os.environ.get(f"{_SHARED_RUN_DIR_PREFIX}{name}")
+        if value:
+            return Path(value)
+    except Exception:
+        return None
+    return None
+
+
+def _start_log_manager() -> Optional[multiprocessing.managers.SyncManager]:
+    """在主进程启动管理器，暴露统一队列供子进程连接"""
+    global _log_manager
+    if _log_manager is not None:
+        return _log_manager
+
+    class _LogQueueManager(multiprocessing.managers.SyncManager):
+        pass
+
+    _shared = {}
+
+    def _get_or_create_queue():
+        q = _shared.get("queue")
+        if q is None:
+            # 使用线程安全队列，由管理器进程持有，避免某些环境的信号量限制
+            q = queue.Queue(-1)
+            _shared["queue"] = q
+        return q
+
+    _LogQueueManager.register("get_log_queue", callable=_get_or_create_queue)
+    try:
+        authkey = os.urandom(16)
+        _log_manager = _LogQueueManager(address=("127.0.0.1", 0), authkey=authkey)
+        _log_manager.start()
+        addr = _log_manager.address
+        if addr:
+            os.environ[_LOG_QUEUE_ADDR_ENV] = f"{addr[0]}:{addr[1]}"
+            os.environ[_LOG_QUEUE_AUTH_ENV] = authkey.hex()
+        return _log_manager
+    except Exception:
+        _log_manager = None
+        return None
+
+
+def _connect_existing_manager(addr_str: str, auth_hex: str):
+    """子进程根据环境变量连接到主进程队列管理器"""
+    try:
+        host, port_str = addr_str.split(":")
+        port = int(port_str)
+        class _LogQueueManager(multiprocessing.managers.SyncManager):
+            pass
+        _LogQueueManager.register("get_log_queue")
+        manager = _LogQueueManager(address=(host, port), authkey=bytes.fromhex(auth_hex))
+        manager.connect()
+        _log_manager_clients.append(manager)
+        return manager.get_log_queue()
+    except Exception:
+        return None
 
 def _get_log_queue() -> Optional[multiprocessing.Queue]:
     """获取全局日志队列（仅在主进程中创建）"""
     # 某些受限环境（如CI/沙箱）可能不允许创建多进程锁/队列，允许通过环境变量禁用
     if os.environ.get("LOG_DISABLE_MP_QUEUE", "").lower() in ("1", "true", "yes"):
         return None
-    global _log_queue
-    if _log_queue is None and _is_main_process():
-        with _log_queue_lock:
-            if _log_queue is None:
-                _log_queue = multiprocessing.Queue(-1)  # 无限制队列
+    global _log_queue, _log_queue_init_failed
+    if _log_queue_init_failed:
+        return None
+    if _log_queue is None:
+        if _is_main_process():
+            with _log_queue_lock:
+                if _log_queue is None:
+                    try:
+                        manager = _start_log_manager()
+                        if manager is not None:
+                            _log_queue = manager.get_log_queue()
+                        else:
+                            _log_queue = multiprocessing.Queue(-1)
+                    except Exception as e:
+                        # 在不支持信号量/共享内存的沙箱环境下，降级为无多进程队列模式
+                        _log_queue_init_failed = True
+                        print(f"创建日志进程队列失败，已禁用多进程日志队列: {e}")
+                        return None
+        else:
+            addr = os.environ.get(_LOG_QUEUE_ADDR_ENV)
+            auth = os.environ.get(_LOG_QUEUE_AUTH_ENV)
+            if addr and auth:
+                queue_obj = _connect_existing_manager(addr, auth)
+                if queue_obj is not None:
+                    _log_queue = queue_obj
     return _log_queue
 
-# 注意：每个logger创建自己的监听器，监听同一个队列
-# QueueListener会从队列中取出日志，并发送到所有提供的handler
-# 由于handler会根据logger名称过滤，多个监听器可能导致日志丢失
-# 实际方案：每个logger创建监听器，但只监听自己logger的日志
-# 这是通过handler的filter机制实现的
+
+def _ensure_global_queue_listener():
+    """确保只有一个全局队列监听器，避免多个监听器竞争同一个队列导致日志丢失"""
+    global _log_listener
+    # 仅主进程负责消费子进程发送的日志
+    if not _is_main_process():
+        return
+    log_queue = _get_log_queue()
+    if log_queue is None:
+        return
+    with _log_listener_lock:
+        if _log_listener is not None:
+            return
+
+        class _DispatchToLogger(logging.Handler):
+            """将进程队列中的日志转发到对应的 logger 管道"""
+            def emit(self, record: logging.LogRecord) -> None:
+                try:
+                    target = _global_loggers.get(record.name)
+                    if target is not None:
+                        # 复用目标 logger 已有的异步/文件/控制台处理链
+                        target.logger.handle(record)
+                    else:
+                        # 如果目标 logger 尚未创建，降级交给同名 logger 处理
+                        logging.getLogger(record.name).handle(record)
+                except Exception:
+                    self.handleError(record)
+
+        _log_listener = logging.handlers.QueueListener(
+            log_queue,
+            _DispatchToLogger(),
+            respect_handler_level=True
+        )
+        _log_listener.start()
+
+# 全局仅创建一个队列监听器，避免多个监听器同时消费同一个队列导致日志丢失
+# 每条日志都会根据 record.name 转发到对应的 logger 管道
 
 def _stop_queue_listener():
     """停止队列监听器（应在程序退出时调用）"""
-    global _log_listener
-    if _log_listener is not None:
+    global _log_listener, _log_manager
+    with _log_listener_lock:
+        if _log_listener is not None:
+            try:
+                _log_listener.stop()
+            except Exception:
+                pass
+            _log_listener = None
+    if _log_manager is not None:
         try:
-            _log_listener.stop()
+            _log_manager.shutdown()
         except Exception:
             pass
-        _log_listener = None
+        _log_manager = None
 
 
 def stop_all_loggers():
@@ -669,18 +810,44 @@ def stop_all_loggers():
             logger.stop()
         except Exception:
             pass
+    _stop_queue_listener()
 
 
 def get_logger(name: str, log_dir: str = "log") -> DebugLogger:
     """获取全局日志记录器"""
     # 队列会在创建logger时自动初始化（通过 _get_log_queue()）
-    if name not in _global_loggers:
-        _global_loggers[name] = create_logger(name, log_dir)
+    existing = _global_loggers.get(name)
+    log_queue = _get_log_queue()
+    # 进程切换时（如子进程 fork 后），需要为当前进程重新创建 logger，避免沿用父进程的 handler/线程
+    if existing is None or getattr(existing, "_owner_pid", None) != os.getpid():
+        # 记录父进程 run_dir，便于无队列时子进程复用
+        if existing is not None:
+            _shared_run_dirs[name] = getattr(existing, "run_dir", None) or _shared_run_dirs.get(name)
+            _export_shared_run_dir(name, _shared_run_dirs.get(name))
+            try:
+                existing.stop()
+            except Exception:
+                pass
+        # 清理根 logger 的旧 handler，避免重复输出
+        base_logger = logging.getLogger(name)
+        for handler in list(base_logger.handlers):
+            try:
+                base_logger.removeHandler(handler)
+            except Exception:
+                pass
+        # 队列不可用时，子进程复用父进程的 run_dir；否则仍按正常流程创建
+        reuse_run_dir = None
+        if log_queue is None:
+            reuse_run_dir = _shared_run_dirs.get(name) or _read_shared_run_dir(name)
+        _global_loggers[name] = create_logger(name, log_dir, run_dir=reuse_run_dir)
+        if name not in _shared_run_dirs:
+            _shared_run_dirs[name] = getattr(_global_loggers[name], "run_dir", None)
+        _export_shared_run_dir(name, _shared_run_dirs.get(name))
     return _global_loggers[name]
 
 
 def cleanup_old_logs(log_dir: str = "log", days: int = 30):
-    """清理旧日志文件"""
+    """清理旧日志文件/目录"""
     log_path = Path(log_dir)
     if not log_path.exists():
         return
@@ -688,17 +855,24 @@ def cleanup_old_logs(log_dir: str = "log", days: int = 30):
     cutoff_time = time.time() - (days * 24 * 60 * 60)
     deleted_count = 0
     
-    for log_file in log_path.glob("*.log*"):
-        if log_file.stat().st_mtime < cutoff_time:
-            try:
-                log_file.unlink()
-                deleted_count += 1
-                print(f"已删除旧日志文件: {log_file}")
-            except Exception as e:
-                print(f"删除日志文件失败: {log_file}, 错误: {e}")
+    for path in log_path.iterdir():
+        try:
+            if path.is_file() and path.suffix.startswith(".log"):
+                if path.stat().st_mtime < cutoff_time:
+                    path.unlink()
+                    deleted_count += 1
+                    print(f"已删除旧日志文件: {path}")
+            elif path.is_dir():
+                for run_dir in path.iterdir():
+                    if run_dir.is_dir() and run_dir.stat().st_mtime < cutoff_time:
+                        shutil.rmtree(run_dir, ignore_errors=True)
+                        deleted_count += 1
+                        print(f"已删除旧日志目录: {run_dir}")
+        except Exception as e:
+            print(f"删除日志失败: {path}, 错误: {e}")
     
     if deleted_count > 0:
-        print(f"清理完成，共删除 {deleted_count} 个旧日志文件")
+        print(f"清理完成，共删除 {deleted_count} 个旧日志")
 
 # ==================== 日志初始化功能 ====================
 # 确保log目录存在

@@ -68,9 +68,7 @@ from config import (
     SC_REF_DATE, SC_LOOKBACK_D, SC_PRESCREEN_LOOKBACK_D, SC_BASE_SCORE, SC_MIN_SCORE,
     SC_TIE_BREAK, SC_MAX_WORKERS, SC_READ_TAIL_DAYS,
     SC_OUTPUT_DIR, SC_CACHE_DIR,
-    SC_DO_TRACKING, SC_DO_SURGE,
-    SC_WRITE_WHITELIST, SC_WRITE_BLACKLIST, SC_ATTENTION_SOURCE,
-    SC_ATTENTION_WINDOW_D, SC_ATTENTION_MIN_HITS, SC_ATTENTION_TOP_K,
+    SC_ATTENTION_SOURCE, SC_ATTENTION_WINDOW_D, SC_ATTENTION_MIN_HITS, SC_ATTENTION_TOP_K,
     SC_BENCH_CODES, SC_BENCH_WINDOW, SC_BENCH_FILL, SC_BENCH_FEATURES,
     SC_UNIVERSE, 
     SC_DETAIL_STORAGE, SC_USE_DB_STORAGE, SC_DB_FALLBACK_TO_JSON,
@@ -79,7 +77,6 @@ from config import (
     SC_ENABLE_RULE_DETAILS,
     SC_ENABLE_CUSTOM_TAGS,
     SC_ENABLE_VERBOSE_SCORE_LOG,
-    SC_ENABLE_VECTOR_BOOL,
     SC_ENABLE_BATCH_XSEC,
     SC_DYNAMIC_RESAMPLE,
 )
@@ -129,8 +126,6 @@ def _read_data_via_dispatcher(ts_code: str, start_date: str, end_date: str, colu
 from utils import (
     normalize_ts, normalize_trade_date,
     get_latest_date_from_database as _get_latest_date_from_database,
-    get_latest_date_from_daily_partition as _get_latest_date_from_daily_partition,
-    get_latest_date_from_single_dir as _get_latest_date_from_single_dir
 )
 import tdx_compat as tdx
 from tdx_compat import evaluate_bool  # evaluate_bool 内部已使用 compile_script 的 LRU 缓存进行表达式预编译优化
@@ -522,7 +517,9 @@ def _load_score_all_csv_cached(d: str, usecols_key: str = "ts_code,rank,trade_da
     # 数据类型配置
     dtype = {"ts_code": str, "rank": "Int64", "trade_date": str}
     try:
-        return pd.read_csv(path, usecols=usecols or None, dtype=dtype, engine="c")
+        df = pd.read_csv(path, usecols=usecols or None, dtype=dtype, engine="c", encoding="utf-8-sig")
+        df.columns = [str(c).lstrip("\ufeff").strip() for c in df.columns]
+        return df
     except Exception as e:
         LOGGER.warning(f"[attention] 读取失败 {path}: {e}")
         return pd.DataFrame(columns=usecols or ["ts_code","rank","trade_date"])
@@ -1079,9 +1076,6 @@ def _get_batch_buffer_data():
         filtered_per_rules = _filter_rules_by_ref_date(per_rules, ref_date)
         
         # 对 JSON 字段进行序列化
-        highlights_json = json.dumps(summary.get('highlights', []), ensure_ascii=False)
-        drawbacks_json = json.dumps(summary.get('drawbacks', []), ensure_ascii=False)
-        opportunities_json = json.dumps(summary.get('opportunities', []), ensure_ascii=False)
         rules_json = json.dumps(filtered_per_rules if filtered_per_rules else [], ensure_ascii=False)
         
         # 正确处理tiebreak的None值
@@ -1103,9 +1097,6 @@ def _get_batch_buffer_data():
             'ref_date': summary['ref_date'],
             'score': summary.get('score', 0.0),
             'tiebreak': tiebreak_value,
-            'highlights': highlights_json,
-            'drawbacks': drawbacks_json,
-            'opportunities': opportunities_json,
             'rank': 0,
             'total': 0,
             'rules': rules_json
@@ -1167,9 +1158,6 @@ def _flush_batch_buffer():
             filtered_per_rules = _filter_rules_by_ref_date(per_rules, ref_date)
             
             # 对 JSON 字段进行序列化
-            highlights_json = json.dumps(summary.get('highlights', []), ensure_ascii=False)
-            drawbacks_json = json.dumps(summary.get('drawbacks', []), ensure_ascii=False)
-            opportunities_json = json.dumps(summary.get('opportunities', []), ensure_ascii=False)
             rules_json = json.dumps(filtered_per_rules if filtered_per_rules else [], ensure_ascii=False)
             
             # 正确处理tiebreak的None值
@@ -1191,9 +1179,6 @@ def _flush_batch_buffer():
                 'ref_date': summary['ref_date'],
                 'score': summary.get('score', 0.0),
                 'tiebreak': tiebreak_value,  # 正确处理None值
-                'highlights': highlights_json,
-                'drawbacks': drawbacks_json,
-                'opportunities': opportunities_json,
                 'rank': 0,  # 排名将在后续批量更新时设置
                 'total': 0,  # 总数将在后续批量更新时设置
                 'rules': rules_json
@@ -1700,7 +1685,7 @@ def backfill_prev_n_days(ref_date: str | None = None,
     include_today=False 表示窗口不包含参考日（“前 n 天”通常不含当天）。
     """
     # 1) 锚定参考日：无参则用 _pick_ref_date()
-    ref = ref_date or _pick_ref_date()
+    ref = ref_date or _pick_ref_date_stock()
 
     # 2) 读取交易日日历（daily 分区）
     get_trade_dates, _ = _get_database_manager_functions()
@@ -1759,46 +1744,156 @@ def _validate_config_ref_date(config_date: str, latest_date: str) -> str:
         return config_date
 
 
-def _pick_ref_date() -> str:
-    """
-    获取参考日期，按优先级尝试多种方式。
-    若 SC_REF_DATE 指定了 YYYYMMDD，优先使用它（会验证存在性）。
-    """
-    # 1. 优先从数据库获取最新日期
-    latest = _get_latest_date_from_database()
-    
-    # 2. 如果数据库获取失败，从daily分区获取
-    if latest is None:
-        latest = _get_latest_date_from_daily_partition()
-    
-    # 3. 如果daily分区也失败，从single目录推断
-    if latest is None:
-        # 尝试从single目录获取（需要传入路径）
-        try:
-            from config import DATA_ROOT, API_ADJ
-            single_dir = os.path.join(DATA_ROOT, "stock", "single", f"single_{API_ADJ}_indicators")
-            latest = _get_latest_date_from_single_dir(single_dir)
-        except Exception:
-            pass
-    
-    # 4. 如果所有方式都失败，抛出异常
-    if latest is None:
-        raise FileNotFoundError("无法从数据库、daily 或 single 目录推断参考日，请检查数据目录或者占用问题。")
+def _latest_rank_date_from_csv() -> str | None:
+    """从已生成的排名文件中获取最新日期。"""
+    try:
+        candidates: list[str] = []
+        for p in ALL_DIR.glob("score_all_*.csv"):
+            if not p.is_file() or p.stat().st_size == 0:
+                continue
+            m = re.match(r"score_all_(\d{8})\\.csv$", p.name)
+            if m:
+                candidates.append(m.group(1))
+        if candidates:
+            return max(candidates)
+    except Exception as e:
+        LOGGER.debug(f"[参考日] 扫描排名文件失败: {e}")
+    return None
 
-    # 5. 处理配置中的指定日期
+
+def _latest_ref_from_details_db() -> str | None:
+    """从 details 数据库获取最新参考日。"""
+    try:
+        from database_manager import (
+            get_details_db_path_with_fallback,
+            is_details_db_available,
+            query_details_recent_dates,
+            get_database_manager,
+        )
+
+        db_path = get_details_db_path_with_fallback()
+        manager = get_database_manager()
+        if not db_path or not manager or not is_details_db_available():
+            return None
+        dates = query_details_recent_dates(1, db_path)
+        return dates[0] if dates else None
+    except Exception as e:
+        LOGGER.debug(f"[参考日] 从details数据库获取最新日期失败: {e}")
+        return None
+
+
+def _list_rank_dates_from_csv() -> list[str]:
+    """获取已有排名文件中的所有日期（去重、排序）。"""
+    try:
+        dates: list[str] = []
+        for p in ALL_DIR.glob("score_all_*.csv"):
+            if not p.is_file() or p.stat().st_size == 0:
+                continue
+            m = re.match(r"score_all_(\d{8})\\.csv$", p.name)
+            if m:
+                dates.append(m.group(1))
+        return sorted(set(dates))
+    except Exception as e:
+        LOGGER.debug(f"[参考日] 扫描排名文件列表失败: {e}")
+        return []
+
+
+def _latest_trade_date_from_status_file() -> str | None:
+    """优先从 stock_data 的状态文件获取最新交易日。"""
+    try:
+        _, get_database_manager = _get_database_manager_functions()
+        manager = get_database_manager()
+        if not manager:
+            return None
+        status = manager.load_status_file()
+        if not status:
+            return None
+        stock_data = status.get("stock_data", {})
+        adj_types = stock_data.get("adj_types", {}) if isinstance(stock_data, dict) else {}
+        candidates = []
+        for adj_status in adj_types.values():
+            if isinstance(adj_status, dict):
+                md = adj_status.get("max_date")
+                if md:
+                    candidates.append(str(md))
+        if candidates:
+            return max(candidates)
+    except Exception as e:
+        LOGGER.debug(f"[参考日] 从状态文件获取最新交易日失败: {e}")
+    return None
+
+
+def _apply_config_ref_date(latest: str) -> str:
+    """应用配置中的 SC_REF_DATE（若设置），并记录必要的校验。"""
     if isinstance(SC_REF_DATE, str) and re.fullmatch(r"\d{8}", SC_REF_DATE):
-        ref = _validate_config_ref_date(SC_REF_DATE, latest)
-    else:
-        ref = latest
+        return _validate_config_ref_date(SC_REF_DATE, latest)
+    return latest
 
-    # 6. 打印对比信息
+
+def _log_ref_choice(ref: str, source: str):
     sys_today = _today_str()
     if ref != sys_today:
-        LOGGER.info(f"[参考日] 使用分区最新日 {ref}；系统今日 {sys_today}，请知悉。")
+        LOGGER.info(f"[参考日] 来自 {source}: {ref}；系统今日 {sys_today}")
     else:
-        LOGGER.info(f"[参考日] 使用今日分区 {ref}。")
-    
+        LOGGER.info(f"[参考日] 来自 {source}: 今日 {ref}")
+
+
+def _pick_ref_date_stock(*, emit_log: bool = True) -> str:
+    """仅使用股票数据链路（状态文件优先，其次数据库）确定参考日。"""
+    ref_source = _latest_trade_date_from_status_file()
+    if ref_source is None:
+        ref_source = _get_latest_date_from_database()
+    if ref_source is None:
+        raise FileNotFoundError("无法从状态文件或股票数据库推断参考日，请检查数据目录或数据库连接。")
+    ref = _apply_config_ref_date(ref_source)
+    if emit_log:
+        _log_ref_choice(ref, "stock_data")
     return ref
+
+
+def _pick_ref_date_rank(*, emit_log: bool = True) -> str:
+    """优先使用已有排名文件，兜底到股票数据链路。"""
+    ref_source = _latest_rank_date_from_csv()
+    if ref_source:
+        ref = _apply_config_ref_date(ref_source)
+        if emit_log:
+            _log_ref_choice(ref, "rank_csv")
+        return ref
+    return _pick_ref_date_stock(emit_log=emit_log)
+
+
+def _pick_ref_date_details(*, emit_log: bool = True) -> str:
+    """
+    需要 details 数据的场景：
+      1) 优先已有排名文件；2) 其次 details 数据库；3) 兜底股票数据链路。
+    """
+    ref_source = _latest_rank_date_from_csv()
+    if ref_source:
+        ref = _apply_config_ref_date(ref_source)
+        if emit_log:
+            _log_ref_choice(ref, "rank_csv")
+        return ref
+    ref_source = _latest_ref_from_details_db()
+    if ref_source:
+        ref = _apply_config_ref_date(ref_source)
+        if emit_log:
+            _log_ref_choice(ref, "details_db")
+        return ref
+    return _pick_ref_date_stock(emit_log=emit_log)
+
+
+def _pick_ref_date(*, rank_related: bool = False, use_details: bool = False) -> str:
+    """
+    向后兼容入口：
+      - rank_related=True → 使用排名文件兜底到股票数据（不默认触发 details）
+      - use_details=True  → 只有显式需要 details 数据时才会尝试 details 参考日
+    新代码建议直接调用：_pick_ref_date_stock / _pick_ref_date_rank / _pick_ref_date_details。
+    """
+    if use_details:
+        return _pick_ref_date_details()
+    if rank_related:
+        return _pick_ref_date_rank()
+    return _pick_ref_date_stock()
 
 
 # def _list_codes_for_day(day: str) -> List[str]:
@@ -2322,9 +2417,6 @@ def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: li
                 db_manager.init_stock_details_tables(details_db_path, "duckdb")
             
             # 准备股票详情数据 - 对 JSON 字段进行序列化
-            highlights_json = json.dumps(summary.get('highlights', []), ensure_ascii=False)
-            drawbacks_json = json.dumps(summary.get('drawbacks', []), ensure_ascii=False)
-            opportunities_json = json.dumps(summary.get('opportunities', []), ensure_ascii=False)
             rules_json = json.dumps(filtered_per_rules if filtered_per_rules else [], ensure_ascii=False)
             
             # 正确处理tiebreak的None值
@@ -2346,9 +2438,6 @@ def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: li
                 'ref_date': ref_date,
                 'score': summary.get('score', 0.0),
                 'tiebreak': tiebreak_value,  # 正确处理None值
-                'highlights': highlights_json,
-                'drawbacks': drawbacks_json,
-                'opportunities': opportunities_json,
                 'rank': 0,  # 排名将在批量更新时设置
                 'total': 0,  # 总数将在批量更新时设置
                 'rules': rules_json
@@ -2394,7 +2483,7 @@ def _write_detail_json(ts_code: str, ref_date: str, summary: dict, per_rules: li
             payload = {
                 "ts_code": ts_code,
                 "ref_date": ref_date,
-                "summary": summary,      # {"score": float, "tiebreak": float|None, "highlights": [...], "drawbacks":[...]}
+                "summary": summary,      # {"score": float, "tiebreak": float|None}
                 "rules": filtered_per_rules       # 每条规则的细粒度命中情况（见下），已过滤只保留ref_date的命中
             }
             with open(out_path, "w", encoding="utf-8") as f:
@@ -3614,6 +3703,9 @@ def _trade_span(start: Optional[str], end: str) -> List[str]:
     except Exception as e:
         LOGGER.error(f"获取交易日列表失败: {e}")
         return []
+    if not days:
+        # 无法从数据库取到交易日，回退到已有排名文件
+        days = _list_rank_dates_from_csv()
     days = [d for d in days if d <= end]
     if start:
         days = [d for d in days if d >= start]
@@ -4114,7 +4206,7 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
 
 
 def apply_rule_across_universe(rule: dict, ref_date: str | None = None, universe: str | list[str] | None = "all", return_df: bool = True):
-    ref = ref_date or _pick_ref_date()
+    ref = ref_date or _pick_ref_date_stock()
     tf  = str(rule.get("timeframe","D")).upper()
     win = int(rule.get("score_windows", SC_LOOKBACK_D))
     st  = _start_for_tf_window(ref, tf, win)
@@ -4402,9 +4494,6 @@ def _score_on_df_core(
                     summary={
                         "score": float(score),
                         "tiebreak": tb2,
-                        "highlights": list(highlights),
-                        "drawbacks": list(drawbacks),
-                        "opportunities": list(opportunities),
                     },
                     per_rules=per_rules
                 )
@@ -4921,7 +5010,7 @@ def build_category_rank(category_type: str = "strength",
     窗口：若未给 start，则取最近 SC_ATTENTION_WINDOW_D 个交易日，以 end/ref_date 为右端点。
     输出：{category_type}_{source}_{span_start}_{span_end}.csv（会直接覆盖旧文件）。
     """
-    end = end or _pick_ref_date()
+    end = end or _pick_ref_date_stock()
     source = (source or SC_ATTENTION_SOURCE).lower()
     min_hits = int(min_hits or SC_ATTENTION_MIN_HITS)
     topN = int(topN or SC_ATTENTION_TOP_K)
@@ -4931,6 +5020,9 @@ def build_category_rank(category_type: str = "strength",
     if not span:
         LOGGER.warning(f"[分类榜/{category_type}] 交易日窗口为空，start={start} end={end}")
         return None
+    min_hits_eff = max(1, min(min_hits, len(span)))
+    if min_hits_eff != min_hits:
+        LOGGER.info(f"[分类榜/{category_type}] 可用交易日不足，最小上榜次数从 {min_hits} 调整为 {min_hits_eff}（窗口={len(span)}）")
 
     mode = (mode or "strength").lower()
     if mode == "hits" or source in ("white", "black"):
@@ -4945,7 +5037,8 @@ def build_category_rank(category_type: str = "strength",
                 if not os.path.isfile(path_all):
                     continue
                 try:
-                    df = pd.read_csv(path_all, dtype={"ts_code": str})
+                    df = pd.read_csv(path_all, dtype={"ts_code": str}, encoding="utf-8-sig")
+                    df.columns = [str(c).lstrip("\ufeff").strip() for c in df.columns]
                     if df.empty:
                         continue
                     if "rank" in df.columns:
@@ -4987,10 +5080,10 @@ def build_category_rank(category_type: str = "strength",
             return None
         rows = [
             {"ts_code": c, "hits": n, "first": first_last[c][0], "last": first_last[c][1]}
-            for c, n in hit_cnt.items() if n >= min_hits
+            for c, n in hit_cnt.items() if n >= min_hits_eff
         ]
         if not rows:
-            LOGGER.info("[分类榜/%s] 命中数 >= %d 的为空。", category_type, min_hits); return None
+            LOGGER.info("[分类榜/%s] 命中数 >= %d 的为空。", category_type, min_hits_eff); return None
         out_df = pd.DataFrame(rows).sort_values(["hits", "last", "ts_code"], ascending=[False, False, True]).head(topN)
     else:
         # ===== 新口径：排名强度（带时间权重） =====
@@ -5010,7 +5103,8 @@ def build_category_rank(category_type: str = "strength",
             df = None; total = 0
             if os.path.isfile(path_all):
                 try:
-                    df = pd.read_csv(path_all, dtype={"ts_code": str})
+                    df = pd.read_csv(path_all, dtype={"ts_code": str}, encoding="utf-8-sig")
+                    df.columns = [str(c).lstrip("\ufeff").strip() for c in df.columns]
                     if df.empty:
                         df = None
                     else:
@@ -5058,7 +5152,7 @@ def build_category_rank(category_type: str = "strength",
         rows = []
         for c, s in strength.items():
             n = hits.get(c, 0)
-            if n >= min_hits:
+            if n >= min_hits_eff:
                 f, l = first_last.get(c, (span[0], span[-1]))
                 rows.append({
                     "ts_code": c,
@@ -5070,7 +5164,7 @@ def build_category_rank(category_type: str = "strength",
                     "first": f, "last": l
                 })
         if not rows:
-            LOGGER.info("[分类榜/%s] 强度口径下，命中数 >= %d 的为空。", category_type, min_hits); return None
+            LOGGER.info("[分类榜/%s] 强度口径下，命中数 >= %d 的为空。", category_type, min_hits_eff); return None
         out_df = (pd.DataFrame(rows)
                   .sort_values(["strength", "last", "best_rank", "ts_code"],
                                ascending=[False, False, True, True])
@@ -5111,7 +5205,7 @@ def backfill_category_rolling(category_type: str = "strength",
     """
     if start is None:
         raise ValueError("start 参数必须提供")
-    end = end or _pick_ref_date()
+    end = end or _pick_ref_date_stock()
     days = _trade_span(start, end)
     if not days:
         category_name = {"strength": "强度榜", "momentum": "动量榜"}.get(category_type, f"{category_type}榜")
@@ -5222,7 +5316,8 @@ def build_custom_rank(combo_name: str,
             return any((n in names_triggered) for n in rule_names_set)
         return all((n in names_triggered) for n in rule_names_set)
     
-    ref_date = ref_date or _pick_ref_date()
+    # 自选榜需要 details 数据，允许使用 details 参考日链路
+    ref_date = ref_date or _pick_ref_date_details()
     if not ref_date:
         LOGGER.warning(f"[自选榜] 未能确定参考日")
         return None
@@ -5560,7 +5655,7 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     scoring_start_time = time.time()
     # 1) 参考日
     if not ref_date:
-        ref_date = _pick_ref_date()
+        ref_date = _pick_ref_date_stock()
     _progress("select_ref_date", message=f"ref={ref_date}")
     
     # 0) 先尝试清理可能残留的数据库连接（避免之前的详情浏览等功能占用连接）
@@ -5814,9 +5909,6 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
                     'ref_date': ref_date,
                     'score': stock.score,
                     'tiebreak': stock.tiebreak,
-                    'highlights': json.dumps(stock.highlights if stock.highlights else [], ensure_ascii=False),
-                    'drawbacks': json.dumps(stock.drawbacks if stock.drawbacks else [], ensure_ascii=False),
-                    'opportunities': json.dumps(stock.opportunities if stock.opportunities else [], ensure_ascii=False),
                     'rank': rank,
                     'total': total_count,
                     'rules': json.dumps([], ensure_ascii=False)
@@ -6152,12 +6244,12 @@ def tdx_screen(
     universe: str | list[str] | None = "all",
     use_prescreen_first: bool = True,
     return_df: bool = True
-):
+    ):
     when = (when or "").strip()
     if not when:
         raise ValueError("when 不能为空")
 
-    ref = ref_date or _pick_ref_date()
+    ref = ref_date or _pick_ref_date_stock()
     tf  = (timeframe or "D").upper()
     user_score_windows = int(window or 30)  # 用户输入的 window 参数理解为 score_windows（计分窗口）
     
@@ -6478,7 +6570,7 @@ def diagnose_expr(when: str, ref_date: str | None = None, timeframe: str = "D", 
     if not when:
         return {"ok": False, "error": "when 不能为空", "need_cols": [], "missing": []}
 
-    ref = ref_date or _pick_ref_date()
+    ref = ref_date or _pick_ref_date_stock()
     tf  = (timeframe or "D").upper()
     win = int(window)
     st  = _start_for_tf_window(ref, tf, win)
