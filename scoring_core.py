@@ -279,6 +279,72 @@ def _normalize_gate(rule: dict) -> dict | None:
     return None
 
 
+def _merge_gate_into_rule(rule: dict) -> dict:
+    """
+    将 gate/trigger/require 合并进主体 rule：
+      - 对于单条 when，将 gate 表达式与 when 进行 AND 组合
+      - 对于 clauses 规则，将 gate 表达式追加为额外子句
+    仅组合表达式，不再做 gate 的独立判定。
+    """
+    if not rule:
+        return rule
+    merged = dict(rule)
+
+    # 先递归处理子句，确保子句里的 gate 也被合并
+    if merged.get("clauses"):
+        merged["clauses"] = [_merge_gate_into_rule(c) for c in merged.get("clauses", []) or []]
+
+    gate_raw = merged.get("trigger") or merged.get("gate") or merged.get("require")
+
+    # 汇总 gate 表达式（仅取 when，忽略 scope/timeframe 的特殊处理）
+    gate_exprs: list[str] = []
+    if isinstance(gate_raw, str):
+        g = gate_raw.strip()
+        if g:
+            gate_exprs.append(g)
+    elif isinstance(gate_raw, dict):
+        gw = (gate_raw.get("when") or "").strip()
+        if gw:
+            gate_exprs.append(gw)
+        for c in gate_raw.get("clauses", []) or []:
+            if isinstance(c, dict):
+                cw = (c.get("when") or "").strip()
+                if cw:
+                    gate_exprs.append(cw)
+    elif isinstance(gate_raw, (list, tuple)):
+        for g in gate_raw:
+            if isinstance(g, str):
+                gg = g.strip()
+                if gg:
+                    gate_exprs.append(gg)
+            elif isinstance(g, dict):
+                gw = (g.get("when") or "").strip()
+                if gw:
+                    gate_exprs.append(gw)
+
+    # 无 gate 时直接返回
+    if not gate_exprs:
+        return merged
+
+    # 合并表达式：带 clauses 则追加子句，否则直接 AND 到 when
+    if merged.get("clauses"):
+        tf = str(merged.get("timeframe", "D")).upper()
+        score_window = _get_score_window(merged, SC_LOOKBACK_D)
+        scope = merged.get("scope", "LAST")
+        gate_clauses = [{"timeframe": tf, "score_windows": score_window, "scope": scope, "when": expr} for expr in gate_exprs]
+        merged["clauses"] = (merged.get("clauses") or []) + gate_clauses
+    else:
+        when_expr = (merged.get("when") or "").strip()
+        parts = gate_exprs + ([when_expr] if when_expr else [])
+        merged["when"] = " AND ".join(f"({p})" for p in parts if p)
+
+    # 移除 gate 字段，后续流程不再单独判定
+    for k in ("gate", "trigger", "require"):
+        merged.pop(k, None)
+
+    return merged
+
+
 # 需要先定义 _calc_nested_window，因为 _calc_rule_total_window 会用到它
 # 将 _calc_nested_window 的定义移到这里（在策略编译之前）
 @lru_cache(maxsize=256)
@@ -393,38 +459,11 @@ def _calc_rule_total_window(rule_or_clause: dict, tf: str) -> int:
     # 获取 score_windows
     window = int(rule_or_clause.get("score_windows", SC_LOOKBACK_D))
     
-    # 计算 when 表达式窗口
-    when_expr = (rule_or_clause.get("when") or "").strip()
-    expr_window = 0
-    if when_expr:
-        expr_window = _calc_nested_window(when_expr)
-    
-    # 计算 gate 表达式窗口
-    gate_raw = rule_or_clause.get("gate") or rule_or_clause.get("trigger") or rule_or_clause.get("require")
-    gate_window = 0
-    if gate_raw:
-        gate_norm = _normalize_gate(rule_or_clause)
-        if gate_norm:
-            if isinstance(gate_norm, dict) and "when" in gate_norm:
-                gate_expr = (gate_norm.get("when") or "").strip()
-                if gate_expr:
-                    gate_window = _calc_nested_window(gate_expr)
-            elif isinstance(gate_norm, dict) and "clauses" in gate_norm:
-                # gate 包含多个子句，需要计算每个子句的窗口
-                for clause in gate_norm["clauses"]:
-                    if isinstance(clause, dict) and "when" in clause:
-                        clause_expr = (clause.get("when") or "").strip()
-                        if clause_expr:
-                            clause_window = _calc_nested_window(clause_expr)
-                            gate_window = max(gate_window, clause_window)
-        elif isinstance(gate_raw, str):
-            # gate 是字符串表达式
-            gate_expr = gate_raw.strip()
-            if gate_expr:
-                gate_window = _calc_nested_window(gate_expr)
-    
-    # 总窗口 = score_windows + max(when_window, gate_window)
-    expr_window = max(expr_window, gate_window)
+    # gate 已合并到 when/clauses，这里直接基于合并后的 when 计算窗口
+    merged_rule = _merge_gate_into_rule(rule_or_clause)
+    when_expr = (merged_rule.get("when") or "").strip()
+    expr_window = _calc_nested_window(when_expr) if when_expr else 0
+
     total_window = window + expr_window
     
     # 缓存结果
@@ -1654,6 +1693,7 @@ def _make_time_weights(n: int,
 
 def _eval_gate(df: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = None) -> tuple[bool, str | None, dict | None]:
     """
+    【弃用】gate 已在上层合并进 when/clauses，保留仅为兼容旧调用。
     返回: (gate_ok, err, gate_norm)
     gate 为空 → 视为 True
     多子句（列表）= AND 关系
@@ -2041,6 +2081,7 @@ def _recent_points(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = Non
       2) 字典列表：[{min:0,max:0,points:3}, ...]
     返回 (加分, lag, 错误或None)
     """
+    rule = _merge_gate_into_rule(rule)
     tf = str(rule.get("timeframe", "D")).upper()
     # 对于 RECENT/DIST/NEAR scope，score_windows 会被忽略，直接使用 dist_points 的最大值
     # _get_score_window 已经处理了这个逻辑
@@ -2768,55 +2809,43 @@ def _eval_bool_cached(ctx: dict, base_df: pd.DataFrame, expr: str, tf: str, scor
 
 def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) -> list[dict]:
     rows = []
-    gate_ok=False; gate_norm={}
     try:
         _inject_config_tags(df, ref_date, ctx)   # 让 TAG_HITS/ANY_TAG 能拿到 CUSTOM_TAGS
     except Exception:
         pass
     for rule in _iter_unique_rules():
-        name = str(rule.get("name", "<unnamed>"))
-        scope = str(rule.get("scope", "ANY")).upper().strip()
-        pts   = float(rule.get("points", 0))
-        tf    = str(rule.get("timeframe", "D")).upper()
+        rule_eval = _merge_gate_into_rule(rule)
+        name = str(rule_eval.get("name", "<unnamed>"))
+        scope = str(rule_eval.get("scope", "ANY")).upper().strip()
+        pts   = float(rule_eval.get("points", 0))
+        tf    = str(rule_eval.get("timeframe", "D")).upper()
         # 对于 RECENT/DIST/NEAR scope，score_windows 会被忽略，直接使用 dist_points 的最大值
         # _get_score_window 已经处理了这个逻辑
-        score_window = _get_score_window(rule, SC_LOOKBACK_D)
+        score_window = _get_score_window(rule_eval, SC_LOOKBACK_D)
         
-        expl  = rule.get("explain")
+        expl  = rule_eval.get("explain")
         when  = None
         ok = False
         cnt = None
         add = 0.0
         err = None
         period = None
+        cand_when = None
         try:
             try:
-                period = _period_for_clause(df, rule, ref_date)
+                period = _period_for_clause(df, rule_eval, ref_date)
             except Exception:
                 period = ref_date
             if scope in {"EACH", "PERBAR", "EACH_TRUE"}:
-                # 检查是否有 gate
-                gate_norm = _normalize_gate(rule)
-                if gate_norm:
-                    # 如果有 gate，使用 _count_hits_perbar_with_gate() 函数
-                    # 该函数会对每次命中单独判断 gate，只统计同时满足 when 和 gate 的天数
-                    cnt, err = _count_hits_perbar_with_gate(df, rule, ref_date, ctx)
-                    # 对于带 gate 的 EACH scope，cnt 已经是同时满足 when 和 gate 的天数
-                    # 所以 gate_ok 始终为 True（因为已经过滤过了）
-                    gate_ok = True
-                else:
-                    # 如果没有 gate，使用原来的函数
-                    cnt, err = _count_hits_perbar(df, rule, ref_date, ctx)
-                    gate_ok = True
+                cnt, err = _count_hits_perbar(df, rule_eval, ref_date, ctx)
                 dfTF = df if tf=="D" else _resample(df, tf)
                 win_df = _window_slice(dfTF, ref_date, score_window)
-                cand_when = None
-                if "clauses" in rule and rule["clauses"]:
-                    for c in rule["clauses"]:
+                if "clauses" in rule_eval and rule_eval["clauses"]:
+                    for c in rule_eval["clauses"]:
                         if c.get("when"):
                             cand_when = c["when"]; break
                 else:
-                    cand_when = rule.get("when")
+                    cand_when = rule_eval.get("when")
                 hit_date = None
                 if not err and cand_when:
                     _d, _ = _last_true_date(df, cand_when, ref_date=ref_date, timeframe=tf, window=score_window, ctx=ctx)
@@ -2829,16 +2858,16 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) ->
                     "points": pts, "ok": ok, "cnt": int(cnt or 0),
                     "add": add,
                     "hit_date": hit_date,
-                    "hit_dates": _list_true_dates(df, (cand_when or rule.get("when") or ""), ref_date=ref_date, window=score_window, timeframe=tf, ctx=ctx),
+                    "hit_dates": _list_true_dates(df, (cand_when or rule_eval.get("when") or ""), ref_date=ref_date, window=score_window, timeframe=tf, ctx=ctx),
                     "hit_count": int(cnt or 0),
-                    "gate_ok": bool(gate_ok),
-                    "gate_when": (gate_norm.get("when") if isinstance(gate_norm, dict) else None) if gate_norm else None,
+                    "gate_ok": True,
+                    "gate_when": None,
                 })
                 continue
             else:
                 # === RECENT / DIST / NEAR: 按最近一次命中距今天数计分 ===
                 if scope in {"RECENT", "DIST", "NEAR"}:
-                    add, lag, err = _recent_points(df, rule, ref_date, ctx)
+                    add, lag, err = _recent_points(df, rule_eval, ref_date, ctx)
                     dfTF = df if tf=="D" else _resample(df, tf)
                     win_df = _window_slice(dfTF, ref_date, score_window)
                     hit_date = None
@@ -2853,9 +2882,6 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) ->
                     
                     # 修复：RECENT规则的ok应该基于lag是否存在，而不是初始值False
                     ok = bool(lag is not None and err is None)
-                    gate_ok, gate_err, gate_norm = _eval_gate(df, rule, ref_date, ctx)
-                    if not gate_ok:
-                        add = 0.0
 
                     rows.append({
                         "name": name, "scope": scope, "timeframe": tf, "score_windows": score_window, "period": period,
@@ -2863,23 +2889,22 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) ->
                         "add": add, "lag": (None if lag is None else int(lag)),
                         "hit_date": hit_date, "hit_dates": _list_true_dates(df, cand_when or (when or ""), ref_date=ref_date, window=score_window, timeframe=tf, ctx=ctx),
                         "hit_count": int(cnt or 0),
-                        "gate_ok": bool(gate_ok),
-                        "gate_when": (gate_norm.get("when") if isinstance(gate_norm, dict) else None),
+                        "gate_ok": True,
+                        "gate_when": None,
                     })
                     continue
                 # === 其余仍走原来的布尔命中路径 ===
-                ok_eval, err_eval = _eval_rule(df, rule, ref_date, ctx)
+                ok_eval, err_eval = _eval_rule(df, rule_eval, ref_date, ctx)
                 ok  = bool(ok_eval and not err_eval)
                 err = err_eval
-                when = rule.get("when")
+                when = rule_eval.get("when")
 
 
             # === 追加：常规布尔规则命中日期信息 ===
             hit_date = None
             hit_dates = []
-            gate_ok, gate_err, gate_norm = _eval_gate(df, rule, ref_date, ctx)
-            # 计算add：只有当ok=True、gate_ok=True且pts!=0时，才设置add
-            add = (pts if (ok and gate_ok and pts) else 0.0)
+            # 计算add：只要命中且pts!=0就加分（gate 已合并到 when 中）
+            add = (pts if (ok and pts) else 0.0)
             try:
                 if when:
                     dfTF2 = df if tf=="D" else _resample(df, tf)
@@ -2899,8 +2924,8 @@ def _build_per_rule_detail(df: pd.DataFrame, ref_date: str, ctx: dict = None) ->
             "points": pts, "ok": ok, "cnt": (None if cnt is None else int(cnt)),
             "add": add, "hit_date": hit_date, "hit_dates": hit_dates, "hit_count": (len(hit_dates) if hit_dates else 0),
             "error": err,
-            "gate_ok": bool(gate_ok),
-            "gate_when": (gate_norm.get("when") if isinstance(gate_norm, dict) else None),
+            "gate_ok": True,
+            "gate_when": None,
 
         })
     return rows
@@ -3380,7 +3405,7 @@ def _scope_hit(s_bool: pd.Series, scope: str) -> bool:
       - EACH / PERBAR / EACH_TRUE scope **不使用此函数**
       - 对于 EACH scope，应使用 _count_hits_perbar() 函数来计算窗口内逐K命中次数
       - _count_hits_perbar() 会统计窗口内有多少根K线满足条件，返回命中次数
-      - 如果 _count_hits_perbar() 返回的 cnt > 0，说明策略触发（需要结合 gate 判断最终是否加分）
+      - 如果 _count_hits_perbar() 返回的 cnt > 0，说明策略触发，最终加分 = points * cnt
       - 参考：_eval_single_rule() 函数中对于 EACH scope 的处理逻辑（第3579行）
     
     参数：
@@ -3843,6 +3868,9 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
         category = "filter" if "hard_penalty" in rule or "reason" in rule else "ranking"
         _validate_required_fields(rule, category, rule_name)
     
+    # 将 gate/trigger/require 合并进 when/clauses，后续不再单独判定 gate
+    rule = _merge_gate_into_rule(rule)
+
     tf   = str(rule.get("timeframe","D")).upper()
     scope = str(rule.get("scope", "ANY")).upper().strip()
     # 对于 RECENT/DIST/NEAR scope，score_windows 会被忽略，直接使用 dist_points 的最大值
@@ -3954,26 +3982,12 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
             cand_when = rule.get("when")
         when = cand_when
         
-        # EACH/PERBAR/EACH_TRUE scope 处理：使用 _count_hits_perbar() 或 _count_hits_perbar_with_gate() 函数
-        # 注意：EACH scope 不使用 _scope_hit() 函数，而是使用 _count_hits_perbar() 统计窗口内逐K命中次数
-        # 对于带 gate 的 EACH scope 策略，每次命中都单独判断 gate
-        # 参考：_count_hits_perbar() 函数的详细注释（第4284行）
+        # EACH/PERBAR/EACH_TRUE scope 处理：使用 _count_hits_perbar() 统计窗口内逐K命中次数
+        # gate/trigger/require 已合并到 when，无需单独判定 gate
         if scope in {"EACH","PERBAR","EACH_TRUE"}:
-            # 检查是否有 gate
-            gate_norm = _normalize_gate(rule)
-            if gate_norm:
-                # 如果有 gate，使用 _count_hits_perbar_with_gate() 函数
-                # 该函数会对每次命中单独判断 gate，只统计同时满足 when 和 gate 的天数
-                cnt, err = _count_hits_perbar_with_gate(dfD, rule, ref_date, ctx)
-                if err: res["error"] = err
-                # 对于带 gate 的 EACH scope，cnt 已经是同时满足 when 和 gate 的天数
-                # 所以 gate_ok 始终为 True（因为已经过滤过了）
-                res["gate_ok"] = True
-            else:
-                # 如果没有 gate，使用原来的函数
-                cnt, err = _count_hits_perbar(dfD, rule, ref_date, ctx)
-                if err: res["error"] = err
-                res["gate_ok"] = True
+            cnt, err = _count_hits_perbar(dfD, rule, ref_date, ctx)
+            if err: res["error"] = err
+            res["gate_ok"] = True
             # 即使pts=0，只要cnt>0，也应该设置cnt和add（用于记录details）
             # 加分规则：add = points * count
             if cnt is not None:
@@ -4041,13 +4055,7 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
                 if err: res["error"] = err
                 res["lag"] = (None if lag is None else int(lag))
                 res["add"] = add
-            
-            gate_ok, _, _ = _eval_gate(dfD, rule, ref_date, ctx)
-            res["gate_ok"] = gate_ok
-            if gate_ok and res["add"]:
-                pass  # add已经在上面设置了
-            else:
-                res["add"] = 0.0
+            res["gate_ok"] = True
             
             if res["lag"] is not None and not win_df.empty:
                 idx = win_df.index if isinstance(win_df.index, pd.DatetimeIndex) else pd.to_datetime(win_df["trade_date"].astype(str))
@@ -4140,42 +4148,9 @@ def _eval_single_rule(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = 
             ok, err = _eval_rule(dfD, rule, ref_date, ctx)
         
         if err: res["error"] = err
-        
-        # Gate判断逻辑
-        # 对于LAST scope，gate在参考日判断
-        # 对于ANY/EACH/CONSEC/COUNT>=k等多日窗口scope，gate应该在满足when条件的日期判断
-        gate_norm = _normalize_gate(rule)
-        if gate_norm:
-            if scope == "LAST":
-                # LAST scope：gate在参考日判断
-                gate_ok, _, _ = _eval_gate(dfD, rule, ref_date, ctx)
-            elif ok and w and not win_df.empty:
-                # 多日窗口scope：找到所有满足when条件的日期，对每个日期判断gate
-                # 如果至少有一个日期同时满足when和gate，则gate_ok=True
-                gate_ok = False
-                try:
-                    # 获取所有满足when条件的日期
-                    hit_dates = _list_true_dates(dfD, w, ref_date=ref_date, window=score_window, timeframe=tf, ctx=ctx)
-                    for date_str in hit_dates:
-                        try:
-                            day_gate_ok, gate_err, _ = _eval_gate(dfD, rule, date_str, ctx)
-                            if day_gate_ok and not gate_err:
-                                gate_ok = True
-                                break  # 找到一个满足的日期即可
-                        except Exception:
-                            continue
-                except Exception:
-                    # 如果出错，fallback到参考日判断
-                    gate_ok, _, _ = _eval_gate(dfD, rule, ref_date, ctx)
-            else:
-                # 如果没有when条件或ok=False，fallback到参考日判断
-                gate_ok, _, _ = _eval_gate(dfD, rule, ref_date, ctx)
-        else:
-            # 没有gate，视为通过
-            gate_ok = True
-        
-        res["gate_ok"] = gate_ok
-        if ok and gate_ok and pts:
+
+        res["gate_ok"] = True
+        if ok and pts:
             res["add"] = float(pts)
         # 命中日/全集命中
         if w and not win_df.empty:
@@ -4690,8 +4665,7 @@ def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str, c
       对于 EACH scope 的策略：
       1. 使用此函数计算窗口内逐K命中次数
       2. 如果返回的 count > 0，说明策略触发（有命中）
-      3. 最终是否加分还需要结合 gate 判断（在 _eval_single_rule 中处理）
-      4. 加分 = points * count（如果 gate_ok 为 True）
+      3. 加分 = points * count
     
     处理逻辑：
       - 单条 rule（无 clauses）：
@@ -4722,10 +4696,11 @@ def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str, c
           cnt, err = _count_hits_perbar(dfD, rule, ref_date, ctx)
           if cnt and cnt > 0:
               res["cnt"] = int(cnt)
-              res["add"] = float(pts * int(cnt)) if gate_ok else 0.0
+              res["add"] = float(pts * int(cnt))
       ```
     """
     try:
+        rule_or_clause = _merge_gate_into_rule(rule_or_clause)
         if "clauses" in rule_or_clause and rule_or_clause["clauses"]:
             clauses = rule_or_clause["clauses"]
             tfs = [str(c.get("timeframe","D")).upper() for c in clauses]
@@ -4826,6 +4801,7 @@ def _count_hits_perbar(dfD: pd.DataFrame, rule_or_clause: dict, ref_date: str, c
 
 def _count_hits_perbar_with_gate(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = None) -> Tuple[int, Optional[str]]:
     """
+    【弃用】主流程已将 gate 合并进 when/clauses，保留仅为兼容旧逻辑。
     统计"窗口内逐K命中次数"（专门用于 scope=EACH / PERBAR / EACH_TRUE，且带 gate）。
     
     对于 EACH scope 的策略，每次命中都单独判断 gate：

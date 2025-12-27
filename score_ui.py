@@ -1044,48 +1044,12 @@ def _latest_trade_date(base: str, adj: str) -> str | None:
     except Exception:
         return None
 
-# -------------------- 执行动作（封装 download.py） --------------------
-def _run_fast_init(end_use: str):
-    # 延迟导入 download 模块
-    dl = _lazy_import_download()
-    if dl is None:
-        raise ImportError("无法导入 download 模块")
-    
-    dl.fast_init_download(end_use)                       # 首次全量（单股缓存）
-    # 数据库操作已迁移到 data_reader.py，合并操作已集成到下载过程中
-
-
-def _run_increment(start_use: str, end_use: str, do_stock: bool, do_index: bool, do_indicators: bool):
-    # 延迟导入 download 模块
-    dl = _lazy_import_download()
-    if dl is None:
-        raise ImportError("无法导入 download 模块")
-    
-    # 若 fast_init 的缓存存在，先合并一次（与 main() 逻辑一致）
-    try:
-        if any(
-            os.path.isdir(os.path.join(dl.FAST_INIT_STOCK_DIR, d))
-            and any(f.endswith(".parquet") for f in os.listdir(os.path.join(dl.FAST_INIT_STOCK_DIR, d)))
-            for d in ("raw","qfq","hfq")
-        ):
-            # 数据库操作已迁移到 data_reader.py
-            pass
-    except Exception:
-        pass
-
-    if do_stock and ("stock" in set(dl.ASSETS)):
-        dl.sync_stock_daily_fast(start_use, end_use, threads=dl.STOCK_INC_THREADS)
-    if do_index and ("index" in set(dl.ASSETS)):
-        dl.sync_index_daily_fast(start_use, end_use, dl.INDEX_WHITELIST)
-    if do_indicators:
-        workers = getattr(dl, "INC_RECALC_WORKERS", None) or ((os.cpu_count() or 4) * 2)
-        dl.recalc_symbol_products_for_increment(start_use, end_use, threads=workers)
-
 # ===== 小工具 =====
 def _path_all(ref: str) -> Path: return ALL_DIR / f"score_all_{ref}.csv"
 def _path_detail(ref: str, ts: str) -> Path: return DET_DIR / ref / f"{normalize_ts(ts)}_{ref}.json"
 def _today_str() -> str:
     return date.today().strftime("%Y%m%d")
+
 
 def _normalize_rank_date_cols(df: pd.DataFrame) -> pd.DataFrame:
     """统一排名文件的日期列：优先保留 ref_date，若只有 trade_date 则重命名；两者同时存在则去掉 trade_date。"""
@@ -1122,6 +1086,7 @@ def _cleanup_rank_file_dates(path: str | Path) -> None:
     except Exception as e:
         logger.debug(f"清理排名日期列失败 {path}: {e}")
 
+
 @cache_data(show_spinner=False, ttl=120)
 def _read_rank_all_sorted(ref: str) -> pd.DataFrame:
     """读取全量排名并保证含 rank 列与顺序"""
@@ -1143,6 +1108,7 @@ def _read_rank_all_sorted(ref: str) -> pd.DataFrame:
         df_sorted["rank"] = np.arange(1, len(df_sorted) + 1)
     return df_sorted.reset_index(drop=True)
 
+
 def _slice_top_from_all(ref: str, k: int | None) -> pd.DataFrame:
     df_sorted = _read_rank_all_sorted(ref)
     if df_sorted.empty:
@@ -1150,6 +1116,7 @@ def _slice_top_from_all(ref: str, k: int | None) -> pd.DataFrame:
     if k is None or int(k) <= 0:
         return df_sorted
     return df_sorted.head(int(k))
+
 
 def _board_category(ts_code: str) -> str:
     """按 ts_code 粗分板块分类。"""
@@ -1161,6 +1128,7 @@ def _board_category(ts_code: str) -> str:
     if market == "北交所":
         return "北交所"
     return "其他"
+
 
 def _slice_board_top(ref: str, board: str, k: int = 100) -> pd.DataFrame:
     """按板块取前 k 名；board=全部 时不筛板块。"""
@@ -1176,6 +1144,7 @@ def _slice_board_top(ref: str, board: str, k: int = 100) -> pd.DataFrame:
     if k is None or int(k) <= 0:
         return df_sorted
     return df_sorted.head(int(k))
+
 
 def _codes_triggered_on_rule(ref_date: str, rule_name: str) -> list[str]:
     """
@@ -1272,6 +1241,7 @@ def _codes_triggered_on_rule(ref_date: str, rule_name: str) -> list[str]:
 
     return codes_list
 
+
 @cache_data(show_spinner=False, ttl=600)
 def _get_stock_name_map() -> dict[str, str]:
     """
@@ -1301,6 +1271,7 @@ def _get_stock_name_map() -> dict[str, str]:
     except Exception:
         return {}
 
+
 def _stock_name_of(ts_code: str) -> str | None:
     """根据 ts_code 查找股票名称（优先带后缀匹配，次选去后缀）。"""
     if not ts_code:
@@ -1315,6 +1286,7 @@ def _stock_name_of(ts_code: str) -> str | None:
         core = ts.split(".")[0]
         return mp.get(core)
     return None
+
 
 def _resolve_user_code_input(raw: str) -> str | None:
     """
@@ -1354,6 +1326,7 @@ def _resolve_user_code_input(raw: str) -> str | None:
         return norm or None
     return norm or None
 
+
 @cache_data(show_spinner=False, ttl=300)
 def _get_stock_basic_map() -> dict[str, dict]:
     """
@@ -1379,6 +1352,7 @@ def _get_stock_basic_map() -> dict[str, dict]:
         return mp
     except Exception:
         return {}
+
 
 def _format_market_caps(ts_code: str):
     """返回(总市值, 流通市值)的格式化文本，单位亿元；不可用时返回 (None, None)。"""
@@ -1495,6 +1469,7 @@ def _parse_code_list(raw_text: str) -> list[str]:
             out.append(code)
     return out
 
+
 def _build_external_chart_links(ts_code: str) -> list[tuple[str, str]]:
     """生成外部行情/图表链接，便于快速跳转查看。"""
     if not ts_code or "." not in ts_code:
@@ -1521,167 +1496,6 @@ def _build_external_chart_links(ts_code: str) -> list[tuple[str, str]]:
     if tv_market:
         links.append(("TradingView", f"https://cn.tradingview.com/chart/?symbol={tv_market}:{base}"))
     return links
-
-
-def _parse_hold_windows(raw_text: str, fallback: Sequence[int] = (3, 5)) -> list[int]:
-    """解析持仓窗口输入，返回正整数列表。"""
-    try:
-        vals = []
-        for x in re.split(r"[，,\\s]+", str(raw_text or "")):
-            if not x.strip():
-                continue
-            v = int(float(x))
-            if v > 0:
-                vals.append(v)
-        vals = sorted(set(vals))
-        return vals or list(fallback)
-    except Exception:
-        return list(fallback)
-
-
-def _calc_holding_snapshot(
-    codes: Sequence[str],
-    ref_date: str,
-    hold_days: Sequence[int] = (3, 5),
-    turnover_target: float = 60.0,
-) -> pd.DataFrame:
-    """
-    基于参考日次日开盘买入，计算持仓收益与累计换手耗时。
-    - 买入日：参考日的下一个交易日；若无则返回空表
-    - 收益：持有 n 日，到目标日收盘卖出的相对收益（%）
-    - 换手：累计 tor 达到 turnover_target 所需的交易日数
-    """
-    if not codes or not ref_date:
-        return pd.DataFrame()
-
-    # 规范化并去重
-    codes_norm: list[str] = []
-    seen: set[str] = set()
-    for c in codes:
-        norm = _resolve_user_code_input(c) or normalize_ts(str(c))
-        if norm and norm not in seen:
-            seen.add(norm)
-            codes_norm.append(norm)
-    if not codes_norm:
-        return pd.DataFrame()
-
-    cal = get_trade_dates() or []
-    # 选取买入日：参考日是交易日则取次一交易日；否则取参考日之后的首个交易日；仍无则用参考日
-    entry_date = None
-    if str(ref_date) in cal:
-        entry_date = _shift_trade_date(str(ref_date), 1, clamp=True)
-    if not entry_date:
-        entry_date = next((d for d in cal if d >= str(ref_date)), None)
-    if not entry_date:
-        entry_date = str(ref_date)
-
-    max_hold = max(hold_days) if hold_days else 0
-    end_date = (
-        _shift_trade_date(entry_date, max_hold + 5, clamp=True)
-        or _shift_trade_date(ref_date, max_hold + 5, clamp=True)
-        or (cal[-1] if cal else ref_date)
-    )
-
-    try:
-        df_price = batch_query_stock_data(
-            db_path=os.path.join(DATA_ROOT, UNIFIED_DB_PATH),
-            ts_codes=codes_norm,
-            start_date=str(ref_date),
-            end_date=str(end_date),
-            columns=["ts_code", "trade_date", "open", "close", "tor"],
-            adj_type="qfq",
-        )
-    except Exception:
-        df_price = pd.DataFrame()
-
-    if df_price is None or df_price.empty:
-        return pd.DataFrame(columns=["ts_code", "名称"] + [f"{d}日持仓收益(%)" for d in hold_days] + ["60%换手耗时(天)"])
-
-    df_price = normalize_trade_date(df_price, "trade_date").sort_values(["ts_code", "trade_date"])
-    df_price["trade_date"] = df_price["trade_date"].astype(str)
-    hold_cols = {d: f"{d}日持仓收益(%)" for d in hold_days}
-    rows: list[dict[str, Any]] = []
-
-    for code in codes_norm:
-        sub = df_price[df_price["ts_code"] == code].copy()
-        sub = sub.sort_values("trade_date")
-        row = {
-            "ts_code": code,
-            "名称": _stock_name_of(code) or "",
-            "买入日": None,
-            "买入价": None,
-            "退出日": None,
-            "退出价": None,
-        }
-        for h, col_name in hold_cols.items():
-            row[col_name] = None
-        row["60%换手耗时(天)"] = None
-        row["累计换手(%)"] = None
-
-        if sub.empty:
-            rows.append(row)
-            continue
-
-        # 买入日：>= entry_date 的第一天
-        entry_row = sub[sub["trade_date"] >= entry_date].head(1)
-        if entry_row.empty:
-            entry_row = sub.tail(1)
-        if entry_row.empty:
-            rows.append(row)
-            continue
-
-        entry_trade_date = str(entry_row["trade_date"].iloc[0])
-        try:
-            entry_px = float(entry_row["open"].iloc[0])
-            if not np.isfinite(entry_px) or entry_px <= 0:
-                raise ValueError()
-        except Exception:
-            try:
-                entry_px = float(entry_row["close"].iloc[0])
-            except Exception:
-                entry_px = None
-        if entry_px is None or not np.isfinite(entry_px) or entry_px <= 0:
-            rows.append(row)
-            continue
-
-        row["买入日"] = entry_trade_date
-        row["买入价"] = entry_px
-        after_entry = sub[sub["trade_date"] >= entry_trade_date].copy()
-
-        for h, col_name in hold_cols.items():
-            # 使用个股自身的交易日序列，取买入日后的第 h 个交易日（不足则用最后一日）
-            if after_entry.empty:
-                continue
-            idx = min(max(int(h) - 1, 0), len(after_entry) - 1)
-            exit_row = after_entry.iloc[[idx]]
-            row["退出日"] = str(exit_row["trade_date"].iloc[0])
-            try:
-                exit_px = float(exit_row["close"].iloc[0])
-            except Exception:
-                exit_px = None
-            if exit_px is None or not np.isfinite(exit_px) or exit_px <= 0:
-                continue
-            row["退出价"] = exit_px
-            row[col_name] = (exit_px / entry_px - 1.0) * 100.0
-
-        if "tor" in after_entry.columns:
-            tor_series = pd.to_numeric(after_entry["tor"], errors="coerce").fillna(0.0).reset_index(drop=True)
-            if not tor_series.empty:
-                # tor 已是百分比数值，直接累加
-                threshold = turnover_target
-                csum = tor_series.cumsum()
-                row["累计换手(%)"] = float(csum.iloc[-1]) if np.isfinite(csum.iloc[-1]) else None
-                hit_idx = np.where(csum.values >= threshold)[0]
-                if len(hit_idx) > 0:
-                    row["60%换手耗时(天)"] = int(hit_idx[0]) + 1
-
-        rows.append(row)
-
-    cols = ["ts_code", "名称", "买入日", "买入价", "退出日", "退出价"] + list(hold_cols.values()) + ["60%换手耗时(天)", "累计换手(%)"]
-    df_out = pd.DataFrame(rows)
-    # 只保留需要的列（防止空数据缺列）
-    df_out = df_out[[c for c in cols if c in df_out.columns]]
-    return df_out
 
 
 def _compute_turnover_days(ts_code: str, ref_date: str, target: float = 60.0) -> tuple[Optional[int], Optional[float], Optional[str], int, Optional[str], Optional[str]]:
@@ -2077,6 +1891,7 @@ def _read_df(path: Path, usecols=None, dtype=None, encoding: str = "utf-8-sig") 
     except Exception:
         return pd.DataFrame()
 
+
 @cache_data(show_spinner=False, ttl=600)
 def _cached_trade_dates(base: str, adj: str):
     # 使用 database_manager 获取交易日列表
@@ -2167,14 +1982,6 @@ def se_progress_to_streamlit():
             se.drain_progress_events = _orig_drain
         else:
             se.drain_progress_events = lambda: None
-
-@cache_data(show_spinner=False)
-def _read_md_file(path: str) -> str:
-    try:
-        return Path(path).read_text(encoding="utf-8-sig")
-    except Exception:
-        # 兜底提示，避免页面报错
-        return "⚠️ 未找到帮助文档：" + path
 
 
 def run_se_run_for_date_in_bg(arg):
@@ -2308,9 +2115,6 @@ def _get_latest_date_from_files() -> Optional[str]:
     return max(dates) if dates else None
 
 
-# 函数已迁移到 utils.py，通过导入别名使用
-
-
 def _pick_smart_ref_date() -> Optional[str]:
     """智能获取参考日期，按优先级尝试多种方式"""
     # 1. 优先从数据库获取
@@ -2331,113 +2135,6 @@ def _pick_smart_ref_date() -> Optional[str]:
         logger.error("无法获取任何参考日期")
     
     return latest
-
-
-def _prev_ref_date(cur: str) -> Optional[str]:
-    files = sorted(ALL_DIR.glob("score_all_*.csv"))
-    dates = []
-    for p in files:
-        m = re.search(r"(\d{8})", p.name)
-        if m and m.group(1) < cur:
-            dates.append(m.group(1))
-    return dates[-1] if dates else None
-
-
-def _from_last_hints(days: list[int] | None = None,
-                     base: str = DATA_ROOT, adj: str = API_ADJ,
-                     last: str | None = None):
-    """
-    基于“最新交易日 last（缺省=本地数据的最后一天）”，返回：
-      - 文本提示串（含星期），用于展示；
-      - 映射 dict: {n: d8}，n 个交易日前对应的 yyyymmdd 字符串。
-    """
-    try:
-        ds = get_trade_dates() or []
-        if not ds:
-            return "", {}
-        last = last or ds[-1]
-        if last not in ds:
-            return "", {}
-
-        idx = ds.index(last)
-        days = sorted({int(x) for x in (days or []) if int(x) >= 1})
-
-        from datetime import date as _d
-        def _fmt(d8: str) -> str:
-            y, m, d = int(d8[:4]), int(d8[4:6]), int(d8[6:])
-            wk = "一二三四五六日"[_d(y, m, d).weekday()]
-            return f"{y:04d}-{m:02d}-{d:02d}(周{wk})"
-
-        parts = [f"最新={_fmt(last)}"]
-        mapping = {}
-        for n in days:
-            j = idx - n
-            if j >= 0:
-                mapping[n] = ds[j]
-                parts.append(f"{n}个交易日前={_fmt(ds[j])}")
-            else:
-                parts.append(f"{n}个交易日前=--（数据不足）")
-        return " · ".join(parts), mapping
-    except Exception:
-        return "", {}
-
-
-def _rule_to_screen_args(rule: dict):
-    """返回 (when_expr, timeframe, window, scope)"""
-    # 验证必填字段
-    if "when" in rule or "clauses" in rule:
-        category = "filter" if "hard_penalty" in rule or "reason" in rule else "ranking"
-        try:
-            from rule_editor import StrategyValidator
-            validator = StrategyValidator()
-            result = validator.validate_rule(rule, category)
-            if not result.is_valid and result.errors:
-                missing_fields = [e.get("field", "") for e in result.errors if "缺少必填字段" in e.get("message", "")]
-                if missing_fields:
-                    import warnings
-                    warnings.warn(
-                        f"规则 '{rule.get('name', '<unnamed>')}' 缺少必填字段: {', '.join(missing_fields)}. "
-                        f"将使用默认值，但建议显式指定这些字段。",
-                        UserWarning
-                    )
-        except Exception:
-            pass  # 如果验证器不可用，继续执行
-    
-    if rule.get("clauses"):
-        tfs = {str(c.get("timeframe","D")).upper() for c in rule["clauses"]}
-        wins = {int(c.get("score_windows", 60)) for c in rule["clauses"]}
-        scopes = {str(c.get("scope","ANY")).upper() for c in rule["clauses"]}
-        whens = [f"({c.get('when','').strip()})" for c in rule["clauses"] if c.get("when","").strip()]
-        if not whens:
-            raise ValueError("复合规则缺少 when")
-        # 目前仅支持"相同 tf/window/scope"的复合规则；否则就无法一次性屏全市场
-        if len(tfs)==len(wins)==len(scopes)==1:
-            return " AND ".join(whens), list(tfs)[0], list(wins)[0], list(scopes)[0]
-        else:
-            raise ValueError("全市场跑目前仅支持各子句 tf/window/scope 完全一致的复合规则")
-    else:
-        when = (rule.get("when") or "").strip()
-        if not when:
-            raise ValueError("when 不能为空")
-        tf = str(rule.get("timeframe","D")).upper()
-        win = int(rule.get("score_windows", 60))
-        scope = str(rule.get("scope","ANY")).upper()
-        # --- substitute placeholders (K/M/N) for scope ---
-        try:
-            import re
-            k = int(rule.get("k", rule.get("n", 0)) or 0)
-            m = int(rule.get("m", 0) or 0)
-            # COUNT>=K -> COUNT>=<k or 3>
-            if "COUNT" in scope and re.search(r"\bK\b", scope):
-                scope = re.sub(r"\bK\b", str(k or 3), scope)
-            # CONSEC>=M -> CONSEC>=<m or 3>
-            if "CONSEC" in scope and re.search(r"\bM\b", scope):
-                scope = re.sub(r"\bM\b", str(m or 3), scope)
-            # ANY_N / ALL_N -> ANY_<k or 3> / ALL_<k or 3>
-            scope = scope.replace("ANY_N", f"ANY_{k or 3}").replace("ALL_N", f"ALL_{k or 3}")
-        except Exception:
-            pass
-        return when, tf, win, scope
 
 
 def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
@@ -2720,26 +2417,6 @@ def _tail(path: Path, n: int=400) -> str:
         return ""
 
 
-def _fmt_retcols_percent(df):
-    df = df.copy()
-    cols = [c for c in df.columns if str(c).startswith("ret_fwd_")]
-    if not cols:
-        return df
-    for c in cols:
-        # 转成数值
-        s = pd.to_numeric(df[c], errors="coerce")
-        finite = s[np.isfinite(s)]
-        if finite.shape[0] == 0:
-            continue
-        q95 = finite.abs().quantile(0.95)
-        # 小于等于 0.5 说明是小数（例如 0.034），需要×100
-        if pd.notna(q95) and q95 <= 0.5:
-            s = s * 100.0
-        # 统一两位小数 + 百分号
-        df[c] = s.map(lambda x: (f"{x:.2f}%" if pd.notna(x) else None))
-    return df
-
-
 def _apply_runtime_overrides(rules_obj: dict,
                              tie_break: str, max_workers: int,
                              attn_on: bool, universe: str|List[str]):
@@ -2753,40 +2430,6 @@ def _apply_runtime_overrides(rules_obj: dict,
     setattr(se, "SC_MAX_WORKERS", int(max_workers))
     # setattr(se, "SC_ATTENTION_ENABLE", bool(attn_on))
     setattr(se, "SC_UNIVERSE", universe)
-
-
-def _humanize_error(err) -> tuple[str, list[str], list[str], str]:
-    s = str(err) if not isinstance(err, dict) else str(err.get("error", ""))
-    causes, fixes = [], []
-    title = "运行出错"
-
-    # 结构化判断
-    if "JSONDecodeError" in s or "Expecting value" in s or "Invalid control character" in s:
-        title = "JSON 格式错误"
-        causes = ["JSON 不合法（逗号/引号/花括号/结尾逗号等）"]
-        fixes = ["用 JSON 校验工具检查；字段名一律双引号；最后一项不要加逗号"]
-    elif "表达式错误" in s or "evaluate_bool" in s:
-        title = "策略表达式语法错误"
-        causes = ["括号不配对 / 参数缺失 / 不支持的函数或列名"]
-        fixes = ["检查括号与逗号；确认列名存在；必要时简化表达式逐段排查"]
-    elif "timeframe" in s or "resample" in s:
-        title = "不支持的周期 (timeframe)"
-        causes = ["传入了未实现的周期"]
-        fixes = ["改为项目支持的 D/W/M/60MIN 等"]
-    elif "empty-window" in s or "empty window" in s or "无可用标的" in s:
-        title = "数据窗口无数据"
-        causes = ["窗口区间过短或参考日无交易数据", "标的退市/长期停牌导致无数据"]
-        fixes = ["拉长 window；更换参考日；调整股票池/市场范围"]
-    elif "KeyError" in s or "missing" in s or "列" in s:
-        title = "缺少列/指标"
-        causes = ["表达式引用了数据中不存在的列"]
-        fixes = ["在数据侧补列，或使用内置兜底（如 J/VR）"]
-    elif "database is locked" in s or "file is locked" in s or "database is busy" in s or "file is being used" in s or "另一个程序正在使用此文件" in s:
-        title = "数据库被占用"
-        causes = ["多个进程同时访问数据库文件", "数据库文件被其他程序锁定", "系统资源不足"]
-        fixes = ["等待其他操作完成", "重启应用程序", "检查是否有其他程序在使用数据库文件", "使用内存数据库模式"]
-
-    return title, causes, fixes, s
 
 
 def show_database_diagnosis():
