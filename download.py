@@ -2,10 +2,6 @@
 # -*- coding: utf-8 -*-
 
 """
-下载模块 - 基于database_manager的重构版本
-弃用data_reader，只使用database_manager进行数据管理
-
-新的下载流程：
 1. 从database_manager获取数据库状态
 2. 得到需要下载的数据参数传给tushare接口
 3. 按照原样下载原始数据到内存数据库

@@ -16,6 +16,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 
+# 实时行情走直连：移除环境代理，避免 socks 代理错误
+for _k in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+    os.environ.pop(_k, None)
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost,hq.sinajs.cn,finance.sina.com.cn,api.tushare.pro")
+os.environ.setdefault("no_proxy", os.environ["NO_PROXY"])
+
 # NOTE: Streamlit 即将移除 use_container_width，统一使用 width='stretch'/'content'
 
 # 忽略tushare的FutureWarning
@@ -1576,8 +1582,8 @@ def _next_trade_date(latest_trade_date: Optional[str]) -> Optional[str]:
 def _should_show_realtime_panel(latest_trade_date: Optional[str]) -> tuple[bool, str]:
     """
     判断是否展示实时行情卡片：
-    - 数据库无今日数据 => 展示
-    - 数据库有今日数据，需等到下一交易日 09:30 后才展示
+    - 数据库无今日数据：默认展示，但若未到下一交易日 09:30 则隐藏
+    - 数据库有今日数据：需等到下一交易日 09:30 后才展示
     """
     now = datetime.now()
     today = now.strftime("%Y%m%d")
@@ -1585,6 +1591,11 @@ def _should_show_realtime_panel(latest_trade_date: Optional[str]) -> tuple[bool,
         return True, "数据库缺少最新交易日，开启实时行情"
     latest = str(latest_trade_date)
     if latest < today:
+        next_td = _next_trade_date(latest)
+        if next_td:
+            threshold = datetime.strptime(f"{next_td}0930", "%Y%m%d%H%M")
+            if now < threshold:
+                return False, f"下一交易日 {next_td} 09:30 前不展示实时行情"
         return True, f"数据库最新日 {latest} 早于今日 {today}，展示实时行情"
     if latest > today:
         return False, f"数据库日期 {latest} 晚于今日 {today}，跳过实时行情"
@@ -1653,7 +1664,12 @@ def _fetch_realtime_snapshot_sina(ts_code: str) -> tuple[Optional[Dict[str, Any]
         return None, "代码格式不支持"
     url = f"https://hq.sinajs.cn/list={symbol}"
     try:
-        resp = requests.get(url, headers={"Referer": "https://finance.sina.com.cn"}, timeout=5)
+        resp = requests.get(
+            url,
+            headers={"Referer": "https://finance.sina.com.cn"},
+            timeout=5,
+            proxies={"http": None, "https": None},
+        )
         resp.raise_for_status()
         txt = resp.text
     except Exception as e:
@@ -1706,12 +1722,14 @@ def _fetch_realtime_snapshot(ts_code: str) -> tuple[Optional[Dict[str, Any]], Op
         )
         if df is None or df.empty:
             raise RuntimeError("实时行情返回为空")
-        row = df.iloc[0].to_dict()
+        # tushare realtime_quote 返回的列大写，这里统一转小写便于取值
+        row_raw = df.iloc[0].to_dict()
+        row = {str(k).lower(): v for k, v in row_raw.items()}
 
         def pick(keys: list[str]) -> Any:
             for k in keys:
-                if k in row:
-                    v = row.get(k)
+                if k.lower() in row:
+                    v = row.get(k.lower())
                     if pd.notna(v):
                         return v
             return None
@@ -1719,15 +1737,25 @@ def _fetch_realtime_snapshot(ts_code: str) -> tuple[Optional[Dict[str, Any]], Op
         price = pd.to_numeric(pick(["price", "trade", "current"]), errors="coerce")
         pct = pd.to_numeric(pick(["pct_change", "changepercent", "pct"]), errors="coerce")
         change_val = pd.to_numeric(pick(["change"]), errors="coerce")
-        vol = pd.to_numeric(pick(["volume", "vol"]), errors="coerce")
+        vol_raw = pd.to_numeric(pick(["volume", "vol"]), errors="coerce")
         amount = pd.to_numeric(pick(["amount", "turnover"]), errors="coerce")
+        pre_close = pd.to_numeric(pick(["pre_close", "preclose"]), errors="coerce")
         ts = pick(["time", "timestamp"])
+
+        # 统一成交量单位：sina 源返回股，数据库日线 vol 一般为“手”，这里转换为手以便计算量比
+        vol_hand = None
+        if pd.notna(vol_raw):
+            try:
+                vol_hand = float(vol_raw) / 100.0  # 股 -> 手
+            except Exception:
+                vol_hand = float(vol_raw)
 
         snap: Dict[str, Any] = {
             "price": float(price) if pd.notna(price) else None,
             "pct_change": float(pct) if pd.notna(pct) else None,
             "change": float(change_val) if pd.notna(change_val) else None,
-            "volume": float(vol) if pd.notna(vol) else None,
+            "pre_close": float(pre_close) if pd.notna(pre_close) else None,
+            "volume": float(vol_hand) if vol_hand is not None else None,  # 单位：手
             "amount": float(amount) if pd.notna(amount) else None,
             "source_time": ts,
         }
@@ -1764,15 +1792,31 @@ def _render_realtime_quote_box(ts_code: str, latest_trade_date: Optional[str], p
         except Exception:
             vr = None
 
+    # 计算涨幅，优先使用接口返回的 pct_change；缺失时用最新价/昨收计算
     price_display = "—" if snapshot.get("price") is None else f"{snapshot['price']:.2f}"
     pct_display = snapshot.get("pct_change")
-    pct_delta = None
+    if (pct_display is None or not np.isfinite(pct_display)) and snapshot.get("price") is not None and snapshot.get("pre_close"):
+        try:
+            pct_display = (float(snapshot["price"]) - float(snapshot["pre_close"])) / float(snapshot["pre_close"]) * 100.0
+        except Exception:
+            pct_display = None
+    pct_value = "—"
+    pct_arrow = None  # 使用箭头符号，避免三角形
+    pct_color = None
     if pct_display is not None and np.isfinite(pct_display):
-        pct_delta = f"{pct_display:+.2f}%"
+        pct_value = f"{pct_display:+.2f}%"
+        if pct_display > 0:
+            pct_arrow, pct_color = "↑", "red"
+        elif pct_display < 0:
+            pct_arrow, pct_color = "↓", "green"
 
     vr_display = "—" if vr is None or not np.isfinite(vr) else f"{vr:.2f}x"
-    col_price, col_vr = st.columns(2)
-    col_price.metric("最新价", price_display, pct_delta)
+    col_price, col_pct, col_vr = st.columns(3)
+    col_price.metric("最新价", price_display)
+    # 主值显示百分比，箭头单独渲染，避免重复三角
+    col_pct.metric("涨跌幅", pct_value)
+    if pct_arrow and pct_color:
+        col_pct.markdown(f"<span style='color:{pct_color};font-weight:bold'>{pct_arrow}</span>", unsafe_allow_html=True)
     col_vr.metric("量比（实时/昨）", vr_display)
     last_vol_text = _format_volume_short(last_vol) if last_vol is not None else "—"
     st.caption(f"昨日成交量：{last_vol_text}（数据日：{last_date or '未知'}）")
@@ -3166,8 +3210,8 @@ if _in_streamlit():
     if "export_pref" not in st.session_state:
         st.session_state["export_pref"] = {"style": "space", "with_suffix": True}
 
-    tab_rank, tab_detail, tab_kline, tab_screen, tab_stats, tab_attn, tab_custom, tab_position, tab_predict, tab_rules, tab_tools, tab_port, tab_data_view, tab_logs, = st.tabs(
-        ["排名", "个股详情", "K线看板", "选股", "统计", "衍生榜", "自选榜", "持仓建议", "明日模拟", "规则编辑", "工具箱", "组合模拟/持仓", "数据管理", "日志"])
+    tab_rank, tab_detail, tab_kline, tab_screen, tab_stats, tab_attn, tab_custom, tab_position, tab_predict, tab_rules, tab_tools, tab_port, tab_data_view = st.tabs(
+        ["排名", "个股详情", "K线看板", "选股", "统计", "衍生榜", "自选榜", "持仓建议", "明日模拟", "规则编辑", "工具箱", "组合模拟/持仓", "数据管理"])
 
     # ================== 排名 ==================
     with tab_rank:
@@ -3997,6 +4041,9 @@ if _in_streamlit():
         st.subheader("K线看板")
 
         price_cache = _get_kline_price_cache()
+        if "kline_show_realtime" not in st.session_state:
+            st.session_state["kline_show_realtime"] = True
+        show_realtime_scrape = bool(st.session_state.get("kline_show_realtime", True))
 
         # —— 预先计算参考日/可选股票，供顶部图表使用（控件放在下方） ——
         available_detail_dates = []
@@ -4075,7 +4122,10 @@ if _in_streamlit():
                 st.markdown("**实时行情 / 外部图表**")
                 realtime_col, link_col = st.columns([1.4, 1])
                 with realtime_col:
-                    _render_realtime_quote_box(code_norm_kline, latest_trade_date, price_cache)
+                    if show_realtime_scrape:
+                        _render_realtime_quote_box(code_norm_kline, latest_trade_date, price_cache)
+                    else:
+                        st.info("已关闭爬虫实时行情展示（在下方参数设置中可开启）。")
                 with link_col:
                     if external_links:
                         st.markdown("**外部行情图表**（新标签打开）")
@@ -4129,6 +4179,12 @@ if _in_streamlit():
                     key="kline_display_limit"
                 )
                 display_limit = int(new_limit_val or 0)
+                show_realtime_scrape = st.checkbox(
+                    "显示爬虫实时行情",
+                    value=show_realtime_scrape,
+                    key="kline_show_realtime",
+                    help="关闭后不抓取实时行情，减少切换股票时的卡顿。"
+                )
 
                 topk_value = st.session_state.get("kline_list_topk", 100)
                 board_topk_value = st.session_state.get("kline_board_topk", 100)
@@ -9338,17 +9394,6 @@ if _in_streamlit():
                             st.text(str(info))
                     except Exception as e:
                         st.error(f"获取信息失败: {e}")
-
-    # ================== 日志 ==================
-    with tab_logs:
-        st.subheader("日志")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**score.log（尾部 400 行）**")
-            st.code(_tail(LOG_DIR / "score.log", 400), language="bash")
-        with col2:
-            st.markdown("**score_ui.log（尾部 400 行）**")
-            st.code(_tail(LOG_DIR / "score_ui.log", 400), language="bash")
 
     _anchor = st.session_state.pop("scroll_after_rerun", None)
     if _anchor:

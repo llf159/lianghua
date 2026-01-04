@@ -34,9 +34,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from tqdm import tqdm
 
-# 禁用环境代理，防止请求被重定向到本地代理
-for _k in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]:
+# 禁用环境代理，防止请求被重定向到本地代理/socks
+for _k in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
     os.environ.pop(_k, None)
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+os.environ.setdefault("no_proxy", os.environ["NO_PROXY"])
 # 禁用日志多进程队列（受限环境可能无法创建 SemLock）
 os.environ.setdefault("LOG_DISABLE_MP_QUEUE", "1")
 
@@ -328,6 +330,12 @@ def fetch_realtime_quote(
     except ImportError as e:
         logger.error("未安装 tushare，请先 pip install tushare (%s)", e)
         raise
+
+    # 确保实时行情走直连而非系统代理
+    for _k in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        os.environ.pop(_k, None)
+    os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost,hq.sinajs.cn,finance.sina.com.cn,api.tushare.pro")
+    os.environ.setdefault("no_proxy", os.environ["NO_PROXY"])
 
     token = getattr(cfg, "TOKEN", "") or os.environ.get("TUSHARE_TOKEN", "")
     if token:
