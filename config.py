@@ -88,6 +88,11 @@ DUCKDB_TEMP_DIR = os.path.join(DATA_ROOT, "duckdb_tmp")  # 临时文件目录
 DUCKDB_CLEAR_DAILY_BEFORE = False  # 是否在写入前清理每日数据
 # 全表内存缓存开关（针对小体量数据库，默认开启；关闭后始终走数据库查询）
 FULL_STOCK_CACHE_ENABLED = True
+# 全表缓存阈值配置（优先级：FULL_STOCK_CACHE_MAX_MB > FULL_STOCK_CACHE_RATIO）
+# 设置 FULL_STOCK_CACHE_DISABLE=True 可彻底禁用
+FULL_STOCK_CACHE_MAX_MB = None  # 显式MB上限（None或<=0 表示使用占比阈值）
+FULL_STOCK_CACHE_RATIO = 0.2    # 占用物理内存比例上限（0.01~0.8）
+FULL_STOCK_CACHE_DISABLE = False
 
 # 数据库连接配置（由数据库连接配置管理器统一应用）
 DB_QUERY_TIMEOUT = 30  # 查询超时时间（秒），读写连接为2倍
@@ -114,7 +119,7 @@ SC_TIE_BREAK = "kdj_j_asc"  # 并列打破：使用 KDJ 的 J 值（越小越靠
 
 # 并行与读取优化
 import multiprocessing
-SC_MAX_WORKERS = min((multiprocessing.cpu_count() or 4) * 2, 16)  # 默认 min(2*CPU, 16)，UI 可覆盖
+SC_MAX_WORKERS = multiprocessing.cpu_count() or 4  # 默认与 CPU 核心数一致，UI 可覆盖
 SC_READ_TAIL_DAYS = None       # 若不为 None，则强制只读最近 N 天数据
 
 # 执行器选择（实验特性）：是否在安全条件下使用进程池

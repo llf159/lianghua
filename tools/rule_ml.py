@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stock-db", default=stock_db, help="统一行情数据库路径（含 stock_data 表）")
     parser.add_argument("--details-db", default=details_db, help="评分明细数据库路径（含 stock_details 表）")
     parser.add_argument(
+        "--log-return",
+        action="store_true",
+        help="标签使用对数收益（默认用简单收益）",
+    )
+    parser.add_argument(
         "--horizons",
         nargs="+",
         type=int,
@@ -72,7 +77,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-date", type=str, default=None, help="ref_date 下限 YYYYMMDD")
     parser.add_argument("--end-date", type=str, default=None, help="ref_date 上限 YYYYMMDD")
-    parser.add_argument("--min-hits", type=int, default=30, help="规则最少命中次数，低于则丢弃特征")
+    parser.add_argument(
+        "--min-hits",
+        type=int,
+        default=0,
+        help="规则最少命中次数，低于则丢弃特征（0 表示不限）",
+    )
     parser.add_argument(
         "--test-ratio",
         type=float,
@@ -83,6 +93,24 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default=_abs_norm(os.path.join(os.path.dirname(__file__), "..", "output", "rule_reports")),
         help="输出目录",
+    )
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=1,
+        help="时间滚动验证折数（>1 启用），默认 1 表示只做单次时间拆分",
+    )
+    parser.add_argument(
+        "--num-rounds",
+        type=int,
+        default=400,
+        help="XGBoost 训练轮数（num_boost_round），默认 400",
+    )
+    parser.add_argument(
+        "--early-stopping",
+        type=int,
+        default=50,
+        help="早停轮数，<=0 表示关闭早停，默认 50",
     )
     return parser.parse_args()
 
@@ -134,7 +162,7 @@ def load_rule_hits(details_db: str, start: str | None, end: str | None) -> pd.Da
 
 
 def load_price_panel(
-    stock_db: str, codes: Iterable[str], min_date: str, max_date: str, horizons: List[int]
+    stock_db: str, codes: Iterable[str], min_date: str, max_date: str, horizons: List[int], log_return: bool
 ) -> pd.DataFrame:
     """读取价格并计算未来收益。"""
     if not os.path.exists(stock_db):
@@ -164,16 +192,19 @@ def load_price_panel(
     price_df["trade_date"] = price_df["trade_date"].astype(str)
     price_df = price_df.sort_values(["ts_code", "trade_date"])
     price_df = price_df.groupby("ts_code", group_keys=False).apply(
-        lambda g: _add_forward_returns(g, horizons)
+        lambda g: _add_forward_returns(g, horizons, log_return=log_return)
     )
     return price_df
 
 
-def _add_forward_returns(df: pd.DataFrame, horizons: List[int]) -> pd.DataFrame:
+def _add_forward_returns(df: pd.DataFrame, horizons: List[int], log_return: bool) -> pd.DataFrame:
     df = df.copy()
     df["close"] = df["close"].astype(float)
     for h in horizons:
-        df[f"ret_{h}d"] = df["close"].shift(-h) / df["close"] - 1.0
+        if log_return:
+            df[f"ret_{h}d"] = np.log(df["close"].shift(-h) / df["close"])
+        else:
+            df[f"ret_{h}d"] = df["close"].shift(-h) / df["close"] - 1.0
     return df
 
 
@@ -245,6 +276,34 @@ def split_time(feat: pd.DataFrame, target: pd.Series, test_ratio: float = 0.2):
     return X_train, y_train, X_test, y_test
 
 
+def split_time_folds(
+    feat: pd.DataFrame, target: pd.Series, test_ratio: float, folds: int
+) -> List[Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]]:
+    """时间滚动拆分，用于简单的时序交叉验证。"""
+    df = feat.copy()
+    df["target"] = target
+    df = df.reset_index()
+    df["ref_date"] = df["ref_date"].astype(int)
+    df = df.sort_values("ref_date")
+    test_size = max(1, int(len(df) * test_ratio))
+    results: List[Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]] = []
+    for i in range(max(1, folds)):
+        test_end = len(df) - (max(1, folds) - 1 - i) * test_size
+        test_start = test_end - test_size
+        if test_start <= 0 or test_end <= test_start:
+            continue
+        train_df = df.iloc[:test_start]
+        test_df = df.iloc[test_start:test_end]
+        if len(train_df) == 0 or len(test_df) == 0:
+            continue
+        X_train = train_df.drop(columns=["ts_code", "ref_date", "target"])
+        y_train = train_df["target"]
+        X_test = test_df.drop(columns=["ts_code", "ref_date", "target"])
+        y_test = test_df["target"]
+        results.append((X_train, y_train, X_test, y_test))
+    return results
+
+
 def detect_tree_method() -> str:
     """优先使用 gpu_hist，失败时回落 hist。"""
     try:
@@ -257,7 +316,15 @@ def detect_tree_method() -> str:
     return "gpu_hist"
 
 
-def train_xgb(X_train, y_train, X_test, y_test, tree_method: str):
+def train_xgb(
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    tree_method: str,
+    num_rounds: int,
+    early_stopping: int,
+):
     import xgboost as xgb
 
     dtrain = xgb.DMatrix(X_train, label=y_train)
@@ -271,28 +338,31 @@ def train_xgb(X_train, y_train, X_test, y_test, tree_method: str):
         "tree_method": tree_method,
         "eval_metric": "rmse",
     }
+    train_kwargs = {
+        "params": params,
+        "dtrain": dtrain,
+        "num_boost_round": num_rounds,
+        "evals": [(dtrain, "train"), (dtest, "test")],
+        "verbose_eval": False,
+    }
+    if early_stopping and early_stopping > 0:
+        train_kwargs["early_stopping_rounds"] = early_stopping
     try:
-        booster = xgb.train(
-            params,
-            dtrain,
-            num_boost_round=400,
-            evals=[(dtrain, "train"), (dtest, "test")],
-            verbose_eval=False,
-        )
-    except xgb.core.XGBoostError as e:
+        booster = xgb.train(**train_kwargs)
+    except xgb.core.XGBoostError:
         if tree_method == "gpu_hist":
             params["tree_method"] = "hist"
-            booster = xgb.train(
-                params,
-                dtrain,
-                num_boost_round=400,
-                evals=[(dtrain, "train"), (dtest, "test")],
-                verbose_eval=False,
-            )
+            booster = xgb.train(**train_kwargs)
         else:
             raise
-    train_pred = booster.predict(dtrain)
-    test_pred = booster.predict(dtest)
+
+    def _predict(bst, dmat):
+        if getattr(bst, "best_iteration", None) is not None:
+            return bst.predict(dmat, iteration_range=(0, bst.best_iteration + 1))
+        return bst.predict(dmat)
+
+    train_pred = _predict(booster, dtrain)
+    test_pred = _predict(booster, dtest)
     metrics = {
         "train_rmse": float(np.sqrt(((train_pred - y_train) ** 2).mean())),
         "test_rmse": float(np.sqrt(((test_pred - y_test) ** 2).mean())),
@@ -301,6 +371,7 @@ def train_xgb(X_train, y_train, X_test, y_test, tree_method: str):
         "train_mean": float(train_pred.mean()),
         "test_mean": float(test_pred.mean()),
         "test_size": int(len(y_test)),
+        "best_iteration": int(getattr(booster, "best_iteration", num_rounds - 1)),
     }
     importance = booster.get_score(importance_type="gain")
     imp_df = (
@@ -313,7 +384,14 @@ def train_xgb(X_train, y_train, X_test, y_test, tree_method: str):
     return booster, metrics, imp_df
 
 
-def save_outputs(output_dir: str, imp_df: pd.DataFrame, metrics: Dict[str, float], target_h: int):
+def save_outputs(
+    output_dir: str,
+    imp_df: pd.DataFrame,
+    metrics: Dict[str, float],
+    target_h: int,
+    log_return: bool,
+    cv_metrics: List[Dict[str, float]] | None = None,
+):
     os.makedirs(output_dir, exist_ok=True)
     imp_path = os.path.join(output_dir, "rule_ml_importance.csv")
     md_path = os.path.join(output_dir, "rule_ml_summary.md")
@@ -322,15 +400,33 @@ def save_outputs(output_dir: str, imp_df: pd.DataFrame, metrics: Dict[str, float
     md_lines = [
         "# 规则 ML 重要度报告",
         "",
-        f"- 标签：未来 {target_h} 日收益",
+        f"- 标签：未来 {target_h} 日收益（{'对数' if log_return else '简单'}收益）",
         f"- 训练/验证样本：{metrics.get('test_size', 0)} 条验证样本",
         f"- 训练 RMSE：{metrics.get('train_rmse'):.6f}",
         f"- 验证 RMSE：{metrics.get('test_rmse'):.6f}",
         f"- 验证 MAE：{metrics.get('test_mae'):.6f}",
+        f"- 最佳迭代：{metrics.get('best_iteration', 0)}",
         "",
         "## Top 30 规则（按 gain）",
     ]
     md_lines.append(imp_df.head(30).to_markdown(index=False))
+
+    if cv_metrics:
+        test_rmses = [m["test_rmse"] for m in cv_metrics]
+        test_maes = [m["test_mae"] for m in cv_metrics]
+        md_lines.extend(
+            [
+                "",
+                f"## 时间滚动验证（folds={len(cv_metrics)}）",
+                f"- 验证 RMSE 均值：{np.mean(test_rmses):.6f}，标准差：{np.std(test_rmses):.6f}",
+                f"- 验证 MAE 均值：{np.mean(test_maes):.6f}，标准差：{np.std(test_maes):.6f}",
+            ]
+        )
+        for i, m in enumerate(cv_metrics):
+            md_lines.append(
+                f"  - Fold {i+1}: RMSE={m['test_rmse']:.6f}, MAE={m['test_mae']:.6f}, best_iter={m.get('best_iteration', 0)}"
+            )
+
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(md_lines))
 
@@ -353,24 +449,52 @@ def main():
         min_date=min_ref,
         max_date=str(int(max_ref) + 1000),  # 粗略向后取一年，保证未来窗口
         horizons=horizons,
+        log_return=args.log_return,
     )
 
     X, y = build_dataset(hits, price_df, horizons, target_h, args.min_hits)
     X_train, y_train, X_test, y_test = split_time(X, y, test_ratio=args.test_ratio)
 
     tree_method = detect_tree_method()
+    cv_metrics: List[Dict[str, float]] = []
     try:
-        model, metrics, imp_df = train_xgb(X_train, y_train, X_test, y_test, tree_method)
+        model, metrics, imp_df = train_xgb(
+            X_train,
+            y_train,
+            X_test,
+            y_test,
+            tree_method,
+            num_rounds=args.num_rounds,
+            early_stopping=args.early_stopping,
+        )
     except ModuleNotFoundError:
         raise RuntimeError("未安装 xgboost，请先在当前环境安装：pip install xgboost")
 
-    save_outputs(args.output_dir, imp_df, metrics, target_h)
+    if args.cv_folds and args.cv_folds > 1:
+        folds = split_time_folds(X, y, test_ratio=args.test_ratio, folds=args.cv_folds)
+        for Xtr, ytr, Xte, yte in folds:
+            _, m, _ = train_xgb(
+                Xtr,
+                ytr,
+                Xte,
+                yte,
+                tree_method,
+                num_rounds=args.num_rounds,
+                early_stopping=args.early_stopping,
+            )
+            cv_metrics.append(m)
+
+    save_outputs(args.output_dir, imp_df, metrics, target_h, args.log_return, cv_metrics)
 
     print(f"训练完成（tree_method={tree_method}）")
     print(f"验证集大小: {metrics.get('test_size', 0)}")
     print(f"验证 RMSE: {metrics.get('test_rmse'):.6f}, MAE: {metrics.get('test_mae'):.6f}")
     print(f"Top 10 规则按 gain：")
     print(imp_df.head(10).to_string(index=False))
+    if cv_metrics:
+        mean_rmse = np.mean([m["test_rmse"] for m in cv_metrics])
+        mean_mae = np.mean([m["test_mae"] for m in cv_metrics])
+        print(f"时间滚动验证 folds={len(cv_metrics)}: RMSE 均值={mean_rmse:.6f}, MAE 均值={mean_mae:.6f}")
     print(f"结果已写入: {args.output_dir}")
 
 

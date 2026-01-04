@@ -14,6 +14,7 @@ import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import requests
 
 # NOTE: Streamlit 即将移除 use_container_width，统一使用 width='stretch'/'content'
 
@@ -33,15 +34,28 @@ def ui_cleanup_database_connections():
         # 延迟导入 database_manager，避免启动时立即初始化数据库连接
         try:
             from database_manager import clear_connections_only
+            from database_manager import get_database_manager, get_details_db_path_with_fallback
+            from config import DATA_ROOT, UNIFIED_DB_PATH
         except ImportError as e:
             st.error(f"无法导入 database_manager 模块: {e}")
             return False
-        
+
         # 清理数据库连接（轻量级清理，不关闭工作线程）
         clear_connections_only()
-        
+
+        # 额外关闭细节库和主库的连接池，避免长时间浏览后残留句柄占用写锁
+        try:
+            manager = get_database_manager()
+            details_db_path = get_details_db_path_with_fallback()
+            if details_db_path:
+                manager.close_db_pools(details_db_path)
+            unified_db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            manager.close_db_pools(unified_db_path)
+        except Exception as inner_e:
+            st.warning(f"关闭数据库连接池时出现问题: {inner_e}")
+
         # 数据库连接已通过 database_manager 清理
-        
+
         # 强制垃圾回收
         import gc
         gc.collect()
@@ -146,11 +160,12 @@ from utils import (
 )
 # 使用 database_manager 替代 data_reader
 from database_manager import (
-    get_database_manager, query_stock_data, batch_query_stock_data, get_trade_dates, 
-    get_stock_list, get_latest_trade_date, get_smart_end_date,
+    get_database_manager, query_stock_data, batch_query_stock_data, get_trade_dates, get_trade_dates_from_db,
+    get_stock_list, get_latest_trade_date, get_smart_end_date, get_trade_calendar_cached,
     get_database_info, get_data_source_status, close_all_connections,
     clear_connections_only,
-    is_details_db_reading_enabled, get_details_db_path_with_fallback, is_details_db_available
+    is_details_db_reading_enabled, get_details_db_path_with_fallback, is_details_db_available,
+    get_details_table_info, query_details_recent_dates, query_details_by_date
 )
 
 def _lazy_import_download():
@@ -164,7 +179,7 @@ def _lazy_import_download():
 
 # 直接使用 database_manager 函数，不再需要包装器
 import os
-from config import DATA_ROOT, API_ADJ, UNIFIED_DB_PATH, SC_DETAIL_STORAGE, SC_USE_DB_STORAGE, SC_DB_FALLBACK_TO_JSON, SC_TRACKING_TOP_N, CONCEPT_BLACKLIST, CONCEPT_SHRINK_ALPHA
+from config import DATA_ROOT, API_ADJ, UNIFIED_DB_PATH, SC_TRACKING_TOP_N, CONCEPT_BLACKLIST, CONCEPT_SHRINK_ALPHA
 import tdx_compat as tdx
 # 从 stats_core 移过来的工具函数和类
 from dataclasses import dataclass, asdict
@@ -175,7 +190,7 @@ import json
 
 def _pick_trade_dates(ref_date: str, back: int) -> List[str]:
     """返回 [ref_date-back, ..., ref_date] 范围内的交易日列表，用于价格与回看。"""
-    days = get_trade_dates() or []
+    days = _get_trade_dates_available() or []
     if ref_date not in days:
         raise ValueError(f"ref_date 不在交易日历内: {ref_date}")
     i = days.index(ref_date)
@@ -185,7 +200,7 @@ def _pick_trade_dates(ref_date: str, back: int) -> List[str]:
 
 def _prev_trade_date(ref_date: str, d: int) -> str:
     """返回 ref_date 往前 d 个交易日的日期"""
-    cal = get_trade_dates() or []
+    cal = _get_trade_dates_available() or []
     if ref_date not in cal:
         raise ValueError(f"ref_date 不在交易日内：{ref_date}")
     i = cal.index(ref_date)
@@ -195,7 +210,7 @@ def _prev_trade_date(ref_date: str, d: int) -> str:
 
 def _shift_trade_date(ref_date: str, offset: int, *, clamp: bool = False) -> Optional[str]:
     """根据交易日历偏移 offset 天（可正可负），超界时返回 None/收尾（clamp=True）。"""
-    cal = get_trade_dates() or []
+    cal = _get_trade_dates_available() or []
     if ref_date not in cal:
         return None
     idx = cal.index(ref_date) + int(offset)
@@ -504,9 +519,26 @@ def _save_portfolios(ps: Dict[str, Portfolio]) -> None:
     (PORT_OUT_BASE / "portfolios.json").write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+@lru_cache(maxsize=8)
+def _get_trade_dates_available(db_path: str | None = None, table: str = "stock_data") -> List[str]:
+    """优先返回数据库中已有的交易日列表，兜底使用交易日日历。"""
+    try:
+        dates = get_trade_dates_from_db(db_path, table=table) or []
+        if dates:
+            return dates
+    except Exception as e:
+        logger.debug(f"获取数据库交易日列表失败: {e}")
+    if db_path is None and table == "stock_data":
+        try:
+            return get_trade_dates() or []
+        except Exception as e:
+            logger.debug(f"获取交易日历失败: {e}")
+    return []
+
+
 def _read_trade_dates(asset: str = "stock") -> List[str]:
     # 使用统一的数据库查询
-    return get_trade_dates() or []
+    return _get_trade_dates_available()
 
 
 def _read_px(codes, start, end, *, asset="stock", cols=("open","close")) -> pd.DataFrame:
@@ -941,13 +973,13 @@ def _init_session_state():
         if "expression_screening_active" not in st.session_state:
             st.session_state["expression_screening_active"] = False
         
-        # 添加details数据库读取控制标记，默认不读取数据库避免写入冲突
+        # 添加details数据库读取控制标记，默认开启
         if "details_db_reading_enabled" not in st.session_state:
-            st.session_state["details_db_reading_enabled"] = False
+            st.session_state["details_db_reading_enabled"] = True
         
-        # 添加数据查看页面的数据库查询控制标记，默认不查询数据库避免写入冲突
+        # 数据查看页面的数据库查询控制标记，默认开启
         if "data_view_db_enabled" not in st.session_state:
-            st.session_state["data_view_db_enabled"] = False
+            st.session_state["data_view_db_enabled"] = True
     except Exception:
         pass
 
@@ -1149,7 +1181,7 @@ def _slice_board_top(ref: str, board: str, k: int = 100) -> pd.DataFrame:
 def _codes_triggered_on_rule(ref_date: str, rule_name: str) -> list[str]:
     """
     获取在 ref_date 触发指定策略的股票代码列表。
-    触发判定：ok=True 或 hit_date/hit_dates 包含 ref_date。
+    触发判定：ok=True 或 hit_date/hit_dates 包含 ref_date。仅使用 details 数据库。
     """
     ref_date = (ref_date or "").strip()
     rule_name = (rule_name or "").strip()
@@ -1175,31 +1207,22 @@ def _codes_triggered_on_rule(ref_date: str, rule_name: str) -> list[str]:
     codes: set[str] = set()
     candidates: set[str] = set()
 
-    # 1) 收集候选 ts_code（DB 优先）
-    if is_details_db_reading_enabled() and is_details_db_available():
-        try:
-            details_db_path = get_details_db_path_with_fallback()
-            if details_db_path:
-                manager = get_database_manager()
-                if manager:
-                    sql = "SELECT ts_code FROM stock_details WHERE ref_date = ?"
-                    df_codes = manager.execute_sync_query(details_db_path, sql, [ref_date], timeout=30.0)
-                    if not df_codes.empty and "ts_code" in df_codes.columns:
-                        candidates.update(df_codes["ts_code"].astype(str).str.strip().tolist())
-        except Exception as e:
-            logger.debug(f"读取details数据库失败：{e}")
+    if not is_details_db_reading_enabled() or not is_details_db_available():
+        logger.debug("details 数据库未启用或不可用，无法按策略取名单")
+        return []
 
-    # 2) 补充文件系统候选
-    ddir = DET_DIR / str(ref_date)
-    if ddir.exists():
-        for fp in ddir.glob("*.json"):
-            try:
-                obj = json.loads(fp.read_text(encoding="utf-8-sig"))
-                ts = str(obj.get("ts_code", "")).strip()
-                if ts:
-                    candidates.add(ts)
-            except Exception:
-                continue
+    try:
+        details_db_path = get_details_db_path_with_fallback()
+        if details_db_path:
+            manager = get_database_manager()
+            if manager:
+                sql = "SELECT ts_code FROM stock_details WHERE ref_date = ?"
+                df_codes = manager.execute_sync_query(details_db_path, sql, [ref_date], timeout=30.0)
+                if not df_codes.empty and "ts_code" in df_codes.columns:
+                    candidates.update(df_codes["ts_code"].astype(str).str.strip().tolist())
+    except Exception as e:
+        logger.debug(f"读取details数据库失败：{e}")
+        return []
 
     # 3) 逐个加载详情（_load_detail_json 内部处理 DB/文件），复用选股页的解析逻辑
     for ts in candidates:
@@ -1498,6 +1521,264 @@ def _build_external_chart_links(ts_code: str) -> list[tuple[str, str]]:
     return links
 
 
+def _format_volume_short(val: Any) -> str:
+    """将成交量格式化为简短可读的文本。"""
+    try:
+        v = float(val)
+    except Exception:
+        return "—"
+    if not np.isfinite(v) or v < 0:
+        return "—"
+    if v >= 1e8:
+        return f"{v / 1e8:.2f}亿"
+    if v >= 1e4:
+        return f"{v / 1e4:.2f}万"
+    return f"{v:.0f}"
+
+
+def _format_amount_short(val: Any) -> str:
+    """将成交额格式化为简短可读的文本（假定单位=元）。"""
+    try:
+        v = float(val)
+    except Exception:
+        return "—"
+    if not np.isfinite(v) or v < 0:
+        return "—"
+    if v >= 1e10:
+        return f"{v / 1e10:.2f}百亿"
+    if v >= 1e8:
+        return f"{v / 1e8:.2f}亿"
+    if v >= 1e6:
+        return f"{v / 1e6:.2f}百万"
+    return f"{v:.0f}"
+
+
+def _next_trade_date(latest_trade_date: Optional[str]) -> Optional[str]:
+    """返回下一交易日（优先使用带缓存的交易日历，失败则顺延一天）。"""
+    if not latest_trade_date:
+        return None
+    today = datetime.now().strftime("%Y%m%d")
+    start = min(str(latest_trade_date), today)
+    end_hint = (datetime.now() + timedelta(days=90)).strftime("%Y%m%d")
+    cal = get_trade_calendar_cached(start_date=start, end_date=end_hint, refresh_if_insufficient=True)
+    if cal:
+        # 找到 latest_trade_date 之后的第一天
+        later = [d for d in cal if d > str(latest_trade_date)]
+        if later:
+            return later[0]
+    try:
+        dt = datetime.strptime(str(latest_trade_date), "%Y%m%d") + timedelta(days=1)
+        return dt.strftime("%Y%m%d")
+    except Exception:
+        return None
+
+
+def _should_show_realtime_panel(latest_trade_date: Optional[str]) -> tuple[bool, str]:
+    """
+    判断是否展示实时行情卡片：
+    - 数据库无今日数据 => 展示
+    - 数据库有今日数据，需等到下一交易日 09:30 后才展示
+    """
+    now = datetime.now()
+    today = now.strftime("%Y%m%d")
+    if not latest_trade_date:
+        return True, "数据库缺少最新交易日，开启实时行情"
+    latest = str(latest_trade_date)
+    if latest < today:
+        return True, f"数据库最新日 {latest} 早于今日 {today}，展示实时行情"
+    if latest > today:
+        return False, f"数据库日期 {latest} 晚于今日 {today}，跳过实时行情"
+    next_td = _next_trade_date(latest)
+    if not next_td:
+        return True, "无法确定下一交易日，默认展示实时行情"
+    threshold = datetime.strptime(f"{next_td}0930", "%Y%m%d%H%M")
+    if now >= threshold:
+        return True, f"已到 {next_td} 09:30 之后，展示实时行情"
+    return False, f"下一交易日 {next_td} 09:30 前不展示实时行情"
+
+
+def _get_latest_daily_volume(ts_code: str, price_cache: Optional[dict[str, pd.DataFrame]] = None) -> tuple[Optional[float], Optional[str]]:
+    """从缓存/数据库获取最新一日的成交量（用于对比量比）。"""
+    if price_cache is None:
+        price_cache = _get_kline_price_cache()
+    df_price = price_cache.get(ts_code)
+    if df_price is None or df_price.empty:
+        try:
+            df_price = query_stock_data(
+                db_path=os.path.join(DATA_ROOT, UNIFIED_DB_PATH),
+                ts_code=ts_code,
+                start_date=None,
+                end_date=None,
+                columns=["trade_date", "vol"],
+                adj_type="qfq",
+                limit=None
+            )
+            if df_price is not None and not df_price.empty:
+                price_cache[ts_code] = df_price
+        except Exception as e:
+            logger.debug(f"获取 {ts_code} 最新成交量失败: {e}")
+            return None, None
+    if df_price is None or df_price.empty or "vol" not in df_price.columns:
+        return None, None
+    try:
+        df_price = df_price.copy()
+        df_price["trade_date"] = df_price["trade_date"].astype(str)
+        df_price = df_price.sort_values("trade_date")
+        last_row = df_price.tail(1).iloc[0]
+        return float(pd.to_numeric(last_row.get("vol"), errors="coerce")), str(last_row.get("trade_date"))
+    except Exception as e:
+        logger.debug(f"解析 {ts_code} 最新成交量失败: {e}")
+        return None, None
+
+
+def _ts_to_sina_symbol(ts_code: str) -> Optional[str]:
+    """转换 ts_code 到 sinajs 符号。"""
+    if not ts_code or "." not in ts_code:
+        return None
+    base, _, suf = ts_code.partition(".")
+    suf = suf.lower()
+    if suf in ("sz", "szse"):
+        return f"sz{base}"
+    if suf in ("sh", "sse"):
+        return f"sh{base}"
+    if suf in ("bj", "bse"):
+        return f"bj{base}"
+    return None
+
+
+def _fetch_realtime_snapshot_sina(ts_code: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """直接请求 sinajs 作为兜底，避免 Tushare token 校验失败。"""
+    symbol = _ts_to_sina_symbol(ts_code)
+    if not symbol:
+        return None, "代码格式不支持"
+    url = f"https://hq.sinajs.cn/list={symbol}"
+    try:
+        resp = requests.get(url, headers={"Referer": "https://finance.sina.com.cn"}, timeout=5)
+        resp.raise_for_status()
+        txt = resp.text
+    except Exception as e:
+        return None, f"新浪接口失败: {e}"
+    if "hq_str_" not in txt or "=" not in txt:
+        return None, "新浪接口返回异常"
+    parts = txt.split("=", 1)[-1].strip().strip('";')
+    if not parts:
+        return None, "新浪数据为空"
+    fields = parts.split(",")
+    if len(fields) < 20:
+        return None, "新浪数据字段不足"
+    try:
+        name = fields[0]
+        open_p = float(fields[1])
+        pre_close = float(fields[2])
+        price = float(fields[3])
+        high = float(fields[4])
+        low = float(fields[5])
+        bid = float(fields[6])
+        ask = float(fields[7])
+        volume = float(fields[8])  # 股
+        amount = float(fields[9])  # 元
+        time_str = fields[30] if len(fields) > 31 else ""
+        pct_change = ((price - pre_close) / pre_close * 100.0) if pre_close else None
+    except Exception as e:
+        return None, f"新浪数据解析失败: {e}"
+    snap = {
+        "name": name,
+        "price": price,
+        "pct_change": pct_change,
+        "volume": volume,
+        "amount": amount,
+        "source_time": time_str,
+    }
+    return snap, None
+
+
+def _fetch_realtime_snapshot(ts_code: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """使用 scrape_concepts 的爬虫接口获取单只股票的实时行情；失败时回落到新浪直连。"""
+    try:
+        from scrape_concepts import fetch_realtime_quote
+    except Exception as e:
+        return None, f"导入爬虫接口失败: {e}"
+    try:
+        df = fetch_realtime_quote(
+            ts_codes=ts_code,
+            src="sina",
+            fields=["ts_code", "name", "price", "pre_close", "change", "pct_change", "vol", "volume", "amount", "time", "timestamp", "trade", "current"]
+        )
+        if df is None or df.empty:
+            raise RuntimeError("实时行情返回为空")
+        row = df.iloc[0].to_dict()
+
+        def pick(keys: list[str]) -> Any:
+            for k in keys:
+                if k in row:
+                    v = row.get(k)
+                    if pd.notna(v):
+                        return v
+            return None
+
+        price = pd.to_numeric(pick(["price", "trade", "current"]), errors="coerce")
+        pct = pd.to_numeric(pick(["pct_change", "changepercent", "pct"]), errors="coerce")
+        change_val = pd.to_numeric(pick(["change"]), errors="coerce")
+        vol = pd.to_numeric(pick(["volume", "vol"]), errors="coerce")
+        amount = pd.to_numeric(pick(["amount", "turnover"]), errors="coerce")
+        ts = pick(["time", "timestamp"])
+
+        snap: Dict[str, Any] = {
+            "price": float(price) if pd.notna(price) else None,
+            "pct_change": float(pct) if pd.notna(pct) else None,
+            "change": float(change_val) if pd.notna(change_val) else None,
+            "volume": float(vol) if pd.notna(vol) else None,
+            "amount": float(amount) if pd.notna(amount) else None,
+            "source_time": ts,
+        }
+        return snap, None
+    except Exception as e:
+        # 回退新浪直连，避免 token 校验/网络限制导致整块缺失
+        snap2, err2 = _fetch_realtime_snapshot_sina(ts_code)
+        if snap2:
+            return snap2, None
+        return None, f"实时行情抓取失败: {e if isinstance(e, Exception) else str(e)}；新浪兜底失败: {err2}"
+
+
+def _render_realtime_quote_box(ts_code: str, latest_trade_date: Optional[str], price_cache: Optional[dict[str, pd.DataFrame]] = None) -> None:
+    """左侧实时行情卡片：抓取涨跌幅/量能并与昨日量比对比。"""
+    st.markdown("**实时行情（爬虫）**")
+    show_rt, reason = _should_show_realtime_panel(latest_trade_date)
+    refresh_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not show_rt:
+        st.info(reason)
+        st.caption(f"刷新时间：{refresh_ts}")
+        return
+
+    snapshot, err = _fetch_realtime_snapshot(ts_code)
+    if err or not snapshot:
+        st.warning(err or "实时行情不可用")
+        st.caption(f"刷新时间：{refresh_ts}")
+        return
+
+    last_vol, last_date = _get_latest_daily_volume(ts_code, price_cache)
+    vr = None
+    if snapshot.get("volume") and last_vol and last_vol > 0:
+        try:
+            vr = float(snapshot["volume"]) / float(last_vol)
+        except Exception:
+            vr = None
+
+    price_display = "—" if snapshot.get("price") is None else f"{snapshot['price']:.2f}"
+    pct_display = snapshot.get("pct_change")
+    pct_delta = None
+    if pct_display is not None and np.isfinite(pct_display):
+        pct_delta = f"{pct_display:+.2f}%"
+
+    vr_display = "—" if vr is None or not np.isfinite(vr) else f"{vr:.2f}x"
+    col_price, col_vr = st.columns(2)
+    col_price.metric("最新价", price_display, pct_delta)
+    col_vr.metric("量比（实时/昨）", vr_display)
+    last_vol_text = _format_volume_short(last_vol) if last_vol is not None else "—"
+    st.caption(f"昨日成交量：{last_vol_text}（数据日：{last_date or '未知'}）")
+    st.caption(f"刷新时间：{refresh_ts}")
+
+
 def _compute_turnover_days(ts_code: str, ref_date: str, target: float = 60.0) -> tuple[Optional[int], Optional[float], Optional[str], int, Optional[str], Optional[str]]:
     """
     直接从统一行情库读取换手率，返回 (天数, 累计换手, 错误信息, 参与天数, 开始日期, 结束日期)。
@@ -1566,7 +1847,7 @@ def _render_price_kline_chart(
     with st.container(border=True):
         st.markdown(f"**{expander_label}**")
         try:
-            trade_dates = get_trade_dates()
+            trade_dates = _get_trade_dates_available()
             ref_for_plot = ref_real or (trade_dates[-1] if trade_dates else None)
 
             df_price = None
@@ -1895,7 +2176,7 @@ def _read_df(path: Path, usecols=None, dtype=None, encoding: str = "utf-8-sig") 
 @cache_data(show_spinner=False, ttl=600)
 def _cached_trade_dates(base: str, adj: str):
     # 使用 database_manager 获取交易日列表
-    days = get_trade_dates() or []
+    days = _get_trade_dates_available() or []
     if days:
         return days
     # 回退：从已有排名文件名中提取日期
@@ -2139,154 +2420,86 @@ def _pick_smart_ref_date() -> Optional[str]:
 
 def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
     """
-    加载个股详情，优先从数据库读取，如果数据库不可用则从JSON文件读取
-    注意：只有当 details_db_reading_enabled 为 True 时才会读取数据库，避免与写入操作冲突
+    加载个股详情，仅从 details 数据库读取。
+    注意：details_db_reading_enabled 为 False 时直接返回 None。
     """
-    # 检查是否允许读取数据库（使用统一的函数）
-    db_reading_enabled = is_details_db_reading_enabled()
-    
-    # 1. 优先从数据库读取（只有当db_reading_enabled为True且数据库可用时才读取）
-    if db_reading_enabled and is_details_db_available():
-        try:
-            # 使用统一的函数获取details数据库路径（包含回退逻辑）
-            details_db_path = get_details_db_path_with_fallback()
-            if not details_db_path:
-                # 数据库文件不存在，直接返回None
-                logger.debug(f"数据库文件不存在: {ts}_{ref}")
-                return None
-            
-            # 查询股票详情表
-            logger.info(f"[数据库连接] 开始获取数据库管理器实例 (查询股票详情: {ts}, {ref})")
-            manager = get_database_manager()
-            if not manager:
-                logger.debug(f"无法获取数据库管理器: {ts}_{ref}")
-                return None
-            
-            sql = "SELECT * FROM stock_details WHERE ts_code = ? AND ref_date = ?"
-            df = manager.execute_sync_query(details_db_path, sql, [ts, ref], timeout=30.0)
-            
-            if not df.empty:
-                row = df.iloc[0]
-                
-                # 解析 rules 字段：优先 json.loads，失败则 ast.literal_eval，最后保证是 list[dict]
-                rules_raw = row.get('rules')
-                rules = []
-                if rules_raw:
-                    if isinstance(rules_raw, str):
-                        try:
-                            rules = json.loads(rules_raw)
-                        except Exception:
-                            try:
-                                import ast
-                                rules = ast.literal_eval(rules_raw)
-                            except Exception:
-                                rules = []
-                    elif isinstance(rules_raw, list):
-                        rules = rules_raw
-                
-                # 确保 rules 是 list[dict] 格式
-                if not isinstance(rules, list):
-                    rules = []
-                
-                derived_highlights, derived_drawbacks, derived_opportunities = _derive_rule_buckets(rules)
-                legacy_highlights = _parse_string_list(row.get('highlights')) if 'highlights' in row else []
-                legacy_drawbacks = _parse_string_list(row.get('drawbacks')) if 'drawbacks' in row else []
-                legacy_opportunities = _parse_string_list(row.get('opportunities')) if 'opportunities' in row else []
-                
-                # 获取 rank 和 total 值
-                rank_val = row.get('rank')
-                total_val = row.get('total')
-                
-                # 组装 summary，包含 rank 和 total
-                summary = {
-                    'score': row.get('score'),
-                    'tiebreak': row.get('tiebreak'),
-                    'highlights': derived_highlights or legacy_highlights,
-                    'drawbacks': derived_drawbacks or legacy_drawbacks,
-                    'opportunities': derived_opportunities or legacy_opportunities,
-                    'rank': int(rank_val) if pd.notna(rank_val) else None,
-                    'total': int(total_val) if pd.notna(total_val) else None,
-                }
-                
-                # 组装成与 JSON 文件完全一致的结构，保持兼容性
-                result = {
-                    'ts_code': row.get('ts_code'),
-                    'ref_date': row.get('ref_date'),
-                    'summary': summary,
-                    'rules': rules,
-                    'rank': summary['rank'],   # 兼容旧调用
-                    'total': summary['total'],
-                }
-                return result
-            else:
-                # 数据库查询成功但无数据，直接返回None
-                logger.debug(f"数据库查询为空: {ts}_{ref}")
-                return None
-        except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
-            # 数据库文件不存在或管理器获取失败，直接返回None
-            logger.debug(f"数据库访问失败 {ts}_{ref}: {e}")
+    if not is_details_db_reading_enabled():
+        return None
+    if not is_details_db_available():
+        logger.debug(f"Details 数据库不可用: {ts}_{ref}")
+        return None
+
+    try:
+        details_db_path = get_details_db_path_with_fallback()
+        if not details_db_path:
+            logger.debug(f"未找到 details 数据库路径: {ts}_{ref}")
             return None
-        except Exception as e:
-            # 数据库读取失败（可能是表不存在、连接错误等），直接返回None
-            error_msg = str(e).lower()
-            if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
-                logger.debug(f"Details数据库表不存在: {ts}_{ref}")
-            else:
-                logger.debug(f"数据库读取失败 {ts}_{ref}: {e}")
+
+        manager = get_database_manager()
+        if not manager:
+            logger.debug(f"无法获取数据库管理器: {ts}_{ref}")
             return None
-    
-    # 2. 如果未启用数据库读取，或者配置了JSON存储，则使用JSON文件
-    if (not db_reading_enabled) or SC_DETAIL_STORAGE in ["json", "both"]:
-        try:
-            p = _path_detail(ref, ts)
-            if not p.exists(): 
-                # JSON文件不存在，正常返回None，不报错
-                return None
-            try:
-                data = json.loads(p.read_text(encoding="utf-8-sig"))
-                if not isinstance(data, dict):
-                    return None
-                rules_raw = data.get("rules") or data.get("per_rules") or []
-                rules = rules_raw if isinstance(rules_raw, list) else []
-                summary = data.get("summary") or {}
-                if not summary:
-                    summary = {
-                        "score": data.get("score"),
-                        "tiebreak": data.get("tiebreak"),
-                        "rank": data.get("rank"),
-                        "total": data.get("total"),
-                        "highlights": data.get("highlights", []),
-                        "drawbacks": data.get("drawbacks", []),
-                        "opportunities": data.get("opportunities", []),
-                    }
-                derived_highlights, derived_drawbacks, derived_opportunities = _derive_rule_buckets(rules)
-                summary["highlights"] = derived_highlights or _parse_string_list(summary.get("highlights"))
-                summary["drawbacks"] = derived_drawbacks or _parse_string_list(summary.get("drawbacks"))
-                summary["opportunities"] = derived_opportunities or _parse_string_list(summary.get("opportunities"))
-                data = {
-                    "ts_code": data.get("ts_code", ts),
-                    "ref_date": data.get("ref_date", ref),
-                    "summary": summary,
-                    "rules": rules,
-                    "rank": summary.get("rank"),
-                    "total": summary.get("total"),
-                }
-                return data
-            except json.JSONDecodeError as e:
-                # JSON解析失败，记录日志但不报错
-                logger.debug(f"JSON文件解析失败 {ts}_{ref}: {e}")
-                return None
-            except Exception as e:
-                # 其他读取异常，记录日志但不报错
-                logger.debug(f"JSON文件读取失败 {ts}_{ref}: {e}")
-                return None
-        except Exception as e:
-            # 路径构建或其他异常，记录日志但不报错
-            logger.debug(f"JSON文件路径处理失败 {ts}_{ref}: {e}")
+
+        sql = "SELECT * FROM stock_details WHERE ts_code = ? AND ref_date = ?"
+        df = manager.execute_sync_query(details_db_path, sql, [ts, ref], timeout=30.0)
+        if df.empty:
+            logger.debug(f"数据库查询为空: {ts}_{ref}")
             return None
-    
-    # 兜底：所有路径都失败，返回None
-    return None
+
+        row = df.iloc[0]
+
+        rules_raw = row.get('rules')
+        rules = []
+        if rules_raw:
+            if isinstance(rules_raw, str):
+                try:
+                    rules = json.loads(rules_raw)
+                except Exception:
+                    try:
+                        import ast
+                        rules = ast.literal_eval(rules_raw)
+                    except Exception:
+                        rules = []
+            elif isinstance(rules_raw, list):
+                rules = rules_raw
+
+        if not isinstance(rules, list):
+            rules = []
+
+        derived_highlights, derived_drawbacks, derived_opportunities = _derive_rule_buckets(rules)
+        legacy_highlights = _parse_string_list(row.get('highlights')) if 'highlights' in row else []
+        legacy_drawbacks = _parse_string_list(row.get('drawbacks')) if 'drawbacks' in row else []
+        legacy_opportunities = _parse_string_list(row.get('opportunities')) if 'opportunities' in row else []
+
+        rank_val = row.get('rank')
+        total_val = row.get('total')
+
+        summary = {
+            'score': row.get('score'),
+            'tiebreak': row.get('tiebreak'),
+            'highlights': derived_highlights or legacy_highlights,
+            'drawbacks': derived_drawbacks or legacy_drawbacks,
+            'opportunities': derived_opportunities or legacy_opportunities,
+            'rank': int(rank_val) if pd.notna(rank_val) else None,
+            'total': int(total_val) if pd.notna(total_val) else None,
+        }
+
+        result = {
+            'ts_code': row.get('ts_code'),
+            'ref_date': row.get('ref_date'),
+            'summary': summary,
+            'rules': rules,
+            'rank': summary['rank'],
+            'total': summary['total'],
+        }
+        return result
+    except Exception as e:
+        error_msg = str(e).lower()
+        if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
+            logger.debug(f"Details数据库表不存在: {ts}_{ref}")
+        else:
+            logger.debug(f"数据库读取失败 {ts}_{ref}: {e}")
+        return None
 
 
 def _get_rank_from_files(ref_date: str, ts_code: str) -> tuple[int | None, int | None] | None:
@@ -2375,7 +2588,7 @@ def _get_prev_rank_history(ts_code: str, ref_date: str, max_days: int | None = N
 
     # 2) 兜底：按交易日从最新往前逐日读取文件排名
     try:
-        cal = (get_trade_dates() or [])[::-1]  # 最新在前
+        cal = (_get_trade_dates_available() or [])[::-1]  # 最新在前
         if max_days is not None and max_days > 0:
             cal = cal[:max_days]
     except Exception as e:
@@ -2966,7 +3179,7 @@ if _in_streamlit():
             with c2:
                 tie_default = cfg_str("SC_TIE_BREAK", "none").lower()
                 tie = st.selectbox("同分排序（Tie-break）", ["none", "kdj_j_asc"], index=0 if tie_default=="none" else 1)
-                maxw = st.number_input("最大并行数", min_value=1, max_value=64, value=cfg_int("SC_MAX_WORKERS", 8))
+                maxw = st.number_input("最大并行数", min_value=1, max_value=64, value=cfg_int("SC_MAX_WORKERS", os.cpu_count() or 4))
             with c3:
                 universe = st.selectbox("评分范围", ["全市场","仅白名单","仅黑名单"], index=0)
                 style = st.selectbox("TXT 导出格式", ["空格分隔", "一行一个"], index=0)
@@ -3016,6 +3229,9 @@ if _in_streamlit():
             except Exception as e:
                 st.error(f"评分失败：{e}")
                 ref_to_use = None
+            finally:
+                # 评分结束后自动恢复 details 数据库读取
+                st.session_state["details_db_reading_enabled"] = True
 
         st.divider()
 
@@ -3170,26 +3386,7 @@ if _in_streamlit():
     with tab_detail:
         st.subheader("个股详情")
 
-        # —— 数据库读取控制按钮 ——
-        db_reading_enabled = is_details_db_reading_enabled()
-        col_btn, col_status = st.columns([1, 4])
-        with col_btn:
-            if not db_reading_enabled:
-                if st.button("🔓 启用数据库读取", key="enable_db_reading"):
-                    st.session_state["details_db_reading_enabled"] = True
-                    st.rerun()
-            else:
-                st.success("✅ 已启用")
-        with col_status:
-            if db_reading_enabled:
-                st.info("数据将从 details 数据库读取；如需停用请重启/清空会话。")
-            else:
-                st.info("未启用数据库读取（避免与写入冲突，如需从数据库加载详情请先启用）。")
-        
-        st.divider()
-
         # —— 选择参考日 + 代码（支持从排名前列下拉选择） ——
-        # 可选：从 details 数据库已有日期中选择参考日
         available_detail_dates = []
         try:
             from database_manager import query_details_recent_dates
@@ -3292,7 +3489,7 @@ if _in_streamlit():
                 st.warning("未找到该票的详情数据(请检查数据库是否解锁以及是否写入)。")
             else:
                 data = obj
-                # 兼容数据库格式和JSON格式
+                # 兼容数据库格式
                 if "summary" in data:
                     # 统一格式：{ts_code, ref_date, summary: {...}, rules}
                     summary = data.get("summary", {}) or {}
@@ -3310,42 +3507,6 @@ if _in_streamlit():
                     }
                     ts = data.get("ts_code", code_norm)
                 
-                # 显示数据来源信息（只有在允许读取数据库时才查询数据库状态）
-                db_reading_enabled = is_details_db_reading_enabled()
-                if db_reading_enabled:
-                    try:
-                        # 使用统一的函数获取details数据库路径（包含回退逻辑）
-                        details_db_path = get_details_db_path_with_fallback()
-                        if details_db_path:
-                            # 查询股票详情表
-                            logger.info(f"[数据库连接] 开始获取数据库管理器实例 (查询股票详情: {code_norm}, {ref_real})")
-                            manager = get_database_manager()
-                            if manager:
-                                sql = "SELECT * FROM stock_details WHERE ts_code = ? AND ref_date = ?"
-                                df = manager.execute_sync_query(details_db_path, sql, [code_norm, ref_real], timeout=30.0)
-                                
-                                if not df.empty:
-                                    st.info("数据来源：数据库")
-                                else:
-                                    st.info("数据来源：JSON文件")
-                            else:
-                                st.info("数据来源：JSON文件")
-                        else:
-                            st.info("数据来源：JSON文件")
-                    except (FileNotFoundError, RuntimeError, AttributeError, ImportError) as e:
-                        # 数据库文件不存在或管理器获取失败
-                        logger.debug(f"数据库访问失败: {code_norm}_{ref_real}: {e}")
-                        st.info("数据来源：JSON文件")
-                    except Exception as e:
-                        # 数据库读取失败（可能是表不存在、连接错误等）
-                        error_msg = str(e).lower()
-                        if any(keyword in error_msg for keyword in ['table', 'does not exist', 'no such table', 'catalog', 'relation']):
-                            logger.debug(f"Details数据库表不存在: {code_norm}_{ref_real}")
-                        else:
-                            logger.debug(f"数据库读取失败: {code_norm}_{ref_real}: {e}")
-                        st.info("数据来源：JSON文件")
-                else:
-                    st.info("数据来源：JSON文件（数据库读取未启用）")
                 
                 try:
                     score = float(summary.get("score", 0))
@@ -3384,7 +3545,8 @@ if _in_streamlit():
                     with st.container(border=True):
                         # 基本信息
                         st.metric("代码", ts)
-                        st.metric("市场", market_label(ts))
+                        name_display = _stock_name_of(ts) or ts
+                        st.metric("股票名称", name_display)
                         st.metric("参考日", ref_real)
                         st.divider()
                         # 评分信息
@@ -3853,10 +4015,18 @@ if _in_streamlit():
         # 参考日默认值
         if "kline_ref_date_single" not in st.session_state:
             st.session_state["kline_ref_date_single"] = _get_latest_date_from_files() or ""
+        if "kline_display_limit" not in st.session_state:
+            st.session_state["kline_display_limit"] = 50
         ref_real_kline = (st.session_state.get("kline_ref_date_single") or "").strip() or _get_latest_date_from_files() or ""
         display_codes_saved = st.session_state.get("kline_display_list", [])
+        display_limit = int(st.session_state.get("kline_display_limit", 50) or 0)
         # 仅在用户点击生成名单后使用缓存名单，默认不导入 TopK
-        nav_codes_kline = display_codes_saved
+        nav_codes_kline = display_codes_saved  # 全量名单用于导航/选择
+        prefetch_codes = nav_codes_kline
+        prefetch_limited = False
+        if display_limit > 0 and len(prefetch_codes) > display_limit:
+            prefetch_codes = prefetch_codes[:display_limit]
+            prefetch_limited = True
 
         pending_code_kline = st.session_state.pop("kline_pending_code", None) if "kline_pending_code" in st.session_state else None
         if "kline_last_code" not in st.session_state:
@@ -3884,9 +4054,9 @@ if _in_streamlit():
 
         code_norm_kline = normalize_ts(effective_code_kline) if effective_code_kline else ""
 
-        # 不在启动时预加载 TopK，只有已有名单时才预加载
-        if nav_codes_kline:
-            _prefetch_kline_prices(nav_codes_kline, adj_type="qfq")
+        # 不在启动时预加载 TopK，只有已有名单时才预加载；预加载遵循上限
+        if prefetch_codes:
+            _prefetch_kline_prices(prefetch_codes, adj_type="qfq")
 
         if code_norm_kline and ref_real_kline:
             _render_price_kline_chart(
@@ -3900,14 +4070,22 @@ if _in_streamlit():
             name_map = _get_stock_name_map()
             stock_name = name_map.get(code_norm_kline, name_map.get(code_norm_kline.split(".")[0], ""))
             external_links = _build_external_chart_links(code_norm_kline)
-            if external_links:
-                with st.container(border=True):
-                    st.markdown("**外部行情图表**（新标签打开）")
-                    link_lines = [
-                        f'- <a href=\"{url}\" target=\"_blank\" rel=\"noopener noreferrer\">{name}</a>'
-                        for name, url in external_links
-                    ]
-                    st.markdown("\n".join(link_lines), unsafe_allow_html=True)
+            latest_trade_date = _get_latest_date_from_database()
+            with st.container(border=True):
+                st.markdown("**实时行情 / 外部图表**")
+                realtime_col, link_col = st.columns([1.4, 1])
+                with realtime_col:
+                    _render_realtime_quote_box(code_norm_kline, latest_trade_date, price_cache)
+                with link_col:
+                    if external_links:
+                        st.markdown("**外部行情图表**（新标签打开）")
+                        link_lines = [
+                            f'- <a href=\"{url}\" target=\"_blank\" rel=\"noopener noreferrer\">{name}</a>'
+                            for name, url in external_links
+                        ]
+                        st.markdown("\n".join(link_lines), unsafe_allow_html=True)
+                    else:
+                        st.info("暂无外部图表链接")
             turnover_display = "—"
             turnover_hint = ""
             try:
@@ -3944,10 +4122,18 @@ if _in_streamlit():
                 # 预先写入 session_state 后不再传递 value，避免默认值与 Session State 同时赋值的警告
                 new_ref = st.text_input("参考日（默认=最新文件）", key="kline_ref_date_single")
                 ref_real_kline = (new_ref or "").strip() or ref_real_kline
+                new_limit_val = st.number_input(
+                    "预加载上限（0=不限）",
+                    min_value=0,
+                    step=1,
+                    key="kline_display_limit"
+                )
+                display_limit = int(new_limit_val or 0)
 
                 topk_value = st.session_state.get("kline_list_topk", 100)
                 board_topk_value = st.session_state.get("kline_board_topk", 100)
                 board_choice = st.session_state.get("kline_board_choice", "主板")
+                strategy_board_choice = st.session_state.get("kline_strategy_board", "全部")
 
                 list_source_options = ["TopK导入", "自定义名单", "按板块TopK", "触发了某个策略"]
                 if st.session_state.get("kline_list_source") not in list_source_options:
@@ -3985,7 +4171,14 @@ if _in_streamlit():
                         key="kline_trigger_rule",
                         placeholder="选择策略名"
                     )
-                st.caption("提示：需要读取当日详情数据，若未开启将回退到本地JSON。")
+                    strategy_board_options = ["全部", "主板", "创业/科创", "北交所", "其他"]
+                    strategy_board_default = st.session_state.get("kline_strategy_board", "全部")
+                    st.selectbox(
+                        "板块",
+                        strategy_board_options,
+                        index=strategy_board_options.index(strategy_board_default) if strategy_board_default in strategy_board_options else 0,
+                        key="kline_strategy_board"
+                    )
 
             with colB:
                 options_for_select = nav_codes_kline
@@ -4075,6 +4268,7 @@ if _in_streamlit():
                         st.error(f"读取板块Top名单失败：{e}")
             else:
                 rule_pick = st.session_state.get("kline_trigger_rule", "")
+                strategy_board_choice = st.session_state.get("kline_strategy_board", "全部")
                 if rule_pick in ("", "(暂无可选策略)") or not rule_pick:
                     st.error("请选择策略名以生成名单。")
                 elif not list_ref_to_use:
@@ -4083,6 +4277,8 @@ if _in_streamlit():
                     if not is_details_db_reading_enabled():
                         st.session_state["details_db_reading_enabled"] = True
                     codes_list = _codes_triggered_on_rule(list_ref_to_use, str(rule_pick))
+                    if codes_list and strategy_board_choice and strategy_board_choice != "全部":
+                        codes_list = [c for c in codes_list if _board_category(c) == strategy_board_choice]
                     if not codes_list:
                         st.warning("未找到触发该策略的股票，或参考日无详情数据。")
 
@@ -4113,8 +4309,11 @@ if _in_streamlit():
         display_codes = st.session_state.get("kline_display_list", [])
         display_ref = st.session_state.get("kline_display_ref") or ref_real_kline
         if display_codes and display_ref:
-            st.caption(f"当前名单（参考日 {display_ref}），共 {len(display_codes)} 只：")
+            total_len = len(display_codes)
+            st.caption(f"当前名单（参考日 {display_ref}），共 {total_len} 只：")
             st.dataframe(pd.DataFrame({"ts_code": display_codes}), width="stretch", height=320, hide_index=True)
+            if prefetch_limited and total_len > display_limit:
+                st.caption(f"预加载按上限 {display_limit} 只执行，超过部分按需读取。")
         else:
             st.info("点击上方按钮生成展示名单。")
 
@@ -4173,7 +4372,7 @@ if _in_streamlit():
             entry_price = None
             # 统一参考日
             try:
-                trade_dates = get_trade_dates()
+                trade_dates = _get_trade_dates_available()
                 latest_ref = trade_dates[-1] if trade_dates else ""
             except Exception:
                 latest_ref = ""
@@ -6247,13 +6446,13 @@ if _in_streamlit():
                 st.error("未能确定参考日。")
             elif not picked:
                 st.warning("请先选择至少一个规则名。")
+            elif not is_details_db_available():
+                st.error("details 数据库不可用，无法按触发规则筛选。")
             else:
                 rows = []
                 try:
-                    # 检查是否允许读取数据库（使用统一的函数）
                     db_reading_enabled = is_details_db_reading_enabled()
                     
-                    # 优先使用数据库查询（只有当db_reading_enabled为True且数据库可用时才读取数据库）
                     if db_reading_enabled and is_details_db_available():
                         # 使用 database_manager 查询详情
                         logger.info("[数据库连接] 开始获取数据库管理器实例 (查询股票详情用于UI显示)")
@@ -6338,67 +6537,6 @@ if _in_streamlit():
                                             "score": sc,
                                             "trigger_dates": trigger_dates_list if trigger_dates_list else []
                                         })
-                    
-                    # 回退到JSON文件查询
-                    else:
-                        ddir = DET_DIR / str(ref_real)
-                        allow_set = None
-                        if ddir.exists():
-                            for p in ddir.glob("*.json"):
-                                try:
-                                    j = json.loads(p.read_text(encoding="utf-8-sig"))
-                                except Exception:
-                                    continue
-                                ts2 = str(j.get("ts_code","")).strip()
-                                if not ts2:
-                                    continue
-                                if (allow_set is not None) and (ts2 not in allow_set):
-                                    continue
-                                sm = j.get("summary") or {}
-                                sc = float(sm.get("score", 0.0))
-                                names_today = set()
-                                hit_dates_map = {}  # 策略名 -> 触发日期列表
-                                for rr in (j.get("rules") or []):
-                                    # 只要策略触发（ok=True），就视为命中，无需检查add字段
-                                    # 或者add>0也视为命中（兼容原有逻辑）
-                                    ok_val = rr.get("ok")
-                                    add_val = rr.get("add")
-                                    if bool(ok_val) or (add_val is not None and float(add_val) > 0.0):
-                                        n = rr.get("name")
-                                        if n: 
-                                            names_today.add(str(n))
-                                            # 收集触发日期列表
-                                            hit_date = rr.get("hit_date")
-                                            hit_dates = rr.get("hit_dates", [])
-                                            # 合并hit_date和hit_dates
-                                            all_dates = []
-                                            if hit_date:
-                                                all_dates.append(str(hit_date))
-                                            if hit_dates:
-                                                all_dates.extend([str(d) for d in hit_dates if d])
-                                            # 去重并排序
-                                            all_dates = sorted(set(all_dates))
-                                            if all_dates:
-                                                hit_dates_map[str(n)] = all_dates
-                                if names_today:
-                                    if agg_mode.startswith("任一"):
-                                        hit = any((n in names_today) for n in picked)
-                                    else:
-                                        hit = all((n in names_today) for n in picked)
-                                    if hit:
-                                        # 收集所有选中策略的触发日期列表
-                                        trigger_dates_list = []
-                                        for rule_name in picked:
-                                            if rule_name in hit_dates_map:
-                                                trigger_dates_list.extend(hit_dates_map[rule_name])
-                                        # 去重并排序
-                                        trigger_dates_list = sorted(set(trigger_dates_list))
-                                        rows.append({
-                                            "ts_code": ts2, 
-                                            "score": sc,
-                                            "trigger_dates": trigger_dates_list if trigger_dates_list else []
-                                        })
-                    
                     df_hit = pd.DataFrame(rows)
                     if df_hit.empty:
                         st.info("未筛到命中标的。")
@@ -6510,7 +6648,6 @@ if _in_streamlit():
     with tab_tools:
         st.subheader("工具箱")
         colA, colB = st.columns(2)
-
         with colA:
             st.markdown("**自动补算最近 N 个交易日**")
             n_back = st.number_input("天数 N", min_value=1, max_value=100, value=15)
@@ -6521,14 +6658,39 @@ if _in_streamlit():
 
             go_fill = st.button("执行自动补算", width='stretch')
             if go_fill:
+                # 与“排名”页签保持一致：写入前关闭 details 读取/连接池，避免锁冲突
+                st.session_state["details_db_reading_enabled"] = False
                 try:
-                    if hasattr(se, "backfill_prev_n_days"):
+                    manager = get_database_manager()
+                    if manager:
+                        details_db_path = get_details_db_path_with_fallback()
+                        if details_db_path:
+                            manager.close_db_pools(details_db_path)
+                        try:
+                            unified_db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                            manager.close_db_pools(unified_db_path)
+                        except Exception as e_inner:
+                            logger.warning(f"关闭主库连接池失败: {e_inner}")
+                except Exception as e:
+                    logger.warning(f"自动补算前关闭 details 连接池失败: {e}")
+
+                try:
+                    if not is_details_db_available():
+                        st.error("details 数据库不可用，无法补算。请先检查数据库状态。")
+                    elif hasattr(se, "backfill_prev_n_days"):
                         out = se.backfill_prev_n_days(n=int(n_back), include_today=bool(inc_today), force=bool(do_force))
-                        st.success(f"已处理：{out}")
+                        if out:
+                            st.success(f"已处理：{out}")
+                        elif not do_force:
+                            st.info("所选窗口内的 All 排名文件已存在，无需补算。")
+                        else:
+                            st.info("未处理任何日期，请检查输入区间。")
                     else:
                         st.warning("未检测到 backfill_prev_n_days。")
                 except Exception as e:
                     st.error(f"补算失败：{e}")
+                finally:
+                    st.session_state["details_db_reading_enabled"] = True
 
         with colB:
             st.markdown("**补齐缺失的 All 排名文件**")
@@ -6538,14 +6700,39 @@ if _in_streamlit():
             do_force_fix = st.checkbox("强制重建（覆盖已有）", value=False)
             go_fix = st.button("补齐缺失", width='stretch')
             if go_fix and start and end:
+                # 与“排名”页签保持一致：写入前关闭 details 读取/连接池，避免锁冲突
+                st.session_state["details_db_reading_enabled"] = False
                 try:
-                    if hasattr(se, "backfill_missing_ranks"):                   
+                    manager = get_database_manager()
+                    if manager:
+                        details_db_path = get_details_db_path_with_fallback()
+                        if details_db_path:
+                            manager.close_db_pools(details_db_path)
+                        try:
+                            unified_db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+                            manager.close_db_pools(unified_db_path)
+                        except Exception as e_inner:
+                            logger.warning(f"关闭主库连接池失败: {e_inner}")
+                except Exception as e:
+                    logger.warning(f"补齐缺失前关闭 details 连接池失败: {e}")
+
+                try:
+                    if not is_details_db_available():
+                        st.error("details 数据库不可用，无法补齐缺失的排名文件。")
+                    elif hasattr(se, "backfill_missing_ranks"):                   
                         out = se.backfill_missing_ranks(start, end, force=bool(do_force_fix))
-                        st.success(f"已补齐：{out}")
+                        if out:
+                            st.success(f"已补齐：{out}")
+                        elif not do_force_fix:
+                            st.info("指定日期范围内的 All 排名文件已存在，无需重建。")
+                        else:
+                            st.info("未处理任何日期，请检查输入区间。")
                     else:
                         st.warning("未检测到 backfill_missing_ranks。")
                 except Exception as e:
                     st.error(f"处理失败：{e}")
+                finally:
+                    st.session_state["details_db_reading_enabled"] = True
         st.markdown("---")
         with st.expander("查看已有数据（All / Details / 日历）", expanded=True):
             if "scan_inventory_loaded" not in st.session_state:
@@ -6570,10 +6757,26 @@ if _in_streamlit():
                     cov_min = min(all_dates) if all_dates else ""
                     cov_max = max(all_dates) if all_dates else ""
 
+                    # Details 数据库信息（优先数据库，失败回退到目录）
+                    details_db_path = get_details_db_path_with_fallback()
+                    details_available = bool(details_db_path and is_details_db_available())
+                    details_info = {}
+                    details_dates: list[str] = []
+                    if details_available:
+                        try:
+                            details_info = get_details_table_info(details_db_path, use_cache=True) or {}
+                            details_dates = query_details_recent_dates(60, details_db_path) or []
+                        except Exception as e:
+                            logger.debug(f"读取 details 数据库信息失败: {e}")
+                            details_available = False
+                    if not details_available:
+                        details_info = {"error": "Details 数据库不可用，回退到目录扫描"}
+                        details_dates = det_dates
+
                     # 交易日日历（若存在则用于对比缺失）
                     missing: list[str] = []
                     try:
-                        trade_dates = get_trade_dates() or []
+                        trade_dates = _get_trade_dates_available() or []
                         if trade_dates and cov_min and cov_max:
                             rng = [d for d in trade_dates if cov_min <= d <= cov_max]
                             aset = set(all_dates)
@@ -6583,7 +6786,10 @@ if _in_streamlit():
 
                     col1, col2, col3 = st.columns(3)
                     with col1: st.metric("All 文件数", len(all_files))
-                    with col2: st.metric("Details 日期目录", len(det_dirs))
+                    if details_available:
+                        with col2: st.metric("Details 记录数", int(details_info.get("total_records", 0)))
+                    else:
+                        with col2: st.metric("Details 日期目录", len(det_dirs))
                     with col3: st.metric("0 字节 All 文件", len(zero_all))
 
                     if cov_min:
@@ -6591,13 +6797,21 @@ if _in_streamlit():
                     else:
                         st.caption("All 目录为空。")
 
+                    if details_available:
+                        dr = details_info.get("date_range", {}) or {}
+                        min_d, max_d = dr.get("min_date"), dr.get("max_date")
+                        stock_cnt = details_info.get("stock_count", 0)
+                        st.caption(f"Details 覆盖：{min_d or '未知'} ~ {max_d or '未知'}；股票数约 {stock_cnt}；路径：{details_db_path}")
+                    else:
+                        st.caption(details_info.get("error", "Details 未启用"))
+
                     if zero_all:
                         names = zero_all[:8]
                         st.warning("检测到 0 字节文件（可用“强制重建”覆盖）：\n" + "，".join(names) + (" ……" if len(zero_all) > len(names) else ""))
                     colL, colR = st.columns([1, 2])
                     with colL:
                         kind = st.radio("数据类型", ["All 排名", "Details"], horizontal=True, key="view_kind")
-                        cand = all_dates if kind == "All 排名" else det_dates
+                        cand = all_dates if kind == "All 排名" else details_dates
                         sel_date = st.selectbox("选择日期（倒序）", cand[::-1] if cand else [], key="view_date") if cand else None
                         show_missing = st.checkbox("显示缺失日期（基于交易日历）", value=False, disabled=not missing)
                     with colR:
@@ -6609,11 +6823,19 @@ if _in_streamlit():
                                 else:
                                     st.info("该日 All 文件不存在或为空。")
                             else:
-                                pdir = DET_DIR / sel_date
-                                if pdir.exists():
-                                    st.info(f"{sel_date} 共有 {len(list(pdir.glob('*.json')))} 个详情文件。")
+                                if details_available and details_db_path:
+                                    df_preview = query_details_by_date(sel_date, limit=200, db_path=details_db_path)
+                                    if df_preview is None or df_preview.empty:
+                                        st.info("该日 Details 记录不存在或为空。")
+                                    else:
+                                        st.caption(f"{sel_date} 共有 {len(df_preview)} 条预览（最多200），总记录数可能更大。")
+                                        st.dataframe(df_preview.head(200), width='stretch', height=360)
                                 else:
-                                    st.info("该日没有 Details 目录。")
+                                    pdir = DET_DIR / sel_date
+                                    if pdir.exists():
+                                        st.info(f"{sel_date} 共有 {len(list(pdir.glob('*.json')))} 个详情文件。")
+                                    else:
+                                        st.info("该日没有 Details 目录。")
 
                     if show_missing and missing:
                         st.markdown("**缺失日期（相对 All 覆盖区间）**")
@@ -7397,42 +7619,42 @@ if _in_streamlit():
                     else:
                         df_result["参考日排名"] = None
                     
-                    # 6) 按市场分组并排序
-                    df_result = df_result.sort_values(["市场", f"{n_days}日涨幅"], ascending=[True, False]).reset_index(drop=True)
-                    
-                    # 添加市场内排名
+                    # 6) 排序与总排名
+                    df_result = df_result.sort_values(f"{n_days}日涨幅", ascending=False).reset_index(drop=True)
                     df_result["市场内排名"] = df_result.groupby("市场")[f"{n_days}日涨幅"].rank(ascending=False, method="min").astype(int)
+                    df_result["总排名"] = df_result[f"{n_days}日涨幅"].rank(ascending=False, method="min").astype(int)
                     
                     # 7) 格式化显示
                     df_display = df_result.copy()
-                    
-                    # 格式化涨幅列
                     df_display[f"{n_days}日涨幅"] = df_display[f"{n_days}日涨幅"].map(
                         lambda x: f"{x:.2f}%" if pd.notna(x) else None
                     )
+                    df_display = df_display.sort_values("总排名").reset_index(drop=True)
                     
                     # 选择要显示的列
-                    display_cols = ["市场", "市场内排名", "ts_code", rank_days_ago_col, f"{n_days}日涨幅"]
+                    display_cols = ["总排名", "市场", "市场内排名", "ts_code", rank_days_ago_col, f"{n_days}日涨幅"]
                     available_cols = [c for c in display_cols if c in df_display.columns]
                     
-                    # 按市场分组展示
+                    # 按市场筛选展示
                     markets = df_display["市场"].unique()
-                    # 自定义排序：沪深主板放最前，其他按字母顺序
                     market_order = ["沪A", "深A", "创业板", "科创板", "北交所", "其他"]
                     markets_sorted = sorted(markets, key=lambda x: (
                         market_order.index(x) if x in market_order else len(market_order)
                     ))
-                    
-                    for market in markets_sorted:
-                        market_df = df_display[df_display["市场"] == market].head(100)  # 每个市场最多显示100只
-                        if not market_df.empty:
-                            st.subheader(f"{market}（共 {len(df_display[df_display['市场'] == market])} 只，显示前100）")
-                            # 注意：use_container_width 已废弃，使用 width='stretch' 替代
-                            st.dataframe(
-                                market_df[available_cols],
-                                width='stretch',
-                                height=400
-                            )
+                    market_options = ["全部"] + markets_sorted
+                    selected_market = st.selectbox("选择市场浏览", options=market_options, index=0, key="surge_market_select")
+                    if selected_market == "全部":
+                        filtered = df_display
+                    else:
+                        filtered = df_display[df_display["市场"] == selected_market]
+                    if filtered.empty:
+                        st.info("所选市场无数据。")
+                    else:
+                        st.dataframe(
+                            filtered[available_cols].head(200),
+                            width='stretch',
+                            height=400
+                        )
                     
                     caption_parts = [f"涨幅榜：参考日 {refS}，最近 {n_days} 日涨幅（区间：{start_date} → {end_date}）"]
                     if start_rank_map:
@@ -7617,7 +7839,7 @@ if _in_streamlit():
                                 st.error("无法获取样本股票列表")
                             
                             # 2) 获取区间内的所有交易日（从参考日开始往后推N个交易日）
-                            all_trade_dates_list = get_trade_dates() or []
+                            all_trade_dates_list = _get_trade_dates_available() or []
                             if not all_trade_dates_list:
                                 st.error("无法获取交易日列表")
                             else:
@@ -8124,7 +8346,7 @@ if _in_streamlit():
                                     last_obs_date = interval_dates[-1]
                                     # 从最后一个观察日的下一个交易日开始跟踪
                                     # 获取所有交易日列表，找到 last_obs_date 的下一个交易日
-                                    all_trade_dates = get_trade_dates() or []
+                                    all_trade_dates = _get_trade_dates_available() or []
                                     if not all_trade_dates:
                                         st.warning("无法获取交易日列表")
                                     else:
@@ -8498,29 +8720,9 @@ if _in_streamlit():
                 if not db_path or not is_details_db_available():
                     st.warning(f"Details数据库不可用: {db_path if db_path else '路径获取失败'}")
                 else:
-                    # —— 数据库查询控制按钮 ——
-                    data_view_db_enabled = st.session_state.get("data_view_db_enabled", False)
-                    col_db_ctrl1, col_db_ctrl2 = st.columns([3, 1])
-                    with col_db_ctrl1:
-                        if data_view_db_enabled:
-                            st.success("✅ 数据库查询已启用（可以查询数据库）")
-                        else:
-                            st.info("ℹ️ 数据库查询未启用（点击按钮后才会查询数据库，避免与写入操作冲突）")
-                    with col_db_ctrl2:
-                        if not data_view_db_enabled:
-                            if st.button("🔓 启用数据库查询", key="enable_data_view_db"):
-                                st.session_state["data_view_db_enabled"] = True
-                                st.rerun()
-                        else:
-                            # 一旦启用就不再显示按钮，保持启用状态
-                            pass
-                    
-                    # 只有在启用数据库查询后才执行查询操作
+                    data_view_db_enabled = st.session_state.get("data_view_db_enabled", True)
                     if not data_view_db_enabled:
-                        st.warning("⚠️ 请先点击「启用数据库查询」按钮，然后才能查询数据库数据")
-                    
-                    
-                    # 以下是所有数据库查询操作，只有在启用后才会执行
+                        st.warning("详情数据库查询已关闭。")
                     # 查询类型选择
                     query_type = st.selectbox(
                         "查询类型",
@@ -8545,20 +8747,12 @@ if _in_streamlit():
                                 logger.debug(f"Details数据库表不存在，无法获取最新日期")
                             else:
                                 logger.debug(f"获取最新日期失败: {e}")
-                        # 数据库失败时，回退到文件系统：output/score/details/<YYYYMMDD> 目录
-                        try:
-                            ddir = Path(SC_OUTPUT_DIR) / "details"
-                            if ddir.exists():
-                                dirs = [p.name for p in ddir.iterdir() if p.is_dir() and _is_valid_date(p.name)]
-                                if dirs:
-                                    return max(dirs)
-                        except Exception as e:
-                            logger.debug(f"文件系统兜底获取最新日期失败: {e}")
                         return None
                     
                     latest_date = get_latest_details_date()
-                    
-                    if query_type == "按日期查看":
+                    if not data_view_db_enabled:
+                        st.warning("请开启详情数据库查询后再试。")
+                    elif query_type == "按日期查看":
                         # 如果还没有设置默认日期，使用最新日期
                         if "details_date_value" not in st.session_state:
                             st.session_state["details_date_value"] = latest_date if latest_date else ""
@@ -8801,7 +8995,7 @@ if _in_streamlit():
                 def get_trade_dates_list():
                     """获取交易日期列表"""
                     try:
-                        dates = get_trade_dates(db_path)
+                        dates = _get_trade_dates_available(db_path=db_path)
                         return dates
                     except Exception as e:
                         st.error(f"获取交易日期失败: {e}")

@@ -65,7 +65,7 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 from utils import stock_list_cache_path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import warnings
 from tqdm import tqdm
 
@@ -150,12 +150,12 @@ def _concept_data_exists() -> bool:
 def _confirm_concept_download() -> bool:
     """缺失概念数据时，询问是否下载。非交互环境默认继续以保持行为一致。"""
     if not sys.stdin.isatty():
-        logger.perf("未检测到概念数据，非交互环境默认继续下载。")
+        logger.info("未检测到概念数据，非交互环境默认继续下载。")
         return True
     try:
         choice = input("未检测到概念数据，是否现在下载？[y/N]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
-        logger.perf("未检测到概念数据，用户取消操作。")
+        logger.info("未检测到概念数据，用户取消操作。")
         return False
     return choice == "y"
 
@@ -720,6 +720,18 @@ class TushareManager:
             logger.error(f"获取指数日线数据失败 {ts_code}: {e}")
             raise
     
+    def get_stock_daily_by_date(self, trade_date: str, fields: str = None) -> pd.DataFrame:
+        """按交易日拉取全市场日线（不含换手率）。"""
+        try:
+            return self._make_api_call(
+                self._pro.daily,
+                trade_date=trade_date,
+                fields=fields,
+            )
+        except Exception as e:
+            logger.error(f"获取日线失败 trade_date={trade_date}: {e}")
+            raise
+
     def get_trade_dates(self, start_date: str, end_date: str) -> List[str]:
         """获取交易日列表（使用数据库管理器的统一方法）"""
         try:
@@ -946,12 +958,39 @@ class DataProcessor:
         return df
 
 # ================= 下载器 =================
+def _compute_indicators_task(args):
+    """子进程任务：合并warmup后计算指标并准备写库。"""
+    ts_code, df, adj_type, warmup_df, indicator_names, decs = args
+    try:
+        base_df = df
+        if warmup_df is not None and not warmup_df.empty:
+            base_df = pd.concat([warmup_df, df], ignore_index=True)
+            base_df = base_df.sort_values('trade_date').drop_duplicates('trade_date', keep='last')
+        res = compute(base_df, indicator_names)
+        min_date = df['trade_date'].min()
+        res = res[res['trade_date'] >= min_date].copy()
+        for col, n in decs.items():
+            if col in res.columns and pd.api.types.is_numeric_dtype(res[col]):
+                res[col] = res[col].round(n)
+        res['adj_type'] = adj_type
+        if 'tor' not in res.columns:
+            res['tor'] = np.nan
+        base_columns = ['ts_code', 'trade_date', 'adj_type', 'open', 'high', 'low', 'close', 'vol', 'amount', 'tor']
+        indicator_columns = [c for c in res.columns if c not in base_columns]
+        res = res[base_columns + indicator_columns]
+        return ts_code, res, None
+    except Exception as e:
+        return ts_code, None, str(e)
+
+
 class StockDownloader:
     """股票数据下载器"""
     
-    def __init__(self, config: DownloadConfig, is_first_download: bool = False):
+    def __init__(self, config: DownloadConfig, is_first_download: bool = False, batch_write_once: bool = False):
         self.config = config
         self.is_first_download = is_first_download  # 是否为首次下载
+        # 是否在下载完成后批量一次性写入（适用于重试阶段避免多次写盘）
+        self.batch_write_once = batch_write_once
         # 不在初始化时创建数据库连接，避免子线程创建连接
         
         # 创建限频器（使用令牌桶算法）
@@ -980,6 +1019,48 @@ class StockDownloader:
         self._lock = threading.Lock()
         # 数据库管理器仅在主线程中按需创建
         self.db_manager: Optional[DatabaseManager] = None
+
+    def _detect_preclose_mismatch(self, ts_code: str, raw_df: pd.DataFrame) -> Optional[Tuple[str, float, float]]:
+        """
+        用 warmup 数据校验“增量段首日”的 pre_close，一旦发现不一致，认为可能发生复权。
+        仅在增量下载且存在 warmup 缓存时检查，不访问数据库。
+        返回 (trade_date, pre_close, expected_prev_close) 或 None
+        """
+        try:
+            if self.is_first_download or not self.config.enable_warmup:
+                return None
+            if raw_df is None or raw_df.empty or "pre_close" not in raw_df.columns:
+                return None
+            warmup_df = self._warmup_cache.get(ts_code)
+            if warmup_df is None or warmup_df.empty or "close" not in warmup_df.columns:
+                return None
+            # 增量首日（新段最早日期）
+            first_row = raw_df.sort_values("trade_date").iloc[0]
+            trade_date = str(first_row.get("trade_date"))
+            pre_close = first_row.get("pre_close")
+            if pd.isna(pre_close):
+                return None
+
+            # warmup 最近一日（增量前一交易日）
+            warmup_latest = warmup_df.sort_values("trade_date").iloc[-1]
+            expected = warmup_latest.get("close")
+            expected_date = str(warmup_latest.get("trade_date"))
+
+            if pd.isna(expected):
+                return None
+            try:
+                pre_c = float(pre_close)
+                exp_c = float(expected)
+            except Exception:
+                return None
+
+            if abs(pre_c - exp_c) > 1e-6:
+                logger.debug(f"pre_close 校验 {ts_code}: 首日 {trade_date} pre_close={pre_c}, warmup 最新 {expected_date} close={exp_c}")
+                return trade_date, pre_c, exp_c
+            return None
+        except Exception as e:
+            logger.debug(f"pre_close 校验失败 {ts_code}: {e}")
+            return None
 
     def _persist_stock_list_cache(self, df: pd.DataFrame) -> None:
         """把股票列表缓存到数据库目录下的 stock_list.csv，供其他模块复用。"""
@@ -1167,6 +1248,15 @@ class StockDownloader:
                     return ts_code, "empty", None
                 
                 logger.debug(f"{ts_code} 获取到 {len(raw_data)} 条原始数据")
+
+                # pre_close 与 warmup 数据校验，发现复权则标记失败，交由完整重试
+                mismatch = self._detect_preclose_mismatch(ts_code, raw_data)
+                if mismatch:
+                    trade_date, pre_c, exp_c = mismatch
+                    msg = (f"{ts_code} {trade_date} pre_close={pre_c} 与上一交易日收盘 {exp_c} 不一致，"
+                           f"疑似发生复权，标记失败以触发完整重试")
+                    logger.warning(msg)
+                    return ts_code, f"error: {msg}", None
                 
                 # 清理数据（不依赖数据库连接）
                 logger.debug(f"清理 {ts_code} 数据...")
@@ -1410,61 +1500,69 @@ class StockDownloader:
                         with self._lock:
                             self.stats.empty_count += 1
                     elif status == "success" and data is not None:
-                        # 立即写入数据库（边下载边写入）
-                        try:
-                            logger.debug(f"开始写入 {result_code} 的数据到数据库（{len(data)} 条记录）...")
-                            
-                            # 使用回调函数在写入完成后更新状态
-                            write_completed = threading.Event()
-                            write_result = {"success": False, "error": None}
-                            
-                            def update_status_callback(response):
-                                try:
-                                    if hasattr(response, 'success') and response.success:
-                                        write_result["success"] = True
-                                        logger.debug(f"{result_code} 数据已成功写入数据库，导入 {response.rows_imported} 条记录")
-                                    else:
-                                        write_result["success"] = False
-                                        write_result["error"] = getattr(response, 'error', '未知错误')
-                                        logger.error(f"{result_code} 数据写入数据库失败: {write_result['error']}")
-                                except Exception as e:
-                                    logger.warning(f"更新状态失败 {result_code}: {e}")
-                                finally:
-                                    write_completed.set()
-                            
-                            # 提交写入请求（异步，不阻塞）
-                            request_id = db_manager.receive_stock_data(
-                                source_module="download",
-                                data=data,
-                                mode="upsert",
-                                callback=update_status_callback
-                            )
-                            
-                            # 等待写入完成（最多等待60秒，因为可能需要从数据库获取历史数据进行warmup）
-                            if write_completed.wait(timeout=60):
-                                if not write_result["success"]:
-                                    logger.error(f"{result_code} 写入失败: {write_result['error']}")
-                                    with self._lock:
-                                        self.stats.error_count += 1
-                                        self.stats.failed_stocks.append(
-                                            (result_code, write_result.get("error") or "写入失败")
-                                        )
-                                    continue
-                            else:
-                                logger.warning(f"{result_code} 写入请求超时（60秒），数据可能仍在后台处理中，继续处理下一只股票")
-                            
-                            # 写入成功，更新统计
-                            with self._lock:
+                        if self.batch_write_once:
+                            # 收集数据，稍后统一写入
+                            with write_lock:
+                                collected_data.append(data)
                                 self.stats.success_count += 1
                                 write_count += 1
-                            
-                            logger.debug(f"✓ {result_code} 下载、计算指标、写入完成")
-                            
-                        except Exception as e:
-                            logger.error(f"{result_code} 写入数据库失败: {e}")
-                            with self._lock:
-                                self.stats.error_count += 1
-                                self.stats.failed_stocks.append((result_code, str(e)))
+                            logger.debug(f"✓ {result_code} 下载、计算指标完成，已收集待批量写入（当前 {write_count} 只）")
+                        else:
+                            # 立即写入数据库（边下载边写入）
+                            try:
+                                logger.debug(f"开始写入 {result_code} 的数据到数据库（{len(data)} 条记录）...")
+                                
+                                # 使用回调函数在写入完成后更新状态
+                                write_completed = threading.Event()
+                                write_result = {"success": False, "error": None}
+                                
+                                def update_status_callback(response):
+                                    try:
+                                        if hasattr(response, 'success') and response.success:
+                                            write_result["success"] = True
+                                            logger.debug(f"{result_code} 数据已成功写入数据库，导入 {response.rows_imported} 条记录")
+                                        else:
+                                            write_result["success"] = False
+                                            write_result["error"] = getattr(response, 'error', '未知错误')
+                                            logger.error(f"{result_code} 数据写入数据库失败: {write_result['error']}")
+                                    except Exception as e:
+                                        logger.warning(f"更新状态失败 {result_code}: {e}")
+                                    finally:
+                                        write_completed.set()
+                                
+                                # 提交写入请求（异步，不阻塞）
+                                request_id = db_manager.receive_stock_data(
+                                    source_module="download",
+                                    data=data,
+                                    mode="upsert",
+                                    callback=update_status_callback
+                                )
+                                
+                                # 等待写入完成（最多等待60秒，因为可能需要从数据库获取历史数据进行warmup）
+                                if write_completed.wait(timeout=60):
+                                    if not write_result["success"]:
+                                        logger.error(f"{result_code} 写入失败: {write_result['error']}")
+                                        with self._lock:
+                                            self.stats.error_count += 1
+                                            self.stats.failed_stocks.append(
+                                                (result_code, write_result.get("error") or "写入失败")
+                                            )
+                                        continue
+                                else:
+                                    logger.warning(f"{result_code} 写入请求超时（60秒），数据可能仍在后台处理中，继续处理下一只股票")
+                                
+                                # 写入成功，更新统计
+                                with self._lock:
+                                    self.stats.success_count += 1
+                                    write_count += 1
+                                
+                                logger.debug(f"✓ {result_code} 下载、计算指标、写入完成")
+                                
+                            except Exception as e:
+                                logger.error(f"{result_code} 写入数据库失败: {e}")
+                                with self._lock:
+                                    self.stats.error_count += 1
+                                    self.stats.failed_stocks.append((result_code, str(e)))
                     else:
                         logger.warning(f"下载失败 {result_code}: {status}")
                         with self._lock:
@@ -1487,7 +1585,46 @@ class StockDownloader:
         # 关闭进度条
         progress_bar.close()
         
-        # 所有数据已经边下载边写入，更新状态文件
+        # 批量写入模式：合并所有成功数据后一次性写库
+        if self.batch_write_once:
+            if collected_data:
+                final_df = pd.concat(collected_data, ignore_index=True)
+                logger.info(f"批量写入模式：合并 {len(final_df)} 行，覆盖 {write_count} 只股票，一次性写库")
+                
+                write_completed = threading.Event()
+                write_result = {"success": False, "error": None}
+                
+                def update_status_callback(response):
+                    try:
+                        if hasattr(response, 'success') and response.success:
+                            write_result["success"] = True
+                            logger.info(f"批量写入成功，导入 {response.rows_imported} 条，耗时 {response.execution_time:.2f}s")
+                        else:
+                            write_result["success"] = False
+                            write_result["error"] = getattr(response, 'error', '未知错误')
+                            logger.error(f"批量写入失败: {write_result['error']}")
+                    finally:
+                        write_completed.set()
+                
+                try:
+                    request_id = db_manager.receive_stock_data(
+                        source_module="download",
+                        data=final_df,
+                        mode="upsert",
+                        callback=update_status_callback
+                    )
+                    logger.info(f"批量写入请求已提交 (ID: {request_id})，等待后台线程处理...")
+                    if not write_completed.wait(timeout=300):
+                        logger.warning("批量写入超时（5分钟），数据可能仍在后台处理中")
+                    elif not write_result["success"]:
+                        self.stats.error_count = max(self.stats.error_count, 1)
+                except Exception as e:
+                    logger.error(f"批量写入失败: {e}")
+                    self.stats.error_count = max(self.stats.error_count, 1)
+            else:
+                logger.warning("批量写入模式下无成功数据可写入")
+        
+        # 所有数据写入后更新状态文件
         if self.stats.success_count > 0:
             try:
                 from database_manager import update_stock_data_status
@@ -1506,6 +1643,201 @@ class StockDownloader:
                    f"当前令牌: {rate_stats['current_tokens']:.1f}, 等待时间: {rate_stats['total_wait_time']:.1f}s, "
                    f"限频命中: {rate_stats['rate_limit_hits']}")
         
+        return self.stats
+
+
+class DailyStockDownloader(StockDownloader):
+    """按交易日增量下载器：先按日拉取全市场，再统一计算指标并写库。"""
+
+    def __init__(self, config: DownloadConfig):
+        super().__init__(config, is_first_download=False)
+
+    def _fetch_daily_frames(self, trade_dates: List[str]) -> List[pd.DataFrame]:
+        frames = []
+        progress = tqdm(
+            total=len(trade_dates),
+            desc='按日拉取',
+            unit='日',
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            **_tqdm_kwargs()
+        )
+        for td in trade_dates:
+            try:
+                daily_df = self.tushare_manager.get_stock_daily_by_date(
+                    trade_date=td,
+                    fields='ts_code,trade_date,open,high,low,close,pre_close,vol,amount'
+                )
+                if daily_df is None or daily_df.empty:
+                    progress.update(1)
+                    continue
+                merged = daily_df
+                if self.config.download_tor:
+                    try:
+                        basic_df = self.tushare_manager.get_daily_basic_by_date(
+                            trade_date=td,
+                            fields='ts_code,trade_date,turnover_rate'
+                        )
+                        if basic_df is not None and not basic_df.empty:
+                            merged = daily_df.merge(
+                                basic_df[['ts_code', 'trade_date', 'turnover_rate']],
+                                on=['ts_code', 'trade_date'],
+                                how='left'
+                            )
+                    except Exception as e:
+                        logger.warning(f"{td} 获取换手率失败，继续：{e}")
+                frames.append(merged)
+            except Exception as e:
+                logger.warning(f"按日拉取失败 {td}: {e}")
+            finally:
+                progress.update(1)
+        progress.close()
+        return frames
+
+    def download_all_stocks(self, stock_codes: Optional[List[str]] = None) -> DownloadStats:
+        logger.info("按交易日增量下载模式：按日拉取后统一计算指标")
+        if self.db_manager is None:
+            logger.info("[数据库连接] 开始获取数据库管理器实例 (按日增量)")
+            self.db_manager = get_database_manager()
+        data_processor = DataProcessor(self.db_manager)
+
+        trade_dates = self.tushare_manager.get_trade_dates(self.config.start_date, self.config.end_date)
+        if not trade_dates:
+            logger.warning(f"指定区间内无交易日: {self.config.start_date} - {self.config.end_date}")
+            return self.stats
+
+        frames = self._fetch_daily_frames(trade_dates)
+        if not frames:
+            logger.warning("按日拉取无数据")
+            return self.stats
+
+        all_data = pd.concat(frames, ignore_index=True)
+        if all_data.empty:
+            logger.warning("按日拉取后为空")
+            return self.stats
+
+        if stock_codes:
+            whitelist = {normalize_ts(c) or str(c).strip() for c in stock_codes if c}
+            if whitelist:
+                all_data = all_data[all_data['ts_code'].isin(whitelist)]
+
+        # 预载 warmup（需要股票列表）
+        codes = sorted(set(all_data['ts_code'].astype(str).tolist()))
+        self.stats.total_stocks = len(codes)
+        if not codes:
+            logger.warning("无可处理股票")
+            return self.stats
+
+        if self.config.enable_warmup:
+            self._preload_warmup_data(self.db_manager, codes, data_processor)
+
+        indicator_names = data_processor.indicator_names
+        decs = outputs_for(indicator_names)
+
+        tasks = []
+        for ts_code, group in all_data.groupby('ts_code'):
+            if group is None or group.empty:
+                self.stats.empty_count += 1
+                continue
+            mismatch = self._detect_preclose_mismatch(ts_code, group)
+            if mismatch:
+                trade_date, pre_c, exp_c = mismatch
+                msg = f"{ts_code} {trade_date} pre_close={pre_c} 与 warmup 最新 close 不一致"
+                logger.warning(msg)
+                self.stats.error_count += 1
+                self.stats.failed_stocks.append((ts_code, msg))
+                continue
+            cleaned = data_processor.clean_stock_data(group, ts_code)
+            if cleaned is None or cleaned.empty:
+                self.stats.empty_count += 1
+                continue
+            tasks.append((ts_code, cleaned, self.config.adj_type, self._warmup_cache.get(ts_code), indicator_names, decs))
+
+        if not tasks:
+            logger.warning("按日拉取后无可计算的数据")
+            return self.stats
+
+        workers = max(2, min(self.config.threads, os.cpu_count() or 2))
+        results = []
+        compute_bar = tqdm(
+            total=len(tasks),
+            desc='指标计算',
+            unit='只',
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            **_tqdm_kwargs()
+        )
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            future_to_code = {pool.submit(_compute_indicators_task, t): t[0] for t in tasks}
+            for fut in as_completed(future_to_code):
+                ts_code = future_to_code[fut]
+                try:
+                    code, data, err = fut.result()
+                    if err or data is None or data.empty:
+                        self.stats.error_count += 1
+                        self.stats.failed_stocks.append((ts_code, err or 'compute_empty'))
+                    else:
+                        results.append(data)
+                        self.stats.success_count += 1
+                    compute_bar.update(1)
+                    _refresh_postfix(compute_bar, {'成功': self.stats.success_count, '失败': self.stats.error_count})
+                except Exception as e:
+                    self.stats.error_count += 1
+                    self.stats.failed_stocks.append((ts_code, str(e)))
+                    compute_bar.update(1)
+        compute_bar.close()
+
+        # 过滤掉空或全 NA 的结果，避免 pandas FutureWarning
+        filtered_results = [
+            df for df in results
+            if df is not None and not df.empty and not df.isna().all().all()
+        ]
+        if not filtered_results:
+            logger.warning("指标计算结果为空")
+            return self.stats
+
+        final_df = pd.concat(filtered_results, ignore_index=True)
+        logger.info(f"按日模式合并后准备写入 {len(final_df)} 行，覆盖 {self.stats.success_count} 只股票")
+
+        write_completed = threading.Event()
+        write_result = {'success': False, 'error': None}
+
+        def update_status_callback(response):
+            try:
+                if hasattr(response, 'success') and response.success:
+                    write_result['success'] = True
+                    logger.info(f"按日增量写入成功，导入 {response.rows_imported} 条，耗时 {response.execution_time:.2f}s")
+                    from database_manager import update_stock_data_status
+                    update_stock_data_status()
+                else:
+                    write_result['success'] = False
+                    write_result['error'] = getattr(response, 'error', '未知错误')
+                    logger.error(f"按日增量写入失败: {write_result['error']}")
+            finally:
+                write_completed.set()
+
+        try:
+            request_id = self.db_manager.receive_stock_data(
+                source_module='download',
+                data=final_df,
+                mode='upsert',
+                callback=update_status_callback
+            )
+            logger.info(f"写入请求已提交 (ID: {request_id})，等待后台线程处理...")
+            if not write_completed.wait(timeout=300):
+                logger.warning("按日增量写入超时（5分钟），数据可能仍在后台处理中")
+            elif not write_result['success']:
+                self.stats.error_count = max(self.stats.error_count, 1)
+        except Exception as e:
+            logger.error(f"按日增量写入失败: {e}")
+            self.stats.error_count = max(self.stats.error_count, 1)
+        finally:
+            rate_stats = self.tushare_manager.rate_limiter.get_stats()
+            logger.info(
+                f"令牌桶限频器统计 - 总调用: {rate_stats['total_calls']}, 成功率: {rate_stats['success_rate']:.1f}%, "
+                f"补充速率: {rate_stats['current_refill_rate']:.2f}次/秒, 容量: {rate_stats['current_capacity']:.1f}, "
+                f"当前令牌: {rate_stats['current_tokens']:.1f}, 等待时间: {rate_stats['total_wait_time']:.1f}s, "
+                f"限频命中: {rate_stats['rate_limit_hits']}"
+            )
+
         return self.stats
 
 
@@ -2090,7 +2422,7 @@ class DownloadManager:
                             f"实际结束日期: {actual_end_date})"
                         )
                     
-                    logger.perf(f"跳过下载原因: 开始日期({actual_start_date}) > 结束日期({actual_end_date})")
+                    logger.info(f"跳过下载原因: 开始日期({actual_start_date}) > 结束日期({actual_end_date})")
                     return {
                         "skip_download": True,
                         "is_first_download": is_first_download,
@@ -2141,9 +2473,21 @@ class DownloadManager:
             download_tor=self.config.download_tor,
         )
         
-        # 传递是否为首次下载的信息
+        # 传递是否为首次下载的信息；增量重试或补齐场景可强制回退到逐股模式
         is_first_download = strategy.get("is_first_download", False)
-        downloader = StockDownloader(stock_config, is_first_download=is_first_download)
+        force_per_stock_retry = strategy.get("force_per_stock_retry", False)
+        batch_write_once = strategy.get("batch_write_once", False)
+        # 补齐最新日期缺失数据时也使用逐股下载，避免按日模式遗漏
+        fill_missing_latest_date = strategy.get("fill_missing_latest_date", False)
+        per_stock_mode = is_first_download or force_per_stock_retry or fill_missing_latest_date
+        if per_stock_mode:
+            downloader = StockDownloader(
+                stock_config,
+                is_first_download=is_first_download,
+                batch_write_once=batch_write_once
+            )
+        else:
+            downloader = DailyStockDownloader(stock_config)
         
         stock_whitelist = strategy.get("stock_whitelist")
         if stock_whitelist:
@@ -2219,12 +2563,13 @@ class DownloadManager:
         
         def _log_results(res: Dict[str, DownloadStats], heading: str) -> Tuple[int, int, int]:
             total_success, total_error, total_empty = _collect_totals(res)
-            logger.perf(heading)
+            logger.info(heading)
             for asset_type, stats in res.items():
-                logger.perf(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
+                logger.info(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
                 if stats.failed_stocks:
-                    logger.warning(f"{asset_type} 失败股票: {[code for code, _ in stats.failed_stocks[:5]]}")
-            logger.perf(f"总计: 成功={total_success}, 空数据={total_empty}, 失败={total_error}")
+                    failed_codes = [code for code, _ in stats.failed_stocks if code]
+                    logger.warning(f"{asset_type} 失败股票: {failed_codes}")
+            logger.info(f"总计: 成功={total_success}, 空数据={total_empty}, 失败={total_error}")
             return total_success, total_error, total_empty
         
         def _unique_failed_codes(failed_list: List[Tuple[str, str]]) -> List[str]:
@@ -2270,8 +2615,8 @@ class DownloadManager:
             logger.info("=" * 30)
             logger.info("智能日期判断说明")
             logger.info("=" * 30)
-            logger.perf(f"• 配置的结束日期: today (今日)")
-            logger.perf(f"• 智能判断后的实际结束日期: {smart_end_date}")
+            logger.info(f"• 配置的结束日期: today (今日)")
+            logger.info(f"• 智能判断后的实际结束日期: {smart_end_date}")
             logger.info("• 智能判断逻辑:")
             logger.info("  - 如果今天是交易日且当前时间 < 15:00，使用前一个交易日")
             logger.info("  - 如果今天是交易日且当前时间 >= 15:00，使用今天")
@@ -2300,7 +2645,7 @@ class DownloadManager:
             if "stock" in assets:
                 current_asset += 1
                 overall_progress.set_description(f"下载股票数据 ({strategy['start_date']} - {strategy['end_date']})")
-                logger.perf(f"开始下载股票数据: {strategy['start_date']} - {strategy['end_date']}")
+                logger.info(f"开始下载股票数据: {strategy['start_date']} - {strategy['end_date']}")
                 results["stock"] = self.download_stocks(strategy)
                 overall_progress.update(1)
                 _refresh_postfix(overall_progress, {
@@ -2312,7 +2657,7 @@ class DownloadManager:
             if "index" in assets:
                 current_asset += 1
                 overall_progress.set_description(f"下载指数数据 ({strategy['start_date']} - {strategy['end_date']})")
-                logger.perf(f"开始下载指数数据: {strategy['start_date']} - {strategy['end_date']}")
+                logger.info(f"开始下载指数数据: {strategy['start_date']} - {strategy['end_date']}")
                 results["index"] = self.download_indices(strategy, index_whitelist)
                 overall_progress.update(1)
                 _refresh_postfix(overall_progress, {
@@ -2355,12 +2700,20 @@ class DownloadManager:
                     retry_strategy = dict(strategy)
                     retry_strategy["stock_whitelist"] = retry_stock_codes
                     retry_strategy["skip_download"] = False
-                    logger.perf(f"股票重试列表共 {len(retry_stock_codes)} 只")
+                    retry_strategy["start_date"] = self.config.start_date
+                    # 重试时强制回退到逐股下载，避免按日模式再失败
+                    retry_strategy["force_per_stock_retry"] = True
+                    # 重试阶段按需求一次性写盘，避免多次写入
+                    retry_strategy["batch_write_once"] = True
+                    logger.info(f"股票重试列表共 {len(retry_stock_codes)} 只")
                     retry_results["stock"] = self.download_stocks(retry_strategy)
                 
                 if retry_index_codes:
-                    logger.perf(f"指数重试列表共 {len(retry_index_codes)} 只")
-                    retry_results["index"] = self.download_indices(strategy, retry_index_codes)
+                    retry_index_strategy = dict(strategy)
+                    retry_index_strategy["skip_download"] = False
+                    retry_index_strategy["start_date"] = self.config.start_date
+                    logger.info(f"指数重试列表共 {len(retry_index_codes)} 只")
+                    retry_results["index"] = self.download_indices(retry_index_strategy, retry_index_codes)
                 
                 # 合并重试结果
                 if retry_results:
@@ -2421,12 +2774,12 @@ def download_data(start_date: str, end_date: str, adj_type: str = "qfq",
         if "stock" in assets:
             try:
                 if not _concept_data_exists() and not _confirm_concept_download():
-                    logger.perf("缺少概念数据，用户选择跳过抓取。")
+                    logger.info("缺少概念数据，用户选择跳过抓取。")
                 else:
                     from scrape_concepts import main as scrape_concepts
-                    logger.perf("开始抓取概念数据（爬虫,可能失败）...")
+                    logger.info("开始抓取概念数据（爬虫,可能失败）...")
                     scrape_concepts()
-                    logger.perf("概念抓取完成，输出目录 stock_data/concepts")
+                    logger.info("概念抓取完成，输出目录 stock_data/concepts")
             except Exception as e:
                 logger.warning(f"概念抓取失败，已跳过：{e}")
         return results
@@ -2457,13 +2810,13 @@ def main():
     assets = ASSETS
     threads = STOCK_INC_THREADS
     
-    logger.perf("=" * 30)
-    logger.perf("开始下载数据")
-    logger.perf("=" * 30)
-    logger.perf(f"日期范围: {start_date} - {end_date}")
-    logger.perf(f"复权类型: {adj_type}")
-    logger.perf(f"资产类型: {', '.join(assets)}")
-    logger.perf("=" * 30)
+    logger.info("=" * 30)
+    logger.info("开始下载数据")
+    logger.info("=" * 30)
+    logger.info(f"日期范围: {start_date} - {end_date}")
+    logger.info(f"复权类型: {adj_type}")
+    logger.info(f"资产类型: {', '.join(assets)}")
+    logger.info("=" * 30)
     
     try:
         # 执行下载
@@ -2478,11 +2831,12 @@ def main():
         
         # 打印结果
         for asset_type, stats in results.items():
-            logger.perf(f"{asset_type} 下载结果: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
+            logger.info(f"{asset_type} 下载结果: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
             if stats.failed_stocks:
-                logger.warning(f"{asset_type} 失败股票: {[code for code, _ in stats.failed_stocks[:10]]}")
+                failed_codes = [code for code, _ in stats.failed_stocks if code]
+                logger.warning(f"{asset_type} 失败股票: {failed_codes}")
         
-        logger.perf("下载任务完成，若出现失败可重新运行以补齐数据")
+        logger.info("下载任务完成，若出现失败可重新运行以补齐数据")
         
     except Exception as e:
         logger.error(f"下载任务失败: {e}")
@@ -2529,7 +2883,8 @@ def main_cli():
     for asset_type, stats in results.items():
         print(f"{asset_type}: 成功={stats.success_count}, 空数据={stats.empty_count}, 失败={stats.error_count}")
         if stats.failed_stocks:
-            print(f"失败股票: {[code for code, _ in stats.failed_stocks[:5]]}")
+            failed_codes = [code for code, _ in stats.failed_stocks if code]
+            print(f"失败股票: {failed_codes}")
     print("=" * 30)
 
 

@@ -52,7 +52,7 @@ class DatabaseAdapter:
         """获取交易日期列表（兼容 parquet_viewer.list_trade_dates）"""
         try:
             # 使用数据库管理器获取交易日期
-            return self.db_manager.get_trade_dates(self.db_path)
+            return self.db_manager.get_trade_dates_from_db(self.db_path)
         except Exception as e:
             logger.error(f"获取交易日期失败: {e}")
             return []

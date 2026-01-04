@@ -1579,7 +1579,7 @@ def run_predict_ranking(inp: PredictRankingInput) -> tuple[pd.DataFrame, Optiona
     _emit("pred_rank_sim_done", total=total_codes, current=0, message=f"模拟完成，待评分 {total_codes} 只股票")
 
     # 与正式排名一致的执行器选择逻辑
-    max_workers = getattr(cfg, "SC_MAX_WORKERS", None) or min(os.cpu_count() * 2, 16)
+    max_workers = getattr(cfg, "SC_MAX_WORKERS", None) or (os.cpu_count() or 4)
     env_use_proc = str(os.getenv("SC_USE_PROCESS_POOL", "")).strip().lower() in {"1", "true", "yes"}
     use_proc_cfg = bool(getattr(cfg, "SC_USE_PROCESS_POOL", False) or env_use_proc)
     can_use_proc = use_proc_cfg

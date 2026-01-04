@@ -171,8 +171,13 @@ class PerformanceLogger:
     
     def __call__(self, message: str, **kwargs):
         """使 PerformanceLogger 可以像函数一样被调用"""
-        # 仍用 WARNING 级别，让控制台能看到性能提醒，但普通等级文件已排除 [PERF]
-        self.logger.warning(f"[PERF] {message}", **kwargs)
+        # 直接按 INFO 级别记录，去掉 [PERF] 前缀以减少日志噪音
+        extra = kwargs.pop("extra", None) or {}
+        merged_extra = {"is_perf": True}
+        if isinstance(extra, dict):
+            merged_extra.update(extra)
+        kwargs["extra"] = merged_extra
+        self.logger.info(message, **kwargs)
     
     def start_timer(self, operation: str) -> None:
         """开始计时"""
@@ -180,7 +185,7 @@ class PerformanceLogger:
             self._timers[operation] = time.time()
             self.logger.debug(f"开始执行: {operation}")
     
-    def end_timer(self, operation: str, log_level: int = logging.DEBUG) -> float:
+    def end_timer(self, operation: str, log_level: int = logging.INFO, **kwargs) -> float:
         """结束计时并记录"""
         with self._lock:
             if operation in self._timers:
@@ -190,17 +195,23 @@ class PerformanceLogger:
                 if self.debug_logger is not None:
                     # 如果有 DebugLogger 引用，使用它的 performance 方法
                     self.debug_logger.performance(f"完成执行: {operation} (耗时: {duration:.3f}s)")
-                elif log_level >= logging.INFO:
-                    # 如果 log_level >= INFO，使用指定的级别记录
-                    self.logger.log(log_level, f"完成执行: {operation} (耗时: {duration:.3f}s)")
                 else:
-                    # 默认使用 WARNING 级别，直接添加 [PERF] 前缀，会被性能日志过滤器捕获
-                    self.logger.warning(f"[PERF] 完成执行: {operation} (耗时: {duration:.3f}s)")
+                    # 使用指定的级别记录（默认 INFO）
+                    extra = kwargs.pop("extra", None) or {}
+                    merged_extra = {"is_perf": True}
+                    if isinstance(extra, dict):
+                        merged_extra.update(extra)
+                    kwargs["extra"] = merged_extra
+                    self.logger.log(
+                        max(log_level, logging.INFO),
+                        f"完成执行: {operation} (耗时: {duration:.3f}s)",
+                        **kwargs
+                    )
                 return duration
             return 0.0
     
     @contextmanager
-    def timer(self, operation: str, log_level: int = logging.DEBUG):
+    def timer(self, operation: str, log_level: int = logging.INFO):
         """上下文管理器形式的计时器"""
         self.start_timer(operation)
         try:
@@ -296,7 +307,7 @@ class DebugLogger:
         """设置日志处理器"""
         # 控制台处理器（所有进程都使用）
         console_handler = logging.StreamHandler(sys.stdout)
-        # 设为 WARNING：控制台显示 WARNING/ERROR/CRITICAL（包括带[PERF]前缀的性能日志）
+        # 设为 WARNING：控制台只显示 WARNING/ERROR/CRITICAL，性能日志已降级为 INFO 不会刷屏
         console_handler.setLevel(logging.WARNING)
         console_formatter = ColoredFormatter(
             '%(asctime)s %(levelname)s [%(name)s] %(message)s',
@@ -331,13 +342,10 @@ class DebugLogger:
             def filter(self, record: logging.LogRecord) -> bool:
                 return record.levelno == self.levelno
 
-        # 排除 [PERF] 到普通等级日志文件，避免重复
+        # 性能日志现在也是 INFO，保留过滤器以兼容旧格式（当前不做过滤）
         class _ExcludePerf(logging.Filter):
             def filter(self, record: logging.LogRecord) -> bool:
-                try:
-                    return not str(record.getMessage()).startswith("[PERF]")
-                except Exception:
-                    return True
+                return True
 
         # ---- 按等级分别落盘（仅主进程） ----
         # 主进程：创建文件处理器并设置监听器
@@ -415,7 +423,7 @@ class DebugLogger:
 
         # 性能文件处理器
         perf_formatter = logging.Formatter(
-            '%(asctime)s [PERF] %(message)s',
+            '%(asctime)s %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         perf_handler = logging.handlers.RotatingFileHandler(
@@ -425,11 +433,11 @@ class DebugLogger:
         )
         perf_handler.setLevel(logging.INFO)
         perf_handler.setFormatter(perf_formatter)
-        # 仅写入 [PERF] 开头的记录
+        # 仅写入标记为性能日志的记录
         class _PerfOnly(logging.Filter):
             def filter(self, record: logging.LogRecord) -> bool:
                 try:
-                    return str(record.getMessage()).startswith("[PERF]")
+                    return bool(getattr(record, "is_perf", False))
                 except Exception:
                     return False
         perf_handler.addFilter(_PerfOnly())
@@ -532,8 +540,13 @@ class DebugLogger:
         # 确保消息是UTF-8编码的字符串
         if isinstance(message, bytes):
             message = message.decode('utf-8', errors='replace')
-        # 仍用 WARNING 级别，让控制台能看到性能提醒，但普通等级文件已排除 [PERF]
-        self.logger.warning(f"[PERF] {message}", **kwargs)
+        # 作为 INFO 级别记录，去掉 [PERF] 前缀以减少噪音
+        extra = kwargs.pop("extra", None) or {}
+        merged_extra = {"is_perf": True}
+        if isinstance(extra, dict):
+            merged_extra.update(extra)
+        kwargs["extra"] = merged_extra
+        self.logger.info(message, **kwargs)
 
     # 新增：PREP 等级便捷方法
     def prep(self, message: str, **kwargs):
@@ -618,7 +631,7 @@ def log_function_calls(logger: DebugLogger):
     return decorator
 
 
-def log_performance(logger: DebugLogger, operation: str, log_level: int = logging.DEBUG):
+def log_performance(logger: DebugLogger, operation: str, log_level: int = logging.INFO):
     """装饰器：记录性能"""
     def decorator(func):
         @functools.wraps(func)

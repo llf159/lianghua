@@ -20,7 +20,7 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 多进程环境检测
 try:
@@ -741,6 +741,13 @@ class DatabaseConnectionPool:
     
     def get_connection(self, read_only: bool = True, timeout: float = 30.0):
         """获取连接 - 真正的连接池复用版本，支持阻塞等待"""
+        # 确保连接请求的模式与连接池一致，避免混用 read_only/read_write 配置导致 DuckDB 拒绝新连接
+        if read_only != self.read_only:
+            logger.debug(
+                f"连接请求模式 ({'只读' if read_only else '读写'}) 与连接池模式 "
+                f"({'只读' if self.read_only else '读写'}) 不一致，已使用连接池模式以保持配置一致"
+            )
+            read_only = self.read_only
         with self._condition:
             try:
                 # 先尝试从池中获取可用连接
@@ -1144,6 +1151,27 @@ class DatabaseManager:
             )
             worker.start()
             self._worker_threads.append(worker)
+
+    def _reset_pools_for_path(self, abs_path: str, *, wait: float = 1.0, reason: str = ""):
+        """自愈：关闭并移除指定路径的读/写连接池，等待锁释放"""
+        logger.warning(
+            f"触发连接池自愈（{abs_path}）：{reason or '未知原因'}，将关闭并重建连接池"
+        )
+        # 先尝试关闭读池和写池
+        for label, pools in (("只读", self._read_pools), ("读写", self._write_pools)):
+            pool = pools.pop(abs_path, None)
+            if pool:
+                try:
+                    pool.close_all()
+                    logger.debug(f"{label}连接池已关闭（自愈）: {abs_path}")
+                except Exception as e:
+                    logger.warning(f"{label}连接池关闭失败（自愈）{abs_path}: {e}")
+        # 等待锁释放
+        if wait and wait > 0:
+            try:
+                time.sleep(wait)
+            except Exception:
+                pass
     
     def _get_connection_pool(self, db_path: str, read_only: bool = True) -> DatabaseConnectionPool:
         """获取连接池 - 支持读写分离，不同数据库路径完全独立
@@ -1172,22 +1200,21 @@ class DatabaseManager:
         db_path_lower = abs_path.lower().replace('\\', '/')
         is_write_database = 'details' in db_path_lower or 'detail' in db_path_lower
         
-        # stock_data.db：排名/查询场景优先使用只读池，写入时再按需切换到写池
-        # 这样可以在纯读场景减少对数据库的占用，避免误判为写锁
+        # stock_data.db 在下载/指标计算场景下始终会发生写入。
+        # 为避免 DuckDB read_only/read_write 配置混用导致的冲突，统一使用读写连接池。
         is_stock_data_db = 'stock_data' in db_path_lower and db_path_lower.endswith('.db')
-        if is_stock_data_db and not read_only:
-            # 只有明确需要写入时才强制使用写池
+        if is_stock_data_db:
+            if read_only:
+                logger.debug(
+                    f"数据库 {abs_path} 为 stock_data.db，覆盖只读请求并使用读写连接池，"
+                    f"以避免 read_only/read_write 配置冲突"
+                )
+            else:
+                logger.debug(
+                    f"数据库 {abs_path} 需要写入（stock_data.db），"
+                    f"使用读写连接池以避免配置冲突"
+                )
             is_write_database = True
-            logger.debug(
-                f"数据库 {abs_path} 需要写入（stock_data.db），"
-                f"本次连接使用读写池以避免配置冲突"
-            )
-        elif is_stock_data_db:
-            # 纯读场景使用只读池；若后续出现写请求，会先关闭只读池再切换
-            logger.debug(
-                f"数据库 {abs_path} 检测为 stock_data.db，当前为只读请求，"
-                f"优先使用只读连接池以减少占用。如后续发生写入会自动切换。"
-            )
         
         with self._lock:
             # DuckDB 限制：同一个数据库文件的所有连接必须使用相同的 read_only 配置
@@ -1223,23 +1250,33 @@ class DatabaseManager:
                             while active_count > 0 and (time.time() - wait_start) < max_wait:
                                 time.sleep(0.2)
                                 active_count = read_pool._stats.get('active_count', 0)
+                            
+                            # 若仍未释放，触发自愈重置
+                            if active_count > 0:
+                                self._reset_pools_for_path(
+                                    abs_path, wait=1.5,
+                                    reason="写库切换时只读池仍有活跃连接"
+                                )
+                                # 自愈后不再尝试关闭原池，直接进入写池创建逻辑
+                                if abs_path not in self._read_pools:
+                                    logger.debug(f"自愈后已移除只读池: {abs_path}")
+                                    read_pool = None
                         
-                        # 关闭连接池
-                        read_pool.close_all()
-                        # 等待更长时间，确保DuckDB连接真正关闭（至少1秒）
-                        time.sleep(1.0)
-                        # 移除只读连接池
-                        del self._read_pools[abs_path]
-                        logger.debug(f"已关闭只读连接池并切换到读写连接池: {abs_path}")
+                        if read_pool is not None and abs_path in self._read_pools:
+                            # 关闭连接池
+                            read_pool.close_all()
+                            # 等待更长时间，确保DuckDB连接真正关闭（至少1秒）
+                            time.sleep(1.0)
+                            # 移除只读连接池
+                            del self._read_pools[abs_path]
+                            logger.debug(f"已关闭只读连接池并切换到读写连接池: {abs_path}")
                     except Exception as e:
                         logger.warning(f"关闭只读连接池时出错: {e}")
-                        # 即使关闭失败，也尝试删除连接池，避免后续错误
-                        try:
-                            del self._read_pools[abs_path]
-                        except:
-                            pass
-                        # 等待一段时间，让DuckDB释放连接
-                        time.sleep(1.0)
+                        # 强制重置以避免卡死
+                        self._reset_pools_for_path(
+                            abs_path, wait=1.5,
+                            reason="写库切换关闭只读池失败"
+                        )
                 
                 # 对于需要写入的数据库，直接创建读写连接池（即使是只读操作）
                 if abs_path not in self._write_pools:
@@ -1280,15 +1317,22 @@ class DatabaseManager:
                         active_count = read_pool._stats.get('active_count', 0)
                     
                     if active_count > 0:
-                        logger.error(
-                            f"数据库 {abs_path} 只读连接池仍有 {active_count} 个活跃连接，"
-                            f"无法切换到读写连接池。可能原因：排名操作正在使用只读连接。"
-                            f"请等待排名操作完成后再进行下载。"
+                        # 自愈：强制重置该路径的连接池，避免长时间占用导致写入失败
+                        self._reset_pools_for_path(
+                            abs_path, wait=1.5,
+                            reason="读写切换时只读池活跃连接未释放"
                         )
-                        raise RuntimeError(
-                            f"无法获取读写连接：只读连接池仍有 {active_count} 个活跃连接在使用。"
-                            f"请等待只读操作完成后再尝试写入。"
-                        )
+                        # 重置后尝试获取最新的read_pool引用
+                        read_pool = self._read_pools.get(abs_path)
+                        active_count = read_pool._stats.get('active_count', 0) if read_pool else 0
+                        if active_count > 0:
+                            logger.error(
+                                f"数据库 {abs_path} 自愈后仍有 {active_count} 个只读活跃连接，"
+                                f"无法切换到读写连接池，请稍后重试。"
+                            )
+                            raise RuntimeError(
+                                f"无法获取读写连接：自愈后只读连接仍未释放 ({active_count})。"
+                            )
                 
                 logger.warning(
                     f"数据库 {abs_path} 已有只读连接池，需要读写连接，"
@@ -1296,22 +1340,25 @@ class DatabaseManager:
                 )
                 try:
                     # 关闭只读连接池中的所有连接
-                    read_pool.close_all()
-                    # 等待更长时间，确保DuckDB连接真正关闭（至少1秒）
-                    time.sleep(1.0)
-                    # 移除只读连接池
-                    del self._read_pools[abs_path]
-                    logger.debug(f"已成功关闭只读连接池并切换到读写连接池: {abs_path}")
+                    if read_pool:
+                        read_pool.close_all()
+                        # 等待更长时间，确保DuckDB连接真正关闭（至少1秒）
+                        time.sleep(1.0)
+                        # 移除只读连接池
+                        del self._read_pools[abs_path]
+                        logger.debug(f"已成功关闭只读连接池并切换到读写连接池: {abs_path}")
+                    else:
+                        logger.debug(f"自愈后不存在只读池，直接创建读写池: {abs_path}")
                 except Exception as e:
                     logger.error(f"关闭只读连接池时出错: {e}")
-                    # 如果关闭失败，尝试强制删除连接池引用，但可能会有问题
-                    try:
-                        del self._read_pools[abs_path]
-                    except:
-                        pass
-                    # 等待一段时间，让DuckDB释放连接
-                    time.sleep(1.0)
-                    raise RuntimeError(f"无法关闭只读连接池以切换到读写模式: {e}")
+                    # 强制重置后再尝试写池创建
+                    self._reset_pools_for_path(
+                        abs_path, wait=1.5,
+                        reason="读写切换关闭只读池失败"
+                    )
+                    read_pool = self._read_pools.get(abs_path)
+                    if read_pool:
+                        raise RuntimeError(f"无法关闭只读连接池以切换到读写模式: {e}")
             
             # 根据 read_only 参数选择相应的连接池
             if read_only:
@@ -2020,32 +2067,74 @@ class DatabaseManager:
             return None
     
     def get_trade_dates(self, db_path: str = None) -> List[str]:
-        """获取数据库所有交易日期列表（兼容旧接口）"""
+        """
+        获取交易日历（默认走缓存，每次调用都会检查未来覆盖是否满足15天，必要时自动刷新）。
+        db_path 参数保留兼容，当前不再从数据库 distinct 读取。
+        """
+        try:
+            cal = self.get_trade_calendar_cached(refresh_if_insufficient=True)
+            if cal:
+                return cal
+            logger.warning("交易日历缓存为空，尝试回退数据库 distinct")
+        except Exception as e:
+            logger.warning(f"交易日历缓存获取失败: {e}，尝试回退数据库 distinct")
+        # 兜底：旧逻辑从数据库 distinct
         try:
             if db_path is None:
                 from config import DATA_ROOT, UNIFIED_DB_PATH
                 db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
-            
             if not os.path.exists(db_path):
                 logger.warning(f"数据库文件不存在: {db_path}")
                 return []
-            
-            # 获取所有不重复的交易日期
             sql = "SELECT DISTINCT trade_date FROM stock_data ORDER BY trade_date"
             df = self.execute_sync_query(db_path, sql, [], timeout=30.0)
-            
             if not df.empty and "trade_date" in df.columns:
-                trade_dates = df["trade_date"].astype(str).tolist()
-                logger.debug(f"从数据库获取交易日列表: {len(trade_dates)} 个日期")
-                return trade_dates
-            
-            logger.debug("数据库为空或无交易日数据")
-            return []
-            
+                return df["trade_date"].astype(str).tolist()
         except Exception as e:
             logger.error(f"获取交易日列表失败: {e}")
-            return []
-    
+        return []
+
+    def get_trade_dates_from_db(self, db_path: str = None, *, table: str = "stock_data") -> List[str]:
+        """
+        获取数据库中实际存在的交易日期列表（按日期升序去重）。
+        
+        Args:
+            db_path: 数据库路径；None 时使用默认路径或 details 路径
+            table: 使用的表名，仅支持 'stock_data' 或 'stock_details'
+        """
+        try:
+            table_date_col = {
+                "stock_data": "trade_date",
+                "stock_details": "ref_date",
+            }
+            date_col = table_date_col.get(table)
+            if date_col is None:
+                logger.error(f"不支持的表名: {table}")
+                return []
+
+            if table == "stock_details":
+                db_path = get_details_db_path(db_path)
+            elif db_path is None:
+                from config import DATA_ROOT, UNIFIED_DB_PATH
+                db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+
+            if not db_path or not os.path.exists(db_path):
+                logger.warning(f"数据库文件不存在: {db_path}")
+                return []
+
+            sql = f"""
+            SELECT DISTINCT {date_col} AS d
+            FROM {table}
+            WHERE {date_col} IS NOT NULL
+            ORDER BY {date_col}
+            """
+            df = self.execute_sync_query(db_path, sql, [], timeout=30.0)
+            if df is not None and not df.empty and "d" in df.columns:
+                return df["d"].astype(str).tolist()
+        except Exception as e:
+            logger.error(f"从数据库获取交易日列表失败: {e}")
+        return []
+
     def get_trade_dates_from_tushare(self, start_date: str, end_date: str) -> List[str]:
         """从Tushare获取交易日列表"""
         try:
@@ -2090,6 +2179,64 @@ class DatabaseManager:
             logger.error(f"从Tushare获取交易日列表失败: {e}")
             return []
     
+    def get_trade_calendar_cached(self, start_date: Optional[str] = None, end_date: Optional[str] = None, refresh_if_insufficient: bool = True) -> List[str]:
+        """
+        从缓存获取全量交易日历；覆盖未来不足15天时自动刷新并写回缓存。
+        """
+        # 与 stock_list.csv 同目录（DATA_ROOT 下，与统一行情库同级）
+        try:
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            cache_dir = os.path.dirname(db_path)
+        except Exception:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            cache_dir = os.path.join(base_dir, "cache", "stock_list")
+        cache_path = os.path.join(cache_dir, "trade_calendar.csv")
+        try:
+            from config import START_DATE as _CFG_START
+            cfg_start = str(_CFG_START) if _CFG_START else "20000101"
+        except Exception:
+            cfg_start = "20000101"
+        start = start_date or cfg_start
+        if end_date is None:
+            end_date = (datetime.now() + timedelta(days=365)).strftime("%Y%m%d")
+        need_until = (datetime.now() + timedelta(days=15)).strftime("%Y%m%d")
+
+        def _load_cache() -> List[str]:
+            if not os.path.exists(cache_path):
+                return []
+            try:
+                df = pd.read_csv(cache_path, dtype=str)
+                if "cal_date" in df.columns:
+                    vals = [str(x) for x in df["cal_date"].tolist() if pd.notna(x)]
+                    vals = sorted(set(vals))
+                    return vals
+            except Exception as e:
+                logger.debug(f"读取交易日历缓存失败: {e}")
+            return []
+
+        cached = _load_cache()
+        cover_future_ok = bool(cached) and cached[-1] >= need_until
+        cover_start_ok = bool(cached) and cached[0] <= start
+        has_range = cover_future_ok and cover_start_ok
+        if cached and has_range:
+            return cached
+        if cached and not refresh_if_insufficient:
+            return cached
+
+        fetched = self.get_trade_dates_from_tushare(start, end_date)
+        if not fetched:
+            return cached
+
+        merged = sorted(set(cached) | set(fetched))
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            pd.DataFrame({"cal_date": merged}).to_csv(cache_path, index=False)
+            logger.info(f"交易日历已更新缓存: {cache_path}，共 {len(merged)} 条")
+        except Exception as e:
+            logger.warning(f"写入交易日历缓存失败: {e}")
+        return merged
+    
     def get_smart_end_date(self, end_date_config: str) -> str:
         """
         智能获取结束日期，考虑市场开盘时间和休盘情况
@@ -2108,7 +2255,7 @@ class DatabaseManager:
             # 获取最近15个交易日，用于判断今天是否开盘
             try:
                 start_date = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
-                trading_days_list = self.get_trade_dates_from_tushare(start_date, today_str)
+                trading_days_list = self.get_trade_calendar_cached(start_date=start_date, end_date=today_str, refresh_if_insufficient=True)
                 
                 if trading_days_list:
                     # 检查今天是否开盘
@@ -2143,8 +2290,15 @@ class DatabaseManager:
                             return today_str
                     else:
                         # 今天不开盘，使用最近的交易日
+                        # 仅使用今天及之前的交易日，防止缓存包含未来日期导致选到未来无数据的日子
+                        past_or_today = [day for day in trading_days_list if day <= today_str]
+                        if past_or_today:
+                            latest_trading_day = past_or_today[-1]
+                            logger.debug(f"[SMART] 今天休盘，使用最近交易日(<=today): {latest_trading_day}")
+                            return latest_trading_day
+                        # 兜底：若列表全是未来日期，仍用最后一个并记录警告
                         latest_trading_day = trading_days_list[-1]
-                        logger.debug(f"[SMART] 今天休盘，使用最近交易日: {latest_trading_day}")
+                        logger.warning(f"[SMART] 交易日历仅有未来日期，兜底使用: {latest_trading_day}")
                         return latest_trading_day
                 else:
                     # 无法获取交易日历，使用今天
@@ -2326,12 +2480,20 @@ class DatabaseManager:
                         if stock_df.empty:
                             continue
                     
-                    # 确保包含所需的列
-                    available_cols = [col for col in columns if col in stock_df.columns]
-                    if not available_cols:
+                    # 确保包含所需的列（去重基础列，避免 trade_date 重复）
+                    base_cols = [c for c in ["ts_code", "trade_date"] if c in stock_df.columns]
+                    available_cols = [
+                        col for col in columns
+                        if col in stock_df.columns and col not in base_cols
+                    ]
+                    col_order: list[str] = []
+                    for c in base_cols + available_cols:
+                        if c not in col_order:
+                            col_order.append(c)
+                    if not col_order:
                         continue
                     
-                    result_df = stock_df[["ts_code", "trade_date"] + available_cols]
+                    result_df = stock_df[col_order]
                     logger.debug(f"[{ts_code}] 使用{cache_name}预加载数据: {len(result_df)} 条记录")
                     return result_df
                     
@@ -2346,31 +2508,34 @@ class DatabaseManager:
         判断是否启用全表内存缓存：
         - 优先 FULL_STOCK_CACHE_MAX_MB 设定绝对阈值（MB）
         - 否则按内存占比阈值判断：默认最多占用物理内存的 20%（可用 FULL_STOCK_CACHE_RATIO 调整）
-        - 配置 FULL_STOCK_CACHE_ENABLED=False 或环境变量 FULL_STOCK_CACHE_DISABLE=1 时禁用
+        - 配置 FULL_STOCK_CACHE_ENABLED=False 或 FULL_STOCK_CACHE_DISABLE=True 时禁用
         """
         try:
-            from config import FULL_STOCK_CACHE_ENABLED
+            from config import (
+                FULL_STOCK_CACHE_ENABLED,
+                FULL_STOCK_CACHE_MAX_MB,
+                FULL_STOCK_CACHE_RATIO,
+                FULL_STOCK_CACHE_DISABLE,
+            )
         except Exception:
             FULL_STOCK_CACHE_ENABLED = True
+            FULL_STOCK_CACHE_MAX_MB = None
+            FULL_STOCK_CACHE_RATIO = 0.2
+            FULL_STOCK_CACHE_DISABLE = False
         
-        if not FULL_STOCK_CACHE_ENABLED:
+        if not FULL_STOCK_CACHE_ENABLED or FULL_STOCK_CACHE_DISABLE:
             logger.debug("[full-cache] FULL_STOCK_CACHE_ENABLED=False，禁用全表缓存")
             return False
         
-        if os.environ.get("FULL_STOCK_CACHE_DISABLE", "").lower() in ("1", "true", "yes"):
-            return False
         # 1) 显式 MB 阈值优先
         try:
-            if "FULL_STOCK_CACHE_MAX_MB" in os.environ:
-                max_mb = float(os.environ.get("FULL_STOCK_CACHE_MAX_MB", 0))
-            else:
-                max_mb = None
+            max_mb = float(FULL_STOCK_CACHE_MAX_MB) if FULL_STOCK_CACHE_MAX_MB is not None else None
         except Exception:
             max_mb = None
         # 2) 按内存占比计算阈值
         if max_mb is None or max_mb <= 0:
             try:
-                ratio = float(os.environ.get("FULL_STOCK_CACHE_RATIO", 0.2))
+                ratio = float(FULL_STOCK_CACHE_RATIO)
                 ratio = min(max(ratio, 0.01), 0.8)  # clamp 1%~80%
             except Exception:
                 ratio = 0.2
@@ -3590,6 +3755,18 @@ def get_trade_dates(db_path: str = None) -> List[str]:
     """获取交易日列表的便捷函数"""
     manager = get_database_manager()
     return manager.get_trade_dates(db_path)
+
+
+def get_trade_dates_from_db(db_path: str = None, *, table: str = "stock_data") -> List[str]:
+    """获取数据库中已有交易日的便捷函数（按日期升序）。"""
+    manager = get_database_manager()
+    return manager.get_trade_dates_from_db(db_path, table=table)
+
+
+def get_trade_calendar_cached(start_date: Optional[str] = None, end_date: Optional[str] = None, refresh_if_insufficient: bool = True) -> List[str]:
+    """获取交易日历（带缓存）的便捷函数。"""
+    manager = get_database_manager()
+    return manager.get_trade_calendar_cached(start_date, end_date, refresh_if_insufficient)
 
 
 def get_stock_list(db_path: str = None, adj_type: str = "raw") -> List[str]:

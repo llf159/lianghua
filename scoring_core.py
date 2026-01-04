@@ -3036,6 +3036,348 @@ def backfill_missing_ranks(start_date: str, end_date: str, *, force: bool=False)
     return processed
 
 
+def _compute_start_for_rules(ref_date: str, rules: list[dict]) -> str:
+    """
+    根据所选规则估算读取起点（兼顾 D/W/M）。
+    使用 _start_for_tf_window 的经验公式，取最大值。
+    """
+    if not rules:
+        return ref_date
+    max_d = 0
+    for r in rules:
+        for tf in ["D", "W", "M"]:
+            win = _calc_rule_total_window(r, tf)
+            if win <= 0:
+                continue
+            if tf == "D":
+                days = int(win) + 120
+            elif tf == "W":
+                days = int(win) * 6 + 180
+            else:
+                days = int(win) * 22 + 260
+            max_d = max(max_d, days)
+    if max_d <= 0:
+        return ref_date
+    try:
+        return _compute_start_date_by_trade_dates(ref_date, max_d)
+    except Exception:
+        start_dt = dt.datetime.strptime(ref_date, "%Y%m%d") - dt.timedelta(days=max_d)
+        return start_dt.strftime("%Y%m%d")
+
+
+def _compute_tiebreak_j(df: pd.DataFrame, ref_date: str) -> Optional[float]:
+    """提取参考日的 J 值作为 tiebreak（与 run_for_date 保持一致）。"""
+    try:
+        df_idxed = _ensure_datetime_index(df)
+        if getattr(df_idxed.index, "has_duplicates", False):
+            df_idxed = df_idxed[~df_idxed.index.duplicated(keep="last")]
+        if "j" not in df_idxed.columns:
+            return None
+        ref_ts = pd.to_datetime(str(ref_date), errors="coerce")
+        if ref_ts is not None and ref_ts in df_idxed.index:
+            tb = float(df_idxed.loc[ref_ts, "j"])
+        else:
+            tb = float(df_idxed["j"].iloc[-1])
+        if math.isnan(tb) or math.isinf(tb):
+            return None
+        return tb
+    except Exception:
+        return None
+
+
+def _recalc_one_strategy(params: tuple) -> Optional[dict]:
+    """
+    单票补算：用于线程池/进程池。
+    params: (ts_code, start_date, ref_date, columns, base_score_map, rules_use)
+    """
+    ts_code, start_date, ref_date, columns, base_score_map, rules_use = params
+    try:
+        df = _read_stock_df(ts_code, start_date, ref_date, columns)
+        if df is None or df.empty:
+            return None
+        df = df.copy()
+        df["ts_code"] = df.get("ts_code", ts_code)
+        df["trade_date"] = df["trade_date"].astype(str)
+
+        ctx = {
+            'bool_lru': _SmallLRU(BOOL_CACHE_SIZE),
+            'resampled': {},
+            'win_cache': {},
+            'data_win_cache': {},
+            'max_windows_by_tf': _MAX_WINDOWS_BY_TF.copy(),
+            'bool_cache_hit': 0,
+            'bool_cache_miss': 0
+        }
+        tdx.EXTRA_CONTEXT.update(get_eval_env(ts_code, ref_date))
+
+        # 预筛
+        pres = _prescreen(df, ref_date, ctx)
+        if not pres.passed:
+            return None
+
+        # 基础分：使用全量排名的原始分数，未找到则用 SC_BASE_SCORE；仅累加所选策略的新增分数
+        score = float(base_score_map.get(ts_code, SC_BASE_SCORE))
+        per_rules = []
+
+        for rule in rules_use:
+            res = _eval_single_rule(df, rule, ref_date, ctx, compute_hit_dates=True)
+            add = res.get("add", 0.0)
+            cnt = res.get("cnt")
+            hit_date = res.get("hit_date")
+            hit_dates = res.get("hit_dates", [])
+            gate_ok = res.get("gate_ok", True)
+
+            if gate_ok and add != 0:
+                score += float(add)
+
+            scope = str(rule.get("scope", "ANY")).upper().strip()
+            if scope in {"EACH", "PERBAR", "EACH_TRUE"}:
+                ok = bool(cnt and cnt > 0)
+            else:
+                ok = bool(add != 0)
+
+            per_rules.append({
+                "name": rule.get("name", "<unnamed>"),
+                "scope": scope,
+                "timeframe": str(rule.get("timeframe", "D")).upper(),
+                "score_windows": _get_score_window(rule, SC_LOOKBACK_D),
+                "points": float(rule.get("points", 0)),
+                "ok": ok,
+                "cnt": cnt,
+                "add": add,
+                "hit_date": hit_date,
+                "hit_dates": hit_dates,
+                "hit_count": len(hit_dates) if hit_dates else (cnt or 0),
+                "gate_ok": bool(gate_ok),
+                "error": res.get("error"),
+            })
+
+        score = max(score, float(SC_MIN_SCORE))
+        tb = _compute_tiebreak_j(df, ref_date)
+        return {
+            "ts_code": ts_code,
+            "score": score,
+            "tiebreak": tb,
+            "rules_json": json.dumps(per_rules or [], ensure_ascii=False),
+        }
+    except Exception as e:
+        LOGGER.warning(f"[补算] {ts_code} 失败：{e}")
+        return None
+
+
+def recalc_strategies_for_date(
+    ref_date: str,
+    strategy_names: list[str],
+    *,
+    update_db: bool = True,
+    update_csv: bool = True,
+) -> dict:
+    """
+    手动选择策略补算指定日期：
+      - 仅使用所选策略重新计算得分/排名（基础分仍使用 SC_BASE_SCORE）
+      - 更新 output/all/score_all_<ref>.csv
+      - 更新 details 数据库中的 score/tiebreak/rank/total（rules 字段仅对补算股票更新）
+
+    返回摘要信息字典。
+    """
+    if not ref_date:
+        raise ValueError("ref_date 不能为空")
+    chosen = [s.strip() for s in (strategy_names or []) if s and str(s).strip()]
+    if not chosen:
+        raise ValueError("strategy_names 不能为空")
+
+    rule_map = {str(r.get("name")): r for r in (SC_RULES or [])}
+    missing = [n for n in chosen if n not in rule_map]
+    if missing:
+        raise ValueError(f"策略不存在: {', '.join(missing)}")
+    rules_use = [rule_map[n] for n in chosen]
+
+    # 读取参考日的全量排名，作为默认 universe & 基础数据来源
+    all_path = os.path.join(SC_OUTPUT_DIR, "all", f"score_all_{ref_date}.csv")
+    df_all_base = pd.read_csv(all_path, dtype={"ts_code": str}) if os.path.isfile(all_path) else pd.DataFrame()
+    codes_all = df_all_base["ts_code"].astype(str).tolist() if not df_all_base.empty else []
+
+    # 补算范围：自动使用原始数据库的全量股票；兜底参考日 all 文件或当日分区列表
+    codes: list[str] = []
+    try:
+        from database_manager import get_stock_list
+        df_codes = get_stock_list(ref_date=ref_date)
+        if df_codes is not None and not df_codes.empty and "ts_code" in df_codes.columns:
+            codes = df_codes["ts_code"].astype(str).tolist()
+    except Exception as e:
+        LOGGER.debug(f"[补算] get_stock_list 失败，回退：{e}")
+
+    if not codes and codes_all:
+        codes = codes_all
+    if not codes:
+        codes = _list_codes_for_day(ref_date)
+    if not codes:
+        raise RuntimeError("无法确定补算范围：无可用股票代码")
+
+    # 读取全量排名得分作为基线（仅累加新增策略，不处理重名覆盖）
+    base_score_map = {}
+    try:
+        if not df_all_base.empty:
+            base_score_map = dict(zip(df_all_base["ts_code"].astype(str), pd.to_numeric(df_all_base["score"], errors="coerce")))
+    except Exception:
+        base_score_map = {}
+
+    # 准备数据窗口
+    columns = _select_columns_for_rules()
+    start_date = _compute_start_for_rules(ref_date, rules_use)
+    # 为预加载补充 universe 元数据，避免缺省时空列表
+    try:
+        _RANK_G["codes"] = codes
+        _RANK_G["codes_sig"] = _codes_sig(codes)
+        _RANK_G["ref"] = ref_date
+        _RANK_G["base"] = DATA_ROOT
+        _RANK_G["adj"] = API_ADJ
+    except Exception:
+        pass
+    # 预加载排名数据，命中则后续 _read_stock_df 可直接切片缓存
+    try:
+        preload_rank_data(ref_date, start_date, columns)
+    except Exception as e:
+        LOGGER.debug(f"[补算] 预加载排名数据失败，继续单票读取: {e}")
+
+    results = []
+    # 选择执行器：与正式排名对齐，预加载命中且允许时用进程池，否则线程池
+    env_use_proc = str(os.getenv("SC_USE_PROCESS_POOL", "")).strip().lower() in {"1", "true", "yes"}
+    use_proc_cfg = bool(SC_USE_PROCESS_POOL or env_use_proc)
+    can_use_proc = False
+    if use_proc_cfg:
+        if os.name == 'nt':
+            can_use_proc = True
+        else:
+            can_use_proc = _RANK_DATA_CACHE.get("data") is not None
+
+    max_workers = min(len(codes), SC_MAX_WORKERS or (os.cpu_count() or 4))
+    max_workers = max(1, max_workers)
+    if can_use_proc:
+        os.environ['DB_PROCESS_COUNT'] = str(max_workers)
+        ExecutorCls = ProcessPoolExecutor
+    else:
+        ExecutorCls = ThreadPoolExecutor
+
+    tasks = [(c, start_date, ref_date, columns, base_score_map, rules_use) for c in codes]
+    if len(tasks) <= 4 and not can_use_proc:
+        for params in tqdm(tasks, desc=f"策略补算 {ref_date}"):
+            r = _recalc_one_strategy(params)
+            if r:
+                results.append(r)
+    else:
+        with ExecutorCls(max_workers=max_workers) as ex:
+            fut_map = {ex.submit(_recalc_one_strategy, p): p[0] for p in tasks}
+            for fut in tqdm(as_completed(fut_map), total=len(fut_map), desc=f"策略补算 {ref_date}"):
+                r = fut.result()
+                if r:
+                    results.append(r)
+
+    if not results:
+        raise RuntimeError("未生成任何补算结果，请检查数据或策略选择。")
+
+    # 汇总结果并缓存规则 JSON
+    df_new_records = []
+    recalc_rules_json: dict[str, str] = {}
+    for r in results:
+        recalc_rules_json[r["ts_code"]] = r.get("rules_json") or "[]"
+        df_new_records.append({"ts_code": r["ts_code"], "score": r["score"], "tiebreak": r["tiebreak"]})
+
+    df_new = pd.DataFrame(df_new_records)
+    df_new["ref_date"] = ref_date
+    df_new["tiebreak_j"] = df_new["tiebreak"]
+
+    if not results:
+        raise RuntimeError("未生成任何补算结果，请检查数据或策略选择。")
+
+    df_new = pd.DataFrame(results)
+    df_new["ref_date"] = ref_date
+    df_new["tiebreak_j"] = df_new["tiebreak"]
+
+    # 合并到全量排名并重排
+    if df_all_base.empty:
+        df_all = df_new.copy()
+    else:
+        df_all = df_all_base.copy()
+        df_all["ts_code"] = df_all["ts_code"].astype(str)
+        df_new_slim = df_new[["ts_code", "score", "tiebreak_j"]]
+        # 外连接：保留原有行，新增补算行；补算结果覆盖同码的旧分数
+        df_all = df_all.merge(df_new_slim, on="ts_code", how="outer", suffixes=("", "_new"))
+        df_all["score"] = df_all["score_new"].combine_first(df_all["score"])
+        df_all["tiebreak_j"] = df_all["tiebreak_j_new"].combine_first(df_all.get("tiebreak_j"))
+        df_all = df_all.drop(columns=["score_new", "tiebreak_j_new"], errors="ignore")
+
+    df_all = df_all.dropna(subset=["score"])
+    df_all["score"] = pd.to_numeric(df_all["score"], errors="coerce")
+    df_all["tiebreak_j"] = pd.to_numeric(df_all.get("tiebreak_j"), errors="coerce")
+    df_all = df_all.sort_values(["score", "tiebreak_j", "ts_code"], ascending=[False, True, True]).reset_index(drop=True)
+    df_all["rank"] = np.arange(1, len(df_all) + 1)
+    df_all["ref_date"] = ref_date
+    df_all["trade_date"] = ref_date
+
+    if update_csv:
+        os.makedirs(ALL_DIR, exist_ok=True)
+        df_all.to_csv(all_path, index=False, encoding="utf-8-sig")
+
+    detail_rows = []
+    total = len(df_all)
+    ts_set = set(df_new["ts_code"].astype(str))
+
+    for _, row in df_all.iterrows():
+        ts = str(row["ts_code"])
+        rules_json = recalc_rules_json.get(ts, "[]")
+        detail_rows.append({
+            "ts_code": ts,
+            "ref_date": ref_date,
+            "score": float(row["score"]) if pd.notna(row["score"]) else None,
+            "tiebreak": float(row["tiebreak_j"]) if pd.notna(row.get("tiebreak_j")) else None,
+            "rank": int(row["rank"]),
+            "total": int(total),
+            "rules": rules_json,
+        })
+
+    db_result = None
+    if update_db and detail_rows:
+        try:
+            try:
+                from database_manager import get_database_manager, get_details_db_path_with_fallback
+            except Exception as e:
+                LOGGER.debug(f"[补算] 导入 details 写入依赖失败：{e}")
+                raise
+
+            db_manager = get_database_manager()
+            details_db_path = get_details_db_path_with_fallback() or os.path.join(SC_OUTPUT_DIR, SC_DETAIL_DB_PATH)
+            os.makedirs(os.path.dirname(details_db_path), exist_ok=True)
+            db_manager.init_stock_details_tables(details_db_path, "duckdb")
+            df_write = pd.DataFrame(detail_rows)
+            receiver = db_manager.get_data_receiver()
+            db_result = receiver.import_data_sync(
+                source_module="strategy_recalc",
+                data_type="custom",
+                data=df_write,
+                table_name="stock_details",
+                mode="upsert",
+                db_path=details_db_path,
+                validation_rules={"required_columns": ["ts_code", "ref_date"]},
+            )
+            try:
+                from database_manager import update_details_data_status
+                update_details_data_status()
+            except Exception:
+                pass
+        except Exception as e:
+            _abort_details_db_error(e)
+
+    return {
+        "ref_date": ref_date,
+        "strategies": chosen,
+        "universe_size": len(codes),
+        "updated": list(ts_set),
+        "csv_path": all_path if update_csv else None,
+        "db_result": getattr(db_result, "success", None) if db_result else None,
+    }
+
+
 def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     """确保以 trade_date 为 DatetimeIndex，并自动处理**重复列名**等异常情况。
 
@@ -3673,9 +4015,17 @@ def _get_data_from_cache(
             if stock_df.empty:
                 return None
         
-        # 确保包含所需的列
-        available_cols = [col for col in columns if col in stock_df.columns]
-        if not available_cols:
+        # 确保包含所需的列（去重基础列，避免 trade_date 重复）
+        base_cols = [c for c in ["ts_code", "trade_date"] if c in stock_df.columns]
+        available_cols = [
+            col for col in columns
+            if col in stock_df.columns and col not in base_cols
+        ]
+        col_order: list[str] = []
+        for c in base_cols + available_cols:
+            if c not in col_order:
+                col_order.append(c)
+        if not col_order:
             return None
         
         # 统计：单票读取阶段命中预加载
@@ -3684,7 +4034,7 @@ def _get_data_from_cache(
         except Exception:
             pass
         
-        result_df = stock_df[["ts_code", "trade_date"] + available_cols]
+        result_df = stock_df[col_order]
         LOGGER.debug(f"[{ts_code}] 使用{cache_name}预加载数据: {len(result_df)} 条记录")
         return result_df
         
@@ -5725,8 +6075,8 @@ def run_for_date(ref_date: Optional[str] = None) -> str:
     # 5) 数据预加载 - 一次读取，并发分发
     _ensure_dirs(ref_date)
     columns = _select_columns_for_rules()
-    # 提高工作进程数量，充分利用CPU
-    max_workers = SC_MAX_WORKERS or min(os.cpu_count() * 2, 16)  # 最多16个进程
+    # 工作进程数量：默认等于 CPU 核心数，可由配置覆盖
+    max_workers = SC_MAX_WORKERS or (os.cpu_count() or 4)
     
     # 无条件"尽力预加载"：成功则极大提升命中，失败直接跳过不影响流程
     preload_start_time = time.time()
@@ -6343,8 +6693,8 @@ def tdx_screen(
     whitelist_items: list[tuple[str, str, str]] = []
     blacklist_items: list[tuple[str, str, str]] = []
 
-    # 提高工作进程数量，充分利用CPU（使用和排名一样的逻辑）
-    max_workers = SC_MAX_WORKERS or min(os.cpu_count() * 2, 16)  # 最多16个进程
+    # 工作进程数量：默认等于 CPU 核心数，可由配置覆盖
+    max_workers = SC_MAX_WORKERS or (os.cpu_count() or 4)
     
     # 并行处理
     # 实验特性：在安全条件下尝试使用进程池（和排名功能保持一致）

@@ -622,6 +622,19 @@ def _make_ths_session() -> requests.Session:
     return session
 
 
+def _deduplicate_ths_output(df: pd.DataFrame) -> pd.DataFrame:
+    """同花顺结果去重：优先保留非空概念，按 ts_code 唯一化。"""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ts_code", "concepts_code", "concepts_name", "stock_name"])
+    df = df.copy()
+    df["concepts_name"] = df["concepts_name"].fillna("")
+    df["_is_empty"] = df["concepts_name"].str.strip() == ""
+    # 非空优先
+    df = df.sort_values(by=["_is_empty"])
+    df = df.drop_duplicates(subset=["ts_code"], keep="first")
+    return df.drop(columns=["_is_empty"])
+
+
 def build_all_from_ths(max_workers: Optional[int] = None) -> pd.DataFrame:
     """
     全量同花顺概念：对 stock_list 所有股票抓取概念，写出 stock_concepts。
@@ -641,7 +654,13 @@ def build_all_from_ths(max_workers: Optional[int] = None) -> pd.DataFrame:
     empty_or_missing: set[str] = set()
     if THS_OUTPUT_PATH.exists():
         try:
-            existing = pd.read_csv(THS_OUTPUT_PATH, dtype=str)
+            existing_raw = pd.read_csv(THS_OUTPUT_PATH, dtype=str)
+            existing = _deduplicate_ths_output(existing_raw)
+            if not existing_raw.equals(existing):
+                try:
+                    existing.to_csv(THS_OUTPUT_PATH, index=False)
+                except Exception as e:
+                    logger.warning("重写去重后的同花顺结果失败（忽略）：%s", e)
             if not existing.empty and "ts_code" in existing.columns:
                 existing_codes = set(existing["ts_code"].astype(str))
                 append_header = THS_OUTPUT_PATH.stat().st_size == 0
@@ -775,6 +794,19 @@ def build_all_from_ths(max_workers: Optional[int] = None) -> pd.DataFrame:
             tqdm.write(f"[FAIL] {line}")
     else:
         tqdm.write(f"同花顺抓取完成：全部成功，HTTP失败 {http_fail}，空概念 {empty_count}。")
+
+    # 最终写回：去重并优先保留非空概念
+    try:
+        combined = existing if rows else existing.copy()
+        if rows:
+            combined = pd.concat([existing, pd.DataFrame(rows)], ignore_index=True)
+        combined = _deduplicate_ths_output(combined)
+        combined.to_csv(THS_OUTPUT_PATH, index=False)
+        empty_final = combined["concepts_name"].fillna("").str.strip().eq("").sum()
+        tqdm.write(f"同花顺结果已去重写回：总计 {len(combined)} 条，空概念 {empty_final}。")
+    except Exception as e:
+        logger.warning("写回去重后的同花顺结果失败：%s", e)
+
     # 返回合并后的结果（读盘保证与文件一致）
     try:
         final_df = pd.read_csv(THS_OUTPUT_PATH, dtype=str)
