@@ -1689,6 +1689,92 @@ class DailyStockDownloader(StockDownloader):
         progress.close()
         return frames
 
+    def _check_preclose_mismatches_by_dates(self, all_data: pd.DataFrame,
+                                            trade_dates: List[str]) -> Dict[str, List[Tuple[str, float, float]]]:
+        """
+        按交易日逐对检查 pre_close 是否等于上一交易日 close。
+        返回 {ts_code: [(trade_date, pre_close, prev_close), ...]}
+        """
+        mismatches: Dict[str, List[Tuple[str, float, float]]] = {}
+        if all_data is None or all_data.empty or not trade_dates:
+            return mismatches
+
+        pairs = [(trade_dates[i - 1], trade_dates[i]) for i in range(1, len(trade_dates))]
+        if not pairs:
+            return mismatches
+
+        check_bar = tqdm(
+            total=len(pairs),
+            desc="pre_close 校验",
+            unit="段",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            **_tqdm_kwargs()
+        )
+        try:
+            for prev_date, curr_date in pairs:
+                prev_df = all_data[all_data["trade_date"] == prev_date][["ts_code", "close"]]
+                curr_df = all_data[all_data["trade_date"] == curr_date][["ts_code", "pre_close"]]
+                if prev_df.empty or curr_df.empty:
+                    check_bar.update(1)
+                    _refresh_postfix(check_bar, {"区间": f"{prev_date}->{curr_date}"})
+                    continue
+                merged = curr_df.merge(prev_df, on="ts_code", how="inner")
+                if merged.empty:
+                    check_bar.update(1)
+                    _refresh_postfix(check_bar, {"区间": f"{prev_date}->{curr_date}"})
+                    continue
+                merged = merged.dropna(subset=["pre_close", "close"])
+                if merged.empty:
+                    check_bar.update(1)
+                    _refresh_postfix(check_bar, {"区间": f"{prev_date}->{curr_date}"})
+                    continue
+                diff = (merged["pre_close"].astype(float) - merged["close"].astype(float)).abs()
+                bad = merged[diff > 1e-6]
+                if not bad.empty:
+                    for row in bad.itertuples(index=False):
+                        ts_code = str(row.ts_code)
+                        mismatches.setdefault(ts_code, []).append(
+                            (str(curr_date), float(row.pre_close), float(row.close))
+                        )
+                check_bar.update(1)
+                _refresh_postfix(check_bar, {"区间": f"{prev_date}->{curr_date}"})
+        finally:
+            check_bar.close()
+
+        return mismatches
+
+    def _check_preclose_mismatch_with_warmup(self, all_data: pd.DataFrame) -> Dict[str, List[Tuple[str, float, float]]]:
+        """
+        对每只股票的增量首日，用 warmup 最新 close 进行 pre_close 校验。
+        返回 {ts_code: [(trade_date, pre_close, warmup_close), ...]}
+        """
+        mismatches: Dict[str, List[Tuple[str, float, float]]] = {}
+        if all_data is None or all_data.empty:
+            return mismatches
+        for ts_code, group in all_data.groupby("ts_code"):
+            if group is None or group.empty:
+                continue
+            warmup_df = self._warmup_cache.get(ts_code)
+            if warmup_df is None or warmup_df.empty or "close" not in warmup_df.columns:
+                continue
+            first_row = group.sort_values("trade_date").iloc[0]
+            pre_close = first_row.get("pre_close")
+            trade_date = str(first_row.get("trade_date"))
+            if pd.isna(pre_close):
+                continue
+            warmup_latest = warmup_df.sort_values("trade_date").iloc[-1]
+            expected = warmup_latest.get("close")
+            if pd.isna(expected):
+                continue
+            try:
+                pre_c = float(pre_close)
+                exp_c = float(expected)
+            except Exception:
+                continue
+            if abs(pre_c - exp_c) > 1e-6:
+                mismatches.setdefault(str(ts_code), []).append((trade_date, pre_c, exp_c))
+        return mismatches
+
     def download_all_stocks(self, stock_codes: Optional[List[str]] = None) -> DownloadStats:
         logger.info("按交易日增量下载模式：按日拉取后统一计算指标")
         if self.db_manager is None:
@@ -1726,6 +1812,21 @@ class DailyStockDownloader(StockDownloader):
         if self.config.enable_warmup:
             self._preload_warmup_data(self.db_manager, codes, data_processor)
 
+        # pre_close 校验：逐日检查本次按日下载区间，并补充 warmup 边界检查
+        date_mismatches = self._check_preclose_mismatches_by_dates(all_data, trade_dates)
+        warmup_mismatches = self._check_preclose_mismatch_with_warmup(all_data)
+        for ts_code, rows in warmup_mismatches.items():
+            date_mismatches.setdefault(ts_code, []).extend(rows)
+        if date_mismatches:
+            total_issues = sum(len(v) for v in date_mismatches.values())
+            sample = []
+            for code, rows in list(date_mismatches.items())[:5]:
+                td, pre_c, exp_c = rows[0]
+                sample.append(f"{code}:{td} pre_close={pre_c} != prev_close={exp_c}")
+            logger.warning(
+                f"pre_close 校验发现不一致: 股票 {len(date_mismatches)} 只, 记录 {total_issues} 条; 示例: {sample}"
+            )
+
         indicator_names = data_processor.indicator_names
         decs = outputs_for(indicator_names)
 
@@ -1734,11 +1835,9 @@ class DailyStockDownloader(StockDownloader):
             if group is None or group.empty:
                 self.stats.empty_count += 1
                 continue
-            mismatch = self._detect_preclose_mismatch(ts_code, group)
-            if mismatch:
-                trade_date, pre_c, exp_c = mismatch
-                msg = f"{ts_code} {trade_date} pre_close={pre_c} 与 warmup 最新 close 不一致"
-                logger.warning(msg)
+            if ts_code in date_mismatches:
+                trade_date, pre_c, exp_c = date_mismatches[ts_code][0]
+                msg = f"{ts_code} {trade_date} pre_close={pre_c} 与上一交易日收盘 {exp_c} 不一致"
                 self.stats.error_count += 1
                 self.stats.failed_stocks.append((ts_code, msg))
                 continue
@@ -1782,10 +1881,14 @@ class DailyStockDownloader(StockDownloader):
         compute_bar.close()
 
         # 过滤掉空或全 NA 的结果，避免 pandas FutureWarning
-        filtered_results = [
-            df for df in results
-            if df is not None and not df.empty and not df.isna().all().all()
-        ]
+        filtered_results = []
+        for df in results:
+            if df is None or df.empty:
+                continue
+            trimmed = df.dropna(axis=1, how="all")
+            if trimmed.empty or trimmed.isna().all().all():
+                continue
+            filtered_results.append(trimmed)
         if not filtered_results:
             logger.warning("指标计算结果为空")
             return self.stats
@@ -2330,13 +2433,67 @@ class DownloadManager:
                 )
             
             return result
-        
+
         except Exception as e:
             logger.warning(f"检查日期 {trade_date} 的股票数据完整性失败: {e}")
             result["can_check"] = False
             result["missing_codes"] = []
             return result
-    
+
+    def _prompt_latest_date_action(self, latest_date: str, end_date: str,
+                                   coverage_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """当数据库已覆盖到结束日期时，提供交互式选项。"""
+        if not sys.stdin.isatty():
+            return None
+
+        missing_count = len(coverage_info.get("missing_codes") or [])
+        can_check = bool(coverage_info.get("can_check", False))
+        if can_check:
+            missing_hint = f"缺失 {missing_count} 只" if missing_count else "无缺失"
+        else:
+            missing_hint = "无法校验完整性"
+
+        print("\n数据库最新日期已覆盖到结束日期。")
+        print(f"最新日期: {latest_date}，结束日期: {end_date}，完整性: {missing_hint}")
+        print("选项:")
+        print("1. 正常补齐")
+        print("2. 强制重建（输入重建多少日数据，增量模式重建）")
+        print("3. 退出")
+
+        choice = input("请选择 (1-3, 默认: 1): ").strip() or "1"
+        if choice == "2":
+            while True:
+                days_str = input("请输入重建的交易日数量 (>=1): ").strip()
+                if not days_str:
+                    continue
+                if days_str.isdigit() and int(days_str) > 0:
+                    return {"action": "rebuild", "days": int(days_str)}
+                print("输入无效，请输入正整数。")
+        if choice == "3":
+            return {"action": "exit"}
+        return {"action": "normal"}
+
+    def _calc_rebuild_start_date(self, end_date: str, days: int) -> str:
+        """根据交易日历计算强制重建的开始日期。"""
+        if not end_date or days <= 1:
+            return end_date
+        try:
+            trade_dates = self.db_manager.get_trade_dates()
+            if trade_dates:
+                trade_dates = [d for d in trade_dates if d and str(d) <= end_date]
+                if trade_dates:
+                    idx = max(0, len(trade_dates) - days)
+                    return str(trade_dates[idx])
+        except Exception as e:
+            logger.warning(f"获取交易日历失败，回退到自然日计算: {e}")
+        try:
+            from datetime import datetime, timedelta
+            end_obj = datetime.strptime(str(end_date), "%Y%m%d")
+            start_obj = end_obj - timedelta(days=days - 1)
+            return start_obj.strftime("%Y%m%d")
+        except Exception:
+            return end_date
+
     def determine_download_strategy(self) -> Dict[str, Any]:
         """确定下载策略"""
         # 使用预先判断的首次下载状态
@@ -2355,15 +2512,24 @@ class DownloadManager:
                 latest_date = self.db_manager.get_latest_trade_date(db_path)
                 logger.debug(f"[determine_download_strategy] 获取到最新日期: {latest_date}")
                 
-                # 如果获取不到最新日期，说明数据库可能为空，重新判断为首次下载
+                # 如果获取不到最新日期，说明数据库不可读或为空
                 if not latest_date:
-                    logger.info("数据库存在但无数据，重新判断为首次下载")
-                    is_first_download = True
+                    status = self.db_manager.load_status_file()
+                    status_db_exists = False
+                    if isinstance(status, dict):
+                        stock_status = status.get("stock_data", {})
+                        if isinstance(stock_status, dict):
+                            status_db_exists = bool(stock_status.get("database_exists", False))
+                    if not status_db_exists:
+                        logger.info("状态文件显示数据库不存在，重新判断为首次下载")
+                        is_first_download = True
+                    else:
+                        raise RuntimeError("状态文件显示数据库存在但无法读取最新日期，可能被占用，请关闭占用后重试。")
             except Exception as e:
-                logger.warning(f"获取最新日期失败: {e}，重新判断为首次下载")
+                logger.error(f"获取最新日期失败: {e}")
                 import traceback
                 logger.debug(f"获取最新日期失败详情: {traceback.format_exc()}")
-                is_first_download = True
+                raise
         else:
             # 首次下载，不需要查询数据库
             logger.info("首次下载，跳过数据库查询")
@@ -2389,6 +2555,41 @@ class DownloadManager:
                     coverage_info = self._check_latest_date_completeness(latest_date)
                     missing_codes = coverage_info.get("missing_codes", []) if isinstance(coverage_info, dict) else []
                     can_check = coverage_info.get("can_check", False) if isinstance(coverage_info, dict) else False
+
+                    action = self._prompt_latest_date_action(latest_date, actual_end_date, coverage_info)
+                    if action:
+                        if action.get("action") == "exit":
+                            logger.info("用户选择退出下载流程")
+                            return {
+                                "skip_download": True,
+                                "user_exit": True,
+                                "is_first_download": is_first_download,
+                                "latest_date": latest_date,
+                                "start_date": actual_start_date,
+                                "end_date": actual_end_date,
+                                "adj_type": self.config.adj_type,
+                                "asset_type": self.config.asset_type,
+                                "stock_whitelist": None,
+                                "latest_date_completeness": coverage_info,
+                                "fill_missing_latest_date": False
+                            }
+                        if action.get("action") == "rebuild":
+                            rebuild_days = int(action.get("days", 1))
+                            rebuild_start = self._calc_rebuild_start_date(actual_end_date, rebuild_days)
+                            logger.warning(f"用户选择强制重建最近 {rebuild_days} 日数据: {rebuild_start} - {actual_end_date}")
+                            return {
+                                "skip_download": False,
+                                "is_first_download": False,
+                                "latest_date": latest_date,
+                                "start_date": rebuild_start,
+                                "end_date": actual_end_date,
+                                "adj_type": self.config.adj_type,
+                                "asset_type": self.config.asset_type,
+                                "stock_whitelist": None,
+                                "latest_date_completeness": coverage_info,
+                                "fill_missing_latest_date": False,
+                                "rebuild_days": rebuild_days
+                            }
                     
                     if can_check and missing_codes:
                         logger.warning(
@@ -2590,6 +2791,9 @@ class DownloadManager:
         
         # 检查是否需要跳过下载（必须在访问其他键之前检查）
         if strategy.get("skip_download", False):
+            if strategy.get("user_exit"):
+                logger.info("用户选择退出下载流程")
+                return {"stock": DownloadStats(), "index": DownloadStats()}
             logger.warning("=" * 30)
             logger.warning("数据已是最新，跳过下载")
             logger.warning("=" * 30)
@@ -2602,6 +2806,11 @@ class DownloadManager:
             missing_count = len(strategy.get("stock_whitelist") or [])
             logger.warning(
                 f"触发最新日期补齐流程: 需要补齐 {missing_count} 只股票 (日期 {strategy.get('end_date')})"
+            )
+        if strategy.get("rebuild_days"):
+            logger.warning(
+                f"强制重建模式: 最近 {strategy.get('rebuild_days')} 日 "
+                f"({strategy.get('start_date')} - {strategy.get('end_date')})"
             )
         
         # 添加智能日期判断的详细说明（如果配置为"today"）

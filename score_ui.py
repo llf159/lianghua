@@ -4181,7 +4181,6 @@ if _in_streamlit():
                 display_limit = int(new_limit_val or 0)
                 show_realtime_scrape = st.checkbox(
                     "显示爬虫实时行情",
-                    value=show_realtime_scrape,
                     key="kline_show_realtime",
                     help="关闭后不抓取实时行情，减少切换股票时的卡顿。"
                 )
@@ -6732,6 +6731,16 @@ if _in_streamlit():
 
                 try:
                     if not is_details_db_available():
+                        # 首次使用时尝试预初始化 details 数据库，避免被动拦截
+                        try:
+                            from config import SC_OUTPUT_DIR, SC_DETAIL_DB_PATH
+                            db_manager = get_database_manager()
+                            details_db_path = os.path.join(SC_OUTPUT_DIR, SC_DETAIL_DB_PATH)
+                            os.makedirs(os.path.dirname(details_db_path), exist_ok=True)
+                            db_manager.init_stock_details_tables(details_db_path, "duckdb")
+                        except Exception as e_init:
+                            logger.warning(f"补算前初始化details数据库失败: {e_init}")
+                    if not is_details_db_available():
                         st.error("details 数据库不可用，无法补算。请先检查数据库状态。")
                     elif hasattr(se, "backfill_prev_n_days"):
                         out = se.backfill_prev_n_days(n=int(n_back), include_today=bool(inc_today), force=bool(do_force))
@@ -6773,6 +6782,16 @@ if _in_streamlit():
                     logger.warning(f"补齐缺失前关闭 details 连接池失败: {e}")
 
                 try:
+                    if not is_details_db_available():
+                        # 首次使用时尝试预初始化 details 数据库，避免被动拦截
+                        try:
+                            from config import SC_OUTPUT_DIR, SC_DETAIL_DB_PATH
+                            db_manager = get_database_manager()
+                            details_db_path = os.path.join(SC_OUTPUT_DIR, SC_DETAIL_DB_PATH)
+                            os.makedirs(os.path.dirname(details_db_path), exist_ok=True)
+                            db_manager.init_stock_details_tables(details_db_path, "duckdb")
+                        except Exception as e_init:
+                            logger.warning(f"补齐前初始化details数据库失败: {e_init}")
                     if not is_details_db_available():
                         st.error("details 数据库不可用，无法补齐缺失的排名文件。")
                     elif hasattr(se, "backfill_missing_ranks"):                   

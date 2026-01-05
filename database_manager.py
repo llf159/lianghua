@@ -4564,6 +4564,8 @@ class DataReceiver:
                             # 简化处理：如果是stock_details表，主键是(ts_code, ref_date)
                             if table_name == "stock_details":
                                 primary_key_columns = ["ts_code", "ref_date"]
+                            elif table_name == "stock_data":
+                                primary_key_columns = ["ts_code", "trade_date", "adj_type"]
                             else:
                                 # 对于其他表，尝试从表结构推断主键（NOT NULL且唯一）
                                 # 如果无法确定，使用所有匹配的列作为主键
