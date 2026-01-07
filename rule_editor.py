@@ -833,8 +833,9 @@ def render_rule_editor():
             # 分数
             points = st.number_input(
                 "分数 (points)",
-                value=st.session_state.get('template_points', 0),
-                step=1,
+                value=float(st.session_state.get('template_points', 0)),
+                step=0.1,
+                format="%.2f",
                 help="规则命中时的加分或减分，正数为加分，负数为减分"
             )
         

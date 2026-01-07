@@ -421,17 +421,16 @@ def _calc_nested_window(expr: str) -> int:
                     except (ValueError, TypeError):
                         pass
     
-    # 如果没有找到需要嵌套的函数，再匹配REF等简单函数
-    if max_total_window == 0:
-        ref_pattern = r'REF\s*\([^)]+,\s*(\d+)'
-        matches = re.finditer(ref_pattern, expr, re.IGNORECASE)
-        for match in matches:
-            try:
-                window = int(match.group(1))
-                max_total_window = max(max_total_window, window)
-            except (ValueError, TypeError):
-                pass
-    
+    # 额外扫描 REF 窗口（即使存在嵌套函数也要纳入最大窗口）
+    ref_pattern = r'REF\s*\([^)]+,\s*(\d+)'
+    matches = re.finditer(ref_pattern, expr, re.IGNORECASE)
+    for match in matches:
+        try:
+            window = int(match.group(1))
+            max_total_window = max(max_total_window, window)
+        except (ValueError, TypeError):
+            pass
+
     return max_total_window
 
 
@@ -3523,10 +3522,27 @@ def _get_score_window(rule_or_clause: dict, default_window: int = None) -> int:
     
     # 使用 score_windows（如果明确指定）
     if "score_windows" in rule_or_clause and rule_or_clause["score_windows"] is not None:
-        return int(rule_or_clause["score_windows"])
-    
-    # 使用默认值
-    return int(default_window)
+        base_window = int(rule_or_clause["score_windows"])
+    else:
+        # 使用默认值
+        base_window = int(default_window)
+
+    # scope 自带最小长度需求（避免窗口太短导致必然无法触发）
+    min_required = 0
+    m_count = re.match(r"COUNT\s*(?:>=|=|≥|＝)\s*(\d+)\b", scope_upper)
+    if m_count:
+        min_required = max(min_required, int(m_count.group(1)))
+    m_consec = re.match(r"CONSEC\s*(?:>=|=|≥|＝)\s*(\d+)\b", scope_upper)
+    if m_consec:
+        min_required = max(min_required, int(m_consec.group(1)))
+    m_any = re.match(r"ANY(?:[_\-\s]?)(\d+)$", scope_upper)
+    if m_any:
+        min_required = max(min_required, int(m_any.group(1)))
+    m_all = re.match(r"ALL(?:[_\-\s]?)(\d+)$", scope_upper)
+    if m_all:
+        min_required = max(min_required, int(m_all.group(1)))
+
+    return max(base_window, min_required) if min_required > 0 else base_window
 
 
 @lru_cache(maxsize=256)
@@ -6569,7 +6585,8 @@ def tdx_screen(
     write_black_rest: bool = False,
     universe: str | list[str] | None = "all",
     use_prescreen_first: bool = True,
-    return_df: bool = True
+    return_df: bool = True,
+    safe_mode: bool | None = None,
     ):
     when = (when or "").strip()
     if not when:
@@ -6693,6 +6710,9 @@ def tdx_screen(
     whitelist_items: list[tuple[str, str, str]] = []
     blacklist_items: list[tuple[str, str, str]] = []
 
+    # 安全模式：强制使用线程池，避免多进程访问带来的兼容风险
+    safe_mode_effective = bool(safe_mode) if safe_mode is not None else False
+
     # 工作进程数量：默认等于 CPU 核心数，可由配置覆盖
     max_workers = SC_MAX_WORKERS or (os.cpu_count() or 4)
     
@@ -6701,7 +6721,10 @@ def tdx_screen(
     env_use_proc = str(os.getenv("SC_USE_PROCESS_POOL", "")).strip().lower() in {"1","true","yes"}
     use_proc_cfg = bool(SC_USE_PROCESS_POOL or env_use_proc)
     can_use_proc = False
-    if use_proc_cfg:
+    if safe_mode_effective:
+        can_use_proc = False
+        LOGGER.info("[执行器] 安全模式已开启：强制使用 ThreadPool")
+    elif use_proc_cfg:
         try:
             if os.name == 'nt':
                 # Windows: 允许进程池，但子进程各自读库（由 database_manager 的多进程读队列优化负责）

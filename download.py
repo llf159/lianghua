@@ -1371,19 +1371,21 @@ class StockDownloader:
             self.db_manager = get_database_manager()
         
         # 获取股票列表
+        stock_list = None
+        # 下载新数据时：可选择主动刷新名单（补齐模式也刷新缓存，但不强制覆盖传入列表）
+        if getattr(self.config, "refresh_stock_list_on_download", True):
+            try:
+                stock_list = self.tushare_manager.get_stock_list()
+            except Exception as e:
+                logger.warning(f"刷新股票列表失败（继续尝试缓存/数据库）: {e}")
+                stock_list = None
+            if stock_list is not None and not stock_list.empty and "ts_code" in stock_list.columns:
+                stock_list = self._attach_total_share_to_list(stock_list)
+                self._persist_stock_list_cache(stock_list)
+
         if stock_codes is None:
-            stock_list = None
-            # 下载新数据时：可选择主动刷新名单
-            if getattr(self.config, "refresh_stock_list_on_download", True):
-                try:
-                    stock_list = self.tushare_manager.get_stock_list()
-                except Exception as e:
-                    logger.warning(f"刷新股票列表失败（继续尝试缓存/数据库）: {e}")
-                    stock_list = None
-                if stock_list is not None and not stock_list.empty and "ts_code" in stock_list.columns:
-                    stock_list = self._attach_total_share_to_list(stock_list)
-                    self._persist_stock_list_cache(stock_list)
-                    stock_codes = stock_list["ts_code"].astype(str).tolist()
+            if stock_list is not None and not stock_list.empty and "ts_code" in stock_list.columns:
+                stock_codes = stock_list["ts_code"].astype(str).tolist()
 
             if stock_codes is None:
                 # 优先使用本地缓存/数据库，只有完全没有名单时才调用 Tushare
@@ -1584,7 +1586,14 @@ class StockDownloader:
         # 批量写入模式：合并所有成功数据后一次性写库
         if self.batch_write_once:
             if collected_data:
-                final_df = pd.concat(collected_data, ignore_index=True)
+                non_empty_data = [
+                    df for df in collected_data
+                    if df is not None and not df.empty and not df.isna().all().all()
+                ]
+                if not non_empty_data:
+                    logger.warning("批量写入模式：无有效数据可合并写入")
+                    return
+                final_df = pd.concat(non_empty_data, ignore_index=True)
                 logger.info(f"批量写入模式：合并 {len(final_df)} 行，覆盖 {write_count} 只股票，一次性写库")
                 
                 write_completed = threading.Event()
@@ -1781,6 +1790,17 @@ class DailyStockDownloader(StockDownloader):
             logger.info("[数据库连接] 开始获取数据库管理器实例 (按日增量)")
             self.db_manager = get_database_manager()
         data_processor = DataProcessor(self.db_manager)
+
+        # 日常增量也尝试刷新一次股票列表缓存
+        if getattr(self.config, "refresh_stock_list_on_download", True):
+            try:
+                stock_list = self.tushare_manager.get_stock_list()
+            except Exception as e:
+                logger.warning(f"刷新股票列表失败（增量按日，继续下载）：{e}")
+                stock_list = None
+            if stock_list is not None and not stock_list.empty and "ts_code" in stock_list.columns:
+                stock_list = self._attach_total_share_to_list(stock_list)
+                self._persist_stock_list_cache(stock_list)
 
         trade_dates = self.tushare_manager.get_trade_dates(self.config.start_date, self.config.end_date)
         if not trade_dates:
@@ -2146,7 +2166,14 @@ class IndexDownloader:
             logger.info(f"开始统一写入 {len(collected_data)} 只指数的数据到数据库...")
             try:
                 # 合并所有数据
-                all_data = pd.concat(collected_data, ignore_index=True)
+                non_empty_data = [
+                    df for df in collected_data
+                    if df is not None and not df.empty and not df.isna().all().all()
+                ]
+                if not non_empty_data:
+                    logger.warning("统一写入：无有效数据可合并写入")
+                    return
+                all_data = pd.concat(non_empty_data, ignore_index=True)
                 logger.info(f"合并后共 {len(all_data)} 条记录")
                 
                 # 统一写入数据库

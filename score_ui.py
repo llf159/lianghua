@@ -2370,7 +2370,7 @@ def run_se_run_for_date_in_bg(arg):
         return result["path"]
 
 
-def run_se_screen_in_bg(*, when_expr, ref_date, timeframe, window, scope, universe, write_white, write_black_rest, return_df=True):
+def run_se_screen_in_bg(*, when_expr, ref_date, timeframe, window, scope, universe, write_white, write_black_rest, return_df=True, safe_mode=False):
     """在后台线程运行 se.tdx_screen(...)，并在主线程渲染进度（用于“普通选股”）"""
     with se_progress_to_streamlit() as (status, bar, info):
         import threading, time
@@ -2393,17 +2393,33 @@ def run_se_screen_in_bg(*, when_expr, ref_date, timeframe, window, scope, univer
                 st.session_state["expression_screening_active"] = True
                 
                 try:
-                    result["df"] = se.tdx_screen(
-                        when_expr,
-                        ref_date=ref_date,
-                        timeframe=timeframe,
-                        window=_safe_int(window, 30),
-                        scope=scope,
-                        universe=universe,
-                        write_white=write_white,
-                        write_black_rest=write_black_rest,
-                        return_df=return_df
-                    )
+                    import inspect
+                    tdx_params = set(inspect.signature(se.tdx_screen).parameters.keys())
+                    if "safe_mode" in tdx_params:
+                        result["df"] = se.tdx_screen(
+                            when_expr,
+                            ref_date=ref_date,
+                            timeframe=timeframe,
+                            window=_safe_int(window, 30),
+                            scope=scope,
+                            universe=universe,
+                            write_white=write_white,
+                            write_black_rest=write_black_rest,
+                            return_df=return_df,
+                            safe_mode=safe_mode,
+                        )
+                    else:
+                        result["df"] = se.tdx_screen(
+                            when_expr,
+                            ref_date=ref_date,
+                            timeframe=timeframe,
+                            window=_safe_int(window, 30),
+                            scope=scope,
+                            universe=universe,
+                            write_white=write_white,
+                            write_black_rest=write_black_rest,
+                            return_df=return_df,
+                        )
                 finally:
                     st.session_state["expression_screening_active"] = False
                     
@@ -3351,11 +3367,30 @@ if _in_streamlit():
                     # 统一使用 _board_category 将市场映射到主板/创业/北交所/其他
                     df_all["板块分类"] = df_all["ts_code"].apply(_board_category)
                 
-                # 板块筛选
-                board_filter_col1, board_filter_col2 = st.columns([1, 3])
+                # 板块筛选 + 展示设置
+                board_filter_col1, board_filter_col2, board_filter_col3 = st.columns([0.5, 0.5, 1])
                 with board_filter_col1:
                     board_filter = st.selectbox("板块筛选", ["全部", "主板", "创业/科创", "北交所"], index=0, key="board_filter")
-                
+                with board_filter_col2:
+                    show_mode = st.radio("展示方式", ["限制条数", "显示全部"], horizontal=True, key="rank_show_mode")
+                with board_filter_col3:
+                    rows_to_show = st.number_input(
+                        "显示行数",
+                        min_value=5,
+                        max_value=1000,
+                        value=100,
+                        key="rank_rows_cfg",
+                        disabled=(show_mode == "显示全部"),
+                    )
+
+                cap_sel_rank = st.multiselect(
+                    "总市值筛选（亿元，留空=不限；多选=并集）",
+                    options=[b[0] for b in _CAP_BUCKETS],
+                    default=[],
+                    key="rank_cap_filter",
+                    help="基于 stock_list.csv 的 total_mv；查不到则无法命中筛选。",
+                )
+
                 # 应用板块筛选
                 if board_filter != "全部" and "板块分类" in df_all.columns:
                     df_filtered = df_all[df_all["板块分类"] == board_filter].copy()
@@ -3373,20 +3408,8 @@ if _in_streamlit():
                             return name_map.get(ts.split(".")[0], "")
                         return ""
                     df_filtered["名称"] = df_filtered["ts_code"].apply(_lookup_name)
-                    # 添加总市值（亿元），用于展示
-                    mp_basic = _get_stock_basic_map()
-                    df_filtered["总市值(亿)"] = df_filtered["ts_code"].apply(
-                        lambda x: _total_mv_billion(str(x), mp_basic)
-                    )
+                    df_filtered = _apply_total_mv_filter(df_filtered, cap_sel_rank, out_col="总市值(亿)")
                     df_filtered = add_concept_column(df_filtered, ts_col="ts_code", out_col="概念", blacklist=CONCEPT_BLACKLIST)
-                
-                # 展示方式设置
-                with board_filter_col2:
-                    show_mode = st.radio("展示方式", ["限制条数", "显示全部"], horizontal=True, key="rank_show_mode")
-                
-                rows_to_show = None
-                if show_mode == "限制条数":
-                    rows_to_show = st.number_input("显示行数", min_value=5, max_value=1000, value=100, key="rank_rows_cfg")
                 
                 if not df_filtered.empty:
                     if show_mode == "显示全部":
@@ -4186,11 +4209,10 @@ if _in_streamlit():
                 )
 
                 topk_value = st.session_state.get("kline_list_topk", 100)
-                board_topk_value = st.session_state.get("kline_board_topk", 100)
-                board_choice = st.session_state.get("kline_board_choice", "主板")
+                topk_board_choice = st.session_state.get("kline_topk_board", "全部")
                 strategy_board_choice = st.session_state.get("kline_strategy_board", "全部")
 
-                list_source_options = ["TopK导入", "自定义名单", "按板块TopK", "触发了某个策略"]
+                list_source_options = ["TopK导入", "自定义名单", "触发了某个策略"]
                 if st.session_state.get("kline_list_source") not in list_source_options:
                     st.session_state["kline_list_source"] = list_source_options[0]
                 list_source = st.selectbox(
@@ -4204,17 +4226,14 @@ if _in_streamlit():
                 # 显示当前选项的专属配置
                 if list_source == "TopK导入":
                     topk_value = st.number_input("TopK数量", min_value=1, max_value=5000, value=int(topk_value or 100), step=5, key="kline_list_topk")
+                    topk_board_choice = st.selectbox(
+                        "板块",
+                        ["全部", "主板", "创业/科创", "北交所", "其他"],
+                        index=["全部", "主板", "创业/科创", "北交所", "其他"].index(str(topk_board_choice)) if topk_board_choice in ["全部","主板","创业/科创","北交所","其他"] else 0,
+                        key="kline_topk_board"
+                    )
                     ref_for_list = ref_real_kline
                 elif list_source == "自定义名单":
-                    ref_for_list = ref_real_kline
-                elif list_source == "按板块TopK":
-                    board_choice = st.selectbox(
-                        "板块",
-                        ["主板", "创业/科创", "北交所", "其他", "全部"],
-                        index=["主板", "创业/科创", "北交所", "其他", "全部"].index(str(board_choice)) if board_choice in ["主板","创业/科创","北交所","其他","全部"] else 0,
-                        key="kline_board_choice"
-                    )
-                    board_topk_value = st.number_input("板块TopK数量", min_value=1, max_value=5000, value=int(board_topk_value or 100), step=5, key="kline_board_topk")
                     ref_for_list = ref_real_kline
                 else:
                     rule_names_for_trigger = _get_rule_names()
@@ -4300,27 +4319,16 @@ if _in_streamlit():
                     st.error("请选择参考日以从TopK导入。")
                 else:
                     try:
-                        df_topk = _slice_top_from_all(list_ref_to_use, int(topk_value))
+                        topk_board_choice = st.session_state.get("kline_topk_board", "全部")
+                        df_topk = _slice_board_top(list_ref_to_use, str(topk_board_choice), int(topk_value))
                         if df_topk.empty:
-                            st.error(f"无法从排名文件读取Top-{int(topk_value)}股票（参考日：{list_ref_to_use}）")
+                            st.error(f"无法从排名文件读取Top-{int(topk_value)}股票（参考日：{list_ref_to_use}，板块：{topk_board_choice}）")
                         else:
                             codes_list = df_topk["ts_code"].astype(str).tolist()
                     except Exception as e:
                         st.error(f"读取TopK失败：{e}")
             elif list_source == "自定义名单":
                 codes_list = _parse_code_list(custom_text)
-            elif list_source == "按板块TopK":
-                if not list_ref_to_use:
-                    st.error("请选择参考日以生成板块Top名单。")
-                else:
-                    try:
-                        df_topk = _slice_board_top(list_ref_to_use, str(board_choice), int(board_topk_value))
-                        if df_topk.empty:
-                            st.error(f"板块Top名单为空（参考日：{list_ref_to_use}，板块：{board_choice}）")
-                        else:
-                            codes_list = df_topk["ts_code"].astype(str).tolist()
-                    except Exception as e:
-                        st.error(f"读取板块Top名单失败：{e}")
             else:
                 rule_pick = st.session_state.get("kline_trigger_rule", "")
                 strategy_board_choice = st.session_state.get("kline_strategy_board", "全部")
@@ -6376,7 +6384,7 @@ if _in_streamlit():
         with st.form("expression_screening_form"):
             st.markdown("### 表达式筛选")
             exp = st.text_input("表达式（示例：CLOSE>MA(CLOSE,20) AND VOL>MA(VOL,5)）", value=st.session_state.get("screen_expr",""), key="screen_expr")
-            c1, c2, c3, c4, c5, c6 = st.columns([1,1,1,1,1,1])
+            c1, c2, c3, c4, c5, c6, c7 = st.columns([1,1,1,1,1,1,1])
             with c1:
                 level = st.selectbox("时间级别", ["D","W","M"], index=0, key="screen_level")
             with c2:
@@ -6390,6 +6398,8 @@ if _in_streamlit():
             with c5:
                 tiebreak_expr = st.selectbox("同分排序", ["none", "kdj_j_asc"], index=1, key="screen_tiebreak_expr")
             with c6:
+                safe_mode = st.checkbox("安全模式(强制多线程)", value=False, key="screen_safe_mode")
+            with c7:
                 run_btn = st.form_submit_button("运行筛选", width='stretch')
             cap_sel_expr = st.multiselect(
                 "总市值筛选（亿元，留空=不限；多选=并集）",
@@ -6400,7 +6410,7 @@ if _in_streamlit():
             )
 
         if run_btn:
-            logger.info(f"用户点击运行筛选: 表达式={exp[:50]}..., 级别={level}, 窗口={window}, 范围={scope_logic}")
+            logger.info(f"用户点击运行筛选: 表达式={exp.strip()}, 级别={level}, 窗口={window}, 范围={scope_logic}")
             try:
                 if not exp.strip():
                     st.warning("请先输入表达式。")
@@ -6425,6 +6435,7 @@ if _in_streamlit():
                         universe=_uni_map.get(uni_choice,"all"),
                         write_white=False,
                         write_black_rest=False,
+                        safe_mode=safe_mode,
                         return_df=True,
                     )
                     if df_sel is None or df_sel.empty:
@@ -7672,7 +7683,8 @@ if _in_streamlit():
                             ret = (end_close / start_close - 1.0) * 100.0
                             
                             # 获取市场标签
-                            market = market_label(code_str)
+                            market_raw = market_label(code_str)
+                            market = "主板" if market_raw in ("沪A", "深A") else market_raw
                             
                             results.append({
                                 "ts_code": code_str,
@@ -7710,88 +7722,118 @@ if _in_streamlit():
                     display_cols = ["总排名", "市场", "市场内排名", "ts_code", rank_days_ago_col, f"{n_days}日涨幅"]
                     available_cols = [c for c in display_cols if c in df_display.columns]
                     
-                    # 按市场筛选展示
-                    markets = df_display["市场"].unique()
-                    market_order = ["沪A", "深A", "创业板", "科创板", "北交所", "其他"]
-                    markets_sorted = sorted(markets, key=lambda x: (
-                        market_order.index(x) if x in market_order else len(market_order)
-                    ))
-                    market_options = ["全部"] + markets_sorted
-                    selected_market = st.selectbox("选择市场浏览", options=market_options, index=0, key="surge_market_select")
-                    if selected_market == "全部":
-                        filtered = df_display
-                    else:
-                        filtered = df_display[df_display["市场"] == selected_market]
-                    if filtered.empty:
-                        st.info("所选市场无数据。")
-                    else:
-                        st.dataframe(
-                            filtered[available_cols].head(200),
-                            width='stretch',
-                            height=400
-                        )
+                    st.session_state["surge_cache"] = {
+                        "df_result": df_result,
+                        "df_display": df_display,
+                        "n_days": int(n_days),
+                        "refS": refS,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "rank_days_ago_col": rank_days_ago_col,
+                        "has_start_rank": bool(start_rank_map),
+                        "has_ref_rank": bool(ref_rank_map),
+                    }
                     
-                    caption_parts = [f"涨幅榜：参考日 {refS}，最近 {n_days} 日涨幅（区间：{start_date} → {end_date}）"]
-                    if start_rank_map:
-                        caption_parts.append(f"附 {rank_days_ago_col}（来源：score_all_{start_date}.csv）")
-                    else:
-                        caption_parts.append(f"未找到 {start_date} 的排名文件，{rank_days_ago_col} 为空")
-                    st.caption("；".join(caption_parts))
-                    
-                    # 额外：排名Top涨幅榜
-                    st.subheader("排名Top涨幅榜")
-                    if not ref_rank_map:
-                        st.info(f"参考日 {refS} 的排名文件不存在，无法生成排名Top榜。")
-                    else:
-                        df_top_rank = df_result.copy()
-                        df_top_rank = df_top_rank[df_top_rank["参考日排名"].notna()]
-                        df_top_rank = df_top_rank[df_top_rank["参考日排名"] <= int(surge_top_k)]
-                        if df_top_rank.empty:
-                            st.info(f"参考日排名 Top-{int(surge_top_k)} 无数据，或对应股票无涨幅记录。")
-                        else:
-                            df_top_rank = df_top_rank.sort_values(f"{n_days}日涨幅", ascending=False).reset_index(drop=True)
-                            df_top_display = df_top_rank.copy()
-                            df_top_display[f"{n_days}日涨幅"] = df_top_display[f"{n_days}日涨幅"].map(lambda x: f"{x:.2f}%" if pd.notna(x) else None)
-                            display_cols_top = ["参考日排名", rank_days_ago_col, "ts_code", "市场", "市场内排名", f"{n_days}日涨幅"]
-                            available_cols_top = [c for c in display_cols_top if c in df_top_display.columns]
-                            st.dataframe(
-                                df_top_display[available_cols_top],
-                                width='stretch',
-                                height=400
-                            )
-                            st.caption(f"排名Top-{int(surge_top_k)} 涨幅榜：参考日排名文件 {refS}，{rank_days_ago_col} 基于 {start_date}。")
-                    
-                    # 显示统计信息
-                    with st.expander("市场统计摘要", expanded=False):
-                        market_stats = []
-                        for market in markets_sorted:
-                            market_data = df_result[df_result["市场"] == market]
-                            if not market_data.empty:
-                                market_stats.append({
-                                    "市场": market,
-                                    "股票数": len(market_data),
-                                    "平均涨幅": market_data[f"{n_days}日涨幅"].mean(),
-                                    "最大涨幅": market_data[f"{n_days}日涨幅"].max(),
-                                    "最小涨幅": market_data[f"{n_days}日涨幅"].min(),
-                                    "正收益数": (market_data[f"{n_days}日涨幅"] > 0).sum(),
-                                    "正收益比例": (market_data[f"{n_days}日涨幅"] > 0).sum() / len(market_data) * 100
-                                })
-                        
-                        if market_stats:
-                            df_stats = pd.DataFrame(market_stats)
-                            # 格式化百分比
-                            for col in ["平均涨幅", "最大涨幅", "最小涨幅"]:
-                                if col in df_stats.columns:
-                                    df_stats[col] = df_stats[col].map(lambda x: f"{x:.2f}%" if pd.notna(x) else None)
-                            df_stats["正收益比例"] = df_stats["正收益比例"].map(lambda x: f"{x:.1f}%" if pd.notna(x) else None)
-                            
-                            # 注意：use_container_width 已废弃，使用 width='stretch' 替代
-                            st.dataframe(df_stats, width='stretch')
                     
                 except Exception as e:
                     st.error(f"生成失败：{e}")
                     import traceback
                     st.code(traceback.format_exc())
+
+            cache = st.session_state.get("surge_cache")
+            if not cache:
+                st.info("请先点击“生成涨幅榜”。")
+            else:
+                df_result = cache["df_result"]
+                df_display = cache["df_display"]
+                n_days_cached = int(cache["n_days"])
+                rank_days_ago_col = cache["rank_days_ago_col"]
+                refS_cached = cache["refS"]
+                start_date = cache["start_date"]
+                end_date = cache["end_date"]
+
+                display_cols = ["总排名", "市场", "市场内排名", "ts_code", rank_days_ago_col, f"{n_days_cached}日涨幅"]
+                available_cols = [c for c in display_cols if c in df_display.columns]
+
+                # 按市场筛选展示
+                markets = df_display["市场"].unique()
+                market_order = ["主板", "创业板", "科创板", "北交所", "B股", "其他"]
+                markets_sorted = sorted(markets, key=lambda x: (
+                    market_order.index(x) if x in market_order else len(market_order)
+                ))
+                market_options = ["全部"] + markets_sorted
+                selected_market = st.selectbox("选择市场浏览", options=market_options, index=0, key="surge_market_select")
+                if selected_market == "全部":
+                    filtered = df_display
+                else:
+                    filtered = df_display[df_display["市场"] == selected_market]
+                if filtered.empty:
+                    st.info("所选市场无数据。")
+                else:
+                    st.dataframe(
+                        filtered[available_cols].head(200),
+                        width='stretch',
+                        height=400
+                    )
+
+                caption_parts = [f"涨幅榜：参考日 {refS_cached}，最近 {n_days_cached} 日涨幅（区间：{start_date} → {end_date}）"]
+                if cache.get("has_start_rank"):
+                    caption_parts.append(f"附 {rank_days_ago_col}（来源：score_all_{start_date}.csv）")
+                else:
+                    caption_parts.append(f"未找到 {start_date} 的排名文件，{rank_days_ago_col} 为空")
+                st.caption("；".join(caption_parts))
+
+                # 额外：排名Top涨幅榜
+                st.subheader("排名Top涨幅榜")
+                if not cache.get("has_ref_rank"):
+                    st.info(f"参考日 {refS_cached} 的排名文件不存在，无法生成排名Top榜。")
+                else:
+                    df_top_rank = df_result.copy()
+                    df_top_rank = df_top_rank[df_top_rank["参考日排名"].notna()]
+                    df_top_rank = df_top_rank[df_top_rank["参考日排名"] <= int(surge_top_k)]
+                    if df_top_rank.empty:
+                        st.info(f"参考日排名 Top-{int(surge_top_k)} 无数据，或对应股票无涨幅记录。")
+                    else:
+                        df_top_rank = df_top_rank.sort_values(f"{n_days_cached}日涨幅", ascending=False).reset_index(drop=True)
+                        df_top_display = df_top_rank.copy()
+                        df_top_display[f"{n_days_cached}日涨幅"] = df_top_display[f"{n_days_cached}日涨幅"].map(
+                            lambda x: f"{x:.2f}%" if pd.notna(x) else None
+                        )
+                        display_cols_top = ["参考日排名", rank_days_ago_col, "ts_code", "市场", "市场内排名", f"{n_days_cached}日涨幅"]
+                        available_cols_top = [c for c in display_cols_top if c in df_top_display.columns]
+                        st.dataframe(
+                            df_top_display[available_cols_top],
+                            width='stretch',
+                            height=400
+                        )
+                        st.caption(f"排名Top-{int(surge_top_k)} 涨幅榜：参考日排名文件 {refS_cached}，{rank_days_ago_col} 基于 {start_date}。")
+
+                # 显示统计信息
+                with st.expander("市场统计摘要", expanded=False):
+                    market_stats = []
+                    for market in markets_sorted:
+                        market_data = df_result[df_result["市场"] == market]
+                        if not market_data.empty:
+                            market_stats.append({
+                                "市场": market,
+                                "股票数": len(market_data),
+                                "平均涨幅": market_data[f"{n_days_cached}日涨幅"].mean(),
+                                "最大涨幅": market_data[f"{n_days_cached}日涨幅"].max(),
+                                "最小涨幅": market_data[f"{n_days_cached}日涨幅"].min(),
+                                "正收益数": (market_data[f"{n_days_cached}日涨幅"] > 0).sum(),
+                                "正收益比例": (market_data[f"{n_days_cached}日涨幅"] > 0).sum() / len(market_data) * 100
+                            })
+
+                    if market_stats:
+                        df_stats = pd.DataFrame(market_stats)
+                        # 格式化百分比
+                        for col in ["平均涨幅", "最大涨幅", "最小涨幅"]:
+                            if col in df_stats.columns:
+                                df_stats[col] = df_stats[col].map(lambda x: f"{x:.2f}%" if pd.notna(x) else None)
+                        df_stats["正收益比例"] = df_stats["正收益比例"].map(lambda x: f"{x:.1f}%" if pd.notna(x) else None)
+
+                        # 注意：use_container_width 已废弃，使用 width='stretch' 替代
+                        st.dataframe(df_stats, width='stretch')
 
         # --- 策略触发统计 ---
         with sub_tabs[3]:
