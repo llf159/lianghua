@@ -710,8 +710,9 @@ def _first_non_limit_open(
 
 def _bucket_ret_pct(pct: pd.Series) -> pd.Series:
     """将涨跌幅分桶，返回区间标签。"""
-    bins = [-1.0, -0.05, -0.03, -0.01, 0.0, 0.01, 0.03, 0.05, 1.0]
-    labels = ["<-5%", "-5~-3%", "-3~-1%", "-1~0%", "0~1%", "1~3%", "3~5%", ">5%"]
+    # 合并 -1~0 与 0~1 区间为 -1~1
+    bins = [-1.0, -0.05, -0.03, -0.01, 0.01, 0.03, 0.05, 1.0]
+    labels = ["<-5%", "-5~-3%", "-3~-1%", "-1~1%", "1~3%", "3~5%", ">5%"]
     try:
         return pd.cut(pct, bins=bins, labels=labels, include_lowest=True, right=False)
     except Exception:
@@ -2154,17 +2155,17 @@ def _render_price_kline_chart(
                 except Exception:
                     pass
 
-                # 副图：J 值、RSI6、RSI12 共用同一纵轴
+                # 副图：显示 J 值 + 补票长短线（折线，long=红、short=绿）
                 try:
-                    indicator_cols = {
-                        "J": "j",
-                        "RSI6": "rsi6",
-                        "RSI12": "rsi12",
-                    }
+                    indicator_cols = [
+                        ("J", "j", "#000000"),
+                        ("bupiao_long", "bupiao_long", "#e74c3c"),  # 红色
+                        ("bupiao_short", "bupiao_short", "#2ecc71"), # 绿色
+                    ]
                     added_indicator = False
                     indicator_latest = []
                     indicator_all_vals = []
-                    for name, col in indicator_cols.items():
+                    for name, col, color in indicator_cols:
                         if col in df_price.columns:
                             ser = pd.to_numeric(df_price[col], errors="coerce")
                             if ser.notna().any():
@@ -2173,7 +2174,7 @@ def _render_price_kline_chart(
                                         x=df_price["trade_date"],
                                         y=ser,
                                         mode="lines",
-                                        line=dict(width=1.2),
+                                        line=dict(width=1.2, color=color),
                                         name=name,
                                     ),
                                     row=2,
@@ -2183,7 +2184,7 @@ def _render_price_kline_chart(
                                 indicator_all_vals.append(ser)
                                 indicator_latest.append(f"{name}: {ser.dropna().iloc[-1]:.2f}")
                     if added_indicator:
-                        fig.update_yaxes(title_text="J / RSI", row=2, col=1)
+                        fig.update_yaxes(title_text="J / bupiao", row=2, col=1)
                         try:
                             # 在副图顶部展示最新数值，类似常见行情软件
                             y_top = None
@@ -2206,6 +2207,29 @@ def _render_price_kline_chart(
                                 )
                         except Exception:
                             pass
+                    # 根据可见窗口动态调整副图纵轴范围，避免全局数据挤压
+                    try:
+                        indicator_range = None
+                        indicator_window = df_price.tail(default_window) if visible_range is not None else df_price
+                        series_list = []
+                        for _, col, _ in indicator_cols:
+                            if col in indicator_window.columns:
+                                ser = pd.to_numeric(indicator_window[col], errors="coerce")
+                                if ser.notna().any():
+                                    series_list.append(ser)
+                        if series_list:
+                            v_min = min(s.min() for s in series_list if pd.notna(s.min()))
+                            v_max = max(s.max() for s in series_list if pd.notna(s.max()))
+                            if pd.notna(v_min) and pd.notna(v_max):
+                                if v_max == v_min:
+                                    pad = abs(v_max) * 0.1 if v_max else 1.0
+                                else:
+                                    pad = max((v_max - v_min) * 0.1, 1.0)
+                                indicator_range = [v_min - pad, v_max + pad]
+                        if indicator_range:
+                            fig.update_yaxes(range=indicator_range, row=2, col=1)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -3667,25 +3691,36 @@ if _in_streamlit():
         with c1:
             # 确保options_codes不为空，且index有效
             if options_codes:
-                default_idx = 0
-                # 1) 导航跳转优先
+                desired_code = st.session_state.get("detail_code_from_top", "")
+                # 1) 导航跳转优先（来自上一轮“上一条/下一条”按钮）
                 if pending_code and pending_code in options_codes:
-                    default_idx = options_codes.index(pending_code)
-                    st.session_state["detail_code_from_top"] = pending_code
-                # 2) 当前已选
-                elif st.session_state.get("detail_code_from_top") in options_codes:
-                    default_idx = options_codes.index(st.session_state["detail_code_from_top"])
-                # 3) 历史记录
-                elif st.session_state.detail_last_code and st.session_state.detail_last_code in options_codes:
-                    default_idx = options_codes.index(st.session_state.detail_last_code)
+                    desired_code = pending_code
+                # 2) 继续使用上一次选中的票
+                elif desired_code not in options_codes:
+                    if st.session_state.detail_last_code and st.session_state.detail_last_code in options_codes:
+                        desired_code = st.session_state.detail_last_code
+                    else:
+                        desired_code = options_codes[0]
 
-                code_from_list = st.selectbox("从排名前列选择", options=options_codes,
-                                            index=default_idx, placeholder="选择股票 ↓", key="detail_code_from_top")
+                # 通过 Session State 设置默认值，确保 selectbox 跟随导航跳转
+                if desired_code and desired_code in options_codes:
+                    st.session_state["detail_code_from_top"] = desired_code
+
+                code_from_list = st.selectbox(
+                    "从排名前列选择",
+                    options=options_codes,
+                    placeholder="选择股票 ↓",
+                    key="detail_code_from_top"
+                )
             else:
                 # 当没有可选数据时，提供一个默认选项但不禁用
-                code_from_list = st.selectbox("从排名前列选择", options=[""],
-                                            index=0, placeholder="暂无可选股票", 
-                                            key="detail_code_from_top")
+                st.session_state["detail_code_from_top"] = ""
+                code_from_list = st.selectbox(
+                    "从排名前列选择",
+                    options=[""],
+                    placeholder="暂无可选股票",
+                    key="detail_code_from_top"
+                )
 
         manual_code_raw = st.text_input(
             "或手动输入代码/简称",
@@ -3892,9 +3927,6 @@ if _in_streamlit():
                                 if not item:
                                     continue
                                 rank_text = f"{item.get('rank')}"
-                                total_val = item.get("total")
-                                if isinstance(total_val, int) and total_val > 0:
-                                    rank_text = f"{rank_text} / {total_val}"
                                 st.write(f"{item.get('date', '')} · {rank_text}")
 
                 # 交易性机会
@@ -4269,7 +4301,10 @@ if _in_streamlit():
             st.session_state["kline_display_base"] = base_codes_saved
 
         def _apply_kline_filter(codes: list[str], ref_date: str) -> list[str]:
-            """二次过滤：按板块、策略触发或自定义名单对展示列表做交集。"""
+            """二次过滤：按板块/策略/自定义名单对列表做一次性的交集处理。
+
+            现在只在生成名单时调用，不在展示阶段重复过滤，避免 K 线导航随 UI 变化漂移。
+            """
             filtered = list(codes or [])
             if not filtered:
                 return []
@@ -4298,11 +4333,11 @@ if _in_streamlit():
                     filtered = []
             return filtered
 
-        display_codes_saved = list(base_codes_saved or [])
+        # 展示列表直接使用上一次生成时已过滤好的名单；不在渲染阶段重复过滤
+        display_codes_saved = list(st.session_state.get("kline_display_list", base_codes_saved or []))
         display_limit = int(st.session_state.get("kline_display_limit", 50) or 0)
-        filtered_codes_saved = _apply_kline_filter(display_codes_saved, ref_real_kline)
         # 仅在用户点击生成名单后使用缓存名单，默认不导入 TopK
-        nav_codes_kline = filtered_codes_saved
+        nav_codes_kline = display_codes_saved
         prefetch_codes = nav_codes_kline
         prefetch_limited = False
         if display_limit > 0 and len(prefetch_codes) > display_limit:
@@ -4371,9 +4406,6 @@ if _in_streamlit():
                             if not item:
                                 continue
                             rank_text = f"{item.get('rank')}"
-                            total_val = item.get("total")
-                            if isinstance(total_val, int) and total_val > 0:
-                                rank_text = f"{rank_text} / {total_val}"
                             st.write(f"{item.get('date', '')} · {rank_text}")
             concept_kline = concept_text_for_stock(code_norm_kline, blacklist=CONCEPT_BLACKLIST)
             name_map = _get_stock_name_map()
@@ -4695,16 +4727,24 @@ if _in_streamlit():
                     if c and c not in seen:
                         seen.add(c)
                         deduped.append(c)
-                codes_list = deduped
-                st.session_state["kline_display_base"] = codes_list
-                st.session_state["kline_display_list"] = codes_list
+                raw_codes = deduped
+                # 在生成名单阶段执行一次性二次过滤
+                filtered_once = _apply_kline_filter(raw_codes, list_ref_to_use)
+                st.session_state["kline_display_base"] = raw_codes  # 未过滤的原始名单
+                st.session_state["kline_display_list"] = filtered_once  # 过滤后的最终展示名单
                 st.session_state["kline_display_ref"] = list_ref_to_use
                 st.session_state["kline_custom_text"] = custom_text
-                st.success(f"已生成名单：{len(codes_list)} 只，参考日 {list_ref_to_use or '—'}")
+                st.success(
+                    f"已生成名单：过滤前 {len(raw_codes)} 只，过滤后 {len(filtered_once)} 只，参考日 {list_ref_to_use or '—'}"
+                )
                 # 自动让 K 线跟随名单首只票（通过 pending_code + rerun，避免修改已实例化的控件）
-                first_code = normalize_ts(codes_list[0])
-                st.session_state["kline_pending_code"] = first_code
-                st.session_state["kline_last_code"] = first_code
+                if filtered_once:
+                    first_code = normalize_ts(filtered_once[0])
+                else:
+                    first_code = normalize_ts(raw_codes[0])
+                if first_code:
+                    st.session_state["kline_pending_code"] = first_code
+                    st.session_state["kline_last_code"] = first_code
                 try:
                     st.rerun()
                 except Exception:
@@ -4714,7 +4754,7 @@ if _in_streamlit():
                 st.session_state["kline_display_list"] = []
                 st.warning("名单为空，请检查TopK文件或自定义输入。")
 
-        display_codes = filtered_codes_saved
+        display_codes = display_codes_saved
         display_ref = st.session_state.get("kline_display_ref") or ref_real_kline
         if display_codes and display_ref:
             total_len = len(display_codes)
@@ -4722,8 +4762,8 @@ if _in_streamlit():
             st.dataframe(pd.DataFrame({"ts_code": display_codes}), width="stretch", height=320, hide_index=True)
             if prefetch_limited and total_len > display_limit:
                 st.caption(f"预加载按上限 {display_limit} 只执行，超过部分按需读取。")
-        elif (display_codes_saved or base_codes_saved) and display_ref:
-            st.info("过滤后名单为空，请调整过滤条件。")
+        elif (st.session_state.get("kline_display_base") or base_codes_saved) and display_ref:
+            st.info("二次过滤后名单为空，请调整过滤条件并重新生成。")
         else:
             st.info("点击上方按钮生成展示名单。")
 
@@ -6769,7 +6809,7 @@ if _in_streamlit():
 
             c4, c5, c6 = st.columns([1, 1, 1])
             with c4:
-                hold_days = st.multiselect("持有期（交易日）", options=[1,3,5,10,20], default=[5,10,20], key="review_holds")
+                hold_days = st.multiselect("持有期（交易日）", options=[1,3,5,10,20], default=[], key="review_holds")
             with c5:
                 high_thr = st.number_input("亮点阈值 ≥%", min_value=-50.0, max_value=200.0, value=5.0, step=0.5, key="review_high_thr")
                 low_thr = st.number_input("缺点阈值 ≤%", min_value=-200.0, max_value=50.0, value=-3.0, step=0.5, key="review_low_thr")
@@ -6899,7 +6939,7 @@ if _in_streamlit():
                                 name_map = _get_stock_name_map()
                                 preview_missing = [f"{c}({name_map.get(c,'')})" for c in missing_for_chart[:15]]
                                 st.caption(f"观测日无行情/被过滤的排名内标的 {len(missing_for_chart)} 只：" + "、".join(preview_missing) + (" …" if len(missing_for_chart)>15 else ""))
-                            order = ["<-5%","-5~-3%","-3~-1%","-1~0%","0~1%","1~3%","3~5%",">5%"]
+                            order = ["<-5%","-5~-3%","-3~-1%","-1~1%","1~3%","3~5%",">5%"]
                             rank_mkt["bucket"] = pd.Categorical(_bucket_ret_pct(rank_mkt["ret"]), categories=order, ordered=True)
                             mkt["bucket"] = pd.Categorical(_bucket_ret_pct(mkt["ret"]), categories=order, ordered=True)
 
