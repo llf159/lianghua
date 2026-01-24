@@ -795,20 +795,20 @@ class DataProcessor:
         if "tor" not in df.columns:
             df["tor"] = np.nan
         
-        # 删除不需要的列
-        columns_to_drop = ["pre_close", "change", "pct_chg"]
+        # 删除不需要的列（保留 pre_close 以供后续校验和展示）
+        columns_to_drop = ["change", "pct_chg"]
         for col in columns_to_drop:
             if col in df.columns:
                 df = df.drop(columns=[col])
         
         # 数值化处理
-        numeric_columns = ["open", "high", "low", "close", "vol", "amount", "tor"]
+        numeric_columns = ["open", "high", "low", "close", "pre_close", "vol", "amount", "tor"]
         for col in numeric_columns:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         
         # 精度控制
-        price_columns = ["open", "high", "low", "close", "vol", "amount", "tor"]
+        price_columns = ["open", "high", "low", "close", "pre_close", "vol", "amount", "tor"]
         for col in price_columns:
             if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
                 df[col] = df[col].astype(float).round(2)

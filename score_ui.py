@@ -548,8 +548,13 @@ def _read_trade_dates(asset: str = "stock") -> List[str]:
 
 
 def _read_px(codes, start, end, *, asset="stock", cols=("open","close")) -> pd.DataFrame:
-    sel = ["ts_code", "trade_date", *cols]
-    
+    """
+    读取价格数据；不直接请求数据库缺失的列（如 pre_close），统一事后用收盘价平移补齐。
+    """
+    cols = tuple(cols) if cols else ("open", "close")
+    need_pre_close = "pre_close" in cols
+    sel = ["ts_code", "trade_date"] + [c for c in cols if c != "pre_close"]
+
     # 优先使用缓存读取（仅对单只股票）
     if len(codes) == 1 and asset == "stock":
         try:
@@ -564,58 +569,211 @@ def _read_px(codes, start, end, *, asset="stock", cols=("open","close")) -> pd.D
             )
             if not df.empty:
                 df = normalize_trade_date(df, "trade_date")
+                if need_pre_close and "close" in df.columns and "pre_close" not in df.columns:
+                    df = df.sort_values(["ts_code", "trade_date"])
+                    df["pre_close"] = df.groupby("ts_code")["close"].shift(1)
                 return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
-        except:
+        except Exception:
             pass
-    
-    # 使用 database_manager 直接查询
-    try:
-        from config import DATA_ROOT, UNIFIED_DB_PATH
-        db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
-        
-        # 构建查询条件
-        conditions = []
-        params = []
-        
-        if codes:
-            placeholders = ",".join(["?"] * len(codes))
-            conditions.append(f"ts_code IN ({placeholders})")
-            params.extend(codes)
-        
-        if start:
-            conditions.append("trade_date >= ?")
-            params.append(start)
-            
-        if end:
-            conditions.append("trade_date <= ?")
-            params.append(end)
-            
-        conditions.append("adj_type = ?")
-        params.append(API_ADJ)
-        
-        # 构建SQL查询
-        select_cols = "*" if not sel else ", ".join(sel)
-        sql = f"SELECT {select_cols} FROM stock_data"
-        
-        if conditions:
-            sql += " WHERE " + " AND ".join(conditions)
-        
-        sql += " ORDER BY ts_code, trade_date"
-        
-        # 执行查询
-        logger.info(f"[数据库连接] 开始获取数据库管理器实例 (读取价格数据用于回测: codes={len(codes) if codes else 'all'}, {start}~{end})")
-        manager = get_database_manager()
-        df = manager.execute_sync_query(db_path, sql, params, timeout=120.0)
-    except Exception as e:
-        logger.error(f"读取数据范围失败: {e}")
-        df = pd.DataFrame()
-    
-    if df is None or len(df) == 0:
-        return pd.DataFrame(columns=sel)
+
+    # 使用 database_manager 直接查询（仅请求存在的列）
+    def _do_query(select_cols: list[str], *, with_adj: bool = True) -> pd.DataFrame:
+        try:
+            from config import DATA_ROOT, UNIFIED_DB_PATH
+            db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+            conditions = []
+            params = []
+            if codes:
+                placeholders = ",".join(["?"] * len(codes))
+                conditions.append(f"ts_code IN ({placeholders})")
+                params.extend(codes)
+            if start:
+                conditions.append("trade_date >= ?")
+                params.append(start)
+            if end:
+                conditions.append("trade_date <= ?")
+                params.append(end)
+            if with_adj:
+                conditions.append("adj_type = ?")
+                params.append(API_ADJ)
+            sql = f"SELECT {', '.join(select_cols)} FROM stock_data"
+            if conditions:
+                sql += " WHERE " + " AND ".join(conditions)
+            sql += " ORDER BY ts_code, trade_date"
+            manager = get_database_manager()
+            return manager.execute_sync_query(db_path, sql, params, timeout=120.0)
+        except Exception as e:
+            # 降低日志级别，避免 Binder Error 滚屏
+            logger.debug(f"读取数据范围失败（降级查询）: {e}")
+            return pd.DataFrame()
+
+    df = _do_query(sel, with_adj=True)
+    if df is None or df.empty:
+        # 再尝试无 adj_type 条件（兼容缺列或未填充 adj_type 的库）
+        df = _do_query(sel, with_adj=False)
+    if df is None or df.empty:
+        # 若首次查询失败（含 pre_close 缺失等），降级只取 open/close
+        fallback_sel = [c for c in ["ts_code", "trade_date", "open", "close"] if c in sel or c in ("ts_code","trade_date","open","close")]
+        df = _do_query(fallback_sel)
+    missing_pre_close = need_pre_close and ("pre_close" not in (df.columns if df is not None else []))
+
+    if df is None or df.empty:
+        cols_out = sel.copy()
+        if need_pre_close and "pre_close" not in cols_out:
+            cols_out.append("pre_close")
+        return pd.DataFrame(columns=cols_out)
+
     df = normalize_trade_date(df, "trade_date")
     if codes:
         df = df[df["ts_code"].isin(set(codes))]
-    return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+    df = df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+
+    # 事后补 pre_close
+    if missing_pre_close:
+        if "close" in df.columns:
+            df = df.sort_values(["ts_code", "trade_date"])
+            df["pre_close"] = df.groupby("ts_code")["close"].shift(1)
+        else:
+            df["pre_close"] = np.nan
+
+    return df
+
+
+def _limit_up_pct(ts_code: str, *, name_hint: str | None = None) -> float:
+    """按板块推断涨停幅度，兼顾 ST 名称提示。"""
+    try:
+        df_hint = None
+        if name_hint:
+            df_hint = pd.DataFrame({"name": [name_hint]})
+        return float(tdx._calc_limit_up_pct(ts_code, df=df_hint))
+    except Exception:
+        return 0.10
+
+
+def _first_non_limit_open(
+    px: pd.DataFrame,
+    ts_code: str,
+    ref_date: str,
+    *,
+    max_shift: int = 2,
+) -> tuple[Optional[float], Optional[str]]:
+    """找到参考日后第一个非涨停的开盘价，最多顺延 max_shift 个交易日。"""
+    if px is None or px.empty:
+        return None, None
+    df = px[px["ts_code"] == ts_code].sort_values("trade_date").reset_index(drop=True)
+    if df.empty:
+        return None, None
+
+    # 定位参考日索引（含 ref 日）
+    try:
+        idx_ref = df.index[df["trade_date"] == ref_date]
+        if len(idx_ref):
+            start_idx = idx_ref[-1] + 1  # 从下一交易日开始
+        else:
+            # 若没有 ref 日，取首个晚于 ref_date 的行
+            start_idx = df.index[df["trade_date"] > ref_date][0]
+    except Exception:
+        return None, None
+
+    name_hint = _stock_name_of(ts_code) or ""
+    limit_pct = _limit_up_pct(ts_code, name_hint=name_hint)
+
+    prev_close_cache = None
+    # 若存在 pre_close 列优先使用
+    if "pre_close" in df.columns:
+        prev_close_cache = df["pre_close"].shift(0)
+
+    for i in range(start_idx, min(start_idx + max_shift + 1, len(df))):
+        row = df.loc[i]
+        trade_date = str(row.get("trade_date"))
+        if trade_date <= ref_date:
+            continue
+        open_px = pd.to_numeric(row.get("open"), errors="coerce")
+        close_prev = None
+        if prev_close_cache is not None:
+            close_prev = pd.to_numeric(prev_close_cache.iloc[i], errors="coerce")
+        if pd.isna(close_prev):
+            # 回退到前一行的收盘
+            if i > 0:
+                close_prev = pd.to_numeric(df.loc[i - 1].get("close"), errors="coerce")
+        if pd.isna(open_px) or pd.isna(close_prev):
+            continue
+
+        limit_up_price = close_prev * (1 + limit_pct)
+        # 若开盘触及/超过涨停，视为涨停，继续顺延
+        if open_px >= limit_up_price * 0.999:
+            continue
+        return float(open_px), trade_date
+
+    return None, None
+
+
+def _bucket_ret_pct(pct: pd.Series) -> pd.Series:
+    """将涨跌幅分桶，返回区间标签。"""
+    bins = [-1.0, -0.05, -0.03, -0.01, 0.0, 0.01, 0.03, 0.05, 1.0]
+    labels = ["<-5%", "-5~-3%", "-3~-1%", "-1~0%", "0~1%", "1~3%", "3~5%", ">5%"]
+    try:
+        return pd.cut(pct, bins=bins, labels=labels, include_lowest=True, right=False)
+    except Exception:
+        return pd.Series([], dtype=str)
+
+
+def _nearest_trade_date_on_or_before(date_str: str) -> Optional[str]:
+    """返回 <= 指定日期的最近交易日；若无数据返回 None。"""
+    cal = _get_trade_dates_available() or []
+    if not cal:
+        return None
+    target = str(date_str)
+    for d in sorted(cal, reverse=True):
+        if d <= target:
+            return d
+    return None
+
+
+def _read_daily_market(trade_date: str, *, allow_prev: bool = True) -> tuple[pd.DataFrame, Optional[str]]:
+    """读取某交易日行情并直接附上上一交易日收盘价，避免 pre_close 缺失。
+    返回 (DataFrame, 实际使用的交易日)。
+    """
+    from config import DATA_ROOT, UNIFIED_DB_PATH
+    db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
+    manager = get_database_manager()
+
+    # 确定使用的交易日（可回退到最近可用交易日）
+    t_use = trade_date
+    if allow_prev:
+        nearest = _nearest_trade_date_on_or_before(trade_date)
+        if nearest:
+            t_use = nearest
+    prev = _prev_trade_date(t_use, 1)
+    if not prev:
+        return pd.DataFrame(), t_use
+
+    def _query(with_adj: bool) -> pd.DataFrame:
+        try:
+            sql = """
+            SELECT a.ts_code, a.trade_date, a.open, a.close, b.close AS pre_close
+            FROM stock_data a
+            JOIN stock_data b ON a.ts_code = b.ts_code AND b.trade_date = ?
+            WHERE a.trade_date = ?
+            """
+            params = [prev, t_use]
+            if with_adj:
+                sql += " AND a.adj_type = ?"
+                params.append(API_ADJ)
+            sql += " ORDER BY a.ts_code"
+            dfq = manager.execute_sync_query(db_path, sql, params, timeout=60.0)
+            return dfq if dfq is not None else pd.DataFrame()
+        except Exception as e:
+            logger.debug(f"读取市场日行情失败(with_adj={with_adj}): {e}")
+            return pd.DataFrame()
+
+    df = _query(True)
+    if df.empty:
+        df = _query(False)
+
+    if not df.empty:
+        df = normalize_trade_date(df, "trade_date")
+    return df, t_use
 
 # PortfolioManager 类
 class PortfolioManager:
@@ -1315,6 +1473,16 @@ def _stock_name_of(ts_code: str) -> str | None:
         core = ts.split(".")[0]
         return mp.get(core)
     return None
+
+
+def _is_st_stock(ts_code: str, name_map: Dict[str, str] | None = None) -> bool:
+    """粗判是否 ST：名称含 ST/*ST。"""
+    nm = None
+    if name_map:
+        nm = name_map.get(ts_code) or name_map.get(ts_code.split(".")[0], None)
+    if not nm:
+        return False
+    return bool(re.match(r"\s*\*?ST", str(nm), flags=re.IGNORECASE))
 
 
 def _resolve_user_code_input(raw: str) -> str | None:
@@ -3226,8 +3394,8 @@ if _in_streamlit():
     if "export_pref" not in st.session_state:
         st.session_state["export_pref"] = {"style": "space", "with_suffix": True}
 
-    tab_rank, tab_detail, tab_kline, tab_screen, tab_stats, tab_attn, tab_custom, tab_position, tab_predict, tab_rules, tab_tools, tab_port, tab_data_view = st.tabs(
-        ["排名", "个股详情", "K线看板", "选股", "统计", "衍生榜", "自选榜", "持仓建议", "明日模拟", "规则编辑", "工具箱", "组合模拟/持仓", "数据管理"])
+    tab_rank, tab_detail, tab_kline, tab_review, tab_screen, tab_stats, tab_attn, tab_custom, tab_position, tab_predict, tab_rules, tab_tools, tab_port, tab_data_view = st.tabs(
+        ["排名", "个股详情", "K线看板", "复盘", "选股", "统计", "衍生榜", "自选榜", "持仓建议", "明日模拟", "规则编辑", "工具箱", "组合模拟/持仓", "数据管理"])
 
     # ================== 排名 ==================
     with tab_rank:
@@ -3731,7 +3899,8 @@ if _in_streamlit():
 
                 # 交易性机会
                 ops = (summary.get("opportunities") or [])
-                with st.expander("交易性机会", expanded=True):
+                st.markdown("**交易性机会**")
+                with st.container(border=True):
                     if ops:
                         for t in ops:
                             if t:
@@ -4087,11 +4256,53 @@ if _in_streamlit():
             st.session_state["kline_ref_date_single"] = _get_latest_date_from_files() or ""
         if "kline_display_limit" not in st.session_state:
             st.session_state["kline_display_limit"] = 50
+        st.session_state.setdefault("kline_filter_mode", "不过滤")
+        st.session_state.setdefault("kline_filter_boards", [])
+        st.session_state.setdefault("kline_filter_rule", "")
+        st.session_state.setdefault("kline_filter_ref", st.session_state.get("kline_ref_date_single", ""))
+        st.session_state.setdefault("kline_filter_custom", "")
         ref_real_kline = (st.session_state.get("kline_ref_date_single") or "").strip() or _get_latest_date_from_files() or ""
-        display_codes_saved = st.session_state.get("kline_display_list", [])
+
+        base_codes_saved = st.session_state.get("kline_display_base", None)
+        if base_codes_saved is None:
+            base_codes_saved = st.session_state.get("kline_display_list", [])
+            st.session_state["kline_display_base"] = base_codes_saved
+
+        def _apply_kline_filter(codes: list[str], ref_date: str) -> list[str]:
+            """二次过滤：按板块、策略触发或自定义名单对展示列表做交集。"""
+            filtered = list(codes or [])
+            if not filtered:
+                return []
+            mode = st.session_state.get("kline_filter_mode", "不过滤")
+            if mode == "按板块分类":
+                boards = st.session_state.get("kline_filter_boards") or []
+                if boards:
+                    filtered = [c for c in filtered if _board_category(c) in boards]
+            elif mode == "按触发策略":
+                rule_pick = st.session_state.get("kline_filter_rule", "")
+                filter_ref = (st.session_state.get("kline_filter_ref") or ref_date or "").strip()
+                if rule_pick and rule_pick != "(暂无可选策略)" and filter_ref:
+                    try:
+                        triggered = set(_codes_triggered_on_rule(filter_ref, str(rule_pick)))
+                    except Exception as e:
+                        st.warning(f"按策略过滤失败：{e}")
+                        triggered = set()
+                    filtered = [c for c in filtered if c in triggered] if triggered else []
+            elif mode == "自定义名单":
+                custom_text = st.session_state.get("kline_filter_custom", "")
+                allow_list = _parse_code_list(custom_text)
+                if allow_list:
+                    allow = set(allow_list)
+                    filtered = [c for c in filtered if c in allow]
+                else:
+                    filtered = []
+            return filtered
+
+        display_codes_saved = list(base_codes_saved or [])
         display_limit = int(st.session_state.get("kline_display_limit", 50) or 0)
+        filtered_codes_saved = _apply_kline_filter(display_codes_saved, ref_real_kline)
         # 仅在用户点击生成名单后使用缓存名单，默认不导入 TopK
-        nav_codes_kline = display_codes_saved  # 全量名单用于导航/选择
+        nav_codes_kline = filtered_codes_saved
         prefetch_codes = nav_codes_kline
         prefetch_limited = False
         if display_limit > 0 and len(prefetch_codes) > display_limit:
@@ -4129,13 +4340,41 @@ if _in_streamlit():
             _prefetch_kline_prices(prefetch_codes, adj_type="qfq")
 
         if code_norm_kline and ref_real_kline:
-            _render_price_kline_chart(
-                ts=code_norm_kline,
-                ref_real=ref_real_kline,
-                options_codes=nav_codes_kline,
-                nav_state_prefix="kline",
-                price_cache=price_cache,
-            )
+            # 右侧展示前日排名，布局与个股详情保持一致（默认取近 15 天，可再调）
+            prev_ranks_kline = []
+            try:
+                prev_ranks_kline = _get_prev_rank_history(code_norm_kline, ref_real_kline, max_days=15)
+            except Exception as e:
+                logger.debug(f"读取前日排名失败（k线看板） {code_norm_kline}: {e}")
+            has_prev_ranks_kline = bool(prev_ranks_kline)
+
+            if has_prev_ranks_kline:
+                chart_col, rank_col = st.columns([5, 1])
+            else:
+                chart_col = st.container()
+                rank_col = None
+
+            with chart_col:
+                _render_price_kline_chart(
+                    ts=code_norm_kline,
+                    ref_real=ref_real_kline,
+                    options_codes=nav_codes_kline,
+                    nav_state_prefix="kline",
+                    price_cache=price_cache,
+                )
+
+            if has_prev_ranks_kline and rank_col:
+                with rank_col:
+                    st.markdown("**前日排名**")
+                    with st.container(border=True):
+                        for item in prev_ranks_kline:
+                            if not item:
+                                continue
+                            rank_text = f"{item.get('rank')}"
+                            total_val = item.get("total")
+                            if isinstance(total_val, int) and total_val > 0:
+                                rank_text = f"{rank_text} / {total_val}"
+                            st.write(f"{item.get('date', '')} · {rank_text}")
             concept_kline = concept_text_for_stock(code_norm_kline, blacklist=CONCEPT_BLACKLIST)
             name_map = _get_stock_name_map()
             stock_name = name_map.get(code_norm_kline, name_map.get(code_norm_kline.split(".")[0], ""))
@@ -4184,6 +4423,68 @@ if _in_streamlit():
                     st.metric("参考日", ref_real_kline or "—")
                 with info_col2:
                     st.metric("60%换手耗时", turnover_display)
+                # 交易性机会（格式对齐个股详情）
+                opps = []
+                rules_list_for_mapping = []
+                try:
+                    detail_obj = _load_detail_json(ref_real_kline, code_norm_kline)
+                    if detail_obj:
+                        summary_kline = detail_obj.get("summary", {}) or {}
+                        opps = summary_kline.get("opportunities", []) or []
+                        rules_list_for_mapping = detail_obj.get("rules", []) or []
+                except Exception:
+                    opps = []
+                    rules_list_for_mapping = []
+
+                explain_to_name = {}
+                try:
+                    for r in (getattr(se, "SC_RULES", []) or []):
+                        explain_val = r.get("explain")
+                        name_val = r.get("name")
+                        if explain_val and name_val:
+                            explain_str = str(explain_val).strip()
+                            name_str = str(name_val)
+                            explain_to_name[explain_str] = name_str
+                            explain_normalized = re.sub(r'\s+', '', explain_str)
+                            if explain_normalized != explain_str:
+                                explain_to_name[explain_normalized] = name_str
+                except Exception:
+                    pass
+
+                if isinstance(rules_list_for_mapping, list):
+                    for r in rules_list_for_mapping:
+                        if isinstance(r, dict):
+                            explain_val = r.get("explain")
+                            name_val = r.get("name")
+                            if explain_val and name_val:
+                                explain_str = str(explain_val).strip()
+                                name_str = str(name_val)
+                                if explain_str not in explain_to_name:
+                                    explain_to_name[explain_str] = name_str
+                                explain_normalized = re.sub(r'\s+', '', explain_str)
+                                if explain_normalized not in explain_to_name:
+                                    explain_to_name[explain_normalized] = name_str
+
+                def _get_rule_name(explain_text: str) -> str:
+                    if not explain_text:
+                        return explain_text
+                    explain_text = str(explain_text).strip()
+                    if explain_text in explain_to_name:
+                        return explain_to_name[explain_text]
+                    explain_normalized = re.sub(r'\s+', '', explain_text)
+                    if explain_normalized in explain_to_name:
+                        return explain_to_name[explain_normalized]
+                    return explain_text
+
+                st.markdown("**交易性机会**")
+                with st.container(border=True):
+                    if opps:
+                        for t in opps:
+                            if t:
+                                rule_name = _get_rule_name(t)
+                                st.write("• " + rule_name)
+                    else:
+                        st.caption("暂无")
         else:
             st.info("请选择股票和参考日以绘制K线。")
 
@@ -4211,6 +4512,7 @@ if _in_streamlit():
                 topk_value = st.session_state.get("kline_list_topk", 100)
                 topk_board_choice = st.session_state.get("kline_topk_board", "全部")
                 strategy_board_choice = st.session_state.get("kline_strategy_board", "全部")
+                rule_names_for_trigger = _get_rule_names()
 
                 list_source_options = ["TopK导入", "自定义名单", "触发了某个策略"]
                 if st.session_state.get("kline_list_source") not in list_source_options:
@@ -4236,7 +4538,6 @@ if _in_streamlit():
                 elif list_source == "自定义名单":
                     ref_for_list = ref_real_kline
                 else:
-                    rule_names_for_trigger = _get_rule_names()
                     ref_for_list = ref_real_kline
                     st.selectbox(
                         "选择策略",
@@ -4252,6 +4553,47 @@ if _in_streamlit():
                         strategy_board_options,
                         index=strategy_board_options.index(strategy_board_default) if strategy_board_default in strategy_board_options else 0,
                         key="kline_strategy_board"
+                    )
+
+                st.markdown("**二次过滤（常驻）**")
+                filter_mode_options = ["不过滤", "按板块分类", "按触发策略", "自定义名单"]
+                filter_mode_default = st.session_state.get("kline_filter_mode", filter_mode_options[0])
+                filter_mode = st.selectbox(
+                    "过滤方式",
+                    filter_mode_options,
+                    index=filter_mode_options.index(filter_mode_default) if filter_mode_default in filter_mode_options else 0,
+                    key="kline_filter_mode",
+                    help="对已生成名单做二次过滤，不影响原始名单。"
+                )
+                if filter_mode == "按板块分类":
+                    st.multiselect(
+                        "选择板块（可多选）",
+                        ["主板", "创业/科创", "北交所", "其他"],
+                        default=st.session_state.get("kline_filter_boards", []),
+                        key="kline_filter_boards",
+                        help="按交易所分类过滤。"
+                    )
+                elif filter_mode == "按触发策略":
+                    st.selectbox(
+                        "过滤策略名（仅保留触发的票）",
+                        options=rule_names_for_trigger or ["(暂无可选策略)"],
+                        index=0,
+                        key="kline_filter_rule",
+                        placeholder="选择策略名"
+                    )
+                    filter_ref_default = st.session_state.get("kline_filter_ref") or ref_for_list
+                    st.text_input(
+                        "过滤参考日（留空=使用上方参考日）",
+                        value=filter_ref_default,
+                        key="kline_filter_ref",
+                        help="从详情库读取该日的触发记录，再与当前名单取交集。"
+                    )
+                elif filter_mode == "自定义名单":
+                    st.text_area(
+                        "过滤名单（仅保留交集，可用代码/简称，支持换行/逗号分隔）",
+                        value=st.session_state.get("kline_filter_custom", ""),
+                        key="kline_filter_custom",
+                        height=80
                     )
 
             with colB:
@@ -4296,7 +4638,7 @@ if _in_streamlit():
                     custom_default = st.session_state.get("kline_custom_text", "")
                     col_clear1, col_clear2 = st.columns([1, 1])
                     with col_clear1:
-                        if st.button("清空自定义名单", key="btn_clear_kline_custom", use_container_width=True):
+                        if st.button("清空自定义名单", key="btn_clear_kline_custom", width="stretch"):
                             st.session_state["kline_custom_text"] = ""
                             st.session_state["kline_custom_text_area"] = ""
                     custom_text = st.text_area(
@@ -4354,6 +4696,7 @@ if _in_streamlit():
                         seen.add(c)
                         deduped.append(c)
                 codes_list = deduped
+                st.session_state["kline_display_base"] = codes_list
                 st.session_state["kline_display_list"] = codes_list
                 st.session_state["kline_display_ref"] = list_ref_to_use
                 st.session_state["kline_custom_text"] = custom_text
@@ -4367,9 +4710,11 @@ if _in_streamlit():
                 except Exception:
                     pass
             else:
+                st.session_state["kline_display_base"] = []
+                st.session_state["kline_display_list"] = []
                 st.warning("名单为空，请检查TopK文件或自定义输入。")
 
-        display_codes = st.session_state.get("kline_display_list", [])
+        display_codes = filtered_codes_saved
         display_ref = st.session_state.get("kline_display_ref") or ref_real_kline
         if display_codes and display_ref:
             total_len = len(display_codes)
@@ -4377,6 +4722,8 @@ if _in_streamlit():
             st.dataframe(pd.DataFrame({"ts_code": display_codes}), width="stretch", height=320, hide_index=True)
             if prefetch_limited and total_len > display_limit:
                 st.caption(f"预加载按上限 {display_limit} 只执行，超过部分按需读取。")
+        elif (display_codes_saved or base_codes_saved) and display_ref:
+            st.info("过滤后名单为空，请调整过滤条件。")
         else:
             st.info("点击上方按钮生成展示名单。")
 
@@ -6368,6 +6715,264 @@ if _in_streamlit():
         else:
             st.info("自定义榜单目录不存在")
 
+    # ================== 复盘 ==================
+    with tab_review:
+        st.subheader("复盘")
+
+        # 参考日列表（优先 details 库，其次评分文件）
+        available_review_dates: list[str] = []
+        try:
+            db_path = get_details_db_path_with_fallback()
+            if db_path and is_details_db_available():
+                dates_from_db = query_details_recent_dates(365, db_path)
+                if dates_from_db:
+                    available_review_dates = sorted(dates_from_db, reverse=True)
+        except Exception as e:
+            logger.debug(f"读取复盘参考日失败: {e}")
+        if not available_review_dates:
+            try:
+                files = sorted(ALL_DIR.glob("score_all_*.csv"))
+                for p in files:
+                    m = re.search(r"(\\d{8})", p.name)
+                    if m:
+                        available_review_dates.append(m.group(1))
+                available_review_dates = sorted(set(available_review_dates), reverse=True)
+            except Exception:
+                available_review_dates = []
+
+        latest_trade = ""
+        try:
+            latest_trade = get_latest_trade_date() or ""
+        except Exception:
+            latest_trade = _get_latest_date_from_files() or ""
+
+        st.caption("说明：买入价=参考日后首个未触及涨停的开盘价（区分主板/创业科创/北交/ST 对应 10%/20%/30%/5%，最多顺延 2 个交易日）。")
+
+        with st.form("review_form"):
+            c1, c2, c3 = st.columns([1.2, 1, 1])
+            with c1:
+                ref_review = st.selectbox(
+                    "参考日（排名日）",
+                    options=available_review_dates if available_review_dates else ["（暂无可选日期）"],
+                    index=0 if available_review_dates else 0,
+                    key="review_ref_date",
+                )
+            with c2:
+                obs_date = st.text_input(
+                    "观测截止日（YYYYMMDD）",
+                    value=latest_trade,
+                    help="用于单日市场分布与持有期收益终点；默认数据库最新交易日。",
+                    key="review_obs_date",
+                )
+            with c3:
+                topn_review = st.number_input("Top-N（0=全量）", min_value=0, max_value=5000, value=200, step=20, key="review_topn")
+
+            c4, c5, c6 = st.columns([1, 1, 1])
+            with c4:
+                hold_days = st.multiselect("持有期（交易日）", options=[1,3,5,10,20], default=[5,10,20], key="review_holds")
+            with c5:
+                high_thr = st.number_input("亮点阈值 ≥%", min_value=-50.0, max_value=200.0, value=5.0, step=0.5, key="review_high_thr")
+                low_thr = st.number_input("缺点阈值 ≤%", min_value=-200.0, max_value=50.0, value=-3.0, step=0.5, key="review_low_thr")
+            with c6:
+                max_shift = st.number_input("买点顺延天数", min_value=0, max_value=5, value=2, step=1, key="review_max_shift")
+                include_st = st.checkbox("包含 ST/北交所", value=False, key="review_include_st")
+                price_mode_choice = st.selectbox("买价口径", ["T+1非涨停开盘", "T+1开盘(不判涨停)"], index=0, key="review_price_mode")
+
+            run_review = st.form_submit_button("生成复盘", width="stretch")
+
+        if run_review:
+            ref_use = str(ref_review).strip()
+            obs_use = str(obs_date).strip()
+            if not ref_use or not _is_valid_date(ref_use):
+                st.error("参考日无效")
+            elif not obs_use or not _is_valid_date(obs_use):
+                st.error("观测截止日无效")
+            elif obs_use < ref_use:
+                st.error("观测日不能早于参考日")
+            else:
+                df_rank = _slice_top_from_all(ref_use, None if topn_review == 0 else int(topn_review))
+                if df_rank.empty:
+                    st.warning("未找到参考日的排名数据")
+                else:
+                    name_map = _get_stock_name_map()
+                    total_rank_cnt = len(df_rank)
+                    if not include_st:
+                        df_rank = df_rank[~df_rank["ts_code"].astype(str).apply(lambda x: _is_st_stock(x, name_map))]
+                    st.caption(f"排名样本：原始 {total_rank_cnt} 只；去除 ST/北交 {len(df_rank)} 只。")
+                    codes = df_rank["ts_code"].astype(str).tolist()
+
+                    # 拉取价格：包含 open/close/pre_close
+                    px_cols = ("open","close","pre_close")
+                    px = _read_px(codes, ref_use, obs_use, cols=px_cols)
+                    if px.empty:
+                        st.error("未能获取价格数据")
+                    else:
+                        hold_days_sorted = sorted({int(x) for x in hold_days}) if hold_days else [5,10,20]
+                        rows = []
+                        failed_buy = []
+                        for _, r in df_rank.iterrows():
+                            ts = str(r["ts_code"])
+                            px_ts = px[px["ts_code"] == ts]
+                            if px_ts.empty:
+                                failed_buy.append((ts, "无价格数据"))
+                                continue
+                            if price_mode_choice.startswith("T+1非涨停"):
+                                entry_px, entry_date = _first_non_limit_open(px_ts, ts, ref_use, max_shift=int(max_shift))
+                            else:
+                                entry_date = _shift_trade_date(ref_use, 1, clamp=True)
+                                entry_row = px_ts[px_ts["trade_date"] == entry_date]
+                                entry_px = float(entry_row["open"].iloc[0]) if len(entry_row) else None
+                            if entry_px is None or not entry_date:
+                                failed_buy.append((ts, "买点无效/连续涨停"))
+                                continue
+
+                            for h in hold_days_sorted:
+                                tgt_date = _shift_trade_date(entry_date, h, clamp=True)
+                                if tgt_date is None or tgt_date > obs_use:
+                                    continue
+                                tgt_row = px_ts[px_ts["trade_date"] == tgt_date]
+                                if tgt_row.empty:
+                                    continue
+                                close_px = float(tgt_row["close"].iloc[0])
+                                ret = close_px / entry_px - 1.0
+                                rows.append({
+                                    "ts_code": ts,
+                                    "rank": r.get("rank"),
+                                    "entry_date": entry_date,
+                                    "hold": h,
+                                    "tgt_date": tgt_date,
+                                    "entry_px": entry_px,
+                                    "close_px": close_px,
+                                    "ret_pct": ret,
+                                })
+
+                        df_ret = pd.DataFrame(rows)
+                        if df_ret.empty:
+                            st.warning("无有效持有期收益记录（可能全部买点失效或缺行情）")
+                        else:
+                            # 亮点 / 缺点列表（按最长持有期收益判定）
+                            long_h = max(hold_days_sorted) if hold_days_sorted else 0
+                            latest_ret = df_ret[df_ret["hold"] == long_h].copy()
+                            latest_ret["name"] = latest_ret["ts_code"].map(lambda x: _stock_name_of(x) or "")
+                            latest_ret["ret_pct_view"] = (latest_ret["ret_pct"] * 100).round(2)
+                            highlight = latest_ret[latest_ret["ret_pct_view"] >= high_thr].sort_values("ret_pct_view", ascending=False)
+                            drawback = latest_ret[latest_ret["ret_pct_view"] <= low_thr].sort_values("ret_pct_view")
+
+                            st.markdown("**亮点（≥阈值）**")
+                            if highlight.empty:
+                                st.info("无满足亮点阈值的标的")
+                            else:
+                                st.dataframe(highlight[["rank","ts_code","name","ret_pct_view"]], width='stretch', hide_index=True)
+
+                            st.markdown("**缺点（≤阈值）**")
+                            if drawback.empty:
+                                st.info("无满足缺点阈值的标的")
+                            else:
+                                st.dataframe(drawback[["rank","ts_code","name","ret_pct_view"]], width='stretch', hide_index=True)
+
+                            # 持有期收益明细透视
+                            st.markdown("**持有期收益**（%）")
+                            pivot = df_ret.pivot_table(index="ts_code", columns="hold", values="ret_pct", aggfunc="last")
+                            pivot = pivot.multiply(100).round(2)
+                            pivot.insert(0, "rank", pivot.index.map(lambda x: int(df_rank.loc[df_rank["ts_code"]==x, "rank"].iloc[0]) if (df_rank["ts_code"]==x).any() else None))
+                            pivot = pivot.sort_values("rank")
+                            # 列名混合类型会触发 Streamlit 提示，将列名统一转为字符串
+                            pivot_display = pivot.copy()
+                            pivot_display.columns = pivot_display.columns.astype(str)
+                            st.dataframe(pivot_display, width='stretch', height=420)
+
+                            if failed_buy:
+                                st.caption(f"买点失败 {len(failed_buy)} 只： " + "、".join([f"{c}({msg})" for c, msg in failed_buy[:10]]))
+
+                        # 单日分布柱状图（参考 obs_use）
+                        st.markdown("**单日涨跌分布（排名 vs 全市场）**")
+                        mkt, obs_used = _read_daily_market(obs_use, allow_prev=True)
+                        st.caption(f"观测日使用：{obs_used or obs_use}")
+                        if mkt.empty or "close" not in mkt or "pre_close" not in mkt:
+                            st.info("市场日行情缺失，无法绘制柱状图")
+                        else:
+                            mkt["ret"] = pd.to_numeric(mkt["close"], errors="coerce") / pd.to_numeric(mkt["pre_close"], errors="coerce") - 1.0
+                            mkt = mkt.dropna(subset=["ret"])
+                            rank_mkt = mkt[mkt["ts_code"].isin(codes)].copy()
+                            missing_for_chart = sorted(set(codes) - set(rank_mkt["ts_code"].astype(str)))
+                            if missing_for_chart:
+                                name_map = _get_stock_name_map()
+                                preview_missing = [f"{c}({name_map.get(c,'')})" for c in missing_for_chart[:15]]
+                                st.caption(f"观测日无行情/被过滤的排名内标的 {len(missing_for_chart)} 只：" + "、".join(preview_missing) + (" …" if len(missing_for_chart)>15 else ""))
+                            order = ["<-5%","-5~-3%","-3~-1%","-1~0%","0~1%","1~3%","3~5%",">5%"]
+                            rank_mkt["bucket"] = pd.Categorical(_bucket_ret_pct(rank_mkt["ret"]), categories=order, ordered=True)
+                            mkt["bucket"] = pd.Categorical(_bucket_ret_pct(mkt["ret"]), categories=order, ordered=True)
+
+                            def _count_bucket(df):
+                                return df["bucket"].value_counts(sort=False).reindex(order, fill_value=0).astype(int)
+
+                            rank_cnt = _count_bucket(rank_mkt)
+                            mkt_cnt = _count_bucket(mkt)
+                            rank_pct = (rank_cnt / max(rank_cnt.sum(), 1) * 100).round(2)
+                            mkt_pct = (mkt_cnt / max(mkt_cnt.sum(), 1) * 100).round(2)
+                            diff_pct = (rank_pct - mkt_pct).round(2)
+
+                            st.caption(f"样本统计：排名内 {len(rank_mkt)} 支；全市场 {len(mkt)} 支。")
+                            # 追加累积占比与差异支数，便于快速对比
+                            rank_cum = rank_pct.cumsum().round(2)
+                            mkt_cum = mkt_pct.cumsum().round(2)
+                            diff_cnt = (rank_cnt - mkt_cnt).astype(int)
+                            st.dataframe(
+                                pd.DataFrame({
+                                    "区间": order,
+                                    "排名内支数": rank_cnt.values,
+                                    "全市场支数": mkt_cnt.values,
+                                    "排名占比%": rank_pct.values,
+                                    "全市场占比%": mkt_pct.values,
+                                    "排名累积%": rank_cum.values,
+                                    "全市累积%": mkt_cum.values,
+                                    "差异支数": diff_cnt.values,
+                                    "差异%(排名-全市)": diff_pct.values
+                                }),
+                                width='stretch', height=240, hide_index=True,
+                            )
+
+                            if len(rank_mkt) == 0 and len(mkt) == 0:
+                                st.info("无有效样本，无法绘制柱状图。请检查观测日或行情数据。")
+                            else:
+                                import plotly.graph_objects as go
+                                # 各自动态纵轴：避免一个样本数过大时另一侧柱状图被“压扁”
+                                max_rank_y = max(rank_cnt.max(), 1)
+                                max_mkt_y = max(mkt_cnt.max(), 1)
+                                ymax_rank = float(math.ceil(max_rank_y * 1.15))
+                                ymax_mkt = float(math.ceil(max_mkt_y * 1.15))
+
+                                col_left, col_right = st.columns(2)
+                                with col_left:
+                                    fig_rank = go.Figure()
+                                    fig_rank.add_bar(x=rank_cnt.index.astype(str), y=rank_cnt.values,
+                                                     text=[f"{c} ({p}%)" for c, p in zip(rank_cnt.values, rank_pct.values)],
+                                                     textposition="auto",
+                                                     marker_color="#1f77b4", name="排名内")
+                                    fig_rank.update_layout(
+                                        title="排名内分布",
+                                        yaxis_title="支数",
+                                        xaxis_title="当日涨跌幅区间",
+                                        yaxis=dict(range=[0, ymax_rank], showline=True, zeroline=False),
+                                        width=450, height=420,
+                                    )
+                                    st.plotly_chart(fig_rank, width="stretch")
+                                with col_right:
+                                    fig_mkt = go.Figure()
+                                    fig_mkt.add_bar(x=mkt_cnt.index.astype(str), y=mkt_cnt.values,
+                                                    text=[f"{c} ({p}%)" for c, p in zip(mkt_cnt.values, mkt_pct.values)],
+                                                    textposition="auto",
+                                                    marker_color="#ff7f0e", name="全市场")
+                                    fig_mkt.update_layout(
+                                        title="全市场分布",
+                                        yaxis_title="支数",
+                                        xaxis_title="当日涨跌幅区间",
+                                        yaxis=dict(range=[0, ymax_mkt], showline=True, zeroline=False),
+                                        width=450, height=420,
+                                    )
+                                    st.plotly_chart(fig_mkt, width="stretch")
+
+
     # ================== 选股 ==================
     with tab_screen:
         st.subheader("选股")
@@ -6663,7 +7268,7 @@ if _in_streamlit():
                             key="screen_cap_concept",
                             help="基于 stock_list.csv 的 total_mv；查不到则无法命中筛选。"
                         )
-                        show_btn = st.form_submit_button("显示筛选结果", use_container_width=True, type="primary")
+                        show_btn = st.form_submit_button("显示筛选结果", width="stretch", type="primary")
 
                     if sel_concepts:
                         mask = df_concept_base["概念"].apply(
