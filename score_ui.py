@@ -6830,6 +6830,26 @@ if _in_streamlit():
             elif obs_use < ref_use:
                 st.error("观测日不能早于参考日")
             else:
+                _can_review = True
+                # 将观测日对齐到最近的交易日，避免非交易日导致价格缺失
+                obs_trade = _nearest_trade_date_on_or_before(obs_use)
+                if not obs_trade:
+                    st.error("无法找到可用的观测交易日")
+                    _can_review = False
+                else:
+                    if obs_trade != obs_use:
+                        st.info(f"观测截止日 {obs_use} 非交易日，已自动对齐到最近交易日 {obs_trade}")
+                        obs_use = obs_trade
+
+                    # 观测日至少需要覆盖参考日后的首个交易日，否则无法形成买点
+                    next_trade_after_ref = _shift_trade_date(ref_use, 1, clamp=False)
+                    if next_trade_after_ref and obs_use < next_trade_after_ref:
+                        st.error(f"观测日需不早于参考日后首个交易日：{next_trade_after_ref}")
+                        _can_review = False
+
+                if not _can_review:
+                    st.stop()
+
                 df_rank = _slice_top_from_all(ref_use, None if topn_review == 0 else int(topn_review))
                 if df_rank.empty:
                     st.warning("未找到参考日的排名数据")
@@ -6842,12 +6862,41 @@ if _in_streamlit():
                     codes = df_rank["ts_code"].astype(str).tolist()
 
                     # 拉取价格：包含 open/close/pre_close
+                    hold_days_sorted = sorted({int(x) for x in hold_days}) if hold_days else [5,10,20]
+
+                    # 根据可用交易日动态裁剪持有期，避免观测日过近导致无结果
+                    cal = _get_trade_dates_available() or []
+                    effective_holds = hold_days_sorted
+                    if ref_use in cal and obs_use in cal:
+                        try:
+                            obs_idx = cal.index(obs_use)
+                            earliest_entry = _shift_trade_date(ref_use, 1, clamp=True) or ref_use
+                            entry_idx = cal.index(earliest_entry) if earliest_entry in cal else cal.index(obs_use)
+                            max_hold_possible = max(0, obs_idx - entry_idx)
+                            # 如果观测日恰好等于最早买入日，允许 0 日持有（同日开收）
+                            if max_hold_possible == 0:
+                                effective_holds = [0]
+                            else:
+                                effective_holds = [h for h in hold_days_sorted if h <= max_hold_possible]
+                                if not effective_holds:
+                                    effective_holds = [max_hold_possible]
+                            if effective_holds != hold_days_sorted:
+                                st.info(f"持有期已根据观测日自动裁剪为: {effective_holds}")
+                        except Exception:
+                            effective_holds = hold_days_sorted
+
+                    # 价格查询的结束日需要覆盖买点顺延及最长持有期，避免非最新观测日导致数据不足
+                    fetch_end = obs_use
+                    max_need = max([int(max_shift)] + effective_holds) if effective_holds else int(max_shift)
+                    extra_end = _shift_trade_date(ref_use, max_need + 1, clamp=True)
+                    if extra_end:
+                        fetch_end = max(fetch_end, extra_end)
+
                     px_cols = ("open","close","pre_close")
-                    px = _read_px(codes, ref_use, obs_use, cols=px_cols)
+                    px = _read_px(codes, ref_use, fetch_end, cols=px_cols)
                     if px.empty:
                         st.error("未能获取价格数据")
                     else:
-                        hold_days_sorted = sorted({int(x) for x in hold_days}) if hold_days else [5,10,20]
                         rows = []
                         failed_buy = []
                         for _, r in df_rank.iterrows():
@@ -6866,7 +6915,7 @@ if _in_streamlit():
                                 failed_buy.append((ts, "买点无效/连续涨停"))
                                 continue
 
-                            for h in hold_days_sorted:
+                            for h in effective_holds:
                                 tgt_date = _shift_trade_date(entry_date, h, clamp=True)
                                 if tgt_date is None or tgt_date > obs_use:
                                     continue
@@ -6891,7 +6940,7 @@ if _in_streamlit():
                             st.warning("无有效持有期收益记录（可能全部买点失效或缺行情）")
                         else:
                             # 亮点 / 缺点列表（按最长持有期收益判定）
-                            long_h = max(hold_days_sorted) if hold_days_sorted else 0
+                            long_h = max(effective_holds) if effective_holds else 0
                             latest_ret = df_ret[df_ret["hold"] == long_h].copy()
                             latest_ret["name"] = latest_ret["ts_code"].map(lambda x: _stock_name_of(x) or "")
                             latest_ret["ret_pct_view"] = (latest_ret["ret_pct"] * 100).round(2)

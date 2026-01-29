@@ -33,6 +33,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from tqdm import tqdm
+from urllib3.exceptions import ProtocolError
 
 # 禁用环境代理，防止请求被重定向到本地代理/socks
 for _k in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
@@ -45,6 +46,22 @@ os.environ.setdefault("LOG_DISABLE_MP_QUEUE", "1")
 import config as cfg
 from download import TokenBucketRateLimiter
 from utils import normalize_em_ts_code
+
+_em_session = requests.Session()
+_em_adapter = HTTPAdapter(
+    max_retries=Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=None,  # Retry on all methods including GET
+        raise_on_status=False,
+    )
+)
+_em_session.mount("http://", _em_adapter)
+_em_session.mount("https://", _em_adapter)
+# 明确隔离东财会话，避免意外带入同花顺 Cookie/头
+_em_session.cookies.clear()
+_em_session.headers.clear()
 
 BASE_DIR = ROOT / "stock_data" / "concepts"
 EM_DIR = BASE_DIR / "em"
@@ -69,6 +86,20 @@ if THS_PROXY_PORT > 0:
 _ths_proxy_idx = 0
 THS_COOKIE_FILE = THS_DIR / "ths_cookie.txt"
 THS_BACKOFF_DELAYS = [160, 80, 40, 20, 10]  # 失败重试等待（秒），倒序递减，成功后重置
+EM_RETRY_MAX = 4
+EM_RETRY_BASE_DELAY = 3.0
+EM_RETRY_BACKOFF_FACTOR = 2.0
+EM_MEMBER_RETRY_ROUND_MAX = 3  # 成分抓取失败后重新跑的轮次
+EM_MEMBER_RETRY_SLEEP = 120     # 轮次之间的等待秒数
+
+# 端口/协议容错：优先 http，失败时自动降级/切换到 https
+EM_URL_FALLBACK_ENABLE = True
+# 按优先级的东财域名（优先延迟/备站，最后才用主站）
+EM_HOST_FALLBACKS = [
+    "push2delay.eastmoney.com", # 302 指向的延迟域，部分网络更稳定
+    "push2his.eastmoney.com",   # 备站
+    "push2.eastmoney.com",      # 主站
+]
 
 # 东方财富接口参数（概念板块列表 + 成分）
 EM_HEADERS = {
@@ -76,6 +107,8 @@ EM_HEADERS = {
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
     "Referer": "http://quote.eastmoney.com/",
 }
 
@@ -112,6 +145,73 @@ RETRY_ROUND_MAX = 3      # 最多重试轮次，防止无限循环
 THS_COOKIE_ENV = "THS_COOKIE"  # 从环境变量读取同花顺 Cookie（可选）
 THS_LOGIN_URL = "https://upass.10jqka.com.cn/login?redir=https://basic.10jqka.com.cn/"  # 自动获取 Cookie 时打开的登录页
 THS_COOKIE_VERIFY_URL = "https://basic.10jqka.com.cn/"  # 登录后刷新以确保 Cookie 落到目标域
+
+
+def _load_download_sources() -> List[str]:
+    """解析配置中的概念抓取源，返回去重后的有序列表。"""
+    default = ["em", "ths"]
+    raw = getattr(cfg, "CONCEPT_DOWNLOAD_SOURCES", default)
+    if isinstance(raw, str):
+        raw_list = [raw]
+    else:
+        try:
+            raw_list = list(raw)
+        except Exception:
+            raw_list = default
+
+    normalized: List[str] = []
+    for item in raw_list:
+        key = str(item).strip().lower()
+        if not key:
+            continue
+        if key in {"all", "both", "default"}:
+            return default
+        if key in {"em", "eastmoney", "dfcf", "东方财富"}:
+            normalized.append("em")
+        elif key in {"ths", "10jqka", "同花顺"}:
+            normalized.append("ths")
+
+    if not normalized:
+        return default
+
+    # 去重但保持顺序
+    seen = set()
+    ordered: List[str] = []
+    for item in normalized:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _run_ths_with_restart(delay_seconds: int = 600, max_retries: int = 3) -> pd.DataFrame:
+    """
+    运行同花顺抓取，若出现无法自愈的网络问题则延迟后自动重启。
+    判断标准：
+    - run_ths_all_mode 抛出异常或 SystemExit（如连续 403）
+    - 返回结果为空（len == 0）
+    """
+    attempt = 1
+    while attempt <= max_retries:
+        try:
+            df = run_ths_all_mode()
+            if df is not None and not df.empty:
+                return df
+            tqdm.write(f"同花顺抓取结果为空，判定为失败（尝试 {attempt}/{max_retries}）。")
+        except SystemExit as e:
+            tqdm.write(f"同花顺抓取触发 SystemExit({e.code})，可能为网络/403 问题。")
+        except Exception as e:
+            tqdm.write(f"同花顺抓取异常：{e}（尝试 {attempt}/{max_retries}）。")
+
+        if attempt >= max_retries:
+            break
+        attempt += 1
+        tqdm.write(f"{delay_seconds} 秒后自动重启同花顺抓取 ...")
+        time.sleep(delay_seconds)
+
+    tqdm.write("同花顺抓取多次失败，已停止自动重启。")
+    return pd.DataFrame()
 
 
 def _persist_ths_cookie(cookie: str) -> None:
@@ -381,10 +481,70 @@ def fetch_realtime_quote(
 
 
 def _get_json(url: str) -> Dict:
-    em_limiter.wait_if_needed()
-    resp = requests.get(url, headers=EM_HEADERS, timeout=10, proxies=EM_PROXIES)
-    resp.raise_for_status()
-    return resp.json()
+    """请求东财接口，带简单重试与指数退避，缓解偶发网络问题。"""
+    def _candidate_urls(u: str) -> List[str]:
+        if not EM_URL_FALLBACK_ENABLE:
+            return [u]
+        res: List[str] = []
+        from urllib.parse import urlsplit, urlunsplit
+        parsed = urlsplit(u)
+        schemes = ["https", "http"]  # 优先 https，无法连通再降级 http
+        hosts: List[str] = []
+        # 先放备用/延迟域，再放原始域，避免始终卡在默认 host
+        for h in EM_HOST_FALLBACKS:
+            if h and h not in hosts:
+                hosts.append(h)
+        if parsed.hostname and parsed.hostname not in hosts:
+            hosts.append(parsed.hostname)
+        for sch in schemes:
+            for host in hosts:
+                netloc = host
+                if parsed.port:
+                    netloc = f"{host}:{parsed.port}"
+                res.append(urlunsplit((sch, netloc, parsed.path, parsed.query, parsed.fragment)))
+        # 去重保持顺序
+        seen: set = set()
+        uniq: List[str] = []
+        for x in res:
+            if x in seen:
+                continue
+            seen.add(x)
+            uniq.append(x)
+        return uniq
+
+    candidates = _candidate_urls(url)
+
+    for idx, cur_url in enumerate(candidates, start=1):
+        for attempt in range(1, EM_RETRY_MAX + 1):
+            try:
+                em_limiter.wait_if_needed()
+                resp = _em_session.get(cur_url, headers=EM_HEADERS, timeout=10, proxies=EM_PROXIES)
+                resp.raise_for_status()
+                try:
+                    return resp.json()
+                except Exception:
+                    # 可能返回了 HTML（如风控/验证码），记录片段便于判断
+                    text = (resp.text or "")[:400]
+                    raise ValueError(f"非JSON响应，状态{resp.status_code}，片段: {text!r}")
+            except Exception as e:
+                last_candidate = idx == len(candidates)
+                # 对“远端关闭连接”类错误，直接换下一个候选域名以避免无效重试
+                if isinstance(e, ProtocolError) or "RemoteDisconnected" in str(e):
+                    if last_candidate and attempt >= EM_RETRY_MAX:
+                        logger.warning("东财请求多次失败(第%s次)：%s | url=%s", attempt, e, cur_url)
+                        raise
+                    logger.debug("东财请求远端关闭连接，切换下一候选 host：%s", cur_url)
+                    break
+                if attempt >= EM_RETRY_MAX:
+                    if last_candidate:
+                        logger.warning("东财请求多次失败(第%s次)：%s | url=%s", attempt, e, cur_url)
+                        raise
+                    else:
+                        logger.debug("东财请求已在 candidate %s/%s 用尽重试，切换下一个候选：%s", idx, len(candidates), cur_url)
+                        break
+                delay = EM_RETRY_BASE_DELAY * (EM_RETRY_BACKOFF_FACTOR ** (attempt - 1))
+                logger.debug("东财请求失败(第%s次, candidate %s/%s)，%ss后重试：%s", attempt, idx, len(candidates), delay, e)
+                time.sleep(delay)
 
 
 def fetch_concept_list() -> pd.DataFrame:
@@ -843,43 +1003,68 @@ def run_em() -> pd.DataFrame:
             pass
 
     logger.debug("抓取概念列表 ...")
-    concepts = fetch_concept_list()
+    try:
+        concepts = fetch_concept_list()
+    except Exception as e:
+        tqdm.write(f"东财概念列表抓取失败：{e}")
+        logger.warning("东财概念列表抓取失败，终止本轮东财抓取：%s", e)
+        return pd.DataFrame()
     if concepts.empty:
         tqdm.write("概念列表为空，终止。")
         logger.warning("概念列表为空，终止。")
         return pd.DataFrame()
+    tqdm.write(f"东财概念列表获取成功，共 {len(concepts)} 个；开始抓取成分…")
     concepts.to_csv(EM_DIR / "concepts.csv", index=False)
     logger.debug("概念数：%s", len(concepts))
 
+    def _run_batch(target: List[Tuple[str, str]]) -> Tuple[List[pd.DataFrame], List[Tuple[str, str]]]:
+        ok: List[pd.DataFrame] = []
+        failed_local: List[Tuple[str, str]] = []
+        max_workers = min(16, os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(fetch_members, bk): (bk, name) for bk, name in target}
+            with tqdm(total=len(future_map), desc="抓取概念成分", **_tqdm_kwargs()) as bar:
+                for future in as_completed(future_map):
+                    bk, name = future_map[future]
+                    try:
+                        df = future.result()
+                        if not df.empty:
+                            if name:
+                                df["concept_name"] = name
+                            ok.append(df)
+                            logger.debug("板块 %s %s 成分 %s 条", bk, name, len(df))
+                        else:
+                            logger.debug("板块 %s %s 成分为空", bk, name)
+                    except Exception as e:
+                        failed_local.append((bk, str(e)))
+                        logger.warning("板块 %s 抓取失败: %s", bk, e)
+                    bar.update(1)
+                    bar.set_postfix(success=len(ok), failed=len(failed_local))
+                    time.sleep(PAUSE_SEC)
+        return ok, failed_local
+
+    # 初始一轮抓取
+    targets = [(row["concept_code"], row["concept_name"]) for _, row in concepts.iterrows()]
     all_members: List[pd.DataFrame] = []
-    failed: List[Tuple[str, str]] = []
-    max_workers = min(16, os.cpu_count() or 4)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(fetch_members, row["concept_code"]): row for _, row in concepts.iterrows()}
-        with tqdm(total=len(future_map), desc="抓取概念成分", **_tqdm_kwargs()) as bar:
-            for future in as_completed(future_map):
-                row = future_map[future]
-                bk = row["concept_code"]
-                name = row["concept_name"]
-                try:
-                    df = future.result()
-                    if not df.empty:
-                        df["concept_name"] = name
-                        all_members.append(df)
-                        logger.debug("板块 %s %s 成分 %s 条", bk, name, len(df))
-                    else:
-                        logger.debug("板块 %s %s 成分为空", bk, name)
-                except Exception as e:
-                    failed.append((bk, str(e)))
-                    logger.warning("板块 %s 抓取失败: %s", bk, e)
-                bar.update(1)
-                bar.set_postfix(success=len(all_members), failed=len(failed))
-                time.sleep(PAUSE_SEC)
+    ok_batch, failed = _run_batch(targets)
+    all_members.extend(ok_batch)
+
+    # 针对失败的板块做多轮重试
+    round_idx = 1
+    while failed and round_idx <= EM_MEMBER_RETRY_ROUND_MAX:
+        tqdm.write(f"东财成分重试第 {round_idx}/{EM_MEMBER_RETRY_ROUND_MAX} 轮，剩余失败 {len(failed)} 个板块 ...")
+        time.sleep(EM_MEMBER_RETRY_SLEEP)
+        retry_targets = [(bk, None) for bk, _ in failed]  # name 可为空，fetch_members 只需代码
+        ok_batch, failed = _run_batch(retry_targets)
+        all_members.extend(ok_batch)
+        round_idx += 1
 
     if not all_members:
         tqdm.write("未获取到任何板块成分。")
         logger.warning("未获取到任何板块成分。")
         return pd.DataFrame()
+    if failed:
+        tqdm.write(f"东财成分最终仍有 {len(failed)} 个板块失败，详见日志。")
 
     members = pd.concat(all_members, ignore_index=True)
     members.to_csv(EM_DIR / "concept_members.csv", index=False)
@@ -947,7 +1132,11 @@ def main() -> None:
             tqdm.write(f"同花顺 Cookie 已写入：{THS_COOKIE_FILE}")
         return
 
-    if not _ths_cookie:
+    sources = _load_download_sources()
+    tqdm.write(f"CONCEPT_DOWNLOAD_SOURCES: {sources}")
+    need_ths = "ths" in sources
+
+    if need_ths and not _ths_cookie:
         tqdm.write("未检测到 THS_COOKIE，可能导致同花顺抓取 403。")
         choice = input("是否现在打开浏览器获取 Cookie？[y/N]: ").strip().lower()
         if choice == "y":
@@ -961,8 +1150,20 @@ def main() -> None:
                 _persist_ths_cookie(new_cookie)
                 tqdm.write("已更新同花顺 Cookie，继续抓取。")
 
-    run_em()
-    run_ths_all_mode()
+    # 明确提示当前抓取流程与重试策略
+    tqdm.write(
+        f"抓取计划：sources={sources} | EM重试{EM_RETRY_MAX}次(指数退避) "
+        f"| EM成分重试轮次={EM_MEMBER_RETRY_ROUND_MAX}, 间隔={EM_MEMBER_RETRY_SLEEP}s "
+        f"| THS自动重启：间隔600s，最多3轮"
+    )
+
+    for src in sources:
+        if src == "em":
+            run_em()
+        elif src == "ths":
+            _run_ths_with_restart()
+        else:
+            tqdm.write(f"未知的抓取源 {src}，已跳过。")
 
 
 if __name__ == "__main__":

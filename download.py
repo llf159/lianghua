@@ -795,23 +795,27 @@ class DataProcessor:
         if "tor" not in df.columns:
             df["tor"] = np.nan
         
-        # 删除不需要的列（保留 pre_close 以供后续校验和展示）
-        columns_to_drop = ["change", "pct_chg"]
-        for col in columns_to_drop:
-            if col in df.columns:
-                df = df.drop(columns=[col])
-        
         # 数值化处理
-        numeric_columns = ["open", "high", "low", "close", "pre_close", "vol", "amount", "tor"]
+        numeric_columns = ["open", "high", "low", "close",
+                           "pre_close", "change", "pct_chg",
+                           "vol", "amount", "tor",
+                           "total_share", "float_share", "total_mv", "circ_mv"]
         for col in numeric_columns:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         
         # 精度控制
-        price_columns = ["open", "high", "low", "close", "pre_close", "vol", "amount", "tor"]
+        price_columns = ["open", "high", "low", "close",
+                         "pre_close", "change", "pct_chg",
+                         "vol", "amount", "tor",
+                         "total_share", "float_share", "total_mv", "circ_mv"]
         for col in price_columns:
             if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
-                df[col] = df[col].astype(float).round(2)
+                # pct_chg 保留 4 位，其余保留 2 位
+                if col == "pct_chg":
+                    df[col] = df[col].astype(float).round(4)
+                else:
+                    df[col] = df[col].astype(float).round(2)
         
         # 排序和去重
         df = df.sort_values("trade_date")
@@ -942,12 +946,18 @@ class DataProcessor:
         
         # 添加复权类型列
         df = df.copy()
+        # 按需移除不写库的字段（如 total_share）
+        df = df.drop(columns=["total_share"], errors="ignore")
         df['adj_type'] = adj_type
         if "tor" not in df.columns:
             df["tor"] = np.nan
         
         # 确保列顺序正确
-        base_columns = ['ts_code', 'trade_date', 'adj_type', 'open', 'high', 'low', 'close', 'vol', 'amount', 'tor']
+        base_columns = ['ts_code', 'trade_date', 'adj_type',
+                        'open', 'high', 'low', 'close',
+                        'pre_close', 'change', 'pct_chg',
+                        'vol', 'amount', 'tor',
+                        'float_share', 'total_mv', 'circ_mv']
         indicator_columns = [col for col in df.columns if col not in base_columns]
         df = df[base_columns + indicator_columns]
         
@@ -968,6 +978,8 @@ def _compute_indicators_task(args):
         for col, n in decs.items():
             if col in res.columns and pd.api.types.is_numeric_dtype(res[col]):
                 res[col] = res[col].round(n)
+        # 移除不需要写库的字段
+        res = res.drop(columns=["total_share"], errors="ignore")
         res['adj_type'] = adj_type
         if 'tor' not in res.columns:
             res['tor'] = np.nan
@@ -1259,6 +1271,11 @@ class StockDownloader:
                 # 使用临时的DataProcessor进行清理（不需要数据库连接）
                 temp_processor = DataProcessor(None)  # 传入None，因为清理操作不需要数据库
                 cleaned_data = temp_processor.clean_stock_data(raw_data, ts_code)
+                # 如有最新总股本等元数据，填充到行情表（常数列，便于后续使用）
+                meta = self.stock_meta.get(ts_code) if hasattr(self, "stock_meta") else None
+                if meta:
+                    for k, v in meta.items():
+                        cleaned_data[k] = v
                 
                 # 如果提供了data_processor，立即计算指标
                 if data_processor is not None:
@@ -1382,6 +1399,13 @@ class StockDownloader:
             if stock_list is not None and not stock_list.empty and "ts_code" in stock_list.columns:
                 stock_list = self._attach_total_share_to_list(stock_list)
                 self._persist_stock_list_cache(stock_list)
+                # 记录总股本等元数据，供后续写库时补充
+                try:
+                    meta_cols = ["total_share", "float_share", "total_mv", "circ_mv"]
+                    meta_df = stock_list.set_index("ts_code")[meta_cols].copy()
+                    self.stock_meta = meta_df.to_dict(orient="index")
+                except Exception as e:
+                    logger.debug(f"构建股票元数据映射失败: {e}")
 
         if stock_codes is None:
             if stock_list is not None and not stock_list.empty and "ts_code" in stock_list.columns:
@@ -1980,6 +2004,7 @@ class IndexDownloader:
         )
         self.stats = DownloadStats()
         self._lock = threading.Lock()
+        self.stock_meta: Dict[str, Dict[str, Any]] = {}
     
     def download_index_data(self, ts_code: str) -> Tuple[str, str, Optional[pd.DataFrame]]:
         """下载单只指数数据，返回数据而不直接写入数据库
@@ -2014,20 +2039,14 @@ class IndexDownloader:
                 logger.debug(f"清理 {ts_code} 数据...")
                 df = raw_data.copy()
                 
-                # 删除不需要的列
-                columns_to_drop = ["pre_close", "change", "pct_chg"]
-                for col in columns_to_drop:
-                    if col in df.columns:
-                        df = df.drop(columns=[col])
-                
                 # 数值化处理
-                numeric_columns = ["open", "high", "low", "close", "vol", "amount"]
+                numeric_columns = ["open", "high", "low", "close", "pre_close", "change", "pct_chg", "vol", "amount"]
                 for col in numeric_columns:
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
                 
                 # 精度控制
-                price_columns = ["open", "high", "low", "close", "vol", "amount"]
+                price_columns = ["open", "high", "low", "close", "pre_close", "change", "pct_chg", "vol", "amount"]
                 for col in price_columns:
                     if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
                         df[col] = df[col].astype(float).round(2)
@@ -2043,7 +2062,9 @@ class IndexDownloader:
                 df['adj_type'] = 'ind'
                 
                 # 确保列顺序正确
-                base_columns = ['ts_code', 'trade_date', 'adj_type', 'open', 'high', 'low', 'close', 'vol', 'amount']
+                base_columns = ['ts_code', 'trade_date', 'adj_type',
+                                'open', 'high', 'low', 'close', 'pre_close',
+                                'change', 'pct_chg', 'vol', 'amount']
                 df = df[base_columns]
                 
                 logger.debug(f"{ts_code} 下载完成，共 {len(df)} 条记录")
@@ -2244,6 +2265,8 @@ class DownloadManager:
         logger.info("[数据库连接] 开始获取数据库管理器实例 (初始化下载管理器)")
         self.db_manager = get_database_manager()
         self.tushare_manager = TushareManager(token=config.token, db_manager=self.db_manager)
+        # 记录是否需强制触发概念数据抓取（用于数据已最新但用户仍要抓取的场景）
+        self.force_concept_download: bool = False
         
         # 在数据库初始化之前判断是否为首次下载
         self.is_first_download = self._check_if_first_download()
@@ -2485,9 +2508,10 @@ class DownloadManager:
         print("选项:")
         print("1. 正常补齐")
         print("2. 强制重建（输入重建多少日数据，增量模式重建）")
-        print("3. 退出")
+        print("3. 仅抓取/更新概念数据")
+        print("4. 退出")
 
-        choice = input("请选择 (1-3, 默认: 1): ").strip() or "1"
+        choice = input("请选择 (1-4, 默认: 1): ").strip() or "1"
         if choice == "2":
             while True:
                 days_str = input("请输入重建的交易日数量 (>=1): ").strip()
@@ -2497,6 +2521,8 @@ class DownloadManager:
                     return {"action": "rebuild", "days": int(days_str)}
                 print("输入无效，请输入正整数。")
         if choice == "3":
+            return {"action": "concept"}
+        if choice == "4":
             return {"action": "exit"}
         return {"action": "normal"}
 
@@ -2598,7 +2624,8 @@ class DownloadManager:
                                 "asset_type": self.config.asset_type,
                                 "stock_whitelist": None,
                                 "latest_date_completeness": coverage_info,
-                                "fill_missing_latest_date": False
+                                "fill_missing_latest_date": False,
+                                "force_concept_download": False
                             }
                         if action.get("action") == "rebuild":
                             rebuild_days = int(action.get("days", 1))
@@ -2615,7 +2642,24 @@ class DownloadManager:
                                 "stock_whitelist": None,
                                 "latest_date_completeness": coverage_info,
                                 "fill_missing_latest_date": False,
-                                "rebuild_days": rebuild_days
+                                "rebuild_days": rebuild_days,
+                                "force_concept_download": False
+                            }
+                        if action.get("action") == "concept":
+                            logger.info("用户选择仅抓取/更新概念数据，跳过行情下载")
+                            return {
+                                "skip_download": True,
+                                "user_exit": False,
+                                "is_first_download": is_first_download,
+                                "latest_date": latest_date,
+                                "start_date": actual_start_date,
+                                "end_date": actual_end_date,
+                                "adj_type": self.config.adj_type,
+                                "asset_type": self.config.asset_type,
+                                "stock_whitelist": None,
+                                "latest_date_completeness": coverage_info,
+                                "fill_missing_latest_date": False,
+                                "force_concept_download": True
                             }
                     
                     if can_check and missing_codes:
@@ -2633,7 +2677,8 @@ class DownloadManager:
                             "asset_type": self.config.asset_type,
                             "stock_whitelist": missing_codes,
                             "latest_date_completeness": coverage_info,
-                            "fill_missing_latest_date": True
+                            "fill_missing_latest_date": True,
+                            "force_concept_download": False
                         }
                     
                     if not can_check:
@@ -2657,7 +2702,8 @@ class DownloadManager:
                         "asset_type": self.config.asset_type,
                         "stock_whitelist": None,
                         "latest_date_completeness": coverage_info,
-                        "fill_missing_latest_date": False
+                        "fill_missing_latest_date": False,
+                        "force_concept_download": False
                     }
             except Exception as e:
                 logger.warning(f"计算增量下载日期失败: {e}")
@@ -2672,7 +2718,8 @@ class DownloadManager:
             "skip_download": False,
             "stock_whitelist": None,
             "latest_date_completeness": None,
-            "fill_missing_latest_date": False
+            "fill_missing_latest_date": False,
+            "force_concept_download": False
         }
         
         return strategy
@@ -2778,6 +2825,8 @@ class DownloadManager:
         
         # 确定下载策略（内部已经处理了智能结束日期）
         strategy = self.determine_download_strategy()
+        # 记录是否需要在数据已最新时仍强制抓取概念
+        self.force_concept_download = bool(strategy.get("force_concept_download"))
         
         def _collect_totals(res: Dict[str, DownloadStats]) -> Tuple[int, int, int]:
             total_success = sum(stats.success_count for stats in res.values())
@@ -2821,12 +2870,17 @@ class DownloadManager:
             if strategy.get("user_exit"):
                 logger.info("用户选择退出下载流程")
                 return {"stock": DownloadStats(), "index": DownloadStats()}
-            logger.warning("=" * 30)
-            logger.warning("数据已是最新，跳过下载")
-            logger.warning("=" * 30)
-            logger.warning(f"跳过原因: 最新日期={strategy.get('latest_date', 'N/A')}, 计算出的开始日期={strategy.get('start_date', 'N/A')}, 实际结束日期={strategy.get('end_date', 'N/A')}")
-            logger.warning(f"如果最新日期 >= 结束日期，说明数据已经是最新的，无需下载")
-            logger.warning("=" * 30)
+            if strategy.get("force_concept_download"):
+                logger.info("=" * 30)
+                logger.info("数据已最新，按用户选择仅抓取/更新概念数据，跳过行情下载")
+                logger.info("=" * 30)
+            else:
+                logger.warning("=" * 30)
+                logger.warning("数据已是最新，跳过下载")
+                logger.warning("=" * 30)
+                logger.warning(f"跳过原因: 最新日期={strategy.get('latest_date', 'N/A')}, 计算出的开始日期={strategy.get('start_date', 'N/A')}, 实际结束日期={strategy.get('end_date', 'N/A')}")
+                logger.warning(f"如果最新日期 >= 结束日期，说明数据已经是最新的，无需下载")
+                logger.warning("=" * 30)
             return {"stock": DownloadStats(), "index": DownloadStats()}
         
         if strategy.get("fill_missing_latest_date"):
@@ -3005,13 +3059,19 @@ def download_data(start_date: str, end_date: str, adj_type: str = "qfq",
         # 下载完股票后抓取概念（爬虫）
         if "stock" in assets:
             try:
-                if not _concept_data_exists() and not _confirm_concept_download():
-                    logger.info("缺少概念数据，用户选择跳过抓取。")
-                else:
+                if manager.force_concept_download:
+                    logger.info("用户选择仅抓取/更新概念数据，开始执行抓取...")
                     from scrape_concepts import main as scrape_concepts
-                    logger.info("开始抓取概念数据（爬虫,可能失败）...")
                     scrape_concepts()
                     logger.info("概念抓取完成，输出目录 stock_data/concepts")
+                else:
+                    if not _concept_data_exists() and not _confirm_concept_download():
+                        logger.info("缺少概念数据，用户选择跳过抓取。")
+                    else:
+                        from scrape_concepts import main as scrape_concepts
+                        logger.info("开始抓取概念数据（爬虫,可能失败）...")
+                        scrape_concepts()
+                        logger.info("概念抓取完成，输出目录 stock_data/concepts")
             except Exception as e:
                 logger.warning(f"概念抓取失败，已跳过：{e}")
         return results

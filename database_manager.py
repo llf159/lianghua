@@ -4060,6 +4060,12 @@ class DatabaseSchemaManager:
         """为 stock_data 表补充扩展基础列（如总股本），不存在则添加。"""
         extra_columns = {
             "total_share": "DECIMAL(20,4)",
+            "pre_close": "DECIMAL(10,2)",
+            "change": "DECIMAL(10,2)",
+            "pct_chg": "DECIMAL(10,4)",
+            "float_share": "DECIMAL(20,4)",
+            "total_mv": "DECIMAL(20,4)",
+            "circ_mv": "DECIMAL(20,4)",
         }
         try:
             if db_type == "duckdb":
@@ -4349,6 +4355,9 @@ class DataReceiver:
             else:
                 # 转换数据格式
                 df = self._convert_to_dataframe(request.data)
+                # 统一移除不需要写入 stock_data 的字段
+                if request.data_type == "stock_data":
+                    df = df.drop(columns=["total_share"], errors="ignore")
                 logger.info(f"[数据导入] 数据验证通过，开始导入 {len(df)} 条记录到表 {request.table_name}...")
                 
                 # 执行导入
