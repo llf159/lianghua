@@ -820,10 +820,43 @@ class DataProcessor:
         # 排序和去重
         df = df.sort_values("trade_date")
         df = df.drop_duplicates("trade_date", keep="last")
+        # 补齐 pre_close/change/pct_chg
+        df = self._ensure_price_changes(df, ts_code=ts_code, context="clean")
         
         # 规范化日期
         df = normalize_trade_date(df)
         
+        return df
+
+    @staticmethod
+    def _ensure_price_changes(df: pd.DataFrame, ts_code: str = None, context: str = "") -> pd.DataFrame:
+        """补齐缺失的 pre_close / change / pct_chg；不覆盖已有值，并记录兜底次数。"""
+        if df is None or df.empty or "close" not in df.columns:
+            return df
+        df = df.copy()
+        for col in ["pre_close", "change", "pct_chg"]:
+            if col not in df.columns:
+                df[col] = np.nan
+        # pre_close 缺失用前一日收盘
+        pre_mask = df["pre_close"].isna()
+        pre_fills = int(pre_mask.sum())
+        if pre_fills:
+            df.loc[pre_mask, "pre_close"] = df["close"].shift(1)
+        # change 缺失用 close - pre_close
+        change_mask = df["change"].isna()
+        change_fills = int(change_mask.sum())
+        if change_fills:
+            df.loc[change_mask, "change"] = df["close"] - df["pre_close"]
+        # pct_chg 缺失用 change/pre_close*100
+        pct_mask = df["pct_chg"].isna()
+        pct_fills = int(pct_mask.sum())
+        if pct_fills:
+            denom = df["pre_close"].replace(0, np.nan)
+            df.loc[pct_mask, "pct_chg"] = (df["change"] / denom) * 100
+        if pre_fills or change_fills or pct_fills:
+            tgt = ts_code or "<unknown>"
+            ctx = f" ({context})" if context else ""
+            logger.debug(f"补齐涨跌字段{ctx} {tgt}: pre_close={pre_fills}, change={change_fills}, pct_chg={pct_fills}")
         return df
     
     def compute_indicators_with_warmup(self, df: pd.DataFrame, ts_code: str, 
@@ -854,6 +887,7 @@ class DataProcessor:
                 # 合并历史数据和新增数据
                 combined_data = pd.concat([historical_data, df], ignore_index=True)
                 combined_data = combined_data.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+                combined_data = self._ensure_price_changes(combined_data, ts_code=ts_code, context="warmup")
                 
                 # 计算指标
                 df_with_indicators = compute(combined_data, self.indicator_names)
@@ -864,7 +898,8 @@ class DataProcessor:
                 ].copy()
             else:
                 # 没有历史数据，直接计算（首次下载的情况）
-                df_with_indicators = compute(df, self.indicator_names)
+                df_prepared = self._ensure_price_changes(df, ts_code=ts_code, context="fresh")
+                df_with_indicators = compute(df_prepared, self.indicator_names)
             
             # 精度控制
             from indicators import outputs_for
@@ -946,8 +981,8 @@ class DataProcessor:
         
         # 添加复权类型列
         df = df.copy()
-        # 按需移除不写库的字段（如 total_share）
-        df = df.drop(columns=["total_share"], errors="ignore")
+        # 按需移除不写库的字段（市值/股本类仅用于缓存，不入库）
+        df = df.drop(columns=["total_share", "float_share", "total_mv", "circ_mv"], errors="ignore")
         df['adj_type'] = adj_type
         if "tor" not in df.columns:
             df["tor"] = np.nan
@@ -956,8 +991,10 @@ class DataProcessor:
         base_columns = ['ts_code', 'trade_date', 'adj_type',
                         'open', 'high', 'low', 'close',
                         'pre_close', 'change', 'pct_chg',
-                        'vol', 'amount', 'tor',
-                        'float_share', 'total_mv', 'circ_mv']
+                        'vol', 'amount', 'tor']
+        for col in base_columns:
+            if col not in df.columns:
+                df[col] = np.nan
         indicator_columns = [col for col in df.columns if col not in base_columns]
         df = df[base_columns + indicator_columns]
         
@@ -972,6 +1009,9 @@ def _compute_indicators_task(args):
         if warmup_df is not None and not warmup_df.empty:
             base_df = pd.concat([warmup_df, df], ignore_index=True)
             base_df = base_df.sort_values('trade_date').drop_duplicates('trade_date', keep='last')
+        # 补齐缺失的 pre_close / change / pct_chg
+        base_df = DataProcessor._ensure_price_changes(base_df, ts_code=ts_code, context="pool")
+
         res = compute(base_df, indicator_names)
         min_date = df['trade_date'].min()
         res = res[res['trade_date'] >= min_date].copy()
@@ -979,11 +1019,22 @@ def _compute_indicators_task(args):
             if col in res.columns and pd.api.types.is_numeric_dtype(res[col]):
                 res[col] = res[col].round(n)
         # 移除不需要写库的字段
-        res = res.drop(columns=["total_share"], errors="ignore")
+        res = res.drop(columns=["total_share", "float_share", "total_mv", "circ_mv"], errors="ignore")
         res['adj_type'] = adj_type
         if 'tor' not in res.columns:
             res['tor'] = np.nan
-        base_columns = ['ts_code', 'trade_date', 'adj_type', 'open', 'high', 'low', 'close', 'vol', 'amount', 'tor']
+
+        # 写库需要的基础列（与 DataProcessor.prepare_data_for_database 对齐，避免丢失基础行情列）
+        base_columns = [
+            'ts_code', 'trade_date', 'adj_type',
+            'open', 'high', 'low', 'close',
+            'pre_close', 'change', 'pct_chg',
+            'vol', 'amount', 'tor',
+        ]
+        for col in base_columns:
+            if col not in res.columns:
+                res[col] = np.nan
+
         indicator_columns = [c for c in res.columns if c not in base_columns]
         res = res[base_columns + indicator_columns]
         return ts_code, res, None
@@ -1694,7 +1745,7 @@ class DailyStockDownloader(StockDownloader):
             try:
                 daily_df = self.tushare_manager.get_stock_daily_by_date(
                     trade_date=td,
-                    fields='ts_code,trade_date,open,high,low,close,pre_close,vol,amount'
+                    fields='ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount'
                 )
                 if daily_df is None or daily_df.empty:
                     progress.update(1)
@@ -2051,6 +2102,9 @@ class IndexDownloader:
                     if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
                         df[col] = df[col].astype(float).round(2)
                 
+                # 补齐缺失的涨跌字段
+                df = DataProcessor._ensure_price_changes(df, ts_code=ts_code, context="index")
+                
                 # 排序和去重
                 df = df.sort_values("trade_date")
                 df = df.drop_duplicates("trade_date", keep="last")
@@ -2351,10 +2405,27 @@ class DownloadManager:
         try:
             from config import DATA_ROOT, UNIFIED_DB_PATH
             db_path = os.path.join(DATA_ROOT, UNIFIED_DB_PATH)
-            
-            # 如果数据库不存在，初始化表结构
+
+            need_init = False
+
+            # 1) 数据库文件不存在
             if not os.path.exists(db_path):
                 logger.info("数据库不存在，正在初始化...")
+                need_init = True
+            else:
+                # 2) 文件存在但表缺失（本次报错场景）
+                try:
+                    with self.db_manager.get_connection(db_path, read_only=True) as conn:
+                        tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+                        if "stock_data" not in tables:
+                            logger.warning("检测到 stock_data.db 已存在但缺少 stock_data 表，将重新初始化表结构")
+                            need_init = True
+                except Exception as e:
+                    # 3) 无法检查结构，谨慎起见也做初始化
+                    logger.warning(f"检查 stock_data 表结构失败，将重新初始化: {e}")
+                    need_init = True
+
+            if need_init:
                 self.db_manager.init_stock_data_tables(db_path, "duckdb")
                 logger.info("数据库初始化完成")
         except Exception as e:

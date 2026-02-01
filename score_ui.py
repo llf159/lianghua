@@ -6952,12 +6952,26 @@ if _in_streamlit():
                                 st.info("无满足亮点阈值的标的")
                             else:
                                 st.dataframe(highlight[["rank","ts_code","name","ret_pct_view"]], width='stretch', hide_index=True)
+                                hl_codes = highlight["ts_code"].astype(str).tolist()
+                                hl_txt = _codes_to_txt(
+                                    hl_codes,
+                                    st.session_state["export_pref"]["style"],
+                                    st.session_state["export_pref"]["with_suffix"]
+                                )
+                                copy_txt_button(hl_txt, label="📋 复制亮点代码", key=f"copy_review_highlight_{ref_use}_{obs_use}")
 
                             st.markdown("**缺点（≤阈值）**")
                             if drawback.empty:
                                 st.info("无满足缺点阈值的标的")
                             else:
                                 st.dataframe(drawback[["rank","ts_code","name","ret_pct_view"]], width='stretch', hide_index=True)
+                                low_codes = drawback["ts_code"].astype(str).tolist()
+                                low_txt = _codes_to_txt(
+                                    low_codes,
+                                    st.session_state["export_pref"]["style"],
+                                    st.session_state["export_pref"]["with_suffix"]
+                                )
+                                copy_txt_button(low_txt, label="📋 复制缺点代码", key=f"copy_review_drawback_{ref_use}_{obs_use}")
 
                             # 持有期收益明细透视
                             st.markdown("**持有期收益**（%）")

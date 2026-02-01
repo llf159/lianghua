@@ -2201,6 +2201,9 @@ class DatabaseManager:
         if end_date is None:
             end_date = (datetime.now() + timedelta(days=365)).strftime("%Y%m%d")
         need_until = (datetime.now() + timedelta(days=15)).strftime("%Y%m%d")
+        need_since = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+        # 过去30天窗口也作为覆盖要求；与显式 start 取更早者
+        min_start_required = min(start, need_since)
 
         def _load_cache() -> List[str]:
             if not os.path.exists(cache_path):
@@ -2217,14 +2220,14 @@ class DatabaseManager:
 
         cached = _load_cache()
         cover_future_ok = bool(cached) and cached[-1] >= need_until
-        cover_start_ok = bool(cached) and cached[0] <= start
+        cover_start_ok = bool(cached) and cached[0] <= min_start_required
         has_range = cover_future_ok and cover_start_ok
         if cached and has_range:
             return cached
         if cached and not refresh_if_insufficient:
             return cached
 
-        fetched = self.get_trade_dates_from_tushare(start, end_date)
+        fetched = self.get_trade_dates_from_tushare(min_start_required, end_date)
         if not fetched:
             return cached
 
@@ -3868,16 +3871,24 @@ class DatabaseSchemaManager:
                 'ema5', 'ema10', 'ema20',
                 'k', 'd', 'j',
                 'rsi6', 'rsi12', 'rsi24',
-                'macd', 'macd_signal', 'macd_hist',
-                'boll_upper', 'boll_mid', 'boll_lower',
-                'atr', 'cci', 'williams_r', 'obv',
-                # pro_bar换手率因子（短名）
-                'tor'
-            ]
+            'macd', 'macd_signal', 'macd_hist',
+            'boll_upper', 'boll_mid', 'boll_lower',
+            'atr', 'cci', 'williams_r', 'obv',
+            # pro_bar换手率因子（短名）已作为基础列，避免重复
+        ]
     
     def _build_indicator_columns_sql(self) -> List[str]:
         """构建指标列定义SQL"""
         indicator_columns = self._get_indicator_columns()
+
+        # 移除已经作为基础行情列存在的字段，避免重复定义
+        base_cols = {
+            "ts_code", "trade_date", "adj_type",
+            "open", "high", "low", "close",
+            "pre_close", "change", "pct_chg",
+            "vol", "amount", "tor",
+        }
+        indicator_columns = [c for c in indicator_columns if c not in base_cols]
         indicator_cols_sql = []
         
         # SQL保留字列表
@@ -3949,8 +3960,12 @@ class DatabaseSchemaManager:
                 high DECIMAL(10,2),
                 low DECIMAL(10,2),
                 close DECIMAL(10,2),
+                pre_close DECIMAL(10,2),
+                change DECIMAL(10,2),
+                pct_chg DECIMAL(10,4),
                 vol DECIMAL(15,2),
                 amount DECIMAL(20,2),
+                tor DECIMAL(10,4),
                 -- 技术指标列（动态添加）
 {chr(10).join(indicator_cols_sql)[:-1]},
                 PRIMARY KEY (ts_code, trade_date, adj_type)
@@ -3960,8 +3975,8 @@ class DatabaseSchemaManager:
             
             # 动态添加缺失的指标列
             self._add_missing_indicator_columns(conn, "duckdb")
-            # 补充扩展基础列（如总股本）
-            self._ensure_stock_extra_columns(conn, "duckdb")
+            # 仅补充必需的基础行情列（pre_close/change/pct_chg）
+            self._ensure_stock_base_columns(conn, "duckdb")
             
             # 创建优化索引 - 简化索引配置
             # 主键 (ts_code, trade_date, adj_type) 已经覆盖了大部分查询场景
@@ -3997,8 +4012,12 @@ class DatabaseSchemaManager:
                 high DECIMAL(10,2),
                 low DECIMAL(10,2),
                 close DECIMAL(10,2),
+                pre_close DECIMAL(10,2),
+                change DECIMAL(10,2),
+                pct_chg DECIMAL(10,4),
                 vol DECIMAL(15,2),
                 amount DECIMAL(20,2),
+                tor DECIMAL(10,4),
                 -- 技术指标列（动态添加）
 {chr(10).join(indicator_cols_sql)[:-1]},
                 PRIMARY KEY (ts_code, trade_date, adj_type)
@@ -4008,8 +4027,8 @@ class DatabaseSchemaManager:
             
             # 动态添加缺失的指标列
             self._add_missing_indicator_columns(conn, "sqlite")
-            # 补充扩展基础列（如总股本）
-            self._ensure_stock_extra_columns(conn, "sqlite")
+            # 仅补充必需的基础行情列（pre_close/change/pct_chg）
+            self._ensure_stock_base_columns(conn, "sqlite")
             
             # 创建索引 - 优化后只保留必要的复合索引
             # 主键 (ts_code, trade_date, adj_type) 已经覆盖了大部分查询场景
@@ -4056,16 +4075,13 @@ class DatabaseSchemaManager:
         except Exception as e:
             logger.warning(f"动态添加指标列失败: {e}")
 
-    def _ensure_stock_extra_columns(self, conn, db_type: str):
-        """为 stock_data 表补充扩展基础列（如总股本），不存在则添加。"""
-        extra_columns = {
-            "total_share": "DECIMAL(20,4)",
+    def _ensure_stock_base_columns(self, conn, db_type: str):
+        """为 stock_data 表补充必需的基础行情列（不含市值/股本）。"""
+        base_columns = {
             "pre_close": "DECIMAL(10,2)",
             "change": "DECIMAL(10,2)",
             "pct_chg": "DECIMAL(10,4)",
-            "float_share": "DECIMAL(20,4)",
-            "total_mv": "DECIMAL(20,4)",
-            "circ_mv": "DECIMAL(20,4)",
+            "tor": "DECIMAL(10,4)",
         }
         try:
             if db_type == "duckdb":
@@ -4075,16 +4091,16 @@ class DatabaseSchemaManager:
                 cursor = conn.execute("PRAGMA table_info(stock_data)")
                 existing_cols = [row[1] for row in cursor.fetchall()]
 
-            for col, type_sql in extra_columns.items():
+            for col, type_sql in base_columns.items():
                 if col not in existing_cols:
                     try:
                         alter_sql = f'ALTER TABLE stock_data ADD COLUMN "{col}" {type_sql}'
                         conn.execute(alter_sql)
-                        logger.info(f"补充 stock_data 列: {col}")
+                        logger.info(f"补充 stock_data 基础列: {col}")
                     except Exception as e:
-                        logger.warning(f"添加扩展列失败 {col}: {e}")
+                        logger.warning(f"添加基础列失败 {col}: {e}")
         except Exception as e:
-            logger.warning(f"检查/补充扩展列失败: {e}")
+            logger.warning(f"检查/补充基础列失败: {e}")
     
     def init_stock_details_tables(self, db_path: str, db_type: str = "duckdb"):
         """初始化股票详情表结构"""
