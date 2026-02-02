@@ -347,39 +347,64 @@ def _merge_gate_into_rule(rule: dict) -> dict:
 
 # 需要先定义 _calc_nested_window，因为 _calc_rule_total_window 会用到它
 # 将 _calc_nested_window 的定义移到这里（在策略编译之前）
+def _extract_const_assignments(expr: str) -> dict:
+    """提取形如 `VAR := 20;` 的整型常量定义，供窗口推断使用。"""
+    consts = {}
+    if not expr:
+        return consts
+    assign_pat = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*(\d+)\s*;?")
+    for name, val in assign_pat.findall(expr):
+        try:
+            consts[name.upper()] = int(val)
+        except Exception:
+            continue
+    return consts
+
+
+def _resolve_window_token(token: str, consts: dict) -> int | None:
+    """把窗口参数 token 解析成整数，支持常量名及简单 +- 偏移。"""
+    tok = token.strip()
+    # 纯数字
+    if tok.isdigit():
+        return int(tok)
+    # 常量或常量 +/- 数字
+    m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(?:\s*([+-])\s*(\d+))?", tok)
+    if m:
+        name = m.group(1).upper()
+        base = consts.get(name)
+        if base is None:
+            return None
+        sign = m.group(2)
+        off = int(m.group(3)) if m.group(3) else 0
+        return base + off if sign == '+' else base - off
+    return None
+
+
 @lru_cache(maxsize=256)
 def _calc_nested_window(expr: str) -> int:
     """
-    递归计算嵌套函数所需的总窗口大小。
-    例如：HHV(REF(H,1), 20) 需要 20 + 1 = 21天
-         HHV(REF(H,2), 30) 需要 30 + 2 = 32天
-         HHV(MA(REF(C,1),5),20) 需要 20 + 5 + 1 = 26天
-    
-    Args:
-        expr: 表达式字符串
-        
-    Returns:
-        嵌套函数所需的总窗口大小，如果没有找到则返回 0
+    递归计算嵌套函数所需的总窗口大小，支持常量定义。
+    例如：
+      WINDOW := 20; REF(C, WINDOW-1) => 19
+      COUNT(..., WINDOW) => 20
     """
     if not expr:
         return 0
-    
+
+    consts = _extract_const_assignments(expr)
     max_total_window = 0
-    
-    # 需要嵌套的函数列表（这些函数需要递归计算内部表达式）
+
     nested_funcs = ['TS_RANK', 'TS_PCT', 'MA', 'EMA', 'SMA', 'HHV', 'LLV', 'SUM', 'STD', 'COUNT']
-    
-    # 使用递归方法找到所有函数调用
+
     func_calls = []
     processed_ranges = set()
-    
+
     for func_name in nested_funcs:
         func_pattern = func_name + r'\s*\('
         for match in re.finditer(func_pattern, expr, re.IGNORECASE):
             func_start = match.start()
             func_end = match.end()
-            
-            # 找到匹配的右括号
+
             paren_count = 1
             j = func_end
             while j < len(expr) and paren_count > 0:
@@ -388,48 +413,39 @@ def _calc_nested_window(expr: str) -> int:
                 elif expr[j] == ')':
                     paren_count -= 1
                 j += 1
-            
-            if paren_count == 0:
-                if (func_start, j) not in processed_ranges:
-                    func_calls.append((func_start, j, func_name))
-                    processed_ranges.add((func_start, j))
-    
-    # 从外层到内层处理函数调用（按范围大小排序）
+
+            if paren_count == 0 and (func_start, j) not in processed_ranges:
+                func_calls.append((func_start, j, func_name))
+                processed_ranges.add((func_start, j))
+
     func_calls.sort(key=lambda x: x[1] - x[0], reverse=True)
-    
-    # 处理每个函数调用
+
     for func_start, func_end, func_name in func_calls:
         func_call = expr[func_start:func_end]
         func_pattern = func_name + r'\s*\('
         match = re.search(func_pattern, func_call, re.IGNORECASE)
-        if match:
-            params = func_call[len(match.group(0)):len(func_call)-1]
-            
-            # 查找最后一个逗号后的数字（窗口参数）
-            last_comma = params.rfind(',')
-            if last_comma != -1:
-                after_comma = params[last_comma+1:].strip()
-                num_match = re.match(r'(\d+)', after_comma)
-                if num_match:
-                    try:
-                        window = int(num_match.group(1))
-                        # 递归计算内部表达式所需窗口
-                        inner_expr = params[:last_comma].strip()
-                        inner_window = _calc_nested_window(inner_expr)
-                        total_window = window + inner_window
-                        max_total_window = max(max_total_window, total_window)
-                    except (ValueError, TypeError):
-                        pass
-    
-    # 额外扫描 REF 窗口（即使存在嵌套函数也要纳入最大窗口）
-    ref_pattern = r'REF\s*\([^)]+,\s*(\d+)'
-    matches = re.finditer(ref_pattern, expr, re.IGNORECASE)
-    for match in matches:
-        try:
-            window = int(match.group(1))
+        if not match:
+            continue
+        params = func_call[len(match.group(0)):len(func_call)-1]
+
+        last_comma = params.rfind(',')
+        if last_comma != -1:
+            after_comma = params[last_comma+1:].strip()
+            window = _resolve_window_token(after_comma, consts)
+            if window is None:
+                continue
+            inner_expr = params[:last_comma].strip()
+            inner_window = _calc_nested_window(inner_expr)
+            total_window = window + inner_window
+            max_total_window = max(max_total_window, total_window)
+
+    # REF 额外扫描（包含常量/偏移）
+    ref_pattern = r'REF\s*\([^)]+,\s*([^),]+)'
+    for match in re.finditer(ref_pattern, expr, re.IGNORECASE):
+        token = match.group(1)
+        window = _resolve_window_token(token, consts)
+        if window is not None:
             max_total_window = max(max_total_window, window)
-        except (ValueError, TypeError):
-            pass
 
     return max_total_window
 

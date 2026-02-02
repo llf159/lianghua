@@ -2650,24 +2650,19 @@ def _get_latest_date_from_files() -> Optional[str]:
 
 def _pick_smart_ref_date() -> Optional[str]:
     """智能获取参考日期，按优先级尝试多种方式"""
-    # 1. 优先从数据库获取
-    latest = _get_latest_date_from_database()
-    if latest:
-        return latest
-    
-    # 2. 从daily分区获取
-    latest = _get_latest_date_from_daily_partition()
-    if latest:
-        return latest
-    
-    # 3. 最后从评分结果文件获取
+    # 1. 优先从评分结果文件获取
     latest = _get_latest_date_from_files()
     if latest:
-        logger.warning(f"回退到评分结果文件中的最新日期: {latest}")
-    else:
-        logger.error("无法获取任何参考日期")
-    
-    return latest
+        return latest
+
+    # 2. 兜底使用股票数据库最新交易日
+    latest = _get_latest_date_from_database()
+    if latest:
+        logger.warning(f"回退到股票数据库最新日期: {latest}")
+        return latest
+
+    logger.error("无法获取任何参考日期")
+    return None
 
 
 def _load_detail_json(ref: str, ts: str) -> Optional[Dict]:
@@ -4269,6 +4264,29 @@ if _in_streamlit():
             st.session_state["kline_show_realtime"] = True
         show_realtime_scrape = bool(st.session_state.get("kline_show_realtime", True))
 
+        def _resolve_kline_ref_date() -> str:
+            """
+            为K线看板获取一个尽量可用的参考日：
+            1) 优先使用用户输入的值；
+            2) 其次使用智能参考日（数据库/日历/评分文件）；
+            3) 最后兜底到交易日历的最新一日。
+            """
+            manual = (st.session_state.get("kline_ref_date_single") or "").strip()
+            if manual:
+                return manual
+
+            smart = _pick_smart_ref_date()
+            if smart:
+                return smart
+
+            try:
+                trade_dates = _get_trade_dates_available()
+                if trade_dates:
+                    return trade_dates[-1]
+            except Exception as e:
+                logger.debug(f"获取交易日失败（k线看板）: {e}")
+            return ""
+
         # —— 预先计算参考日/可选股票，供顶部图表使用（控件放在下方） ——
         available_detail_dates = []
         try:
@@ -4285,7 +4303,7 @@ if _in_streamlit():
 
         # 参考日默认值
         if "kline_ref_date_single" not in st.session_state:
-            st.session_state["kline_ref_date_single"] = _get_latest_date_from_files() or ""
+            st.session_state["kline_ref_date_single"] = _resolve_kline_ref_date()
         if "kline_display_limit" not in st.session_state:
             st.session_state["kline_display_limit"] = 50
         st.session_state.setdefault("kline_filter_mode", "不过滤")
@@ -4293,7 +4311,7 @@ if _in_streamlit():
         st.session_state.setdefault("kline_filter_rule", "")
         st.session_state.setdefault("kline_filter_ref", st.session_state.get("kline_ref_date_single", ""))
         st.session_state.setdefault("kline_filter_custom", "")
-        ref_real_kline = (st.session_state.get("kline_ref_date_single") or "").strip() or _get_latest_date_from_files() or ""
+        ref_real_kline = _resolve_kline_ref_date()
 
         base_codes_saved = st.session_state.get("kline_display_base", None)
         if base_codes_saved is None:
@@ -4526,7 +4544,7 @@ if _in_streamlit():
             colA, colB = st.columns([1, 2])
             with colA:
                 # 预先写入 session_state 后不再传递 value，避免默认值与 Session State 同时赋值的警告
-                new_ref = st.text_input("参考日（默认=最新文件）", key="kline_ref_date_single")
+                new_ref = st.text_input("参考日（默认=最新可用日期）", key="kline_ref_date_single")
                 ref_real_kline = (new_ref or "").strip() or ref_real_kline
                 new_limit_val = st.number_input(
                     "预加载上限（0=不限）",
@@ -8639,6 +8657,268 @@ if _in_streamlit():
                         value=50,
                         key="strategy_topk"
                     )
+
+                # 缓存键与当前参数，用于避免交互重跑导致数据丢失
+                cache_key = "strategy_stats_cache"
+                current_params = {
+                    "ref_date": ref_date_strategy,
+                    "interval_days": int(interval_days),
+                    "track_days": int(track_days),
+                    "sample_choice": sample_choice,
+                    "topk": int(topk_value) if topk_value is not None else None,
+                }
+                cache_obj = st.session_state.get(cache_key, {})
+                cache_valid = cache_obj.get("params") == current_params
+
+                df_all_render: pd.DataFrame | None = None
+                rank_rows_render: list[dict[str, Any]] = []
+                debug_info_render: list[str] = []
+
+                def _render_strategy_trigger_outputs(df_all_obj: pd.DataFrame | None,
+                                                    rank_rows_obj: list[dict[str, Any]] | None,
+                                                    debug_info_obj: list[str] | None):
+                    """渲染策略触发统计相关的可视化与明细，避免交互控件重跑导致数据丢失。"""
+                    debug_info_obj = debug_info_obj or []
+                    if debug_info_obj:
+                        with st.expander("调试信息（点击查看数据读取情况）", expanded=False):
+                            for info in debug_info_obj:
+                                st.text(info)
+
+                    if df_all_obj is None:
+                        st.info("请点击“生成策略触发统计”后再调整图表参数。")
+                        return
+                    if df_all_obj.empty:
+                        st.warning("未找到任何策略触发数据")
+                        st.info('提示：请确保：\n1. 参考日及区间内的日期都有评分数据\n2. 详情数据已正确存储（数据库或文件系统）\n3. 样本股票列表正确\n4. 展开上方的"调试信息"查看详细情况')
+                        return
+
+                    # 1) 排名分布可视化
+                    df_rank_dist = pd.DataFrame(rank_rows_obj or [])
+                    st.subheader("策略触发股票排名分布")
+                    if df_rank_dist.empty:
+                        st.info("未能在排名文件中找到触发股票的排名，无法绘制分布。")
+                    else:
+                        strategy_options = sorted(df_rank_dist["strategy"].unique())
+                        default_selection = strategy_options[:1]
+                        selected_strategies = st.multiselect(
+                            "选择一个或多个策略，查看触发股票在全量排名中的分布密度",
+                            options=strategy_options,
+                            default=default_selection,
+                            key="strategy_rank_dist_select"
+                        )
+                        if not selected_strategies:
+                            st.warning("请至少选择一个策略。")
+                        else:
+                            chart_type = st.selectbox(
+                                "分布图类型",
+                                ["直方图（密度）", "小提琴图", "箱线图", "ECDF（累计分布）"],
+                                index=0,
+                                key="strategy_rank_dist_chart_type"
+                            )
+                            df_plot = df_rank_dist[df_rank_dist["strategy"].isin(selected_strategies)].copy()
+                            if df_plot.empty:
+                                st.info("所选策略暂无触发排名数据。")
+                            else:
+                                fig = go.Figure()
+                                if chart_type.startswith("直方图"):
+                                    bin_max = max(5, min(200, int(df_plot["rank_at_obs"].nunique()) or 50))
+                                    bin_default = min(50, bin_max)
+                                    bins = st.slider(
+                                        "直方图分箱数（数值越小越聚合，越大越平滑）",
+                                        min_value=5,
+                                        max_value=int(bin_max),
+                                        value=int(bin_default),
+                                        step=1,
+                                        key="strategy_rank_dist_bins"
+                                    )
+                                    hist_mode = st.selectbox(
+                                        "直方图叠加方式",
+                                        ["重叠", "堆叠"],
+                                        index=0,
+                                        key="strategy_rank_dist_hist_mode"
+                                    )
+                                    for strat in selected_strategies:
+                                        ranks = df_plot[df_plot["strategy"] == strat]["rank_at_obs"]
+                                        if ranks.empty:
+                                            continue
+                                        fig.add_trace(go.Histogram(
+                                            x=ranks,
+                                            name=strat,
+                                            nbinsx=int(bins),
+                                            histnorm="probability density",
+                                            opacity=0.55
+                                        ))
+                                    fig.update_layout(
+                                        barmode="overlay" if hist_mode == "重叠" else "stack",
+                                        xaxis_title="触发当日排名（数值越小越靠前）",
+                                        yaxis_title="分布密度",
+                                        legend_title="策略"
+                                    )
+                                elif chart_type == "小提琴图":
+                                    for strat in selected_strategies:
+                                        ranks = df_plot[df_plot["strategy"] == strat]["rank_at_obs"]
+                                        if ranks.empty:
+                                            continue
+                                        fig.add_trace(go.Violin(
+                                            y=ranks,
+                                            x=[strat] * len(ranks),
+                                            name=strat,
+                                            box_visible=True,
+                                            meanline_visible=True,
+                                            points="all",
+                                            jitter=0.12,
+                                            opacity=0.7
+                                        ))
+                                    fig.update_layout(
+                                        xaxis_title="策略",
+                                        yaxis_title="触发当日排名（数值越小越靠前）",
+                                        legend_title="策略"
+                                    )
+                                elif chart_type == "箱线图":
+                                    for strat in selected_strategies:
+                                        ranks = df_plot[df_plot["strategy"] == strat]["rank_at_obs"]
+                                        if ranks.empty:
+                                            continue
+                                        fig.add_trace(go.Box(
+                                            y=ranks,
+                                            name=strat,
+                                            boxpoints="outliers",
+                                            opacity=0.75
+                                        ))
+                                    fig.update_layout(
+                                        yaxis_title="触发当日排名（数值越小越靠前）",
+                                        legend_title="策略"
+                                    )
+                                else:  # ECDF
+                                    for strat in selected_strategies:
+                                        ranks = np.sort(df_plot[df_plot["strategy"] == strat]["rank_at_obs"].to_numpy())
+                                        if ranks.size == 0:
+                                            continue
+                                        y_vals = np.arange(1, ranks.size + 1) / ranks.size
+                                        fig.add_trace(go.Scatter(
+                                            x=ranks,
+                                            y=y_vals,
+                                            mode="lines",
+                                            name=strat
+                                        ))
+                                    fig.update_layout(
+                                        xaxis_title="触发当日排名（数值越小越靠前）",
+                                        yaxis_title="累计占比",
+                                        yaxis=dict(tickformat=".0%"),
+                                        legend_title="策略"
+                                    )
+                                if fig.data:
+                                    st.plotly_chart(fig, width="stretch")
+                                else:
+                                    st.info("所选策略暂无可绘制的排名数据。")
+                            st.caption("数据来源：触发当日的全量排名文件；支持多选策略，颜色区分。")
+
+                    # 2) 每日明细
+                    st.subheader("每日策略触发详情")
+                    df_detail_display = df_all_obj[["obs_date", "name", "trigger_count", "n_sample", "coverage", "best_rank_after_trigger"]].copy()
+                    df_detail_display.columns = ["日期", "策略名", "触发次数", "样本数", "覆盖率", "触发后最高排名"]
+                    df_detail_display["覆盖率"] = df_detail_display["覆盖率"].map(
+                        lambda x: f"{x*100:.2f}%" if pd.notna(x) else None
+                    )
+                    df_detail_display["触发后最高排名"] = df_detail_display["触发后最高排名"].map(
+                        lambda x: int(x) if pd.notna(x) else "-"
+                    )
+                    df_detail_display = df_detail_display.sort_values(["日期", "触发次数"], ascending=[True, False]).reset_index(drop=True)
+                    st.dataframe(df_detail_display, width='stretch', height=400)
+
+                    # 3) 未触发的策略
+                    try:
+                        show_when_untriggered = st.checkbox(
+                            "显示规则 when 表达式",
+                            value=False,
+                            key="stats_show_when"
+                        )
+                        
+                        all_rules = getattr(se, "SC_RULES", []) or []
+                        triggered_rule_names = set(df_all_obj["name"].astype(str).unique())
+                        
+                        # 预先构建 name -> when / explain 映射
+                        name_to_when = {}
+                        name_to_explain = {}
+                        for r in all_rules:
+                            rule_name = str(r.get("name", ""))
+                            if not rule_name:
+                                continue
+                            if "clauses" in r and r["clauses"]:
+                                ws = [c.get("when", "") for c in r["clauses"] if c.get("when")]
+                                name_to_when[rule_name] = " AND ".join(ws)
+                            else:
+                                name_to_when[rule_name] = str(r.get("when", ""))
+                            
+                            explain_val = r.get("explain")
+                            if explain_val:
+                                name_to_explain[rule_name] = str(explain_val)
+                        
+                        untriggered_rules = []
+                        for r in all_rules:
+                            rule_name = str(r.get("name", ""))
+                            if not rule_name or rule_name in triggered_rule_names:
+                                continue
+                            
+                            tf = str(r.get("timeframe", "D")).upper()
+                            scope = str(r.get("scope", "ANY")).upper().strip()
+                            win = None if scope == "LAST" else int(r.get("score_windows", 60))
+                            points = float(r.get("points", 0))
+                            
+                            gate = r.get("gate")
+                            gate_str = ""
+                            if gate:
+                                if isinstance(gate, dict):
+                                    gate_when = gate.get("when", "")
+                                    if gate_when:
+                                        gate_str = f"gate: {gate_when}"
+                                elif isinstance(gate, str):
+                                    gate_str = f"gate: {gate}"
+                            
+                            clauses_info = ""
+                            if "clauses" in r and r.get("clauses"):
+                                clauses = r.get("clauses", [])
+                                clause_parts = []
+                                for c in clauses:
+                                    c_tf = str(c.get("timeframe", "D")).upper()
+                                    c_scope = str(c.get("scope", "ANY")).upper().strip()
+                                    if c_scope == "LAST":
+                                        clause_parts.append(f"{c_tf}/-/LAST")
+                                    else:
+                                        c_win = int(c.get("score_windows", 60))
+                                        clause_parts.append(f"{c_tf}/{c_win}/{c_scope}")
+                                if clause_parts:
+                                    clauses_info = f"子句: {len(clauses)}个 ({', '.join(clause_parts)})"
+                            
+                            rule_data = {
+                                "name": rule_name,
+                                "timeframe": tf,
+                                "scope": scope,
+                                "points": points,
+                                "gate": gate_str if gate_str else "",
+                                "clauses": clauses_info if clauses_info else "",
+                                "when": name_to_when.get(rule_name, ""),
+                                "explain": name_to_explain.get(rule_name, str(r.get("explain", "")))
+                            }
+                            if scope != "LAST":
+                                rule_data["score_windows"] = win
+                            
+                            untriggered_rules.append(rule_data)
+                        
+                        if untriggered_rules:
+                            df_untrig = pd.DataFrame(untriggered_rules)
+                            display_cols = ["name", "timeframe", "scope", "score_windows", "points", "gate", "clauses"]
+                            if show_when_untriggered:
+                                display_cols += ["when", "explain"]
+                            else:
+                                display_cols += ["explain"]
+                            display_cols = [c for c in display_cols if c in df_untrig.columns]
+                            st.subheader("统计区间内未触发的策略")
+                            st.dataframe(df_untrig[display_cols], width='stretch', height=400)
+                        else:
+                            st.info("统计区间内所有策略均有触发。")
+                    except Exception as e:
+                        st.warning(f"展示未触发策略时出错: {e}")
                 
                 if st.button("生成策略触发统计", key="btn_run_strategy_stats", width='stretch'):
                     try:
@@ -8707,6 +8987,9 @@ if _in_streamlit():
                             
                             # 调试信息：检查详情数据来源
                             debug_info = []
+                            # 用于后续排名分布/最佳排名的原始映射
+                            rank_lookup: dict[str, dict[str, int]] = {}
+                            rank_distribution_rows: list[dict[str, Any]] = []
                             
                             for obs_date in interval_dates:
                                 # 先尝试从数据库读取
@@ -8923,12 +9206,6 @@ if _in_streamlit():
                                                 strategy_stocks_map[strategy_name] = {}
                                             strategy_stocks_map[strategy_name][obs_date] = triggered_stocks
                             
-                            # 显示调试信息
-                            if debug_info:
-                                with st.expander("调试信息（点击查看数据读取情况）", expanded=False):
-                                    for info in debug_info:
-                                        st.text(info)
-                            
                             if not all_trigger_stats:
                                 st.warning("未找到任何策略触发数据")
                                 st.info('提示：请确保：\n1. 参考日及区间内的日期都有评分数据\n2. 详情数据已正确存储（数据库或文件系统）\n3. 样本股票列表正确\n4. 展开上方的"调试信息"查看详细情况')
@@ -8939,7 +9216,6 @@ if _in_streamlit():
                                 # 额外计算：触发后最高排名（触发日及之后 track_days 个交易日内的最好名次，越小越好）
                                 best_rank_map: dict[tuple[str, str], int] = {}
                                 if strategy_stocks_map and rank_dates_needed:
-                                    rank_lookup: dict[str, dict[str, int]] = {}
                                     for d in sorted(rank_dates_needed):
                                         df_rank = _read_rank_all_sorted(d)
                                         if df_rank is None or df_rank.empty:
@@ -8952,7 +9228,7 @@ if _in_streamlit():
                                         except Exception as e:
                                             logger.debug(f"构建排名映射失败 {d}: {e}")
                                             continue
-                                    
+
                                     if rank_lookup:
                                         for strategy_name, date_stocks in strategy_stocks_map.items():
                                             for obs_date, stocks in date_stocks.items():
@@ -8973,6 +9249,27 @@ if _in_streamlit():
                                                         best_rank_val = rv_int if best_rank_val is None else min(best_rank_val, rv_int)
                                                 if best_rank_val is not None:
                                                     best_rank_map[(obs_date, strategy_name)] = best_rank_val
+                                        
+                                        # 触发当日的排名分布数据
+                                        for strategy_name, date_stocks in strategy_stocks_map.items():
+                                            for obs_date, stocks in date_stocks.items():
+                                                rmap = rank_lookup.get(obs_date)
+                                                if not rmap:
+                                                    continue
+                                                for ts in stocks:
+                                                    rv = rmap.get(str(ts))
+                                                    if rv is None:
+                                                        continue
+                                                    try:
+                                                        rv_int = int(rv)
+                                                    except Exception:
+                                                        continue
+                                                    rank_distribution_rows.append({
+                                                        "strategy": strategy_name,
+                                                        "obs_date": obs_date,
+                                                        "ts_code": ts,
+                                                        "rank_at_obs": rv_int
+                                                    })
                                 
                                 if not df_all.empty:
                                     if best_rank_map:
@@ -8981,307 +9278,110 @@ if _in_streamlit():
                                         ]
                                     else:
                                         df_all["best_rank_after_trigger"] = [None] * len(df_all)
+
+                                # 缓存并渲染（避免调整控件后数据丢失）
+                                df_all_render = df_all
+                                rank_rows_render = rank_distribution_rows.copy()
+                                debug_info_render = debug_info.copy()
+                                st.session_state[cache_key] = {
+                                    "params": current_params,
+                                    "df_all": df_all_render.copy(),
+                                    "rank_dist_rows": rank_rows_render.copy(),
+                                    "debug_info": debug_info_render.copy(),
+                                }
+                                _render_strategy_trigger_outputs(df_all_render, rank_rows_render, debug_info_render)
+
+                            # 7) 后续跟踪
+                            if track_days > 0 and strategy_stocks_map:
+                                st.subheader("触发策略的后续跟踪")
                                 
-                                # 按策略名汇总
-                                strategy_summary = df_all.groupby("name").agg({
-                                    "trigger_count": ["sum", "max"],
-                                    "coverage": ["max"],
-                                    "obs_date": "nunique"
-                                }).reset_index()
-                                strategy_summary.columns = ["策略名", "总触发次数", "最大单日触发", 
-                                                           "最大覆盖率", "触发天数"]
-                                
-                                # 格式化百分比
-                                strategy_summary["最大覆盖率"] = strategy_summary["最大覆盖率"].map(
-                                    lambda x: f"{x*100:.2f}%" if pd.notna(x) else None
-                                )
-                                
-                                # 按总触发次数降序排序
-                                strategy_summary = strategy_summary.sort_values("总触发次数", ascending=False).reset_index(drop=True)
-                                
-                                st.subheader("策略触发汇总统计")
-                                st.dataframe(strategy_summary, width='stretch', height=400)
-                                
-                                # 5) 详细触发情况（按日期）
-                                st.subheader("每日策略触发详情")
-                                df_detail_display = df_all[["obs_date", "name", "trigger_count", "n_sample", "coverage", "best_rank_after_trigger"]].copy()
-                                df_detail_display.columns = ["日期", "策略名", "触发次数", "样本数", "覆盖率", "触发后最高排名"]
-                                df_detail_display["覆盖率"] = df_detail_display["覆盖率"].map(
-                                    lambda x: f"{x*100:.2f}%" if pd.notna(x) else None
-                                )
-                                df_detail_display["触发后最高排名"] = df_detail_display["触发后最高排名"].map(
-                                    lambda x: int(x) if pd.notna(x) else "-"
-                                )
-                                df_detail_display = df_detail_display.sort_values(["日期", "触发次数"], ascending=[True, False]).reset_index(drop=True)
-                                st.dataframe(df_detail_display, width='stretch', height=400)
-                                
-                                # 6) 未触发的策略
-                                try:
-                                    show_when_untriggered = st.checkbox(
-                                        "显示规则 when 表达式",
-                                        value=False,
-                                        key="stats_show_when"
-                                    )
-                                    
-                                    # 参考所有策略列表，找出统计区间内未触发的策略
-                                    all_rules = getattr(se, "SC_RULES", []) or []
-                                    triggered_rule_names = set(df_all["name"].astype(str).unique())
-                                    
-                                    # 预先构建 name -> when / explain 映射
-                                    name_to_when = {}
-                                    name_to_explain = {}
-                                    for r in all_rules:
-                                        rule_name = str(r.get("name", ""))
-                                        if not rule_name:
-                                            continue
-                                        if "clauses" in r and r["clauses"]:
-                                            ws = [c.get("when", "") for c in r["clauses"] if c.get("when")]
-                                            name_to_when[rule_name] = " AND ".join(ws)
+                                last_obs_date = interval_dates[-1]
+                                all_trade_dates = _get_trade_dates_available() or []
+                                if not all_trade_dates:
+                                    st.warning("无法获取交易日列表")
+                                else:
+                                    try:
+                                        last_idx = all_trade_dates.index(last_obs_date)
+                                        next_idx = last_idx + 1
+                                        if next_idx >= len(all_trade_dates):
+                                            st.warning(f"参考日 {last_obs_date} 是最后一个交易日，无法进行后续跟踪")
                                         else:
-                                            name_to_when[rule_name] = str(r.get("when", ""))
-                                        
-                                        explain_val = r.get("explain")
-                                        if explain_val:
-                                            name_to_explain[rule_name] = str(explain_val)
-                                    
-                                    untriggered_rules = []
-                                    for r in all_rules:
-                                        rule_name = str(r.get("name", ""))
-                                        if not rule_name or rule_name in triggered_rule_names:
-                                            continue
-                                        
-                                        tf = str(r.get("timeframe", "D")).upper()
-                                        scope = str(r.get("scope", "ANY")).upper().strip()
-                                        win = None if scope == "LAST" else int(r.get("score_windows", 60))
-                                        points = float(r.get("points", 0))
-                                        
-                                        gate = r.get("gate")
-                                        gate_str = ""
-                                        if gate:
-                                            if isinstance(gate, dict):
-                                                gate_when = gate.get("when", "")
-                                                if gate_when:
-                                                    gate_str = f"gate: {gate_when}"
-                                            elif isinstance(gate, str):
-                                                gate_str = f"gate: {gate}"
-                                        
-                                        # 汇总子句信息
-                                        clauses_info = ""
-                                        if "clauses" in r and r.get("clauses"):
-                                            clauses = r.get("clauses", [])
-                                            clause_parts = []
-                                            for c in clauses:
-                                                c_tf = str(c.get("timeframe", "D")).upper()
-                                                c_scope = str(c.get("scope", "ANY")).upper().strip()
-                                                if c_scope == "LAST":
-                                                    clause_parts.append(f"{c_tf}/-/LAST")
-                                                else:
-                                                    c_win = int(c.get("score_windows", 60))
-                                                    clause_parts.append(f"{c_tf}/{c_win}/{c_scope}")
-                                            if clause_parts:
-                                                clauses_info = f"子句: {len(clauses)}个 ({', '.join(clause_parts)})"
-                                        
-                                        rule_data = {
-                                            "name": rule_name,
-                                            "timeframe": tf,
-                                            "scope": scope,
-                                            "points": points,
-                                            "gate": gate_str if gate_str else "",
-                                            "clauses": clauses_info if clauses_info else "",
-                                            "when": name_to_when.get(rule_name, ""),
-                                            "explain": name_to_explain.get(rule_name, str(r.get("explain", "")))
-                                        }
-                                        if scope != "LAST":
-                                            rule_data["score_windows"] = win
-                                        
-                                        untriggered_rules.append(rule_data)
-                                    
-                                    if untriggered_rules:
-                                        st.subheader("未触发的策略")
-                                        untriggered_df = pd.DataFrame(untriggered_rules)
-                                        
-                                        # 可选隐藏 when 列
-                                        if not show_when_untriggered and "when" in untriggered_df.columns:
-                                            untriggered_df = untriggered_df.drop(columns=["when"])
-                                        
-                                        # 确定列顺序
-                                        col_order = ["name"]
-                                        for col in ["timeframe", "scope", "points"]:
-                                            if col in untriggered_df.columns:
-                                                col_order.append(col)
-                                        if "score_windows" in untriggered_df.columns:
-                                            if "scope" in untriggered_df.columns:
-                                                has_non_last = (untriggered_df["scope"].astype(str).str.upper() != "LAST").any()
-                                                if has_non_last:
-                                                    col_order.append("score_windows")
+                                            track_dates = all_trade_dates[next_idx:next_idx + track_days]
+                                            if len(track_dates) < 1:
+                                                st.warning("无法获取足够的跟踪日期")
                                             else:
-                                                col_order.append("score_windows")
-                                        for col in ["gate", "clauses"]:
-                                            if col in untriggered_df.columns:
-                                                col_order.append(col)
-                                        if show_when_untriggered and "when" in untriggered_df.columns:
-                                            col_order.append("when")
-                                        if "explain" in untriggered_df.columns:
-                                            col_order.append("explain")
-                                        col_order = [c for c in col_order if c in untriggered_df.columns]
-                                        untriggered_display = untriggered_df[col_order].copy()
-                                        
-                                        # 列配置
-                                        untriggered_column_config = {}
-                                        try:
-                                            if "name" in untriggered_display.columns:
-                                                untriggered_column_config["name"] = st.column_config.TextColumn("策略名称", help="策略的简短名称")
-                                            if "timeframe" in untriggered_display.columns:
-                                                untriggered_column_config["timeframe"] = st.column_config.TextColumn("时间周期", help="D(日线)/W(周线)/M(月线)", width="small")
-                                            if "score_windows" in untriggered_display.columns:
-                                                untriggered_column_config["score_windows"] = st.column_config.TextColumn("计分窗口", help="计分窗口条数（scope 为 LAST 时为空）", width="small")
-                                            if "scope" in untriggered_display.columns:
-                                                untriggered_column_config["scope"] = st.column_config.TextColumn("命中口径", help="ANY/EACH/PERBAR等", width="small")
-                                            if "points" in untriggered_display.columns:
-                                                untriggered_column_config["points"] = st.column_config.NumberColumn("分数", help="命中时加/减分", width="small")
-                                            if "gate" in untriggered_display.columns:
-                                                untriggered_column_config["gate"] = st.column_config.TextColumn("前置门槛", help="前置条件表达式", width="medium")
-                                            if "clauses" in untriggered_display.columns:
-                                                untriggered_column_config["clauses"] = st.column_config.TextColumn("子句信息", help="多子句组合信息", width="medium")
-                                            if "when" in untriggered_display.columns:
-                                                untriggered_column_config["when"] = st.column_config.TextColumn("条件表达式", help="TDX风格表达式", width="large")
-                                            if "explain" in untriggered_display.columns:
-                                                untriggered_column_config["explain"] = st.column_config.TextColumn("详细说明", help="策略的详细说明", width="medium")
-                                        except Exception:
-                                            untriggered_column_config = None
-                                        
-                                        st.dataframe(
-                                            untriggered_display,
-                                            width='stretch',
-                                            height=420,
-                                            hide_index=True,
-                                            column_config=untriggered_column_config if untriggered_column_config else None
-                                        )
-                                        st.caption("以上策略在所选统计区间内未出现触发。")
-                                    else:
-                                        st.info("所选区间内所有策略均有触发。")
-                                except Exception as e:
-                                    logger.debug(f"显示未触发策略失败: {e}")
-                                
-                                # 7) 后续跟踪
-                                if track_days > 0 and strategy_stocks_map:
-                                    st.subheader("触发策略的后续跟踪")
-                                    
-                                    # 获取跟踪日期范围
-                                    last_obs_date = interval_dates[-1]
-                                    # 从最后一个观察日的下一个交易日开始跟踪
-                                    # 获取所有交易日列表，找到 last_obs_date 的下一个交易日
-                                    all_trade_dates = _get_trade_dates_available() or []
-                                    if not all_trade_dates:
-                                        st.warning("无法获取交易日列表")
-                                    else:
-                                        # 找到 last_obs_date 在交易日列表中的位置
-                                        try:
-                                            last_idx = all_trade_dates.index(last_obs_date)
-                                            # 从下一个交易日开始，取 track_days 个交易日
-                                            next_idx = last_idx + 1
-                                            if next_idx >= len(all_trade_dates):
-                                                st.warning(f"参考日 {last_obs_date} 是最后一个交易日，无法进行后续跟踪")
-                                            else:
-                                                track_dates = all_trade_dates[next_idx:next_idx + track_days]
-                                                if len(track_dates) < 1:
-                                                    st.warning("无法获取足够的跟踪日期")
-                                                else:
-                                                    track_start = track_dates[0]
-                                                    track_end = track_dates[-1]
+                                                track_start = track_dates[0]
+                                                track_end = track_dates[-1]
+                                                st.info(f"跟踪区间：{track_start} 至 {track_end}（共 {len(track_dates)} 个交易日）")
+                                                
+                                                all_track_stocks = set()
+                                                for strategy_name, date_stocks in strategy_stocks_map.items():
+                                                    for stocks in date_stocks.values():
+                                                        all_track_stocks.update(stocks)
+                                                
+                                                if all_track_stocks:
+                                                    with st.spinner(f"正在读取 {len(all_track_stocks)} 只股票的价格数据..."):
+                                                        df_prices = _read_stock_prices(list(all_track_stocks), start=track_start, end=track_end)
                                                     
-                                                    st.info(f"跟踪区间：{track_start} 至 {track_end}（共 {len(track_dates)} 个交易日）")
-                                                    
-                                                    # 读取价格数据
-                                                    # _read_stock_prices 已在本文件中定义
-                                                    
-                                                    # 收集所有需要跟踪的股票
-                                                    all_track_stocks = set()
-                                                    for strategy_name, date_stocks in strategy_stocks_map.items():
-                                                        for stocks in date_stocks.values():
-                                                            all_track_stocks.update(stocks)
-                                                    
-                                                    if all_track_stocks:
-                                                        with st.spinner(f"正在读取 {len(all_track_stocks)} 只股票的价格数据..."):
-                                                            df_prices = _read_stock_prices(list(all_track_stocks), start=track_start, end=track_end)
-                                                        
-                                                        if df_prices.empty:
-                                                            st.warning("无法读取价格数据")
+                                                    if df_prices.empty:
+                                                        st.warning("无法读取价格数据")
+                                                    else:
+                                                        track_results = []
+                                                        for strategy_name, date_stocks in strategy_stocks_map.items():
+                                                            strategy_stocks = set()
+                                                            for stocks in date_stocks.values():
+                                                                strategy_stocks.update(stocks)
+                                                            if not strategy_stocks:
+                                                                continue
+                                                            strategy_prices = df_prices[df_prices["ts_code"].isin(strategy_stocks)]
+                                                            if strategy_prices.empty:
+                                                                continue
+                                                            stock_returns = []
+                                                            for ts_code, group in strategy_prices.groupby("ts_code"):
+                                                                group = group.sort_values("trade_date")
+                                                                if len(group) < 2:
+                                                                    continue
+                                                                start_price = group.iloc[0]["close"]
+                                                                end_price = group.iloc[-1]["close"]
+                                                                if pd.notna(start_price) and pd.notna(end_price) and start_price > 0:
+                                                                    stock_returns.append((end_price / start_price - 1.0) * 100.0)
+                                                            if stock_returns:
+                                                                track_results.append({
+                                                                    "策略名": strategy_name,
+                                                                    "触发股票数": len(strategy_stocks),
+                                                                    "可跟踪股票数": len(stock_returns),
+                                                                    "平均涨幅": np.mean(stock_returns),
+                                                                    "最大涨幅": np.max(stock_returns),
+                                                                    "最小涨幅": np.min(stock_returns),
+                                                                    "正收益数": sum(1 for r in stock_returns if r > 0),
+                                                                    "正收益比例": sum(1 for r in stock_returns if r > 0) / len(stock_returns) * 100 if stock_returns else 0
+                                                                })
+                                                        if track_results:
+                                                            df_track = pd.DataFrame(track_results)
+                                                            df_track["_sort_avg_ret"] = df_track["平均涨幅"]
+                                                            for col in ["平均涨幅", "最大涨幅", "最小涨幅"]:
+                                                                if col in df_track.columns:
+                                                                    df_track[col] = df_track[col].map(lambda x: f"{x:.2f}%" if pd.notna(x) else None)
+                                                            df_track["正收益比例"] = df_track["正收益比例"].map(lambda x: f"{x:.1f}%" if pd.notna(x) else None)
+                                                            df_track = df_track.sort_values("_sort_avg_ret", ascending=False).reset_index(drop=True)
+                                                            df_track = df_track.drop(columns=["_sort_avg_ret"])
+                                                            st.dataframe(df_track, width='stretch', height=400)
+                                                            st.caption(f"跟踪结果：统计在区间内触发各策略的股票，在后续 {track_days} 个交易日的表现")
                                                         else:
-                                                            # 按策略统计后续表现
-                                                            track_results = []
-                                                            
-                                                            for strategy_name, date_stocks in strategy_stocks_map.items():
-                                                                # 收集该策略在所有日期触发的股票（去重）
-                                                                strategy_stocks = set()
-                                                                for stocks in date_stocks.values():
-                                                                    strategy_stocks.update(stocks)
-                                                                
-                                                                if not strategy_stocks:
-                                                                    continue
-                                                                
-                                                                # 计算这些股票在跟踪区间的表现
-                                                                strategy_prices = df_prices[df_prices["ts_code"].isin(strategy_stocks)]
-                                                                if strategy_prices.empty:
-                                                                    continue
-                                                                
-                                                                # 按股票分组计算涨幅
-                                                                stock_returns = []
-                                                                for ts_code, group in strategy_prices.groupby("ts_code"):
-                                                                    group = group.sort_values("trade_date")
-                                                                    if len(group) < 2:
-                                                                        continue
-                                                                    
-                                                                    start_price = group.iloc[0]["close"]
-                                                                    end_price = group.iloc[-1]["close"]
-                                                                    if pd.notna(start_price) and pd.notna(end_price) and start_price > 0:
-                                                                        ret = (end_price / start_price - 1.0) * 100.0
-                                                                        stock_returns.append(ret)
-                                                                
-                                                                if stock_returns:
-                                                                    track_results.append({
-                                                                        "策略名": strategy_name,
-                                                                        "触发股票数": len(strategy_stocks),
-                                                                        "可跟踪股票数": len(stock_returns),
-                                                                        "平均涨幅": np.mean(stock_returns),
-                                                                        "最大涨幅": np.max(stock_returns),
-                                                                        "最小涨幅": np.min(stock_returns),
-                                                                        "正收益数": sum(1 for r in stock_returns if r > 0),
-                                                                        "正收益比例": sum(1 for r in stock_returns if r > 0) / len(stock_returns) * 100 if stock_returns else 0
-                                                                    })
-                                                            
-                                                            if track_results:
-                                                                df_track = pd.DataFrame(track_results)
-                                                                
-                                                                # 先保存原始数值用于排序
-                                                                df_track["_sort_avg_ret"] = df_track["平均涨幅"]
-                                                                
-                                                                # 格式化百分比
-                                                                for col in ["平均涨幅", "最大涨幅", "最小涨幅"]:
-                                                                    if col in df_track.columns:
-                                                                        df_track[col] = df_track[col].map(
-                                                                            lambda x: f"{x:.2f}%" if pd.notna(x) else None
-                                                                        )
-                                                                df_track["正收益比例"] = df_track["正收益比例"].map(
-                                                                    lambda x: f"{x:.1f}%" if pd.notna(x) else None
-                                                                )
-                                                                
-                                                                # 按平均涨幅降序排序（使用原始数值）
-                                                                df_track = df_track.sort_values("_sort_avg_ret", ascending=False).reset_index(drop=True)
-                                                                # 删除临时排序列
-                                                                df_track = df_track.drop(columns=["_sort_avg_ret"])
-                                                                
-                                                                st.dataframe(df_track, width='stretch', height=400)
-                                                                st.caption(f"跟踪结果：统计在区间内触发各策略的股票，在后续 {track_days} 个交易日的表现")
-                                                            else:
-                                                                st.warning("无法计算后续跟踪数据")
-                                        except ValueError:
-                                            st.warning(f"参考日 {last_obs_date} 不在交易日列表中")
-                                        
+                                                            st.warning("无法计算后续跟踪数据")
+                                    except ValueError:
+                                        st.warning(f"参考日 {last_obs_date} 不在交易日列表中")
+                    
                     except Exception as e:
                         st.error(f"生成失败：{e}")
                         import traceback
                         st.code(traceback.format_exc())
+
+                elif cache_valid:
+                    df_all_render = cache_obj.get("df_all")
+                    rank_rows_render = cache_obj.get("rank_dist_rows", [])
+                    debug_info_render = cache_obj.get("debug_info", [])
+                    _render_strategy_trigger_outputs(df_all_render, rank_rows_render, debug_info_render)
 
 
     # ================== 数据管理 ==================
