@@ -985,6 +985,59 @@ def GET_LAST_DIFF_HIGH_VALUE(lookback_days=60):
         return 0.0
 
 
+def GET(condition_expr: str, price_field: str = "C", lookback: int = 20):
+    """
+    取回看期内最近一根满足条件的K线价格（不包含当日）
+
+    参数:
+    - condition_expr: 条件表达式字符串；若为 'ZHANG' 则代表涨停判定
+    - price_field: 价格字段，'C'/'O'/'H'/'L'（不区分大小写）
+    - lookback: 回看天数，不含当日
+
+    返回:
+    - 与原数据等长的序列，取最近一根满足条件的指定价格，否则为 NaN
+    """
+    df = EXTRA_CONTEXT.get("DF", None)
+    if df is None or df.empty:
+        return pd.Series(np.nan, index=getattr(df, "index", None))
+
+    # 价格字段映射
+    field_map = {"C": "close", "O": "open", "H": "high", "L": "low"}
+    price_key = field_map.get(str(price_field).upper(), str(price_field))
+    if price_key not in df.columns and "close" in df.columns:
+        price_key = "close"
+    price_series = pd.to_numeric(df.get(price_key, pd.Series(np.nan, index=df.index)), errors="coerce")
+
+    # 条件序列
+    cond_expr = (condition_expr or "").strip()
+    if cond_expr.upper() == "ZHANG":
+        zhang_pct = _calc_limit_up_pct(EXTRA_CONTEXT.get("TS"), df)
+        # 优先用现成涨跌幅字段，避免频繁 shift 计算
+        if "pct_chg" in df.columns:
+            cond_series = pd.to_numeric(df["pct_chg"], errors="coerce") >= (zhang_pct * 100 * 0.98)
+        elif "pre_close" in df.columns:
+            cond_series = SAFE_DIV(df["close"], df["pre_close"]) >= (1 + zhang_pct * 0.98)
+        else:
+            cond_series = SAFE_DIV(df["close"], df["close"].shift(1)) >= (1 + zhang_pct * 0.98)
+    else:
+        cond_series = evaluate_bool(cond_expr, df, skip_var_replacement=False)
+        cond_series = _coerce_bool_series(cond_series)
+
+    lb = max(int(lookback), 1)
+    idx = df.index
+    result = pd.Series(np.nan, index=idx)
+
+    for i in range(len(df)):
+        start = max(0, i - lb)
+        # 不包含当日
+        window_cond = cond_series.iloc[start:i]
+        if window_cond.any():
+            last_idx = window_cond[window_cond].index[-1]
+            result.iloc[i] = price_series.loc[last_idx]
+
+    return result
+
+
 def _calc_limit_up_pct(ts_code: Optional[str], df=None) -> float:
     """
     按板块推断涨停幅度：
@@ -1012,7 +1065,7 @@ def _calc_limit_up_pct(ts_code: Optional[str], df=None) -> float:
 
         try:
             if df is not None:
-                st_pattern = re.compile(r'^\s*\*?ST', flags=re.IGNORECASE)
+                st_pattern = re.compile(r'\*?ST', flags=re.IGNORECASE)
                 for col in ("name", "ts_name", "ts_fullname", "stock_name"):
                     if col in df.columns:
                         ser = df[col]
@@ -1055,6 +1108,12 @@ VAR_MAP = {
     "V": "df['vol']",
     "VOL": "df['vol']",
     "AMOUNT": "df['amount']",
+    "PRE_CLOSE": "df['pre_close']",
+    "pre_close": "df['pre_close']",
+    "CHANGE": "df['change']",
+    "change": "df['change']",
+    "PCT_CHG": "df['pct_chg']",
+    "pct_chg": "df['pct_chg']",
     "REFDATE": "REF_DATE",
     "J": "df['j']",
     "j": "df['j']",  # 添加小写版本
@@ -1097,6 +1156,7 @@ FUNC_MAP = {
     "BARSLAST": "BARSLAST",
     "TS_RANK": "TS_RANK",
     "ATAN": "ATAN",
+    "GET": "GET",
     "FIND_LAST_LOWEST_J": "FIND_LAST_LOWEST_J",
     "GET_LAST_CONDITION_PRICE": "GET_LAST_CONDITION_PRICE",
     "GET_LAST_DIFF_HIGH_PRICE": "GET_LAST_DIFF_HIGH_PRICE",
@@ -1403,6 +1463,7 @@ def evaluate(script, df, extra_context=None):
         "RSV": RSV,
         "TS_RANK": TS_RANK,
         "ATAN": ATAN,
+        "GET": GET,
         "FIND_LAST_LOWEST_J": FIND_LAST_LOWEST_J,
         "GET_LAST_CONDITION_PRICE": GET_LAST_CONDITION_PRICE,
         "GET_LAST_DIFF_HIGH_PRICE": GET_LAST_DIFF_HIGH_PRICE,

@@ -1483,7 +1483,7 @@ def _is_st_stock(ts_code: str, name_map: Dict[str, str] | None = None) -> bool:
         nm = name_map.get(ts_code) or name_map.get(ts_code.split(".")[0], None)
     if not nm:
         return False
-    return bool(re.match(r"\s*\*?ST", str(nm), flags=re.IGNORECASE))
+    return bool(re.search(r"\*?ST", str(nm), flags=re.IGNORECASE))
 
 
 def _resolve_user_code_input(raw: str) -> str | None:

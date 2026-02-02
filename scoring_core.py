@@ -2129,8 +2129,13 @@ def _recent_points(dfD: pd.DataFrame, rule: dict, ref_date: str, ctx: dict = Non
 
 
 def _select_columns_for_rules() -> List[str]:
-    # 基础列：行情 + tor（换手率）即使缺失也作为基础列拉取
-    need = {"trade_date", "open", "high", "low", "close", "vol", "amount", "tor"}
+    # 基础列：行情 + tor（换手率）+ 涨跌幅字段
+    base_cols = {
+        "trade_date", "open", "high", "low", "close",
+        "pre_close", "change", "pct_chg",
+        "vol", "amount", "tor",
+    }
+    need = set(base_cols)
     # 指标输出列：优先通过 get_all_indicator_names + outputs_for 自动获取；失败则使用旧的手工兜底集合
     default_indicator_cols = {"j","vr","bbi","z_score","duokong_long","duokong_short","diff","bar_color","rsi6","rsi12","bupiao_short","bupiao_long"}
     indicator_cols: set[str] = set()
@@ -2154,7 +2159,7 @@ def _select_columns_for_rules() -> List[str]:
     def scan(script: str):
         for name in pattern.findall(script or ""):
             name_low = name.lower()
-            if name_low in indicator_cols:
+            if name_low in indicator_cols or name_low in base_cols:
                 need.add(name_low)
 
     def scan_rule(rr: dict):
